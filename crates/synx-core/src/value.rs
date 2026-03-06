@@ -94,6 +94,30 @@ impl Value {
     }
 }
 
+impl std::fmt::Display for Value {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Value::String(s) | Value::Secret(s) => write!(f, "{}", s),
+            Value::Int(n) => write!(f, "{}", n),
+            Value::Float(fl) => {
+                let s = fl.to_string();
+                if s.contains('.') { write!(f, "{}", s) } else { write!(f, "{}.0", s) }
+            }
+            Value::Bool(b) => write!(f, "{}", b),
+            Value::Null => write!(f, "null"),
+            Value::Array(arr) => {
+                write!(f, "[")?;
+                for (i, item) in arr.iter().enumerate() {
+                    if i > 0 { write!(f, ", ")?; }
+                    write!(f, "{}", item)?;
+                }
+                write!(f, "]")
+            }
+            Value::Object(_) => write!(f, "[Object]"),
+        }
+    }
+}
+
 impl std::ops::Index<&str> for Value {
     type Output = Value;
     fn index(&self, key: &str) -> &Value {
@@ -112,7 +136,7 @@ pub enum Mode {
 }
 
 /// Metadata for a single key (markers, args, constraints).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Meta {
     pub markers: Vec<String>,
     pub args: Vec<String>,
@@ -121,7 +145,7 @@ pub struct Meta {
 }
 
 /// Constraints from [min:3, max:30, required, type:int].
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Constraints {
     pub min: Option<f64>,
     pub max: Option<f64>,
@@ -140,6 +164,7 @@ pub type MetaMap = HashMap<String, Meta>;
 pub struct ParseResult {
     pub root: Value,
     pub mode: Mode,
+    pub locked: bool,
     /// Metadata for each nesting level, keyed by dot-path prefix.
     /// "" = root level, "server" = server sub-object, etc.
     pub metadata: HashMap<String, MetaMap>,

@@ -32,19 +32,21 @@ function castType(val: string): SynxValue {
 
   const c0 = val.charCodeAt(0);
 
-  // Explicit cast: (int)007, (string)90210, (float)3.0, (bool)true
-  if (c0 === 40 && len > 3) { // '('
+  // Explicit cast: (int)007, (string)90210, (float)3.0, (bool)true, (random), (random:bool)
+  if (c0 === 40 && len > 2) { // '('
     const closeIdx = val.indexOf(')');
     if (closeIdx > 1) {
       const hint = val.substring(1, closeIdx);
-      if (hint === 'int' || hint === 'float' || hint === 'bool' || hint === 'string') {
-        const raw = val.substring(closeIdx + 1);
-        switch (hint) {
-          case 'int': return parseInt(raw, 10) || 0;
-          case 'float': return parseFloat(raw) || 0;
-          case 'bool': return raw.trim() === 'true';
-          case 'string': return raw;
-        }
+      const raw = val.substring(closeIdx + 1);
+      switch (hint) {
+        case 'int': return parseInt(raw, 10) || 0;
+        case 'float': return parseFloat(raw) || 0;
+        case 'bool': return raw.trim() === 'true';
+        case 'string': return raw;
+        case 'random': return Math.floor(Math.random() * 2147483647);
+        case 'random:int': return Math.floor(Math.random() * 2147483647);
+        case 'random:float': return Math.random();
+        case 'random:bool': return Math.random() < 0.5;
       }
     }
   }
@@ -157,7 +159,7 @@ function saveMeta(
 }
 
 // ─── Fallback regex for complex lines (type hints, constraints, markers) ──
-const LINE_REGEX = /^([^\s\[:\-#/(][^\s\[:(]*)(?:\((\w+)\))?(?:\[([^\]]*)\])?(?::([\w:]+))?\s*(.*)$/;
+const LINE_REGEX = /^([^\s\[:\-#/(][^\s\[:(]*)(?:\(([\w:]+)\))?(?:\[([^\]]*)\])?(?::([\w:]+))?\s*(.*)$/;
 
 // ─── Parser ───────────────────────────────────────────────
 
@@ -169,6 +171,7 @@ export function parseData(text: string): SynxParseResult {
   ];
 
   let mode: SynxMode = 'static';
+  let locked = false;
   let currentBlock: { indent: number; obj: SynxObject; key: string } | null = null;
   let currentList: { indent: number; arr: SynxArray } | null = null;
 
@@ -212,10 +215,10 @@ export function parseData(text: string): SynxParseResult {
     const trimmed = rawLine.substring(indent, trimEndPos);
     const trimmedLen = trimmed.length;
 
-    // ── Mode declaration: !active ──
-    if (fc === 33 && trimmed === '!active') {
-      mode = 'active';
-      continue;
+    // ── Mode declaration: !active / !lock ──
+    if (fc === 33) {
+      if (trimmed === '!active') { mode = 'active'; continue; }
+      if (trimmed === '!lock') { locked = true; continue; }
     }
 
     // ── Continue multiline block ──
@@ -402,5 +405,5 @@ export function parseData(text: string): SynxParseResult {
     }
   }
 
-  return { root, mode };
+  return { root, mode, locked };
 }

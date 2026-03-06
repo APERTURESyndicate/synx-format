@@ -4,6 +4,7 @@
   "fileTypes": ["synx"],
   "patterns": [
     { "include": "#mode-declaration" },
+    { "include": "#lock-declaration" },
     { "include": "#static-declaration" },
     { "include": "#comment-hash" },
     { "include": "#comment-slash" },
@@ -17,6 +18,12 @@
   "repository": {
     "mode-declaration": {
       "match": "^(!active)\\s*$",
+      "captures": {
+        "1": { "name": "keyword.control.mode.synx" }
+      }
+    },
+    "lock-declaration": {
+      "match": "^(!lock)\\s*$",
       "captures": {
         "1": { "name": "keyword.control.mode.synx" }
       }

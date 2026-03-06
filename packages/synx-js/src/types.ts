@@ -33,7 +33,15 @@ export type SynxMarker =
   | 'geo'
   | 'template'
   | 'split'
-  | 'join';
+  | 'join'
+  | 'clamp'
+  | 'round'
+  | 'map'
+  | 'format'
+  | 'fallback'
+  | 'once'
+  | 'version'
+  | 'watch';
 
 /** Constraint types for [] validation */
 export interface SynxConstraints {
@@ -62,6 +70,7 @@ export interface SynxMetaMap {
 export interface SynxParseResult {
   mode: SynxMode;
   root: SynxObject;
+  locked?: boolean;
 }
 
 /** Options for Synx.parse() / Synx.load() */

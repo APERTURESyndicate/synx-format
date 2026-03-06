@@ -5,8 +5,6 @@
 app_name[required, min:3, max:30] TotalWario
 version[readonly] 2.0.0
 
-variable:
-
 server
   // Порт из переменной окружения, если нет — 8080
   port:env:default:8080 PORT

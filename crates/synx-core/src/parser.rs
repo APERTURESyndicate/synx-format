@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use memchr::memchr_iter;
 use crate::value::*;
+use crate::rng;
 
 /// Parse a SYNX text string into a value tree with metadata.
 pub fn parse(text: &str) -> ParseResult {
@@ -20,6 +21,7 @@ pub fn parse(text: &str) -> ParseResult {
     let mut root = HashMap::new();
     let mut stack: Vec<(i32, StackEntry)> = vec![(-1, StackEntry::Root)];
     let mut mode = Mode::Static;
+    let mut locked = false;
     let mut metadata: HashMap<String, MetaMap> = HashMap::new();
 
     let mut block: Option<BlockState> = None;
@@ -39,6 +41,11 @@ pub fn parse(text: &str) -> ParseResult {
         // Mode declaration
         if trimmed == "!active" {
             mode = Mode::Active;
+            i += 1;
+            continue;
+        }
+        if trimmed == "!lock" {
+            locked = true;
             i += 1;
             continue;
         }
@@ -229,6 +236,7 @@ pub fn parse(text: &str) -> ParseResult {
     ParseResult {
         root: Value::Object(root),
         mode,
+        locked,
         metadata,
     }
 }
@@ -450,6 +458,9 @@ fn cast_typed(val: &str, hint: &str) -> Value {
         "float" => Value::Float(val.parse().unwrap_or(0.0)),
         "bool" => Value::Bool(val.trim() == "true"),
         "string" => Value::String(val.to_string()),
+        "random" | "random:int" => Value::Int(rng::random_i64()),
+        "random:float" => Value::Float(rng::random_f64_01()),
+        "random:bool" => Value::Bool(rng::random_bool()),
         _ => cast(val),
     }
 }
@@ -484,36 +495,52 @@ fn insert_value(
     key: &str,
     value: Value,
 ) {
-    let target = navigate_to_parent(root, stack, parent_idx);
-    target.insert(key.to_string(), value);
+    if let Some(target) = navigate_to_parent(root, stack, parent_idx) {
+        target.insert(key.to_string(), value);
+    }
+    // If the path is broken the line is silently skipped — this should not
+    // happen under well-formed input; malformed input simply loses the entry
+    // rather than inserting it at the wrong nesting level.
 }
 
 fn navigate_to_parent<'a>(
     root: &'a mut HashMap<String, Value>,
     stack: &[(i32, StackEntry)],
     target_idx: usize,
-) -> &'a mut HashMap<String, Value> {
+) -> Option<&'a mut HashMap<String, Value>> {
     if target_idx == 0 {
-        return root;
+        return Some(root);
     }
 
-    let mut path: Vec<&str> = Vec::new();
-    for (_, entry) in stack.iter().skip(1).take(target_idx) {
-        if let StackEntry::Key(ref k) = entry {
-            path.push(k);
-        }
-    }
+    let path: Vec<&str> = stack
+        .iter()
+        .skip(1)
+        .take(target_idx)
+        .filter_map(|(_, entry)| match entry {
+            StackEntry::Key(k) => Some(k.as_str()),
+            _ => None,
+        })
+        .collect();
 
+    // SAFETY: We navigate a tree of nested HashMaps using a raw pointer to
+    // work around the borrow-checker's inability to track that successive
+    // `get_mut` calls target disjoint subtrees.  The invariants that make
+    // this sound are:
+    //   1. `root` is a valid, exclusively-owned mutable reference for 'a.
+    //   2. We descend strictly downward and never alias: at each step we
+    //      replace `current` with a pointer to a child map, discarding the
+    //      parent pointer.
+    //   3. The returned reference re-borrows from `root`'s lifetime 'a and
+    //      is the only mutable reference handed out by this function.
     let mut current = root as *mut HashMap<String, Value>;
     for key in path {
-        unsafe {
-            match (*current).get_mut(key) {
-                Some(Value::Object(map)) => current = map as *mut HashMap<String, Value>,
-                _ => return &mut *current,
-            }
+        let child = unsafe { (*current).get_mut(key) };
+        match child {
+            Some(Value::Object(map)) => current = map as *mut HashMap<String, Value>,
+            _ => return None, // Path segment missing or not an Object
         }
     }
-    unsafe { &mut *current }
+    Some(unsafe { &mut *current })
 }
 
 #[cfg(test)]

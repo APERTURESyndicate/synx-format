@@ -235,8 +235,16 @@ password[required, min:8, max:64, type:string] MyP@ssw0rd
 
 ## Full Specification
 
-- **[SPECIFICATION.md (English)](https://github.com/kaiserrberg/synx-format/blob/main/SPECIFICATION_EN.md)**
-- **[SPECIFICATION_RU.md (Русский)](https://github.com/kaiserrberg/synx-format/blob/main/SPECIFICATION_RU.md)**
+- **Specifications**
+- **[SPECIFICATION_EN.md (English)](https://github.com/kaiserrberg/synx-format/blob/main/packages/synx-js/SPECIFICATION_EN.md)**
+- **[SPECIFICATION_RU.md (Русский)](https://github.com/kaiserrberg/synx-format/blob/main/packages/synx-js/SPECIFICATION_RU.md)**
+- **Guides (All Languages)**
+- **[GUIDE.md (English)](https://github.com/kaiserrberg/synx-format/blob/main/_guides/GUIDE.md)**
+- **[GUIDE_RU.md (Русский)](https://github.com/kaiserrberg/synx-format/blob/main/_guides/GUIDE_RU.md)**
+- **[GUIDE_ZH.md (中文)](https://github.com/kaiserrberg/synx-format/blob/main/_guides/GUIDE_ZH.md)**
+- **[GUIDE_ES.md (Español)](https://github.com/kaiserrberg/synx-format/blob/main/_guides/GUIDE_ES.md)**
+- **[GUIDE_JA.md (日本語)](https://github.com/kaiserrberg/synx-format/blob/main/_guides/GUIDE_JA.md)**
+- **[GUIDE_DE.md (Deutsch)](https://github.com/kaiserrberg/synx-format/blob/main/_guides/GUIDE_DE.md)**
 
 ---
 

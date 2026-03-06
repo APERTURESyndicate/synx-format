@@ -280,6 +280,30 @@ enabled(bool) 1
 
 Verfügbare Typen: `int`, `float`, `bool`, `string`.
 
+#### Zufallswert-Generierung
+
+Generiere Zufallswerte beim Parsen mit `(random)`:
+
+```synx
+pin(random) null
+flag(random:bool) null
+chance(random:float) null
+dice(random:int) null
+```
+
+```json
+{
+  "pin": 1847362951,
+  "flag": true,
+  "chance": 0.7342,
+  "dice": 982451653
+}
+```
+
+Verfügbare Typen: `(random)` (int), `(random:int)`, `(random:float)`, `(random:bool)`.
+
+> Werte werden bei jedem Parsen generiert — jeder Aufruf erzeugt neue Werte.
+
 ---
 
 ### Mehrzeiliger Text
@@ -313,6 +337,91 @@ Setze `!active` in die **erste Zeile**, um Marker und Einschränkungen freizusch
 
 port:env PORT
 boss_hp:calc base_hp * 5
+```
+
+---
+
+## 🔐 Sperrmodus (`!lock`)
+
+Füge `!lock` hinzu, um zu verhindern, dass externer Code Werte über `Synx.set()`, `Synx.add()`, `Synx.remove()` ändert. Interne SYNX-Marker funktionieren weiterhin normal.
+
+```synx
+!active
+!lock
+
+max_players 100
+greeting:random
+  - Hallo!
+  - Willkommen!
+```
+
+```typescript
+const config = Synx.loadSync('./config.synx');
+
+Synx.set(config, 'max_players', 200);
+// ❌ Fehler: "SYNX: Cannot set "max_players" — config is locked (!lock)"
+
+console.log(config.max_players); // ✅ 100 (Lesen ist immer erlaubt)
+```
+
+Verwende `Synx.isLocked(config)` zur Überprüfung.
+
+---
+
+## 🧹 Kanonisches Format (`format`)
+
+`Synx.format()` schreibt jede `.synx`-Datei in eine einzige, normalisierte Form um.
+
+**Was es tut:**
+- **Schlüssel alphabetisch sortiert** auf jeder Verschachtelungsebene
+- **Einrückung normalisiert** auf genau 2 Leerzeichen pro Ebene
+- **Kommentare entfernt** — das kanonische Format enthält nur Daten
+- **Eine Leerzeile** zwischen Top-Level-Blöcken (Objekte und Listen)
+- **Direktiven** (`!active`, `!lock`) bleiben am Anfang der Datei
+- **Reihenfolge von Listenelementen bleibt erhalten** — nur benannte Schlüssel werden sortiert
+
+### Warum das für Git wichtig ist
+
+Ohne kanonisches Format schreiben zwei Entwickler dieselbe Konfiguration unterschiedlich:
+
+```synx
+# Entwickler A               # Entwickler B
+server                       server
+    port 8080                  host 0.0.0.0
+    host 0.0.0.0               port 8080
+```
+
+`git diff` zeigt den gesamten Block als geändert — obwohl die Daten identisch sind.
+
+Nach `Synx.format()` erzeugen beide:
+
+```synx
+server
+  host 0.0.0.0
+  port 8080
+```
+
+Eine kanonische Form. Null Rauschen in Diffs.
+
+### Verwendung
+
+**JavaScript / TypeScript:**
+
+```typescript
+import { Synx } from '@aperturesyndicate/synx';
+import * as fs from 'fs';
+
+const raw = fs.readFileSync('config.synx', 'utf-8');
+fs.writeFileSync('config.synx', Synx.format(raw));
+```
+
+**Rust:**
+
+```rust
+use synx_core::Synx;
+
+let raw = std::fs::read_to_string("config.synx").unwrap();
+std::fs::write("config.synx", Synx::format(&raw)).unwrap();
 ```
 
 ---
@@ -407,9 +516,11 @@ colors:split red, green, blue
 words:split:space hello world foo
 ```
 
-Trennzeichen-Schlüsselwörter: `space`, `pipe`, `dash`, `dot`, `semi`, `tab`
+Trennzeichen-Schlüsselwörter: `space`, `pipe`, `dash`, `dot`, `semi`, `tab`, `slash`
 
 ### `:join` — Array zu String
+
+Trennzeichen-Schlüsselwörter: `space`, `pipe`, `dash`, `dot`, `semi`, `tab`, `slash`. Standard: Komma.
 
 ```synx
 !active
@@ -539,6 +650,22 @@ port:env:default:8080 PORT
 profit:calc:round:2 revenue * margin
 ```
 
+### ✅ Marker-Kompatibilitaet
+
+Gut funktionierende Kombinationen:
+
+- `env:default`
+- `calc:round`
+- `split:unique`
+- `split:join` (ueber ein Zwischen-Array)
+
+Wichtige Einschraenkungen:
+
+- `!active` ist erforderlich, sonst werden Marker nicht ausgewertet.
+- Einige Marker sind typabhaengig: `split` erwartet String, `join` erwartet Array, `round`/`clamp` erwarten Zahlen.
+- Marker-Argumente werden rechts in der Kette gelesen (z. B. `clamp:min:max`, `round:n`, `map:key`).
+- Wenn ein frueher Marker den Typ aendert, kann ein spaeter Marker nicht mehr greifen.
+
 ---
 
 ## 💻 Codebeispiele
@@ -558,7 +685,94 @@ const config = Synx.parse(`
 console.log(config.server.port);  // 8080
 ```
 
+**Laufzeit-Manipulation (set / add / remove):**
+
+```typescript
+import { Synx } from '@aperturesyndicate/synx';
+
+const config = Synx.loadSync('./game.synx');
+
+// Wert setzen
+Synx.set(config, 'max_players', 100);
+Synx.set(config, 'server.host', 'localhost');
+
+// Wert abrufen
+const port = Synx.get(config, 'server.port'); // 8080
+
+// Zur Liste hinzufügen
+Synx.add(config, 'maps', 'Arena of Doom');
+
+// Aus Liste entfernen
+Synx.remove(config, 'maps', 'Arena of Doom');
+
+// Schlüssel komplett löschen
+Synx.remove(config, 'deprecated_key');
+
+// Sperrstatus prüfen
+if (!Synx.isLocked(config)) {
+  Synx.set(config, 'motd', 'Willkommen!');
+}
+```
+
+> **Hinweis:** Wenn die `.synx`-Datei `!lock` enthält, werfen alle `set`/`add`/`remove`-Aufrufe einen Fehler.
+
+**Zugriffsmethoden (JS/TS API):**
+
+- `Synx.get(obj, keyPath)` — Wert per Dot-Path lesen.
+- `Synx.set(obj, keyPath, value)` — Wert per Dot-Path setzen.
+- `Synx.add(obj, keyPath, item)` — Element zu einem Array hinzufuegen.
+- `Synx.remove(obj, keyPath, item?)` — Array-Element entfernen oder Schluessel loeschen.
+- `Synx.isLocked(obj)` — pruefen, ob die Konfiguration durch `!lock` gesperrt ist.
+
 ### Python
+
+Aktuell exportiert `synx_native`: `parse`, `parse_active`, `parse_to_json`.
+
+Python-Aequivalente fuer `get`/`set`/`add`/`remove`:
+
+```python
+def get_path(obj, key_path, default=None):
+  cur = obj
+  for part in key_path.split('.'):
+    if not isinstance(cur, dict) or part not in cur:
+      return default
+    cur = cur[part]
+  return cur
+
+def set_path(obj, key_path, value):
+  parts = key_path.split('.')
+  cur = obj
+  for part in parts[:-1]:
+    if part not in cur or not isinstance(cur[part], dict):
+      cur[part] = {}
+    cur = cur[part]
+  cur[parts[-1]] = value
+
+def add_path(obj, key_path, item):
+  arr = get_path(obj, key_path)
+  if not isinstance(arr, list):
+    set_path(obj, key_path, [] if arr is None else [arr])
+    arr = get_path(obj, key_path)
+  arr.append(item)
+
+def remove_path(obj, key_path, item=None):
+  parts = key_path.split('.')
+  cur = obj
+  for part in parts[:-1]:
+    if not isinstance(cur, dict) or part not in cur:
+      return
+    cur = cur[part]
+  last = parts[-1]
+  if item is None:
+    if isinstance(cur, dict):
+      cur.pop(last, None)
+    return
+  if isinstance(cur, dict) and isinstance(cur.get(last), list):
+    try:
+      cur[last].remove(item)
+    except ValueError:
+      pass
+```
 
 ```python
 import synx_native
@@ -571,6 +785,12 @@ server
 """)
 
 print(config["server"]["port"])  # 8080
+
+# Nutzung der Python-Access-Helper
+set_path(config, "server.port", 9090)
+add_path(config, "maps", "Arena of Doom")
+remove_path(config, "maps", "Arena of Doom")
+print(get_path(config, "server.port"))  # 9090
 ```
 
 ### Rust

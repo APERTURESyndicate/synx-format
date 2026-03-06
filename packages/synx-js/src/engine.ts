@@ -151,18 +151,16 @@ export function resolve(
     // ── :calc ──
     if (markers.includes('calc') && typeof obj[key] === 'string') {
       let expr = obj[key] as string;
-      // Substitute variable references with their numeric values
+      // Collect numeric variables from root + local scope
+      const vars = new Map<string, string>();
       for (const rKey of Object.keys(root)) {
-        if (typeof root[rKey] === 'number') {
-          expr = expr.replace(new RegExp(`\\b${escapeRegex(rKey)}\\b`, 'g'), String(root[rKey]));
-        }
+        if (typeof root[rKey] === 'number') vars.set(rKey, String(root[rKey]));
       }
-      // Also check current object level for local references
       for (const rKey of Object.keys(obj)) {
-        if (rKey !== key && typeof obj[rKey] === 'number') {
-          expr = expr.replace(new RegExp(`\\b${escapeRegex(rKey)}\\b`, 'g'), String(obj[rKey]));
-        }
+        if (rKey !== key && typeof obj[rKey] === 'number') vars.set(rKey, String(obj[rKey]));
       }
+      // Substitute whole-word occurrences without building RegExp objects
+      if (vars.size > 0) expr = replaceVars(expr, vars);
       try {
         obj[key] = safeCalc(expr);
       } catch (e: any) {
@@ -253,8 +251,12 @@ export function resolve(
       const idx = markers.indexOf('clamp');
       const lo = parseFloat(markers[idx + 1] ?? '');
       const hi = parseFloat(markers[idx + 2] ?? '');
-      if (!isNaN(lo) && !isNaN(hi) && typeof obj[key] === 'number') {
-        obj[key] = Math.min(hi, Math.max(lo, obj[key] as number));
+      if (!isNaN(lo) && !isNaN(hi)) {
+        if (lo > hi) {
+          obj[key] = `CONSTRAINT_ERR: clamp min (${lo}) > max (${hi})`;
+        } else if (typeof obj[key] === 'number') {
+          obj[key] = Math.min(hi, Math.max(lo, obj[key] as number));
+        }
       }
     }
 
@@ -374,9 +376,78 @@ export function resolve(
         }
       }
     }
+
+    // ── Constraint validation (always last, after all markers resolved) ──
+    if (metaMap && metaMap[key]?.constraints) {
+      validateConstraints(obj, key, metaMap[key].constraints!);
+    }
   }
 
   return obj;
+}
+
+// ─── Constraint enforcement ───────────────────────────────────────────────
+
+function validateConstraints(obj: SynxObject, key: string, c: import('./types').SynxConstraints): void {
+  const val = obj[key];
+
+  // required
+  if (c.required && (val === null || val === undefined || val === '')) {
+    obj[key] = `CONSTRAINT_ERR: '${key}' is required`;
+    return;
+  }
+  if (val === null || val === undefined) return;
+
+  // type check
+  if (c.type) {
+    const ok = (() => {
+      switch (c.type) {
+        case 'int':    return typeof val === 'number' && Number.isInteger(val);
+        case 'float':  return typeof val === 'number';
+        case 'bool':   return typeof val === 'boolean';
+        case 'string': return typeof val === 'string';
+        default:       return true;
+      }
+    })();
+    if (!ok) {
+      obj[key] = `CONSTRAINT_ERR: '${key}' expected type '${c.type}'`;
+      return;
+    }
+  }
+
+  // enum check
+  if (c.enum) {
+    const strVal = String(val);
+    if (!c.enum.includes(strVal)) {
+      obj[key] = `CONSTRAINT_ERR: '${key}' must be one of [${c.enum.join('|')}]`;
+      return;
+    }
+  }
+
+  // min / max  (numbers: value range; strings: length range)
+  const n = typeof val === 'number' ? val
+          : typeof val === 'string' && (c.min !== undefined || c.max !== undefined)
+            ? val.length : null;
+  if (n !== null) {
+    if (c.min !== undefined && n < c.min) {
+      obj[key] = `CONSTRAINT_ERR: '${key}' value ${n} is below min ${c.min}`;
+      return;
+    }
+    if (c.max !== undefined && n > c.max) {
+      obj[key] = `CONSTRAINT_ERR: '${key}' value ${n} exceeds max ${c.max}`;
+      return;
+    }
+  }
+
+  // pattern (regex match)
+  if (c.pattern && typeof val === 'string') {
+    try {
+      if (!new RegExp(c.pattern).test(val)) {
+        obj[key] = `CONSTRAINT_ERR: '${key}' does not match pattern /${c.pattern}/`;
+        return;
+      }
+    } catch { /* invalid regex — skip silently */ }
+  }
 }
 
 // ─── New-marker helpers ───────────────────────────────────
@@ -492,7 +563,7 @@ function castPrimitive(val: string): SynxValue {
 }
 
 const DELIM_MAP: Record<string, string> = {
-  space: ' ', pipe: '|', dash: '-', dot: '.', semi: ';', tab: '\t',
+  space: ' ', pipe: '|', dash: '-', dot: '.', semi: ';', tab: '\t', slash: '/',
 };
 
 function delimiterFromKeyword(keyword: string): string {
@@ -500,33 +571,67 @@ function delimiterFromKeyword(keyword: string): string {
 }
 
 function weightedRandom(items: SynxValue[], weights: number[]): SynxValue {
-  // Pad weights if fewer than items
   const w: number[] = [...weights];
   if (w.length < items.length) {
     const assigned = w.reduce((a, b) => a + b, 0);
-    const remaining = Math.max(0, 100 - assigned);
-    const perItem = remaining / (items.length - w.length);
-    while (w.length < items.length) {
-      w.push(perItem);
-    }
+    // When assigned < 100: distribute remaining budget equally.
+    // When assigned >= 100: give each unassigned item the same average weight
+    // as the assigned ones so they remain reachable.
+    const perItem = assigned < 100
+      ? (100 - assigned) / (items.length - w.length)
+      : assigned / w.length;
+    while (w.length < items.length) w.push(perItem);
   }
 
-  // Normalize
   const total = w.reduce((a, b) => a + b, 0);
-  const normalized = w.map((v) => v / total);
+  if (total <= 0) return items[Math.floor(Math.random() * items.length)];
 
-  // Pick
   const rand = Math.random();
   let cumulative = 0;
   for (let i = 0; i < items.length; i++) {
-    cumulative += normalized[i];
+    cumulative += w[i] / total;
     if (rand <= cumulative) return items[i];
   }
   return items[items.length - 1];
 }
 
-function escapeRegex(str: string): string {
-  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+// ─── Word-boundary variable substitution (replaces per-key RegExp creation) ─
+
+function isWordChar(code: number): boolean {
+  return (code >= 48 && code <= 57)   // 0-9
+      || (code >= 65 && code <= 90)   // A-Z
+      || (code >= 97 && code <= 122)  // a-z
+      || code === 95;                 // _
+}
+
+function replaceWord(haystack: string, word: string, replacement: string): string {
+  const wLen = word.length;
+  const hLen = haystack.length;
+  let result = '';
+  let i = 0;
+  while (i <= hLen - wLen) {
+    if (haystack.slice(i, i + wLen) === word) {
+      const before = i === 0 || !isWordChar(haystack.charCodeAt(i - 1));
+      const after  = i + wLen >= hLen || !isWordChar(haystack.charCodeAt(i + wLen));
+      if (before && after) {
+        result += replacement;
+        i += wLen;
+        continue;
+      }
+    }
+    result += haystack[i++];
+  }
+  while (i < hLen) result += haystack[i++];
+  return result;
+}
+
+/** Substitute all variable references in `expr` without creating RegExp objects. */
+function replaceVars(expr: string, vars: Map<string, string>): string {
+  // Process longer keys first to avoid partial-match issues (e.g. "hp" vs "base_hp")
+  const sorted = [...vars.entries()].sort((a, b) => b[0].length - a[0].length);
+  let result = expr;
+  for (const [k, v] of sorted) result = replaceWord(result, k, v);
+  return result;
 }
 
 function deepGet(obj: SynxObject, path: string): SynxValue | undefined {

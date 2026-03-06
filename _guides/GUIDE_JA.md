@@ -279,6 +279,30 @@ enabled(bool) 1
 
 利用可能な型：`int`、`float`、`bool`、`string`。
 
+#### ランダム値生成
+
+`(random)` を使用して解析時にランダム値を生成：
+
+```synx
+pin(random) null
+flag(random:bool) null
+chance(random:float) null
+dice(random:int) null
+```
+
+```json
+{
+  "pin": 1847362951,
+  "flag": true,
+  "chance": 0.7342,
+  "dice": 982451653
+}
+```
+
+利用可能な型：`(random)`（整数）、`(random:int)`、`(random:float)`、`(random:bool)`。
+
+> 値は解析時に生成されます — 毎回異なる値が生成されます。
+
 ---
 
 ### 複数行テキスト
@@ -312,6 +336,91 @@ name John  # インラインコメント
 
 port:env PORT
 boss_hp:calc base_hp * 5
+```
+
+---
+
+## 🔐 ロックモード (`!lock`)
+
+`!lock` を追加すると、外部コードから `Synx.set()`、`Synx.add()`、`Synx.remove()` で設定値を変更できなくなります。SYNX 内部マーカーは通常通り動作します。
+
+```synx
+!active
+!lock
+
+max_players 100
+greeting:random
+  - こんにちは！
+  - ようこそ！
+```
+
+```typescript
+const config = Synx.loadSync('./config.synx');
+
+Synx.set(config, 'max_players', 200);
+// ❌ エラー: "SYNX: Cannot set "max_players" — config is locked (!lock)"
+
+console.log(config.max_players); // ✅ 100（読み取りは常に許可）
+```
+
+`Synx.isLocked(config)` でロック状態を確認できます。
+
+---
+
+## 🧹 正規フォーマット (`format`)
+
+`Synx.format()` は任意の `.synx` 文字列を唯一の正規化された形式に書き直します。
+
+**機能：**
+- **すべてのキーをアルファベット順にソート** — すべてのネストレベルで
+- **インデントを正規化** — レベルごとに正確に2スペース
+- **コメントを削除** — 正規フォーマットはデータのみを含む
+- **トップレベルブロック間に1行の空行**（オブジェクトとリスト）
+- **ディレクティブを保持** (`!active`, `!lock`) はファイルの先頭に維持
+- **リスト要素の順序を保持** — 名前付きキーのみがソートされる
+
+### Gitにとっての重要性
+
+正規フォーマットがなければ、2人の開発者が同じ設定を異なる形で書く可能性があります：
+
+```synx
+# 開発者 A                   # 開発者 B
+server                       server
+    port 8080                  host 0.0.0.0
+    host 0.0.0.0               port 8080
+```
+
+`git diff` はブロック全体が変更されたと表示します — データは同一であるにもかかわらず。
+
+`Synx.format()` 後、どちらも同じ出力になります：
+
+```synx
+server
+  host 0.0.0.0
+  port 8080
+```
+
+ひとつの正規形式。diffのノイズはゼロ。
+
+### 使用方法
+
+**JavaScript / TypeScript：**
+
+```typescript
+import { Synx } from '@aperturesyndicate/synx';
+import * as fs from 'fs';
+
+const raw = fs.readFileSync('config.synx', 'utf-8');
+fs.writeFileSync('config.synx', Synx.format(raw));
+```
+
+**Rust：**
+
+```rust
+use synx_core::Synx;
+
+let raw = std::fs::read_to_string("config.synx").unwrap();
+std::fs::write("config.synx", Synx::format(&raw)).unwrap();
 ```
 
 ---
@@ -406,9 +515,11 @@ colors:split red, green, blue
 words:split:space hello world foo
 ```
 
-区切りキーワード：`space`、`pipe`、`dash`、`dot`、`semi`、`tab`
+区切りキーワード：`space`、`pipe`、`dash`、`dot`、`semi`、`tab`、`slash`
 
 ### `:join` — 配列を文字列に
+
+区切りキーワード: `space`, `pipe`, `dash`, `dot`, `semi`, `tab`, `slash`。デフォルト: カンマ。
 
 ```synx
 !active
@@ -538,6 +649,22 @@ port:env:default:8080 PORT
 profit:calc:round:2 revenue * margin
 ```
 
+### ✅ マーカー互換性
+
+よく機能する組み合わせ:
+
+- `env:default`
+- `calc:round`
+- `split:unique`
+- `split:join`（中間配列を経由）
+
+重要な制限:
+
+- `!active` が必要です。ない場合、マーカーは評価されません。
+- 一部のマーカーは型依存です: `split` は文字列、`join` は配列、`round`/`clamp` は数値を想定します。
+- マーカー引数はチェーン内の右側から読み取られます（例: `clamp:min:max`, `round:n`, `map:key`）。
+- 前のマーカーで型が変わると、後続マーカーが適用されない場合があります。
+
 ---
 
 ## 💻 コード例
@@ -557,7 +684,94 @@ const config = Synx.parse(`
 console.log(config.server.port);  // 8080
 ```
 
+**ランタイム操作 (set / add / remove)：**
+
+```typescript
+import { Synx } from '@aperturesyndicate/synx';
+
+const config = Synx.loadSync('./game.synx');
+
+// 値を設定
+Synx.set(config, 'max_players', 100);
+Synx.set(config, 'server.host', 'localhost');
+
+// 値を取得
+const port = Synx.get(config, 'server.port'); // 8080
+
+// リストに追加
+Synx.add(config, 'maps', 'Arena of Doom');
+
+// リストから削除
+Synx.remove(config, 'maps', 'Arena of Doom');
+
+// キーを完全に削除
+Synx.remove(config, 'deprecated_key');
+
+// ロック状態を確認
+if (!Synx.isLocked(config)) {
+  Synx.set(config, 'motd', 'ようこそ!');
+}
+```
+
+> **注意:** `.synx` ファイルに `!lock` がある場合、すべての `set`/`add`/`remove` 呼び出しはエラーをスローします。
+
+**アクセスメソッド (JS/TS API):**
+
+- `Synx.get(obj, keyPath)` — ドットパスで値を取得。
+- `Synx.set(obj, keyPath, value)` — ドットパスで値を設定。
+- `Synx.add(obj, keyPath, item)` — 配列に要素を追加。
+- `Synx.remove(obj, keyPath, item?)` — 配列要素の削除、またはキー全体の削除。
+- `Synx.isLocked(obj)` — `!lock` でロックされているか確認。
+
 ### Python
+
+現在 `synx_native` が公開しているのは `parse`, `parse_active`, `parse_to_json` のみです。
+
+Python での `get`/`set`/`add`/`remove` 相当:
+
+```python
+def get_path(obj, key_path, default=None):
+  cur = obj
+  for part in key_path.split('.'):
+    if not isinstance(cur, dict) or part not in cur:
+      return default
+    cur = cur[part]
+  return cur
+
+def set_path(obj, key_path, value):
+  parts = key_path.split('.')
+  cur = obj
+  for part in parts[:-1]:
+    if part not in cur or not isinstance(cur[part], dict):
+      cur[part] = {}
+    cur = cur[part]
+  cur[parts[-1]] = value
+
+def add_path(obj, key_path, item):
+  arr = get_path(obj, key_path)
+  if not isinstance(arr, list):
+    set_path(obj, key_path, [] if arr is None else [arr])
+    arr = get_path(obj, key_path)
+  arr.append(item)
+
+def remove_path(obj, key_path, item=None):
+  parts = key_path.split('.')
+  cur = obj
+  for part in parts[:-1]:
+    if not isinstance(cur, dict) or part not in cur:
+      return
+    cur = cur[part]
+  last = parts[-1]
+  if item is None:
+    if isinstance(cur, dict):
+      cur.pop(last, None)
+    return
+  if isinstance(cur, dict) and isinstance(cur.get(last), list):
+    try:
+      cur[last].remove(item)
+    except ValueError:
+      pass
+```
 
 ```python
 import synx_native
@@ -570,6 +784,12 @@ server
 """)
 
 print(config["server"]["port"])  # 8080
+
+# Python access helper usage
+set_path(config, "server.port", 9090)
+add_path(config, "maps", "Arena of Doom")
+remove_path(config, "maps", "Arena of Doom")
+print(get_path(config, "server.port"))  # 9090
 ```
 
 ### Rust

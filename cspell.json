@@ -1,0 +1,20 @@
+{
+  "version": "0.2",
+  "words": [
+    "synx",
+    "aperturesyndicate",
+    "SYNX",
+    "loadSync",
+    "unparse",
+    "charcode",
+    "memchr",
+    "xorshift",
+    "subkeys"
+  ],
+  "ignorePaths": [
+    "node_modules",
+    "dist",
+    "target",
+    "*.lock"
+  ]
+}

@@ -149,8 +149,9 @@ impl ExprParser {
             return Err("SYNX :calc — unexpected end of expression".into());
         }
 
-        match self.tokens[self.pos].clone() {
+        match &self.tokens[self.pos] {
             Token::Number(val) => {
+                let val = *val;
                 self.pos += 1;
                 Ok(val)
             }

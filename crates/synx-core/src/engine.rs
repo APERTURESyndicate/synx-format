@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use crate::calc::safe_calc;
 use crate::parser;
+use crate::rng;
 use crate::value::*;
 
 /// Resolve all active-mode markers in a ParseResult.
@@ -13,6 +14,15 @@ pub fn resolve(result: &mut ParseResult, options: &Options) {
         return;
     }
     let metadata = std::mem::take(&mut result.metadata);
+    // SAFETY: `root_ptr` is a raw pointer to `result.root` used exclusively
+    // for *immutable* read access inside marker handlers (:calc, :alias,
+    // :map, :template, :watch) that need to look up other keys in the root
+    // while also holding a mutable reference to a child object.
+    // The invariants that keep this sound:
+    //   1. We never write through `root_ptr` — only reads via `&*root_ptr`.
+    //   2. Mutable writes go through `map` (the current object), which is
+    //      always a distinct subtree from what we read via `root_ptr`.
+    //   3. The pointer is valid for the entire duration of `resolve_value`.
     let root_ptr = &mut result.root as *mut Value;
     resolve_value(&mut result.root, root_ptr, options, &metadata, "");
     result.metadata = metadata;
@@ -146,8 +156,7 @@ fn apply_markers(
                 let weights: Vec<f64> = meta.args.iter().filter_map(|s| s.parse().ok()).collect();
                 weighted_random(arr, &weights)
             } else {
-                let idx = simple_random(arr.len());
-                arr[idx].clone()
+                arr[rng::random_usize(arr.len())].clone()
             };
             map.insert(key.to_string(), picked);
         }
@@ -324,14 +333,18 @@ fn apply_markers(
 
     // ── :clamp ──
     // Syntax: key:clamp:MIN:MAX value
-    // Clamps a numeric value to the specified range.
+    // Clamps a numeric value to [MIN, MAX].
     if markers.contains(&"clamp".to_string()) {
         let clamp_idx = markers.iter().position(|m| m == "clamp").unwrap();
         let min_s = markers.get(clamp_idx + 1).cloned().unwrap_or_default();
         let max_s = markers.get(clamp_idx + 2).cloned().unwrap_or_default();
         if let (Ok(lo), Ok(hi)) = (min_s.parse::<f64>(), max_s.parse::<f64>()) {
-            if let Some(n) = map.get(key).and_then(value_as_number) {
-                let clamped = n.max(lo).min(hi);
+            if lo > hi {
+                map.insert(key.to_string(), Value::String(
+                    format!("CONSTRAINT_ERR: clamp min ({}) > max ({})", lo, hi),
+                ));
+            } else if let Some(n) = map.get(key).and_then(value_as_number) {
+                let clamped = n.clamp(lo, hi);
                 let v = if clamped.fract() == 0.0 && clamped.abs() < i64::MAX as f64 {
                     Value::Int(clamped as i64)
                 } else {
@@ -448,16 +461,14 @@ fn apply_markers(
             map.insert(key.to_string(), Value::String(locked));
         } else {
             let generated = match gen_type {
-                "uuid" => generate_uuid(),
-                "timestamp" => {
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs()
-                        .to_string()
-                }
-                "random" => simple_random(u32::MAX as usize).to_string(),
-                _ => generate_uuid(),
+                "uuid" => rng::generate_uuid(),
+                "timestamp" => std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+                    .to_string(),
+                "random" => rng::random_usize(u32::MAX as usize).to_string(),
+                _ => rng::generate_uuid(),
             };
             write_lock_value(&lock_path, key, &generated);
             map.insert(key.to_string(), Value::String(generated));
@@ -491,7 +502,6 @@ fn apply_markers(
             match std::fs::read_to_string(&full) {
                 Ok(content) => {
                     let value = if let Some(ref kp) = key_path {
-                        // Try JSON extraction
                         extract_from_file_content(&content, kp, full.extension().and_then(|e| e.to_str()).unwrap_or("")).unwrap_or(Value::Null)
                     } else {
                         Value::String(content.trim().to_string())
@@ -504,6 +514,102 @@ fn apply_markers(
             }
         }
     }
+
+    // ── Constraint validation (always last, after all markers resolved) ──
+    if let Some(ref c) = meta.constraints {
+        validate_constraints(map, key, c);
+    }
+}
+
+// ─── Constraint enforcement ───────────────────────────────
+
+fn validate_constraints(map: &mut HashMap<String, Value>, key: &str, c: &Constraints) {
+    let val = match map.get(key) {
+        Some(v) => v.clone(),
+        None => {
+            if c.required {
+                map.insert(key.to_string(), Value::String(
+                    format!("CONSTRAINT_ERR: '{}' is required", key),
+                ));
+            }
+            return;
+        }
+    };
+
+    // required
+    if c.required {
+        let empty = matches!(val, Value::Null)
+            || matches!(&val, Value::String(s) if s.is_empty());
+        if empty {
+            map.insert(key.to_string(), Value::String(
+                format!("CONSTRAINT_ERR: '{}' is required", key),
+            ));
+            return;
+        }
+    }
+
+    // type check
+    if let Some(ref type_name) = c.type_name {
+        let ok = match type_name.as_str() {
+            "int"    => matches!(val, Value::Int(_)),
+            "float"  => matches!(val, Value::Float(_) | Value::Int(_)),
+            "bool"   => matches!(val, Value::Bool(_)),
+            "string" => matches!(val, Value::String(_)),
+            _        => true,
+        };
+        if !ok {
+            map.insert(key.to_string(), Value::String(
+                format!("CONSTRAINT_ERR: '{}' expected type '{}'", key, type_name),
+            ));
+            return;
+        }
+    }
+
+    // enum check
+    if let Some(ref enum_vals) = c.enum_values {
+        let val_str = match &val {
+            Value::String(s) => s.clone(),
+            Value::Int(n)    => n.to_string(),
+            Value::Float(f)  => f.to_string(),
+            Value::Bool(b)   => b.to_string(),
+            _                => String::new(),
+        };
+        if !enum_vals.contains(&val_str) {
+            map.insert(key.to_string(), Value::String(
+                format!("CONSTRAINT_ERR: '{}' must be one of [{}]", key, enum_vals.join("|")),
+            ));
+            return;
+        }
+    }
+
+    // min / max  (numbers: value range; strings: length range)
+    let num = match &val {
+        Value::Int(n)    => Some(*n as f64),
+        Value::Float(f)  => Some(*f),
+        Value::String(s) if c.min.is_some() || c.max.is_some() => Some(s.len() as f64),
+        _                => None,
+    };
+    if let Some(n) = num {
+        if let Some(min) = c.min {
+            if n < min {
+                map.insert(key.to_string(), Value::String(
+                    format!("CONSTRAINT_ERR: '{}' value {} is below min {}", key, n, min),
+                ));
+                return;
+            }
+        }
+        if let Some(max) = c.max {
+            if n > max {
+                map.insert(key.to_string(), Value::String(
+                    format!("CONSTRAINT_ERR: '{}' value {} exceeds max {}", key, n, max),
+                ));
+                return;
+            }
+        }
+    }
+    // Note: `pattern` validation is intentionally skipped in the Rust engine
+    // (adding a regex crate would bloat the dependency tree).  Pattern
+    // validation is fully implemented in the JS engine.
 }
 
 // ─── New-marker helpers ───────────────────────────────────
@@ -597,21 +703,6 @@ fn write_lock_value(lock_path: &std::path::Path, key: &str, value: &str) {
     let _ = std::fs::write(lock_path, lines.join("\n") + "\n");
 }
 
-/// Generate a UUID v4 string using the built-in xorshift PRNG.
-fn generate_uuid() -> String {
-    let a = simple_random(u32::MAX as usize) as u64;
-    let b = simple_random(u32::MAX as usize) as u64;
-    let c = simple_random(u32::MAX as usize) as u64;
-    let d = simple_random(u32::MAX as usize) as u64;
-    let p1 = a as u32;
-    let p2 = (b & 0xFFFF) as u16;
-    let p3 = ((c & 0x0FFF) | 0x4000) as u16;
-    let p4 = ((d & 0x3FFF) | 0x8000) as u16;
-    let p5a = (simple_random(0xFFFFFF) as u32) & 0xFFFFFF;
-    let p5b = (simple_random(0xFFFFFF) as u32) & 0xFFFFFF;
-    format!("{:08x}-{:04x}-{:04x}-{:04x}-{:06x}{:06x}", p1, p2, p3, p4, p5a, p5b)
-}
-
 /// Compare two version strings using a comparison operator.
 fn compare_versions(current: &str, op: &str, required: &str) -> bool {
     let parse_ver = |s: &str| -> Vec<u64> {
@@ -697,6 +788,7 @@ fn delimiter_from_keyword(keyword: &str) -> String {
         "dot" => ".".to_string(),
         "semi" => ";".to_string(),
         "tab" => "\t".to_string(),
+        "slash" => "/".to_string(),
         other => other.to_string(),
     }
 }
@@ -767,52 +859,31 @@ fn is_word_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
-/// Simple deterministic-seed random using thread-local state.
-fn simple_random(bound: usize) -> usize {
-    use std::cell::Cell;
-    use std::time::SystemTime;
-
-    thread_local! {
-        static SEED: Cell<u64> = Cell::new(
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as u64
-        );
-    }
-
-    SEED.with(|s| {
-        // xorshift64
-        let mut x = s.get();
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        s.set(x);
-        (x as usize) % bound
-    })
-}
-
 fn weighted_random(items: &[Value], weights: &[f64]) -> Value {
     let mut w: Vec<f64> = weights.to_vec();
     if w.len() < items.len() {
         let assigned: f64 = w.iter().sum();
-        let remaining = (100.0 - assigned).max(0.0);
-        let per_item = remaining / (items.len() - w.len()) as f64;
+        // If the explicit weights already exceed 100, give unassigned items
+        // the same average weight as the assigned ones so they remain visible.
+        // If there is room left under 100, distribute the remainder equally.
+        let per_item = if assigned < 100.0 {
+            (100.0 - assigned) / (items.len() - w.len()) as f64
+        } else {
+            assigned / w.len() as f64
+        };
         while w.len() < items.len() {
             w.push(per_item);
         }
     }
     let total: f64 = w.iter().sum();
-    let normalized: Vec<f64> = w.iter().map(|v| v / total).collect();
+    if total <= 0.0 {
+        return items[rng::random_usize(items.len())].clone();
+    }
 
-    let rand_val = {
-        let idx = simple_random(10000);
-        idx as f64 / 10000.0
-    };
-
+    let rand_val = rng::random_f64_01();
     let mut cumulative = 0.0;
     for (i, item) in items.iter().enumerate() {
-        cumulative += normalized.get(i).copied().unwrap_or(0.0);
+        cumulative += w[i] / total;
         if rand_val <= cumulative {
             return item.clone();
         }

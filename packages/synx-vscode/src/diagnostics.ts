@@ -17,7 +17,7 @@ const KNOWN_CONSTRAINTS = new Set([
   'min', 'max', 'type', 'required', 'readonly', 'pattern', 'enum',
 ]);
 
-const KNOWN_TYPES = new Set(['int', 'float', 'bool', 'string']);
+const KNOWN_TYPES = new Set(['int', 'float', 'bool', 'string', 'random', 'random:int', 'random:float', 'random:bool']);
 
 const DELIM_KEYWORDS = new Set(['space', 'pipe', 'dash', 'dot', 'semi', 'tab', 'slash']);
 
@@ -93,7 +93,7 @@ function runValidation(doc: vscode.TextDocument, collection: vscode.DiagnosticCo
       const pos = raw.indexOf(`(${node.typeHint})`);
       if (pos !== -1) {
         diagnostics.push(mkDiag(node.line, pos, pos + node.typeHint.length + 2,
-          `Unknown type cast "(${node.typeHint})". Use: int, float, bool, string`, vscode.DiagnosticSeverity.Error));
+          `Unknown type cast "(${node.typeHint})". Use: int, float, bool, string, random, random:int, random:float, random:bool`, vscode.DiagnosticSeverity.Error));
       }
     }
 
@@ -120,10 +120,12 @@ function runValidation(doc: vscode.TextDocument, collection: vscode.DiagnosticCo
         }
       }
 
-      // ── :alias → check reference exists ──
+      // ── :alias → check reference exists (root or sibling scope) ──
       if (node.markers.includes('alias') && node.rawValue && parsed.mode === 'active') {
         const ref = node.rawValue.trim();
-        if (!parsed.keyMap.has(ref)) {
+        const parentPath = getParentPath(node);
+        const siblingPath = parentPath ? `${parentPath}.${ref}` : ref;
+        if (!parsed.keyMap.has(ref) && !parsed.keyMap.has(siblingPath)) {
           const vpos = raw.lastIndexOf(ref);
           if (vpos !== -1) {
             diagnostics.push(mkDiag(node.line, vpos, vpos + ref.length,
@@ -238,8 +240,8 @@ function runValidation(doc: vscode.TextDocument, collection: vscode.DiagnosticCo
 }
 
 function getParentPath(node: SynxNode): string {
-  // Walk up the node tree to find parent key path (simplified)
-  return '';
+  const lastDot = node.dotPath.lastIndexOf('.');
+  return lastDot !== -1 ? node.dotPath.substring(0, lastDot) : '';
 }
 
 function mkDiag(line: number, startCol: number, endCol: number, msg: string, severity: vscode.DiagnosticSeverity): vscode.Diagnostic {

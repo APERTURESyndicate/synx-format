@@ -1,4 +1,9 @@
-# Terrain types for the game
-terrain:random
-  - item1
-  - item2
+!active 
+
+# Test
+
+max_playes:env:calc:clamp:cl
+your_random_name:random:once 3
+  - Alice
+  - Bob
+  - Charlie

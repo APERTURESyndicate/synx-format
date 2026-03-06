@@ -4,8 +4,6 @@
   </a>
 </p>
 
-> **🔗 [Ver logotipo →](https://aperturesyndicate.com/branding/aperturesyndicate.png)**
-
 <h1 align="center">SYNX v3.0 — Guía Completa</h1>
 
 <p align="center">
@@ -280,6 +278,30 @@ enabled(bool) 1
 
 Tipos disponibles: `int`, `float`, `bool`, `string`.
 
+#### Generación de Valores Aleatorios
+
+Genera valores aleatorios al analizar usando `(random)`:
+
+```synx
+pin(random) null
+flag(random:bool) null
+chance(random:float) null
+dice(random:int) null
+```
+
+```json
+{
+  "pin": 1847362951,
+  "flag": true,
+  "chance": 0.7342,
+  "dice": 982451653
+}
+```
+
+Tipos disponibles: `(random)` (int), `(random:int)`, `(random:float)`, `(random:bool)`.
+
+> Los valores se generan en cada análisis — cada llamada produce valores diferentes.
+
 ---
 
 ### Texto Multilínea
@@ -313,6 +335,91 @@ Coloca `!active` en la **primera línea** para desbloquear marcadores y restricc
 
 port:env PORT
 boss_hp:calc base_hp * 5
+```
+
+---
+
+## 🔐 Modo Bloqueado (`!lock`)
+
+Agrega `!lock` para evitar que el código externo modifique valores mediante `Synx.set()`, `Synx.add()`, `Synx.remove()`. Los marcadores internos de SYNX siguen funcionando normalmente.
+
+```synx
+!active
+!lock
+
+max_players 100
+greeting:random
+  - ¡Hola!
+  - ¡Bienvenido!
+```
+
+```typescript
+const config = Synx.loadSync('./config.synx');
+
+Synx.set(config, 'max_players', 200);
+// ❌ error: "SYNX: Cannot set "max_players" — config is locked (!lock)"
+
+console.log(config.max_players); // ✅ 100 (la lectura siempre está permitida)
+```
+
+Usa `Synx.isLocked(config)` para verificar el estado.
+
+---
+
+## 🧹 Formato Canónico (`format`)
+
+`Synx.format()` reescribe cualquier archivo `.synx` en una forma única y normalizada.
+
+**Qué hace:**
+- **Ordena todas las claves alfabéticamente** en cada nivel de anidamiento
+- **Normaliza la indentación** a exactamente 2 espacios por nivel
+- **Elimina comentarios** — el formato canónico contiene solo datos
+- **Una línea en blanco** entre bloques de nivel superior (objetos y listas)
+- **Conserva las directivas** (`!active`, `!lock`) al inicio del archivo
+- **El orden de los elementos de lista se preserva** — solo se ordenan las claves con nombre
+
+### Por qué es importante para Git
+
+Sin formato canónico, dos programadores escriben la misma configuración de forma diferente:
+
+```synx
+# Programador A              # Programador B
+server                       server
+    port 8080                  host 0.0.0.0
+    host 0.0.0.0               port 8080
+```
+
+`git diff` muestra el bloque completo como modificado — aunque los datos son idénticos.
+
+Después de `Synx.format()`, ambos producen:
+
+```synx
+server
+  host 0.0.0.0
+  port 8080
+```
+
+Una forma canónica. Cero ruido en los diffs.
+
+### Uso
+
+**JavaScript / TypeScript:**
+
+```typescript
+import { Synx } from '@aperturesyndicate/synx';
+import * as fs from 'fs';
+
+const raw = fs.readFileSync('config.synx', 'utf-8');
+fs.writeFileSync('config.synx', Synx.format(raw));
+```
+
+**Rust:**
+
+```rust
+use synx_core::Synx;
+
+let raw = std::fs::read_to_string("config.synx").unwrap();
+std::fs::write("config.synx", Synx::format(&raw)).unwrap();
 ```
 
 ---
@@ -407,9 +514,11 @@ colors:split red, green, blue
 words:split:space hello world foo
 ```
 
-Palabras clave de separador: `space`, `pipe`, `dash`, `dot`, `semi`, `tab`
+Palabras clave de separador: `space`, `pipe`, `dash`, `dot`, `semi`, `tab`, `slash`
 
 ### `:join` — Arreglo a Cadena
+
+Palabras clave de separador: `space`, `pipe`, `dash`, `dot`, `semi`, `tab`, `slash`. Valor predeterminado: coma.
 
 ```synx
 !active
@@ -539,6 +648,22 @@ port:env:default:8080 PORT
 profit:calc:round:2 revenue * margin
 ```
 
+### ✅ Compatibilidad de Marcadores
+
+Combinaciones que funcionan bien:
+
+- `env:default`
+- `calc:round`
+- `split:unique`
+- `split:join` (con un arreglo intermedio)
+
+Limitaciones importantes:
+
+- Se requiere `!active`, de lo contrario los marcadores no se resuelven.
+- Algunos marcadores dependen del tipo: `split` espera string, `join` espera arreglo, `round`/`clamp` esperan números.
+- Los argumentos se leen a la derecha en la cadena (por ejemplo `clamp:min:max`, `round:n`, `map:key`).
+- Si un marcador anterior cambia el tipo, el siguiente puede dejar de aplicar.
+
 ---
 
 ## 💻 Ejemplos de Código
@@ -558,7 +683,94 @@ const config = Synx.parse(`
 console.log(config.server.port);  // 8080
 ```
 
+**Manipulación en tiempo de ejecución (set / add / remove):**
+
+```typescript
+import { Synx } from '@aperturesyndicate/synx';
+
+const config = Synx.loadSync('./game.synx');
+
+// Establecer un valor
+Synx.set(config, 'max_players', 100);
+Synx.set(config, 'server.host', 'localhost');
+
+// Obtener un valor
+const port = Synx.get(config, 'server.port'); // 8080
+
+// Agregar a una lista
+Synx.add(config, 'maps', 'Arena of Doom');
+
+// Eliminar de una lista
+Synx.remove(config, 'maps', 'Arena of Doom');
+
+// Eliminar una clave completa
+Synx.remove(config, 'deprecated_key');
+
+// Verificar bloqueo
+if (!Synx.isLocked(config)) {
+  Synx.set(config, 'motd', '¡Bienvenido!');
+}
+```
+
+> **Nota:** Si el archivo `.synx` tiene `!lock`, todas las llamadas `set`/`add`/`remove` lanzarán un error.
+
+**Métodos de acceso (API JS/TS):**
+
+- `Synx.get(obj, keyPath)` — leer un valor por ruta con puntos.
+- `Synx.set(obj, keyPath, value)` — establecer un valor por ruta con puntos.
+- `Synx.add(obj, keyPath, item)` — agregar un elemento a un arreglo.
+- `Synx.remove(obj, keyPath, item?)` — quitar elemento de arreglo o borrar una clave.
+- `Synx.isLocked(obj)` — comprobar si el config está bloqueado por `!lock`.
+
 ### Python
+
+Actualmente `synx_native` exporta: `parse`, `parse_active`, `parse_to_json`.
+
+Equivalentes en Python para `get`/`set`/`add`/`remove`:
+
+```python
+def get_path(obj, key_path, default=None):
+  cur = obj
+  for part in key_path.split('.'):
+    if not isinstance(cur, dict) or part not in cur:
+      return default
+    cur = cur[part]
+  return cur
+
+def set_path(obj, key_path, value):
+  parts = key_path.split('.')
+  cur = obj
+  for part in parts[:-1]:
+    if part not in cur or not isinstance(cur[part], dict):
+      cur[part] = {}
+    cur = cur[part]
+  cur[parts[-1]] = value
+
+def add_path(obj, key_path, item):
+  arr = get_path(obj, key_path)
+  if not isinstance(arr, list):
+    set_path(obj, key_path, [] if arr is None else [arr])
+    arr = get_path(obj, key_path)
+  arr.append(item)
+
+def remove_path(obj, key_path, item=None):
+  parts = key_path.split('.')
+  cur = obj
+  for part in parts[:-1]:
+    if not isinstance(cur, dict) or part not in cur:
+      return
+    cur = cur[part]
+  last = parts[-1]
+  if item is None:
+    if isinstance(cur, dict):
+      cur.pop(last, None)
+    return
+  if isinstance(cur, dict) and isinstance(cur.get(last), list):
+    try:
+      cur[last].remove(item)
+    except ValueError:
+      pass
+```
 
 ```python
 import synx_native
@@ -571,6 +783,12 @@ server
 """)
 
 print(config["server"]["port"])  # 8080
+
+# Uso de helpers de acceso en Python
+set_path(config, "server.port", 9090)
+add_path(config, "maps", "Arena of Doom")
+remove_path(config, "maps", "Arena of Doom")
+print(get_path(config, "server.port"))  # 9090
 ```
 
 ### Rust

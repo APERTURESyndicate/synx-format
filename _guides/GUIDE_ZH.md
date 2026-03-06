@@ -279,6 +279,30 @@ enabled(bool) 1
 
 可用类型：`int`、`float`、`bool`、`string`。
 
+#### 随机值生成
+
+使用 `(random)` 在解析时生成随机值：
+
+```synx
+pin(random) null
+flag(random:bool) null
+chance(random:float) null
+dice(random:int) null
+```
+
+```json
+{
+  "pin": 1847362951,
+  "flag": true,
+  "chance": 0.7342,
+  "dice": 982451653
+}
+```
+
+可用类型：`(random)`（整数）、`(random:int)`、`(random:float)`、`(random:bool)`。
+
+> 每次解析都会生成新的随机值。
+
 ---
 
 ### 多行文本
@@ -312,6 +336,91 @@ name John  # 行内注释
 
 port:env PORT
 boss_hp:calc base_hp * 5
+```
+
+---
+
+## 🔐 锁定模式 (`!lock`)
+
+添加 `!lock` 可以禁止外部代码通过 `Synx.set()`、`Synx.add()`、`Synx.remove()` 修改配置值。内部 SYNX 标记正常工作。
+
+```synx
+!active
+!lock
+
+max_players 100
+greeting:random
+  - 你好！
+  - 欢迎！
+```
+
+```typescript
+const config = Synx.loadSync('./config.synx');
+
+Synx.set(config, 'max_players', 200);
+// ❌ 报错: "SYNX: Cannot set "max_players" — config is locked (!lock)"
+
+console.log(config.max_players); // ✅ 100（读取始终允许）
+```
+
+使用 `Synx.isLocked(config)` 检查是否锁定。
+
+---
+
+## 🧹 规范格式 (`format`)
+
+`Synx.format()` 将任意 `.synx` 字符串重写为唯一的规范化形式。
+
+**功能：**
+- **所有键按字母顺序排序** — 在每个嵌套层级
+- **缩进标准化** — 每级恰好 2 个空格
+- **删除注释** — 规范格式仅包含数据
+- **顶级块之间一个空行**（对象和列表）
+- **保留指令** (`!active`, `!lock`) 在文件顶部
+- **列表元素顺序保留** — 只有命名键被排序
+
+### 对 Git 的意义
+
+没有规范格式时，两位程序员写出的相同配置可能不同：
+
+```synx
+# 程序员 A                   # 程序员 B
+server                       server
+    port 8080                  host 0.0.0.0
+    host 0.0.0.0               port 8080
+```
+
+`git diff` 会显示整个块都已更改 — 尽管数据完全相同。
+
+使用 `Synx.format()` 后，两者都生成：
+
+```synx
+server
+  host 0.0.0.0
+  port 8080
+```
+
+一种规范形式。diff 中零噪音。
+
+### 用法
+
+**JavaScript / TypeScript：**
+
+```typescript
+import { Synx } from '@aperturesyndicate/synx';
+import * as fs from 'fs';
+
+const raw = fs.readFileSync('config.synx', 'utf-8');
+fs.writeFileSync('config.synx', Synx.format(raw));
+```
+
+**Rust：**
+
+```rust
+use synx_core::Synx;
+
+let raw = std::fs::read_to_string("config.synx").unwrap();
+std::fs::write("config.synx", Synx::format(&raw)).unwrap();
 ```
 
 ---
@@ -406,9 +515,11 @@ colors:split red, green, blue
 words:split:space hello world foo
 ```
 
-分隔符关键词：`space`、`pipe`、`dash`、`dot`、`semi`、`tab`
+分隔符关键词：`space`、`pipe`、`dash`、`dot`、`semi`、`tab`、`slash`
 
 ### `:join` — 数组转字符串
+
+分隔符关键词：`space`、`pipe`、`dash`、`dot`、`semi`、`tab`、`slash`。默认：逗号。
 
 ```synx
 !active
@@ -538,6 +649,22 @@ port:env:default:8080 PORT
 profit:calc:round:2 revenue * margin
 ```
 
+### ✅ 标记兼容性
+
+常见且稳定的组合:
+
+- `env:default`
+- `calc:round`
+- `split:unique`
+- `split:join`（通过中间数组）
+
+重要限制:
+
+- 需要 `!active`，否则标记不会被解析。
+- 部分标记依赖类型: `split` 需要字符串，`join` 需要数组，`round`/`clamp` 需要数字。
+- 标记参数从链的右侧读取（例如 `clamp:min:max`、`round:n`、`map:key`）。
+- 如果前一个标记改变了类型，后一个标记可能无法生效。
+
 ---
 
 ## 💻 代码示例
@@ -557,7 +684,94 @@ const config = Synx.parse(`
 console.log(config.server.port);  // 8080
 ```
 
+**运行时管理 (set / add / remove)：**
+
+```typescript
+import { Synx } from '@aperturesyndicate/synx';
+
+const config = Synx.loadSync('./game.synx');
+
+// 设置值
+Synx.set(config, 'max_players', 100);
+Synx.set(config, 'server.host', 'localhost');
+
+// 获取值
+const port = Synx.get(config, 'server.port'); // 8080
+
+// 添加到列表
+Synx.add(config, 'maps', 'Arena of Doom');
+
+// 从列表删除
+Synx.remove(config, 'maps', 'Arena of Doom');
+
+// 删除整个键
+Synx.remove(config, 'deprecated_key');
+
+// 检查锁定状态
+if (!Synx.isLocked(config)) {
+  Synx.set(config, 'motd', '欢迎!');
+}
+```
+
+> **注意：** 如果 `.synx` 文件包含 `!lock`，所有 `set`/`add`/`remove` 调用将抛出错误。
+
+**访问方法 (JS/TS API)：**
+
+- `Synx.get(obj, keyPath)` — 按点路径读取值。
+- `Synx.set(obj, keyPath, value)` — 按点路径设置值。
+- `Synx.add(obj, keyPath, item)` — 向数组追加元素。
+- `Synx.remove(obj, keyPath, item?)` — 删除数组元素或删除整个键。
+- `Synx.isLocked(obj)` — 检查配置是否被 `!lock` 锁定。
+
 ### Python
+
+当前 `synx_native` 仅导出：`parse`、`parse_active`、`parse_to_json`。
+
+Python 中可用以下方式实现 `get`/`set`/`add`/`remove` 等价操作：
+
+```python
+def get_path(obj, key_path, default=None):
+  cur = obj
+  for part in key_path.split('.'):
+    if not isinstance(cur, dict) or part not in cur:
+      return default
+    cur = cur[part]
+  return cur
+
+def set_path(obj, key_path, value):
+  parts = key_path.split('.')
+  cur = obj
+  for part in parts[:-1]:
+    if part not in cur or not isinstance(cur[part], dict):
+      cur[part] = {}
+    cur = cur[part]
+  cur[parts[-1]] = value
+
+def add_path(obj, key_path, item):
+  arr = get_path(obj, key_path)
+  if not isinstance(arr, list):
+    set_path(obj, key_path, [] if arr is None else [arr])
+    arr = get_path(obj, key_path)
+  arr.append(item)
+
+def remove_path(obj, key_path, item=None):
+  parts = key_path.split('.')
+  cur = obj
+  for part in parts[:-1]:
+    if not isinstance(cur, dict) or part not in cur:
+      return
+    cur = cur[part]
+  last = parts[-1]
+  if item is None:
+    if isinstance(cur, dict):
+      cur.pop(last, None)
+    return
+  if isinstance(cur, dict) and isinstance(cur.get(last), list):
+    try:
+      cur[last].remove(item)
+    except ValueError:
+      pass
+```
 
 ```python
 import synx_native
@@ -570,6 +784,12 @@ server
 """)
 
 print(config["server"]["port"])  # 8080
+
+# Python access helper usage
+set_path(config, "server.port", 9090)
+add_path(config, "maps", "Arena of Doom")
+remove_path(config, "maps", "Arena of Doom")
+print(get_path(config, "server.port"))  # 9090
 ```
 
 ### Rust

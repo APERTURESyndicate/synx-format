@@ -22,6 +22,8 @@ export interface SynxNode {
   children: SynxNode[];
   parent: SynxNode | null;
   isListItem: boolean;
+  /** Full dot-path from root, e.g. "gameplay.boss_hp" */
+  dotPath: string;
 }
 
 export interface ParsedDoc {
@@ -37,7 +39,7 @@ export interface ParsedDoc {
 
 // ─── Regex ───────────────────────────────────────────────────────────────────
 
-const LINE_RE = /^([^\s\[:\-#/(][^\s\[:(]*)(?:\((\w+)\))?(?:\[([^\]]*)\])?(?::([\w:]+))?\s*(.*)$/;
+const LINE_RE = /^([^\s\[:\-#/(][^\s\[:(]*)(?:\(([\w:]+)\))?(?:\[([^\]]*)\])?(?::([\w:]+))?\s*(.*)$/;
 
 // ─── Cast ────────────────────────────────────────────────────────────────────
 
@@ -88,9 +90,12 @@ export function parseSynx(text: string): ParsedDoc {
     const trimmed = raw.trim();
 
     // Mode
-    if (trimmed === '!active') {
+    if (trimmed === '!active' || trimmed === '#!mode:active') {
       doc.mode = 'active';
       doc.modeLine = i;
+      continue;
+    }
+    if (trimmed === '!lock') {
       continue;
     }
     if (!trimmed || trimmed.startsWith('#') || trimmed.startsWith('//')) continue;
@@ -119,6 +124,7 @@ export function parseSynx(text: string): ParsedDoc {
             line: i, column: indent + 2, indent,
             markers: [], markerArgs: [], constraints: '', typeHint: '',
             children: [], parent: listTarget.arr, isListItem: true,
+            dotPath: `${listTarget.arr.dotPath}.${m[1]}`,
           };
           listTarget.arr.children.push(childNode);
           doc.allNodes.push(childNode);
@@ -129,6 +135,7 @@ export function parseSynx(text: string): ParsedDoc {
             line: i, column: indent + 2, indent,
             markers: [], markerArgs: [], constraints: '', typeHint: '',
             children: [], parent: listTarget.arr, isListItem: true,
+            dotPath: `${listTarget.arr.dotPath}[${listTarget.arr.children.length}]`,
           };
           listTarget.arr.children.push(childNode);
           doc.allNodes.push(childNode);
@@ -178,6 +185,7 @@ export function parseSynx(text: string): ParsedDoc {
       children: [],
       parent: null,
       isListItem: false,
+      dotPath,
     };
 
     parent.nodes.push(node);
@@ -216,7 +224,7 @@ export function resolveToObject(doc: ParsedDoc): Record<string, SynxVal> {
   const root: Record<string, SynxVal> = {};
   buildObject(doc.nodes, root);
   if (doc.mode === 'active') {
-    resolveActive(root, root);
+    resolveWithNodes(doc.nodes, root, root);
   }
   return root;
 }
@@ -246,21 +254,112 @@ function buildChild(node: SynxNode): SynxVal {
   return obj;
 }
 
-function resolveActive(obj: Record<string, any>, root: Record<string, any>) {
-  for (const key of Object.keys(obj)) {
-    const val = obj[key];
+function resolveWithNodes(nodes: SynxNode[], obj: Record<string, SynxVal>, root: Record<string, SynxVal>) {
+  for (const n of nodes) {
+    if (n.isListItem) continue;
+
+    for (let mi = 0; mi < n.markers.length; mi++) {
+      const marker = n.markers[mi];
+      switch (marker) {
+        case 'env': {
+          // Value is the env var name; fall back to key name
+          const varName = String(obj[n.key] ?? n.key);
+          const envVal = (typeof process !== 'undefined' && process.env)
+            ? process.env[varName]
+            : undefined;
+          if (envVal !== undefined) obj[n.key] = cast(envVal, n.typeHint || undefined);
+          break;
+        }
+        case 'default': {
+          const cur = obj[n.key];
+          if (cur === null || cur === undefined || cur === '') {
+            // Arg may be embedded in marker chain as next entry (e.g. :default:8080)
+            const defVal = n.markers[mi + 1] ?? n.markerArgs[0] ?? '';
+            obj[n.key] = cast(defVal, n.typeHint || undefined);
+          }
+          break;
+        }
+        case 'alias': {
+          const target = String(obj[n.key] ?? '');
+          const parts = target.split('.');
+          let cur: any = root;
+          for (const p of parts) cur = (cur as any)?.[p];
+          if (cur !== undefined) obj[n.key] = cur;
+          break;
+        }
+        case 'calc': {
+          const expr = String(obj[n.key] ?? '');
+          const vars: Record<string, number> = {};
+          for (const [k, v] of Object.entries(obj)) {
+            if (typeof v === 'number') vars[k] = v as number;
+          }
+          for (const [k, v] of Object.entries(root)) {
+            if (typeof v === 'number' && !(k in vars)) vars[k] = v as number;
+          }
+          const result = safeCalc(expr, vars);
+          if (result !== null) obj[n.key] = result;
+          break;
+        }
+        case 'random': {
+          const arr = obj[n.key];
+          if (Array.isArray(arr) && arr.length > 0) {
+            obj[n.key] = arr[Math.floor(Math.random() * arr.length)] as SynxVal;
+          }
+          break;
+        }
+        case 'clamp': {
+          if (n.markerArgs.length >= 2 && typeof obj[n.key] === 'number') {
+            const lo = parseFloat(n.markerArgs[0]);
+            const hi = parseFloat(n.markerArgs[1]);
+            if (!isNaN(lo) && !isNaN(hi) && lo <= hi) {
+              obj[n.key] = Math.min(hi, Math.max(lo, obj[n.key] as number));
+            }
+          }
+          break;
+        }
+        default:
+          break;
+      }
+    }
+
+    // Recurse into nested objects
+    const val = obj[n.key];
     if (val && typeof val === 'object' && !Array.isArray(val)) {
-      resolveActive(val, root);
+      resolveWithNodes(n.children, val as Record<string, SynxVal>, root);
     }
   }
 }
 
 // ─── Calc evaluator (safe, no eval) ──────────────────────────────────────────
 
+function isWordChar(c: string): boolean {
+  return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c === '_';
+}
+
+function replaceWord(s: string, word: string, rep: string): string {
+  let out = '';
+  let i = 0;
+  while (i < s.length) {
+    if (s.startsWith(word, i)) {
+      const before = i > 0 ? s[i - 1] : '\0';
+      const after = i + word.length < s.length ? s[i + word.length] : '\0';
+      if (!isWordChar(before) && !isWordChar(after)) {
+        out += rep;
+        i += word.length;
+        continue;
+      }
+    }
+    out += s[i++];
+  }
+  return out;
+}
+
 export function safeCalc(expr: string, vars: Record<string, number>): number | null {
   let resolved = expr;
-  for (const [k, v] of Object.entries(vars)) {
-    resolved = resolved.replace(new RegExp(`\\b${k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'g'), String(v));
+  // Sort longest-first to prevent partial substitutions (e.g. "hp" inside "base_hp")
+  const sorted = Object.entries(vars).sort((a, b) => b[0].length - a[0].length);
+  for (const [k, v] of sorted) {
+    resolved = replaceWord(resolved, k, String(v));
   }
   // Validate: only digits, operators, spaces, dots, parentheses
   if (!/^[\d\s+\-*/%().]+$/.test(resolved)) return null;

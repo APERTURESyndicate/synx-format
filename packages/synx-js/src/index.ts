@@ -14,7 +14,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { parseData } from './parser';
 import { resolve } from './engine';
-import type { SynxObject, SynxOptions } from './types';
+import type { SynxObject, SynxOptions, SynxValue } from './types';
 
 export type { SynxObject, SynxOptions, SynxValue, SynxArray, SynxPrimitive } from './types';
 
@@ -73,9 +73,17 @@ class Synx {
     }
 
     // Small files or no native binding → pure JS
-    const { root, mode } = parseData(text);
+    const { root, mode, locked } = parseData(text);
     if (mode === 'active') {
       resolve(root, options);
+    }
+    if (locked) {
+      Object.defineProperty(root, '__synx_locked', {
+        value: true,
+        enumerable: false,
+        writable: false,
+        configurable: false,
+      });
     }
     return root as T;
   }
@@ -96,10 +104,9 @@ class Synx {
   static loadSync<T extends SynxObject = SynxObject>(filePath: string, options: SynxOptions = {}): T {
     const absPath = path.resolve(filePath);
     const text = fs.readFileSync(absPath, 'utf-8');
-    if (!options.basePath) {
-      options.basePath = path.dirname(absPath);
-    }
-    return Synx.parse<T>(text, options);
+    // Spread to avoid mutating the caller's options object
+    const opts = options.basePath ? options : { ...options, basePath: path.dirname(absPath) };
+    return Synx.parse<T>(text, opts);
   }
 
   /**
@@ -118,10 +125,9 @@ class Synx {
   static async load<T extends SynxObject = SynxObject>(filePath: string, options: SynxOptions = {}): Promise<T> {
     const absPath = path.resolve(filePath);
     const text = await fs.promises.readFile(absPath, 'utf-8');
-    if (!options.basePath) {
-      options.basePath = path.dirname(absPath);
-    }
-    return Synx.parse<T>(text, options);
+    // Spread to avoid mutating the caller's options object
+    const opts = options.basePath ? options : { ...options, basePath: path.dirname(absPath) };
+    return Synx.parse<T>(text, opts);
   }
 
   /**
@@ -138,6 +144,171 @@ class Synx {
     }
     out += serializeObject(obj, 0);
     return out;
+  }
+
+  // ─── Runtime Manipulation API ─────────────────────────
+
+  /**
+   * Set a value on a parsed SYNX config object.
+   * Supports dot-path notation for nested keys.
+   * Throws if config has `!lock` directive.
+   *
+   * @example
+   * ```ts
+   * const config = Synx.loadSync('config.synx');
+   * Synx.set(config, 'max_players', 100);
+   * Synx.set(config, 'server.host', 'localhost');
+   * ```
+   */
+  static set(obj: SynxObject, keyPath: string, value: SynxValue): void {
+    if ((obj as any).__synx_locked) {
+      throw new Error(`SYNX: Cannot set "${keyPath}" — config is locked (!lock)`);
+    }
+    const parts = keyPath.split('.');
+    let current: any = obj;
+    for (let i = 0; i < parts.length - 1; i++) {
+      if (current[parts[i]] == null || typeof current[parts[i]] !== 'object') {
+        current[parts[i]] = {};
+      }
+      current = current[parts[i]];
+    }
+    current[parts[parts.length - 1]] = value;
+  }
+
+  /**
+   * Get a value from a parsed SYNX config using dot-path notation.
+   *
+   * @example
+   * ```ts
+   * const port = Synx.get(config, 'server.port'); // 8080
+   * ```
+   */
+  static get(obj: SynxObject, keyPath: string): SynxValue | undefined {
+    const parts = keyPath.split('.');
+    let current: any = obj;
+    for (const part of parts) {
+      if (current == null || typeof current !== 'object') return undefined;
+      current = current[part];
+    }
+    return current;
+  }
+
+  /**
+   * Add an item to an array value in the config.
+   * Creates the array if it doesn't exist.
+   * Throws if config has `!lock` directive.
+   *
+   * @example
+   * ```ts
+   * Synx.add(config, 'your_random_name', 'Mark');
+   * // your_random_name: ["Alice", "Caroline", "Mark"]
+   * ```
+   */
+  static add(obj: SynxObject, keyPath: string, item: SynxValue): void {
+    if ((obj as any).__synx_locked) {
+      throw new Error(`SYNX: Cannot add to "${keyPath}" — config is locked (!lock)`);
+    }
+    const parts = keyPath.split('.');
+    let current: any = obj;
+    for (let i = 0; i < parts.length - 1; i++) {
+      if (current[parts[i]] == null || typeof current[parts[i]] !== 'object') {
+        current[parts[i]] = {};
+      }
+      current = current[parts[i]];
+    }
+    const finalKey = parts[parts.length - 1];
+    if (!Array.isArray(current[finalKey])) {
+      current[finalKey] = current[finalKey] != null ? [current[finalKey]] : [];
+    }
+    (current[finalKey] as SynxValue[]).push(item);
+  }
+
+  /**
+   * Remove an item from an array value, or delete a key entirely.
+   * - If value is an array and `item` is provided: removes first occurrence of `item`.
+   * - If `item` is omitted: deletes the key entirely.
+   * Throws if config has `!lock` directive.
+   *
+   * @example
+   * ```ts
+   * Synx.remove(config, 'your_random_name', 'Alice');
+   * // or delete entirely:
+   * Synx.remove(config, 'max_players');
+   * ```
+   */
+  static remove(obj: SynxObject, keyPath: string, item?: SynxValue): void {
+    if ((obj as any).__synx_locked) {
+      throw new Error(`SYNX: Cannot remove "${keyPath}" — config is locked (!lock)`);
+    }
+    const parts = keyPath.split('.');
+    let current: any = obj;
+    for (let i = 0; i < parts.length - 1; i++) {
+      if (current == null || typeof current !== 'object') return;
+      current = current[parts[i]];
+    }
+    if (current == null || typeof current !== 'object') return;
+    const finalKey = parts[parts.length - 1];
+
+    if (item !== undefined && Array.isArray(current[finalKey])) {
+      const arr = current[finalKey] as SynxValue[];
+      const idx = arr.findIndex(v => v === item || String(v) === String(item));
+      if (idx !== -1) arr.splice(idx, 1);
+    } else {
+      delete current[finalKey];
+    }
+  }
+
+  /**
+   * Check if the config is locked (`!lock` directive).
+   */
+  static isLocked(obj: SynxObject): boolean {
+    return !!(obj as any).__synx_locked;
+  }
+
+  /**
+   * Reformat a .synx string into canonical form:
+   * - Keys sorted alphabetically at every nesting level
+   * - Exactly 2 spaces per indentation level
+   * - One blank line between top-level blocks (objects / lists)
+   * - Comments stripped — canonical form is comment-free
+   * - Directive lines (`!active`, `!lock`) preserved at the top
+   *
+   * The same data always produces byte-for-byte identical output,
+   * making `.synx` files deterministic and noise-free in `git diff`.
+   *
+   * @param text - Raw .synx file contents.
+   * @returns Canonical .synx string.
+   *
+   * @example
+   * ```ts
+   * const raw = fs.readFileSync('config.synx', 'utf-8');
+   * fs.writeFileSync('config.synx', Synx.format(raw));
+   * ```
+   */
+  static format(text: string): string {
+    const lines = text.split(/\r?\n/);
+    const directives: string[] = [];
+    let bodyStart = 0;
+
+    for (let i = 0; i < lines.length; i++) {
+      const t = lines[i].trim();
+      if (t === '!active' || t === '!lock' || t === '#!mode:active') {
+        directives.push(t);
+        bodyStart = i + 1;
+      } else if (!t || t.startsWith('#') || t.startsWith('//')) {
+        bodyStart = i + 1;
+      } else {
+        break;
+      }
+    }
+
+    const [nodes] = fmtParse(lines, bodyStart, 0);
+    fmtSort(nodes);
+
+    let out = directives.join('\n');
+    if (directives.length) out += '\n\n';
+    out += fmtEmit(nodes, 0).trimEnd();
+    return out + '\n';
   }
 }
 
@@ -177,6 +348,72 @@ function serializeObject(obj: SynxObject, indent: number): string {
     }
   }
 
+  return out;
+}
+
+// ─── Canonical Formatter ──────────────────────────────────
+
+interface FmtNode {
+  header: string;
+  children: FmtNode[];
+  listItems: string[];
+  isMultiline: boolean;
+}
+
+function fmtParse(lines: string[], start: number, base: number): [FmtNode[], number] {
+  const nodes: FmtNode[] = [];
+  let i = start;
+  while (i < lines.length) {
+    const raw = lines[i];
+    const t = raw.trim();
+    if (!t) { i++; continue; }
+    const ind = raw.search(/\S/);
+    if (ind < base) break;
+    if (ind > base) { i++; continue; }
+    if (t.startsWith('- ') || t.startsWith('#') || t.startsWith('//')) { i++; continue; }
+    const isMultiline = t.trimEnd().endsWith(' |') || t === '|';
+    const node: FmtNode = { header: t, children: [], listItems: [], isMultiline };
+    i++;
+    while (i < lines.length) {
+      const cr = lines[i];
+      const ct = cr.trim();
+      if (!ct) { i++; continue; }
+      const ci = cr.search(/\S/);
+      if (ci <= base) break;
+      if (isMultiline || ct.startsWith('- ')) {
+        node.listItems.push(ct);
+        i++;
+      } else if (ct.startsWith('#') || ct.startsWith('//')) {
+        i++;
+      } else {
+        const [subs, ni] = fmtParse(lines, i, ci);
+        node.children.push(...subs);
+        i = ni;
+      }
+    }
+    nodes.push(node);
+  }
+  return [nodes, i];
+}
+
+function fmtSort(nodes: FmtNode[]): void {
+  nodes.sort((a, b) => {
+    const ka = a.header.split(/[\s\[:(]/)[0].toLowerCase();
+    const kb = b.header.split(/[\s\[:(]/)[0].toLowerCase();
+    return ka.localeCompare(kb);
+  });
+  for (const n of nodes) fmtSort(n.children);
+}
+
+function fmtEmit(nodes: FmtNode[], indent: number): string {
+  const sp = ' '.repeat(indent);
+  let out = '';
+  for (const n of nodes) {
+    out += `${sp}${n.header}\n`;
+    if (n.children.length > 0) out += fmtEmit(n.children, indent + 2);
+    for (const li of n.listItems) out += `${sp}  ${li}\n`;
+    if (indent === 0 && (n.children.length > 0 || n.listItems.length > 0)) out += '\n';
+  }
   return out;
 }
 

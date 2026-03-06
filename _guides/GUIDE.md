@@ -4,8 +4,6 @@
   </a>
 </p>
 
-> **🔗 [View logo →](https://aperturesyndicate.com/branding/aperturesyndicate.png)**
-
 <h1 align="center">SYNX v3.0 — The Complete Guide</h1>
 
 <p align="center">
@@ -41,9 +39,12 @@
   - [Nesting](#nesting)
   - [Lists](#lists)
   - [Type Casting](#type-casting)
+  - [Random Value Generation](#random-value-generation)
   - [Multiline Text](#multiline-text)
   - [Comments](#comments)
 - [Active Mode (`!active`)](#-active-mode-active)
+- [Lock Mode (`!lock`)](#-lock-mode-lock)
+- [Canonical Format (`format`)](#-canonical-format-format)
 - [Markers — Full Reference](#-markers--full-reference)
   - [:env](#env--environment-variable)
   - [:default](#default--fallback-value)
@@ -376,6 +377,30 @@ enabled(bool) 1
 
 Available casts: `int`, `float`, `bool`, `string`.
 
+#### Random Value Generation
+
+Generate random values at parse time using `(random)`:
+
+```synx
+pin(random) null
+flag(random:bool) null
+chance(random:float) null
+dice(random:int) null
+```
+
+```json
+{
+  "pin": 1847362951,
+  "flag": true,
+  "chance": 0.7342,
+  "dice": 982451653
+}
+```
+
+Available random casts: `(random)` (int), `(random:int)`, `(random:float)`, `(random:bool)`.
+
+> Values are generated at parse time — each parse produces different values.
+
 ---
 
 ### Multiline Text
@@ -423,6 +448,107 @@ Without `!active`, all markers like `:env`, `:calc`, `:random` are treated as **
 # Now markers work!
 port:env PORT
 boss_hp:calc base_hp * 5
+```
+
+---
+
+## 🔐 Lock Mode (`!lock`)
+
+Add `!lock` to prevent external code from modifying config values via `Synx.set()`, `Synx.add()`, `Synx.remove()`. Internal SYNX markers still work normally.
+
+```synx
+!active
+!lock
+
+max_players 100
+server_name MyServer
+greeting:random
+  - Hello!
+  - Welcome!
+```
+
+```typescript
+const config = Synx.loadSync('./config.synx');
+
+Synx.set(config, 'max_players', 200);
+// ❌ throws: "SYNX: Cannot set "max_players" — config is locked (!lock)"
+
+console.log(config.max_players); // ✅ 100 (read is always allowed)
+```
+
+Use `Synx.isLocked(config)` to check if a config is locked.
+
+---
+
+## 🧹 Canonical Format (`format`)
+
+`Synx.format()` rewrites any `.synx` string into a single, normalized form.
+
+**What it does:**
+- **Sorts all keys alphabetically** at every nesting level
+- **Normalizes indentation** to exactly 2 spaces per level
+- **Strips comments** — canonical form contains only data
+- **One blank line** between top-level blocks (objects and lists)
+- **Preserves directives** (`!active`, `!lock`) at the top
+- **List item order is preserved** — only named keys are sorted
+
+### Why this matters for Git
+
+Without canonical format, two programmers writing the same config produce different files:
+
+```synx
+# Programmer A                  # Programmer B
+server                          server
+    port 8080                     host 0.0.0.0
+    host 0.0.0.0                  port 8080
+```
+
+`git diff` shows the entire block as changed — even though the data is identical.
+
+After `Synx.format()`, both produce:
+
+```synx
+server
+  host 0.0.0.0
+  port 8080
+```
+
+One canonical form. Zero noise in diffs.
+
+### Usage
+
+**JavaScript / TypeScript:**
+
+```typescript
+import { Synx } from '@aperturesyndicate/synx';
+import * as fs from 'fs';
+
+const raw = fs.readFileSync('config.synx', 'utf-8');
+const canonical = Synx.format(raw);
+fs.writeFileSync('config.synx', canonical);
+```
+
+As a pre-commit hook (add to `.git/hooks/pre-commit`):
+
+```bash
+#!/bin/sh
+node -e "
+const fs = require('fs');
+const { Synx } = require('@aperturesyndicate/synx');
+process.argv.slice(1).forEach(f => {
+  fs.writeFileSync(f, Synx.format(fs.readFileSync(f, 'utf-8')));
+});
+" $(git diff --cached --name-only --diff-filter=ACM | grep '\.synx$')
+```
+
+**Rust:**
+
+```rust
+use synx_core::Synx;
+
+let raw = std::fs::read_to_string("config.synx").unwrap();
+let canonical = Synx::format(&raw);
+std::fs::write("config.synx", canonical).unwrap();
 ```
 
 ---
@@ -698,13 +824,15 @@ hosts:split:pipe host1|host2|host3
 }
 ```
 
-Delimiter keywords: `space`, `pipe`, `dash`, `dot`, `semi`, `tab`. Default: comma.
+Delimiter keywords: `space`, `pipe`, `dash`, `dot`, `semi`, `tab`, `slash`. Default: comma.
 
 ---
 
 ### `:join` — Array to String
 
 Joins list elements into a single string with a delimiter.
+
+Delimiter keywords: `space`, `pipe`, `dash`, `dot`, `semi`, `tab`, `slash`. Default: comma.
 
 ```synx
 !active
@@ -733,7 +861,7 @@ tags_line:join:space
 }
 ```
 
-Delimiter keywords: `space`, `pipe`, `dash`, `slash`. Default: comma.
+Delimiter keywords: `space`, `pipe`, `dash`, `dot`, `semi`, `tab`, `slash`. Default: comma.
 
 ---
 
@@ -1021,6 +1149,22 @@ tags:split:unique red, green, red, blue
 
 Order matters — markers execute left-to-right within the engine's pipeline.
 
+### ✅ Marker Compatibility
+
+Common combinations that work well:
+
+- `env:default`
+- `calc:round`
+- `split:unique`
+- `split:join` (through an intermediate array)
+
+Important limitations:
+
+- `!active` is required, otherwise markers are not resolved.
+- Some markers are type-dependent: `split` expects a string, `join` expects an array, `round`/`clamp` expect numbers.
+- Marker arguments are read from the right side of the chain (for example `clamp:min:max`, `round:n`, `map:key`).
+- If an earlier marker changes the type, a later marker may no longer apply.
+
 ---
 
 ## 💻 Code Examples
@@ -1095,9 +1239,97 @@ const config = Synx.loadSync('./config.synx', {
 });
 ```
 
+**Runtime Manipulation (set / add / remove):**
+
+```typescript
+import { Synx } from '@aperturesyndicate/synx';
+
+const config = Synx.loadSync('./game.synx');
+
+// Set a value
+Synx.set(config, 'max_players', 100);
+Synx.set(config, 'server.host', 'localhost');
+
+// Get a value (dot-path supported)
+const port = Synx.get(config, 'server.port'); // 8080
+
+// Add to a list
+Synx.add(config, 'maps', 'Arena of Doom');
+Synx.add(config, 'maps', 'Crystal Caverns');
+
+// Remove from a list
+Synx.remove(config, 'maps', 'Arena of Doom');
+
+// Delete a key entirely
+Synx.remove(config, 'deprecated_key');
+
+// Check lock status
+if (!Synx.isLocked(config)) {
+  Synx.set(config, 'motd', 'Welcome!');
+}
+```
+
+> **Note:** If the `.synx` file has `!lock`, all `set`/`add`/`remove` calls will throw an error.
+
+**Access Methods (JS/TS API):**
+
+- `Synx.get(obj, keyPath)` — read a value by dot-path.
+- `Synx.set(obj, keyPath, value)` — set a value by dot-path.
+- `Synx.add(obj, keyPath, item)` — append an item to an array field.
+- `Synx.remove(obj, keyPath, item?)` — remove an array item or delete a key.
+- `Synx.isLocked(obj)` — check if config is locked via `!lock`.
+
 ---
 
 ### Python
+
+Current `synx_native` exports: `parse`, `parse_active`, `parse_to_json`.
+
+Python equivalents for `get`/`set`/`add`/`remove` can be implemented like this:
+
+```python
+def get_path(obj, key_path, default=None):
+  cur = obj
+  for part in key_path.split('.'):
+    if not isinstance(cur, dict) or part not in cur:
+      return default
+    cur = cur[part]
+  return cur
+
+def set_path(obj, key_path, value):
+  parts = key_path.split('.')
+  cur = obj
+  for part in parts[:-1]:
+    if part not in cur or not isinstance(cur[part], dict):
+      cur[part] = {}
+    cur = cur[part]
+  cur[parts[-1]] = value
+
+def add_path(obj, key_path, item):
+  arr = get_path(obj, key_path)
+  if not isinstance(arr, list):
+    set_path(obj, key_path, [] if arr is None else [arr])
+    arr = get_path(obj, key_path)
+  arr.append(item)
+
+def remove_path(obj, key_path, item=None):
+  parts = key_path.split('.')
+  cur = obj
+  for part in parts[:-1]:
+    if not isinstance(cur, dict) or part not in cur:
+      return
+    cur = cur[part]
+  last = parts[-1]
+  if item is None:
+    if isinstance(cur, dict):
+      cur.pop(last, None)
+    return
+  if isinstance(cur, dict) and isinstance(cur.get(last), list):
+    try:
+      cur[last].remove(item)
+    except ValueError:
+      pass
+```
 
 ```bash
 pip install synx-format
@@ -1117,6 +1349,12 @@ server
 
 print(config["app_name"])      # "TotalWario"
 print(config["server"]["port"])  # 8080
+
+# Python access helpers usage
+set_path(config, "server.port", 9090)
+add_path(config, "maps", "Arena of Doom")
+remove_path(config, "maps", "Arena of Doom")
+print(get_path(config, "server.port"))  # 9090
 ```
 
 ```python
