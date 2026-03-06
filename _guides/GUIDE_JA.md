@@ -1,6 +1,10 @@
 <p align="center">
-  <img src="https://aperturesyndicate.com/branding/aperturesyndicate.png" alt="APERTURESyndicate" width="400" />
+  <a href="https://aperturesyndicate.com/branding/aperturesyndicate.png" target="_blank">
+    <img src="https://aperturesyndicate.com/branding/aperturesyndicate.png" alt="APERTURESyndicate" width="400" />
+  </a>
 </p>
+
+> **🔗 [ロゴを表示 →](https://aperturesyndicate.com/branding/aperturesyndicate.png)**
 
 <h1 align="center">SYNX v3.0 — 完全ガイド</h1>
 
@@ -76,7 +80,7 @@
 
 | 問題 | JSON | YAML | SYNX |
 |---|:---:|:---:|:---:|
-| あらゆる場所に引用符 | ✗ | ✓ | ✓ |
+| 文字列とキーに引用符が必要 | ✓ | ✗ | ✗ |
 | 末尾カンマでパースエラー | ✗ | — | ✓ |
 | スペース依存のインデント | — | ✗ (危険) | ✓ (安全、2スペース) |
 | コメントサポート | ✗ | ✓ | ✓ |
@@ -102,16 +106,24 @@ SYNXは3つの原則に基づいて構築されています：
 **キー**、**スペース**、**値**だけ。引用符なし、カンマなし、波括弧なし：
 
 <p align="center">
-  <img src="https://aperturesyndicate.com/branding/gifs/synx/synx.gif" alt="静的SYNXの記述" width="720" />
+  <a href="https://aperturesyndicate.com/branding/gifs/synx/synx.gif" target="_blank">
+    <img src="https://aperturesyndicate.com/branding/gifs/synx/synx.gif" alt="静的SYNXの記述" width="720" />
+  </a>
 </p>
+
+> **📺 [デモを見る →](https://aperturesyndicate.com/branding/gifs/synx/synx.gif)**
 
 ### `!active` モード — ロジック付き設定
 
 最初の行に `!active` を追加すると、設定が動き出します — 関数がフォーマットに直接組み込まれています：
 
 <p align="center">
-  <img src="https://aperturesyndicate.com/branding/gifs/synx/synx2.gif" alt="マーカー付きアクティブSYNXの記述" width="720" />
+  <a href="https://aperturesyndicate.com/branding/gifs/synx/synx2.gif" target="_blank">
+    <img src="https://aperturesyndicate.com/branding/gifs/synx/synx2.gif" alt="マーカー付きアクティブSYNXの記述" width="720" />
+  </a>
 </p>
+
+> **📺 [デモを見る →](https://aperturesyndicate.com/branding/gifs/synx/synx2.gif)**
 
 ---
 
@@ -121,16 +133,16 @@ SYNXパイプラインは**2つのステージ**に分かれています — こ
 
 ```
 ┌──────────────┐         ┌─────────────┐         ┌──────────────┐
-│  .synxファイル │ ──────► │  パーサー     │ ──────► │    出力       │
-│  (テキスト)    │         │  (常に実行)   │         │  (JSオブジェクト) │
+│  .synxファイル│ ──────► │  パーサー    │ ──────► │    出力      │
+│  (テキスト)   │         │  (常に実行)  │         │  (JS)        │
 └──────────────┘         └──────┬──────┘         └──────────────┘
                                 │
                          !active あり？
                                 │
                            ┌────▼────┐
                            │ エンジン │
-                           │(マーカー│
-                           │ を実行) │
+                           │(マーカー │
+                           │ を実行)  │
                            └─────────┘
 ```
 

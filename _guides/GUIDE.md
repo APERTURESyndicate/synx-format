@@ -1,6 +1,10 @@
 <p align="center">
-  <img src="https://aperturesyndicate.com/branding/aperturesyndicate.png" alt="APERTURESyndicate" width="400" />
+  <a href="https://aperturesyndicate.com/branding/aperturesyndicate.png" target="_blank">
+    <img src="https://aperturesyndicate.com/branding/aperturesyndicate.png" alt="APERTURESyndicate" width="400" />
+  </a>
 </p>
+
+> **🔗 [View logo →](https://aperturesyndicate.com/branding/aperturesyndicate.png)**
 
 <h1 align="center">SYNX v3.0 — The Complete Guide</h1>
 
@@ -80,7 +84,7 @@ Configuration is the backbone of every application. Yet the industry standard fo
 
 | Problem | JSON | YAML | SYNX |
 |---|:---:|:---:|:---:|
-| Quotes everywhere | ✗ | ✓ | ✓ |
+| Requires quotes for strings/keys | ✓ | ✗ | ✗ |
 | Trailing commas crash the parser | ✗ | — | ✓ |
 | Whitespace-significant indentation | — | ✗ (dangerous) | ✓ (safe, 2-space) |
 | Comments | ✗ | ✓ | ✓ |
@@ -114,8 +118,12 @@ Just **key**, **space**, **value**. No quotes, no commas, no braces:
 Add `!active` on the first line and your config comes alive — with functions built right into the format:
 
 <p align="center">
-  <img src="https://aperturesyndicate.com/branding/gifs/synx/synx2.gif" alt="Writing active SYNX with markers" width="720" />
+  <a href="https://aperturesyndicate.com/branding/gifs/synx/synx2.gif" target="_blank">
+    <img src="https://aperturesyndicate.com/branding/gifs/synx/synx2.gif" alt="Writing active SYNX with markers" width="720" />
+  </a>
 </p>
+
+> **📺 [Watch demo →](https://aperturesyndicate.com/branding/gifs/synx/synx2.gif)**
 
 ---
 
@@ -125,11 +133,11 @@ The SYNX pipeline has **two stages** — and this separation is key to its perfo
 
 ```
 ┌─────────────┐         ┌─────────────┐         ┌──────────────┐
-│  .synx file │ ──────► │   PARSER    │ ──────► │    OUTPUT     │
-│  (text)     │         │ (always)    │         │  (JS object)  │
+│  .synx file │ ──────► │   PARSER    │ ──────► │    OUTPUT    │
+│  (text)     │         │ (always)    │         │  (JS object) │
 └─────────────┘         └──────┬──────┘         └──────────────┘
                                │
-                        has !active?
+                          has !active?
                                │
                           ┌────▼────┐
                           │ ENGINE  │

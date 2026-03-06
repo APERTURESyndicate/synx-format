@@ -1,6 +1,10 @@
 <p align="center">
-  <img src="https://aperturesyndicate.com/branding/aperturesyndicate.png" alt="APERTURESyndicate" width="400" />
+  <a href="https://aperturesyndicate.com/branding/aperturesyndicate.png" target="_blank">
+    <img src="https://aperturesyndicate.com/branding/aperturesyndicate.png" alt="APERTURESyndicate" width="400" />
+  </a>
 </p>
+
+> **🔗 [Logo anzeigen →](https://aperturesyndicate.com/branding/aperturesyndicate.png)**
 
 <h1 align="center">SYNX v3.0 — Vollständiger Leitfaden</h1>
 
@@ -76,7 +80,7 @@ Konfiguration ist das Fundament jeder Anwendung. Doch die Industriestandard-Form
 
 | Problem | JSON | YAML | SYNX |
 |---|:---:|:---:|:---:|
-| Überall Anführungszeichen | ✗ | ✓ | ✓ |
+| Erfordert Anführungszeichen für Strings/Schlüssel | ✓ | ✗ | ✗ |
 | Trailing-Komma bricht Parsing | ✗ | — | ✓ |
 | Leerzeichensensitive Einrückung | — | ✗ (gefährlich) | ✓ (sicher, 2 Leerzeichen) |
 | Kommentar-Unterstützung | ✗ | ✓ | ✓ |
@@ -102,16 +106,24 @@ SYNX basiert auf drei Prinzipien:
 Nur **Schlüssel**, **Leerzeichen**, **Wert**. Keine Anführungszeichen, keine Kommas, keine geschweiften Klammern:
 
 <p align="center">
-  <img src="https://aperturesyndicate.com/branding/gifs/synx/synx.gif" alt="Statisches SYNX schreiben" width="720" />
+  <a href="https://aperturesyndicate.com/branding/gifs/synx/synx.gif" target="_blank">
+    <img src="https://aperturesyndicate.com/branding/gifs/synx/synx.gif" alt="Statisches SYNX schreiben" width="720" />
+  </a>
 </p>
+
+> **📺 [Demo ansehen →](https://aperturesyndicate.com/branding/gifs/synx/synx.gif)**
 
 ### `!active` Modus — Konfiguration mit Logik
 
 Füge `!active` in der ersten Zeile hinzu, und deine Konfiguration wird lebendig — Funktionen direkt im Format integriert:
 
 <p align="center">
-  <img src="https://aperturesyndicate.com/branding/gifs/synx/synx2.gif" alt="Aktives SYNX mit Markern schreiben" width="720" />
+  <a href="https://aperturesyndicate.com/branding/gifs/synx/synx2.gif" target="_blank">
+    <img src="https://aperturesyndicate.com/branding/gifs/synx/synx2.gif" alt="Aktives SYNX mit Markern schreiben" width="720" />
+  </a>
 </p>
+
+> **📺 [Demo ansehen →](https://aperturesyndicate.com/branding/gifs/synx/synx2.gif)**
 
 ---
 
@@ -125,7 +137,7 @@ Die SYNX-Pipeline hat **zwei Stufen** — diese Trennung ist der Schlüssel zur 
 │  (Text)       │         │  (immer)    │         │ (JS-Objekt)  │
 └───────────────┘         └──────┬──────┘         └──────────────┘
                                  │
-                          hat !active?
+                            hat !active?
                                  │
                             ┌────▼────┐
                             │  Engine │

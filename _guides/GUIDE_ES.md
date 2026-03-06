@@ -1,6 +1,10 @@
 <p align="center">
-  <img src="https://aperturesyndicate.com/branding/aperturesyndicate.png" alt="APERTURESyndicate" width="400" />
+  <a href="https://aperturesyndicate.com/branding/aperturesyndicate.png" target="_blank">
+    <img src="https://aperturesyndicate.com/branding/aperturesyndicate.png" alt="APERTURESyndicate" width="400" />
+  </a>
 </p>
+
+> **🔗 [Ver logotipo →](https://aperturesyndicate.com/branding/aperturesyndicate.png)**
 
 <h1 align="center">SYNX v3.0 — Guía Completa</h1>
 
@@ -76,7 +80,7 @@ La configuración es la base de cada aplicación. Sin embargo, los formatos est�
 
 | Problema | JSON | YAML | SYNX |
 |---|:---:|:---:|:---:|
-| Comillas en todas partes | ✗ | ✓ | ✓ |
+| Requiere comillas para strings/claves | ✓ | ✗ | ✗ |
 | Error por coma final | ✗ | — | ✓ |
 | Indentación sensible a espacios | — | ✗ (peligroso) | ✓ (seguro, 2 espacios) |
 | Soporte de comentarios | ✗ | ✓ | ✓ |
@@ -102,16 +106,24 @@ SYNX se construye sobre tres principios:
 Solo **clave**, **espacio**, **valor**. Sin comillas, sin comas, sin llaves:
 
 <p align="center">
-  <img src="https://aperturesyndicate.com/branding/gifs/synx/synx.gif" alt="Escribir SYNX estático" width="720" />
+  <a href="https://aperturesyndicate.com/branding/gifs/synx/synx.gif" target="_blank">
+    <img src="https://aperturesyndicate.com/branding/gifs/synx/synx.gif" alt="Escribir SYNX estático" width="720" />
+  </a>
 </p>
+
+> **📺 [Ver demostración →](https://aperturesyndicate.com/branding/gifs/synx/synx.gif)**
 
 ### Modo `!active` — configuración con lógica
 
 Agrega `!active` en la primera línea y tu configuración cobra vida — funciones integradas directamente en el formato:
 
 <p align="center">
-  <img src="https://aperturesyndicate.com/branding/gifs/synx/synx2.gif" alt="Escribir SYNX activo con marcadores" width="720" />
+  <a href="https://aperturesyndicate.com/branding/gifs/synx/synx2.gif" target="_blank">
+    <img src="https://aperturesyndicate.com/branding/gifs/synx/synx2.gif" alt="Escribir SYNX activo con marcadores" width="720" />
+  </a>
 </p>
+
+> **📺 [Ver demostración →](https://aperturesyndicate.com/branding/gifs/synx/synx2.gif)**
 
 ---
 
@@ -121,8 +133,8 @@ El pipeline de SYNX tiene **dos etapas** — esta separación es clave para el r
 
 ```
 ┌───────────────┐         ┌─────────────┐         ┌──────────────┐
-│  Archivo .synx │ ──────► │   Parser    │ ──────► │    Salida    │
-│  (texto)       │         │ (siempre)   │         │ (objeto JS)  │
+│  Archivo .synx│ ──────► │   Parser   │ ──────► │    Salida    │
+│  (texto)      │         │ (siempre)  │         │ (objeto JS)  │
 └───────────────┘         └──────┬──────┘         └──────────────┘
                                  │
                           ¿tiene !active?

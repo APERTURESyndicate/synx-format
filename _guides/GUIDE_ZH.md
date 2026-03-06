@@ -1,6 +1,10 @@
 <p align="center">
-  <img src="https://aperturesyndicate.com/branding/aperturesyndicate.png" alt="APERTURESyndicate" width="400" />
+  <a href="https://aperturesyndicate.com/branding/aperturesyndicate.png" target="_blank">
+    <img src="https://aperturesyndicate.com/branding/aperturesyndicate.png" alt="APERTURESyndicate" width="400" />
+  </a>
 </p>
+
+> **🔗 [查看徽标 →](https://aperturesyndicate.com/branding/aperturesyndicate.png)**
 
 <h1 align="center">SYNX v3.0 — 完整指南</h1>
 
@@ -76,7 +80,7 @@
 
 | 问题 | JSON | YAML | SYNX |
 |---|:---:|:---:|:---:|
-| 到处都是引号 | ✗ | ✓ | ✓ |
+| 字符串和键需要引号 | ✓ | ✗ | ✗ |
 | 尾部逗号导致解析失败 | ✗ | — | ✓ |
 | 空格敏感的缩进 | — | ✗ (危险) | ✓ (安全，2空格) |
 | 注释支持 | ✗ | ✓ | ✓ |
@@ -102,16 +106,24 @@ SYNX 基于三个原则构建：
 只需 **键**、**空格**、**值**。没有引号，没有逗号，没有花括号：
 
 <p align="center">
-  <img src="https://aperturesyndicate.com/branding/gifs/synx/synx.gif" alt="编写静态 SYNX" width="720" />
+  <a href="https://aperturesyndicate.com/branding/gifs/synx/synx.gif" target="_blank">
+    <img src="https://aperturesyndicate.com/branding/gifs/synx/synx.gif" alt="编写静态 SYNX" width="720" />
+  </a>
 </p>
+
+> **📺 [观看演示 →](https://aperturesyndicate.com/branding/gifs/synx/synx.gif)**
 
 ### `!active` 模式 — 带逻辑的配置
 
 在第一行添加 `!active`，你的配置就活了过来 — 函数直接内置在格式中：
 
 <p align="center">
-  <img src="https://aperturesyndicate.com/branding/gifs/synx/synx2.gif" alt="使用标记编写活动 SYNX" width="720" />
+  <a href="https://aperturesyndicate.com/branding/gifs/synx/synx2.gif" target="_blank">
+    <img src="https://aperturesyndicate.com/branding/gifs/synx/synx2.gif" alt="使用标记编写活动 SYNX" width="720" />
+  </a>
 </p>
+
+> **📺 [观看演示 →](https://aperturesyndicate.com/branding/gifs/synx/synx2.gif)**
 
 ---
 
@@ -121,11 +133,11 @@ SYNX 管道分为 **两个阶段** — 这种分离是性能的关键：
 
 ```
 ┌─────────────┐         ┌─────────────┐         ┌──────────────┐
-│  .synx 文件  │ ──────► │   解析器     │ ──────► │    输出       │
-│  (文本)      │         │  (始终执行)   │         │  (JS 对象)   │
+│  .synx 文件  │ ──────► │   解析器    │ ──────► │    输出      │
+│  (文本)      │         │  (始终执行) │         │  (JS 对象)   │
 └─────────────┘         └──────┬──────┘         └──────────────┘
                                │
-                        有 !active？
+                          有 !active？
                                │
                           ┌────▼────┐
                           │  引擎   │

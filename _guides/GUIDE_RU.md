@@ -1,6 +1,10 @@
 <p align="center">
-  <img src="https://aperturesyndicate.com/branding/aperturesyndicate.png" alt="APERTURESyndicate" width="400" />
+  <a href="https://aperturesyndicate.com/branding/aperturesyndicate.png" target="_blank">
+    <img src="https://aperturesyndicate.com/branding/aperturesyndicate.png" alt="APERTURESyndicate" width="400" />
+  </a>
 </p>
+
+> **🔗 [Посмотреть логотип →](https://aperturesyndicate.com/branding/aperturesyndicate.png)**
 
 <h1 align="center">SYNX v3.0 — Полное руководство</h1>
 
@@ -80,7 +84,7 @@
 
 | Проблема | JSON | YAML | SYNX |
 |---|:---:|:---:|:---:|
-| Кавычки везде | ✗ | ✓ | ✓ |
+| Требуются кавычки для строк и ключей | ✓ | ✗ | ✗ |
 | Запятые ломают парсер | ✗ | — | ✓ |
 | Значимые отступы | — | ✗ (опасно) | ✓ (безопасно, 2 пробела) |
 | Комментарии | ✗ | ✓ | ✓ |
@@ -106,16 +110,24 @@ SYNX построен на трёх принципах:
 Просто **ключ**, **пробел**, **значение**. Без кавычек, запятых и скобок:
 
 <p align="center">
-  <img src="https://aperturesyndicate.com/branding/gifs/synx/synx.gif" alt="Запись статического SYNX" width="720" />
+  <a href="https://aperturesyndicate.com/branding/gifs/synx/synx.gif" target="_blank">
+    <img src="https://aperturesyndicate.com/branding/gifs/synx/synx.gif" alt="Запись статического SYNX" width="720" />
+  </a>
 </p>
+
+> **📺 [Смотреть демонстрацию →](https://aperturesyndicate.com/branding/gifs/synx/synx.gif)**
 
 ### Режим `!active` — конфиги с логикой
 
 Добавь `!active` на первую строку — и конфиг оживает, с функциями прямо внутри формата:
 
 <p align="center">
-  <img src="https://aperturesyndicate.com/branding/gifs/synx/synx2.gif" alt="Запись активного SYNX с маркерами" width="720" />
+  <a href="https://aperturesyndicate.com/branding/gifs/synx/synx2.gif" target="_blank">
+    <img src="https://aperturesyndicate.com/branding/gifs/synx/synx2.gif" alt="Запись активного SYNX с маркерами" width="720" />
+  </a>
 </p>
+
+> **📺 [Смотреть демонстрацию →](https://aperturesyndicate.com/branding/gifs/synx/synx2.gif)**
 
 ---
 
@@ -125,11 +137,11 @@ SYNX построен на трёх принципах:
 
 ```
 ┌─────────────┐         ┌─────────────┐         ┌──────────────┐
-│  Файл .synx │ ──────► │   ПАРСЕР    │ ──────► │   РЕЗУЛЬТАТ   │
-│  (текст)    │         │ (всегда)    │         │  (JS-объект)  │
+│  Файл .synx │ ──────► │   ПАРСЕР    │ ──────► │   РЕЗУЛЬТАТ  │
+│  (текст)    │         │ (всегда)    │         │  (JS-объект) │
 └─────────────┘         └──────┬──────┘         └──────────────┘
                                │
-                        есть !active?
+                          есть !active?
                                │
                           ┌────▼────┐
                           │ ДВИЖОК  │

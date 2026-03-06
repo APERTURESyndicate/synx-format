@@ -8,3 +8,4 @@ A:\APERTURESyndicate\ASC\synx-format\packages\synx-visualstudio\SynxLanguageServ
 A:\APERTURESyndicate\ASC\synx-format\packages\synx-visualstudio\SynxLanguageService\obj\Release\net472\SynxLang.9867C6B9.Up2Date
 A:\APERTURESyndicate\ASC\synx-format\packages\synx-visualstudio\SynxLanguageService\obj\Release\net472\SynxLanguageService.dll
 A:\APERTURESyndicate\ASC\synx-format\packages\synx-visualstudio\SynxLanguageService\obj\Release\net472\SynxLanguageService.pdb
+A:\APERTURESyndicate\ASC\synx-format\packages\synx-visualstudio\SynxLanguageService\obj\Release\net472\SynxLanguageService.sourcelink.json
