@@ -678,7 +678,339 @@ profit:calc:round:2 revenue * margin
 
 ---
 
-## 💻 コード例
+## � CLIツール
+
+> v3.1.3で追加。
+
+npmでグローバルインストール：
+
+```bash
+npm install -g @aperturesyndicate/synx
+```
+
+### `synx convert` — 他のフォーマットへエクスポート
+
+```bash
+# SYNX → JSON
+synx convert config.synx --format json
+
+# SYNX → YAML（Helm、Ansible、K8s向け）
+synx convert config.synx --format yaml > values.yaml
+
+# SYNX → TOML
+synx convert config.synx --format toml
+
+# SYNX → .env（Docker Compose向け）
+synx convert config.synx --format env > .env
+
+# strictモード（マーカーエラーで即座に失敗）
+synx convert config.synx --format json --strict
+```
+
+### `synx validate` — CI/CDバリデーション
+
+```bash
+synx validate config.synx --strict
+# 成功時は終了コード0、INCLUDE_ERR / WATCH_ERR / CALC_ERR / CONSTRAINT_ERRで1
+```
+
+### `synx watch` — ライブリロード
+
+```bash
+# 変更のたびにJSONを出力
+synx watch config.synx --format json
+
+# 変更のたびにコマンドを実行（例：Nginxのリロード）
+synx watch config.synx --exec "nginx -s reload"
+```
+
+### `synx schema` — 制約からJSON Schemaを抽出
+
+```bash
+synx schema config.synx
+# [required, min:N, max:N, type:T, enum:A|B, pattern:R]に基づきJSON Schemaを出力
+```
+
+---
+
+## 📤 エクスポートフォーマット（JS/TS API）
+
+> v3.1.3で追加。
+
+パース済みSYNXオブジェクトをJSON、YAML、TOML、または.envに変換：
+
+```typescript
+import Synx from '@aperturesyndicate/synx';
+
+const config = Synx.loadSync('config.synx');
+
+// JSON
+const json = Synx.toJSON(config);          // 整形済み
+const compact = Synx.toJSON(config, false); // コンパクト
+
+// YAML
+const yaml = Synx.toYAML(config);
+
+// TOML
+const toml = Synx.toTOML(config);
+
+// .env（KEY=VALUEフォーマット）
+const env = Synx.toEnv(config);            // APP_NAME=TotalWario
+const prefixed = Synx.toEnv(config, 'APP'); // APP_APP_NAME=TotalWario
+```
+
+---
+
+## 📋 スキーマエクスポート
+
+> v3.1.3で追加。
+
+SYNXの制約をJSON Schemaオブジェクトとして抽出：
+
+```typescript
+const schema = Synx.schema(`
+!active
+app_name[required, min:3, max:30] TotalWario
+volume[min:0, max:100, type:int] 75
+theme[enum:light|dark|auto] dark
+`);
+```
+
+結果：
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "app_name": { "minimum": 3, "maximum": 30, "required": true },
+    "volume": { "type": "integer", "minimum": 0, "maximum": 100 },
+    "theme": { "enum": ["light", "dark", "auto"] }
+  },
+  "required": ["app_name"]
+}
+```
+
+---
+
+## 👁 ファイルウォッチャー
+
+> v3.1.3で追加。
+
+`.synx`ファイルを監視し、変更のたびに更新された設定を取得：
+
+```typescript
+const handle = Synx.watch('config.synx', (config, error) => {
+  if (error) {
+    console.error('設定のリロードに失敗:', error.message);
+    return;
+  }
+  console.log('設定が更新されました:', config.server.port);
+}, { strict: true });
+
+// 監視を停止
+handle.close();
+```
+
+---
+
+## 🐳 デプロイガイド
+
+> v3.1.3で追加。
+
+### Docker + Docker Compose
+
+SYNXはすべてのサービス設定の**単一の信頼できるソース**として機能します。独自の設定フォーマットが必要なサービス（Nginx、Redisなど）は、起動時に生成された設定を受け取ります。
+
+**パターン：**
+
+```
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│   config.synx   │────▶│  起動スクリプト  │────▶│  nginx.conf     │
+│  （1ファイル）    │     │  またはCLI conv. │     │  .env           │
+│  :env :default  │     │                 │     │  redis.conf     │
+│  :template      │     │                 │     │  アプリ設定      │
+└─────────────────┘     └─────────────────┘     └─────────────────┘
+```
+
+**ステップ1 — 設定を記述：**
+
+```synx
+!active
+
+app
+  name my-service
+  port:env:default:3000 APP_PORT
+  host:env:default:0.0.0.0 APP_HOST
+
+database
+  host:env:default:postgres DB_HOST
+  port:env:default:5432 DB_PORT
+  name:env:default:mydb DB_NAME
+  user:env:default:app DB_USER
+  password:env DB_PASSWORD
+
+redis
+  host:env:default:redis REDIS_HOST
+  port:env:default:6379 REDIS_PORT
+  url:template redis://{redis.host}:{redis.port}/0
+```
+
+**ステップ2 — Docker Compose用の.envを生成：**
+
+```bash
+synx convert config.synx --format env > .env
+```
+
+**ステップ3 — docker-compose.ymlで使用：**
+
+```yaml
+services:
+  web:
+    image: node:20-alpine
+    env_file: .env
+    ports:
+      - "${APP_PORT}:${APP_PORT}"
+
+  redis:
+    image: redis:7-alpine
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${DB_NAME}
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+```
+
+### Nginx設定の生成
+
+テンプレート+起動スクリプトを使用して、SYNXから`nginx.conf`を生成：
+
+```javascript
+const Synx = require('@aperturesyndicate/synx');
+const fs = require('fs');
+
+const config = Synx.loadSync('/config/app.synx', {
+  env: process.env,
+  strict: true,
+});
+
+const nginxConf = `
+server {
+  listen ${config.nginx.listen};
+  location / {
+    proxy_pass http://${config.nginx.upstream_host}:${config.nginx.upstream_port};
+  }
+}`;
+
+fs.writeFileSync('/etc/nginx/conf.d/default.conf', nginxConf);
+```
+
+### Redis接続
+
+```synx
+!active
+
+redis
+  host:env:default:localhost REDIS_HOST
+  port:env:default:6379 REDIS_PORT
+  db:default 0
+  ttl:default 3600
+  password:env REDIS_PASSWORD
+  url:template redis://{redis.host}:{redis.port}/{redis.db}
+```
+
+```javascript
+const config = Synx.loadSync('config.synx', { env: process.env, strict: true });
+const redis = new Redis(config.redis.url);
+```
+
+### PostgreSQL接続
+
+```synx
+!active
+
+db
+  host:env:default:localhost DATABASE_HOST
+  port:env:default:5432 DATABASE_PORT
+  name:env:default:mydb DATABASE_NAME
+  user:env:default:app DATABASE_USER
+  password:env DATABASE_PASSWORD
+  url:template postgresql://{db.user}:{db.password}@{db.host}:{db.port}/{db.name}
+  pool_min:default 5
+  pool_max:default 20
+```
+
+```javascript
+const config = Synx.loadSync('config.synx', { env: process.env, strict: true });
+const pool = new Pool({ connectionString: config.db.url });
+```
+
+### Kubernetes Secrets
+
+K8sはシークレットを`/run/secrets/`にファイルとしてマウントします。`:watch`で読み取り：
+
+```synx
+!active
+
+db_password:watch /run/secrets/db-password
+api_key:watch /run/secrets/api-key
+```
+
+Docker Secretsも同様です — `/run/secrets/`にマウントされます。
+
+### HashiCorp Vault
+
+Vault Agentを使用してシークレットをファイルに書き込み、`:watch`で読み取り：
+
+```synx
+!active
+
+db_creds:watch:password /vault/secrets/database
+api_key:watch:key /vault/secrets/api-key
+```
+
+またはVault Agentの`env_template`を使用して環境変数で注入：
+
+```synx
+!active
+
+db_password:env VAULT_DB_PASSWORD
+api_key:env VAULT_API_KEY
+```
+
+### Helm / Kubernetes
+
+SYNXをYAMLに変換してHelmのvaluesとして使用：
+
+```bash
+synx convert config.synx --format yaml > helm/values.yaml
+helm upgrade my-release ./chart -f helm/values.yaml
+```
+
+### Terraform
+
+TerraformはJSON変数ファイルを受け付けます：
+
+```bash
+synx convert config.synx --format json > terraform.tfvars.json
+terraform apply -var-file=terraform.tfvars.json
+```
+
+### CI/CDパイプラインバリデーション
+
+CIパイプラインに追加して、デプロイ前に設定エラーを検出：
+
+```yaml
+# GitHub Actionsの例
+- name: SYNX設定のバリデーション
+  run: npx @aperturesyndicate/synx validate config.synx --strict
+```
+
+---
+
+## �💻 コード例
 
 ### JavaScript / TypeScript
 

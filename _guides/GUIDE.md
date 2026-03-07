@@ -1179,7 +1179,356 @@ Important limitations:
 
 ---
 
-## 💻 Code Examples
+## � CLI Tool
+
+> Added in v3.1.3.
+
+Install globally via npm:
+
+```bash
+npm install -g @aperturesyndicate/synx
+```
+
+### `synx convert` — Export to Other Formats
+
+```bash
+# SYNX → JSON
+synx convert config.synx --format json
+
+# SYNX → YAML (for Helm, Ansible, K8s)
+synx convert config.synx --format yaml > values.yaml
+
+# SYNX → TOML
+synx convert config.synx --format toml
+
+# SYNX → .env (for Docker Compose)
+synx convert config.synx --format env > .env
+
+# With strict mode (fail on any marker error)
+synx convert config.synx --format json --strict
+```
+
+### `synx validate` — CI/CD Validation
+
+```bash
+synx validate config.synx --strict
+# Exits 0 on success, 1 on any INCLUDE_ERR / WATCH_ERR / CALC_ERR / CONSTRAINT_ERR
+```
+
+### `synx watch` — Live Reload
+
+```bash
+# Print JSON on every change
+synx watch config.synx --format json
+
+# Execute a command on every change (e.g. reload Nginx)
+synx watch config.synx --exec "nginx -s reload"
+```
+
+### `synx schema` — Extract JSON Schema from Constraints
+
+```bash
+synx schema config.synx
+# Outputs JSON Schema based on [required, min:N, max:N, type:T, enum:A|B, pattern:R]
+```
+
+---
+
+## 📤 Export Formats (JS/TS API)
+
+> Added in v3.1.3.
+
+Convert a parsed SYNX object to JSON, YAML, TOML, or .env:
+
+```typescript
+import Synx from '@aperturesyndicate/synx';
+
+const config = Synx.loadSync('config.synx');
+
+// JSON
+const json = Synx.toJSON(config);        // pretty-printed
+const compact = Synx.toJSON(config, false); // compact
+
+// YAML
+const yaml = Synx.toYAML(config);
+
+// TOML
+const toml = Synx.toTOML(config);
+
+// .env (KEY=VALUE format)
+const env = Synx.toEnv(config);           // APP_NAME=TotalWario
+const prefixed = Synx.toEnv(config, 'APP'); // APP_APP_NAME=TotalWario
+```
+
+---
+
+## 📋 Schema Export
+
+> Added in v3.1.3.
+
+Extract SYNX constraints as a JSON Schema object:
+
+```typescript
+const schema = Synx.schema(`
+!active
+app_name[required, min:3, max:30] TotalWario
+volume[min:0, max:100, type:int] 75
+theme[enum:light|dark|auto] dark
+`);
+```
+
+Result:
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "app_name": { "minimum": 3, "maximum": 30, "required": true },
+    "volume": { "type": "integer", "minimum": 0, "maximum": 100 },
+    "theme": { "enum": ["light", "dark", "auto"] }
+  },
+  "required": ["app_name"]
+}
+```
+
+Use in CI to validate configs before deployment:
+
+```bash
+synx schema config.synx > schema.json
+# Feed into any JSON Schema validator
+```
+
+---
+
+## 👁 File Watcher
+
+> Added in v3.1.3.
+
+Watch a `.synx` file and get hot-reloaded config on every change:
+
+```typescript
+const handle = Synx.watch('config.synx', (config, error) => {
+  if (error) {
+    console.error('Config reload failed:', error.message);
+    return;
+  }
+  console.log('Config updated:', config.server.port);
+  // Apply new config to your app without restart
+}, { strict: true });
+
+// Stop watching
+handle.close();
+```
+
+---
+
+## 🐳 Deployment Guide
+
+> Added in v3.1.3.
+
+### Docker + Docker Compose
+
+SYNX serves as the **single source of truth** for all service configuration. Services that need their own config format (Nginx, Redis, etc.) receive generated configs at startup.
+
+**Pattern:**
+
+```
+┌─────────────────┐     ┌────────────────┐     ┌─────────────────┐
+│   config.synx   │────▶│  startup script │────▶│  nginx.conf     │
+│  (one file)     │     │  or CLI convert │     │  .env           │
+│  :env :default  │     │                 │     │  redis.conf     │
+│  :template      │     │                 │     │  app settings   │
+└─────────────────┘     └────────────────┘     └─────────────────┘
+```
+
+**Step 1 — Write your config:**
+
+```synx
+!active
+
+app
+  name my-service
+  port:env:default:3000 APP_PORT
+  host:env:default:0.0.0.0 APP_HOST
+
+database
+  host:env:default:postgres DB_HOST
+  port:env:default:5432 DB_PORT
+  name:env:default:mydb DB_NAME
+  user:env:default:app DB_USER
+  password:env DB_PASSWORD
+
+redis
+  host:env:default:redis REDIS_HOST
+  port:env:default:6379 REDIS_PORT
+  url:template redis://{redis.host}:{redis.port}/0
+
+nginx
+  listen:env:default:8080 NGINX_PORT
+  upstream_host:env:default:web APP_HOST
+  upstream_port:env:default:3000 APP_PORT
+```
+
+**Step 2 — Generate .env for Docker Compose:**
+
+```bash
+synx convert config.synx --format env > .env
+```
+
+**Step 3 — Use in docker-compose.yml:**
+
+```yaml
+services:
+  web:
+    image: node:20-alpine
+    env_file: .env
+    ports:
+      - "${APP_PORT}:${APP_PORT}"
+
+  redis:
+    image: redis:7-alpine
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${DB_NAME}
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+```
+
+### Nginx Config Generation
+
+Use a template + startup script to generate `nginx.conf` from SYNX:
+
+```javascript
+// entrypoint.js — runs before Nginx starts
+const Synx = require('@aperturesyndicate/synx');
+const fs = require('fs');
+
+const config = Synx.loadSync('/config/app.synx', {
+  env: process.env,
+  strict: true,
+});
+
+const nginxConf = `
+server {
+  listen ${config.nginx.listen};
+  location / {
+    proxy_pass http://${config.nginx.upstream_host}:${config.nginx.upstream_port};
+  }
+}`;
+
+fs.writeFileSync('/etc/nginx/conf.d/default.conf', nginxConf);
+```
+
+### Redis Connection
+
+SYNX config feeds Redis connection parameters directly:
+
+```synx
+!active
+
+redis
+  host:env:default:localhost REDIS_HOST
+  port:env:default:6379 REDIS_PORT
+  db:default 0
+  ttl:default 3600
+  password:env REDIS_PASSWORD
+  url:template redis://{redis.host}:{redis.port}/{redis.db}
+```
+
+```javascript
+const config = Synx.loadSync('config.synx', { env: process.env, strict: true });
+const redis = new Redis(config.redis.url);
+```
+
+### PostgreSQL Connection
+
+```synx
+!active
+
+db
+  host:env:default:localhost DATABASE_HOST
+  port:env:default:5432 DATABASE_PORT
+  name:env:default:mydb DATABASE_NAME
+  user:env:default:app DATABASE_USER
+  password:env DATABASE_PASSWORD
+  url:template postgresql://{db.user}:{db.password}@{db.host}:{db.port}/{db.name}
+  pool_min:default 5
+  pool_max:default 20
+```
+
+```javascript
+const config = Synx.loadSync('config.synx', { env: process.env, strict: true });
+const pool = new Pool({ connectionString: config.db.url });
+```
+
+### Kubernetes Secrets
+
+K8s mounts secrets as files in `/run/secrets/`. Use `:watch` to read them:
+
+```synx
+!active
+
+db_password:watch /run/secrets/db-password
+api_key:watch /run/secrets/api-key
+```
+
+Docker Secrets work identically — mounted at `/run/secrets/`.
+
+### HashiCorp Vault
+
+Use Vault Agent to write secrets to files, then read with `:watch`:
+
+```synx
+!active
+
+# Vault Agent writes to /vault/secrets/
+db_creds:watch:password /vault/secrets/database
+api_key:watch:key /vault/secrets/api-key
+```
+
+Or inject via environment variables using Vault Agent's `env_template`:
+
+```synx
+!active
+
+db_password:env VAULT_DB_PASSWORD
+api_key:env VAULT_API_KEY
+```
+
+### Helm / Kubernetes
+
+Convert SYNX to YAML for Helm values:
+
+```bash
+synx convert config.synx --format yaml > helm/values.yaml
+helm upgrade my-release ./chart -f helm/values.yaml
+```
+
+### Terraform
+
+Terraform accepts JSON variable files:
+
+```bash
+synx convert config.synx --format json > terraform.tfvars.json
+terraform apply -var-file=terraform.tfvars.json
+```
+
+### CI/CD Pipeline Validation
+
+Add to your CI pipeline to catch config errors before deploy:
+
+```yaml
+# GitHub Actions example
+- name: Validate SYNX config
+  run: npx @aperturesyndicate/synx validate config.synx --strict
+```
+
+---
+
+## �💻 Code Examples
 
 ### JavaScript / TypeScript
 

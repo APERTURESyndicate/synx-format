@@ -232,6 +232,93 @@ words:join:space
     `);
     expect(data.words).toBe('hello world');
   });
+
+  test('strict=false keeps INCLUDE_ERR as value', () => {
+    const data = Synx.parse(`
+!active
+db:include ./__missing__.synx
+    `);
+    expect(String(data.db)).toContain('INCLUDE_ERR:');
+  });
+
+  test('strict=true throws on INCLUDE_ERR', () => {
+    expect(() => {
+      Synx.parse(`
+!active
+db:include ./__missing__.synx
+      `, { strict: true });
+    }).toThrow(/SYNX strict mode error/);
+  });
+});
+
+// ─── Export format tests ─────────────────────────────────
+
+describe('SYNX Export Formats', () => {
+  const obj = Synx.parse(`
+name Wario
+age 30
+server
+  host localhost
+  port 8080
+tags
+  - red
+  - green
+  - blue
+  `);
+
+  test('toJSON produces valid JSON', () => {
+    const json = Synx.toJSON(obj);
+    const parsed = JSON.parse(json);
+    expect(parsed.name).toBe('Wario');
+    expect(parsed.server.port).toBe(8080);
+  });
+
+  test('toYAML produces YAML', () => {
+    const yaml = Synx.toYAML(obj);
+    expect(yaml).toContain('name: Wario');
+    expect(yaml).toContain('port: 8080');
+    expect(yaml).toContain('- red');
+  });
+
+  test('toTOML produces TOML', () => {
+    const toml = Synx.toTOML(obj);
+    expect(toml).toContain('name = "Wario"');
+    expect(toml).toContain('[server]');
+    expect(toml).toContain('port = 8080');
+  });
+
+  test('toEnv produces KEY=VALUE', () => {
+    const env = Synx.toEnv(obj);
+    expect(env).toContain('NAME=Wario');
+    expect(env).toContain('AGE=30');
+    expect(env).toContain('SERVER_HOST=localhost');
+    expect(env).toContain('SERVER_PORT=8080');
+  });
+
+  test('toEnv with prefix', () => {
+    const env = Synx.toEnv(obj, 'APP');
+    expect(env).toContain('APP_NAME=Wario');
+    expect(env).toContain('APP_SERVER_PORT=8080');
+  });
+});
+
+// ─── Schema tests ────────────────────────────────────────
+
+describe('SYNX Schema Export', () => {
+  test('extracts constraints as JSON Schema', () => {
+    const schema = Synx.schema(`
+!active
+app_name[required, min:3, max:30] TotalWario
+volume[min:0, max:100, type:int] 75
+theme[enum:light|dark|auto] dark
+    `);
+    expect(schema.$schema).toContain('json-schema.org');
+    expect(schema.type).toBe('object');
+    expect(schema.required).toContain('app_name');
+    expect(schema.properties.app_name?.minimum).toBe(3);
+    expect(schema.properties.volume?.type).toBe('integer');
+    expect(schema.properties.theme?.enum).toEqual(['light', 'dark', 'auto']);
+  });
 });
 
 // ─── Safe Calc tests ─────────────────────────────────────

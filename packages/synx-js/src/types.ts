@@ -82,4 +82,6 @@ export interface SynxOptions {
   env?: Record<string, string>;
   /** Region code for :geo (e.g. "RU", "US") */
   region?: string;
+  /** Throw if marker resolution produces runtime error strings (INCLUDE_ERR, WATCH_ERR, etc.) */
+  strict?: boolean;
 }

@@ -52,7 +52,77 @@ console.log(data.server.port); // typed as number
   basePath?: string;                 // For :include resolution
   env?: Record<string, string>;      // Override env vars
   region?: string;                   // For :geo ("RU", "US", etc.)
+  strict?: boolean;                  // Throw on INCLUDE_ERR/WATCH_ERR/CALC_ERR/CONSTRAINT_ERR
 }
+```
+
+`strict: true` enables fail-fast behavior for production: marker runtime errors throw instead of silently remaining in the output object as error strings.
+
+## CLI
+
+Install globally:
+
+```bash
+npm install -g @aperturesyndicate/synx
+```
+
+### Commands
+
+```bash
+# Convert to JSON/YAML/TOML/.env
+synx convert config.synx --format json
+synx convert config.synx --format yaml > values.yaml
+synx convert config.synx --format toml
+synx convert config.synx --format env > .env
+
+# Validate (strict mode, for CI/CD)
+synx validate config.synx --strict
+
+# Watch for changes
+synx watch config.synx --format json
+synx watch config.synx --exec "nginx -s reload"
+
+# Extract JSON Schema from constraints
+synx schema config.synx
+```
+
+## Export Formats
+
+Convert parsed SYNX to other formats programmatically:
+
+```typescript
+const config = Synx.loadSync('config.synx');
+
+Synx.toJSON(config);           // JSON (pretty)
+Synx.toJSON(config, false);    // JSON (compact)
+Synx.toYAML(config);           // YAML
+Synx.toTOML(config);           // TOML
+Synx.toEnv(config);            // KEY=VALUE
+Synx.toEnv(config, 'PREFIX');  // PREFIX_KEY=VALUE
+```
+
+## File Watcher
+
+```typescript
+const handle = Synx.watch('config.synx', (config, error) => {
+  if (error) return console.error(error);
+  console.log('Config reloaded:', config);
+}, { strict: true });
+
+handle.close(); // stop watching
+```
+
+## Schema Export
+
+Extract constraints as JSON Schema:
+
+```typescript
+const schema = Synx.schema(`
+!active
+app_name[required, min:3, max:30] TotalWario
+volume[min:0, max:100, type:int] 75
+`);
+// { "$schema": "...", "properties": { "app_name": { ... } }, "required": ["app_name"] }
 ```
 
 ## Other Languages

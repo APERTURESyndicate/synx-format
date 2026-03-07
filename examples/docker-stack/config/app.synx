@@ -1,0 +1,20 @@
+!active
+
+app
+  name synx-docker-demo
+  env:env:default:development NODE_ENV
+  host:env:default:web APP_HOST
+  port:env:default:5678 APP_PORT
+
+redis
+  host:env:default:redis REDIS_HOST
+  port:env:default:6379 REDIS_PORT
+  url:template redis://{redis.host}:{redis.port}/0
+
+nginx
+  listen:env:default:8080 NGINX_PORT
+  upstream_host:env:default:web APP_HOST
+  upstream_port:env:default:5678 APP_PORT
+
+health
+  path:default /healthz

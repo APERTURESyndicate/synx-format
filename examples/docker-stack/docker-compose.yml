@@ -1,0 +1,37 @@
+services:
+  config-builder:
+    image: node:20-alpine
+    working_dir: /workspace
+    volumes:
+      - ./:/workspace
+    environment:
+      APP_HOST: web
+      APP_PORT: "5678"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      NGINX_PORT: "8080"
+    command: >
+      sh -c "npm --silent i @aperturesyndicate/synx && node scripts/render-nginx.js"
+
+  web:
+    image: hashicorp/http-echo:1.0.0
+    command: ["-listen=:5678", "-text=hello from synx web"]
+    expose:
+      - "5678"
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "no"]
+    expose:
+      - "6379"
+
+  nginx:
+    image: nginx:1.27-alpine
+    depends_on:
+      - config-builder
+      - web
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./generated/default.conf:/etc/nginx/conf.d/default.conf:ro
+    command: ["/bin/sh", "-c", "while [ ! -s /etc/nginx/conf.d/default.conf ]; do sleep 0.2; done; nginx -g 'daemon off;'"]

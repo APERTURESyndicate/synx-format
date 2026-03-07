@@ -678,7 +678,339 @@ profit:calc:round:2 revenue * margin
 
 ---
 
-## 💻 代码示例
+## � CLI 工具
+
+> 在 v3.1.3 中添加。
+
+通过 npm 全局安装：
+
+```bash
+npm install -g @aperturesyndicate/synx
+```
+
+### `synx convert` — 导出为其他格式
+
+```bash
+# SYNX → JSON
+synx convert config.synx --format json
+
+# SYNX → YAML（用于 Helm、Ansible、K8s）
+synx convert config.synx --format yaml > values.yaml
+
+# SYNX → TOML
+synx convert config.synx --format toml
+
+# SYNX → .env（用于 Docker Compose）
+synx convert config.synx --format env > .env
+
+# 严格模式（遇到任何标记错误即失败）
+synx convert config.synx --format json --strict
+```
+
+### `synx validate` — CI/CD 验证
+
+```bash
+synx validate config.synx --strict
+# 成功返回退出码 0，遇到 INCLUDE_ERR / WATCH_ERR / CALC_ERR / CONSTRAINT_ERR 返回 1
+```
+
+### `synx watch` — 实时重载
+
+```bash
+# 每次更改时打印 JSON
+synx watch config.synx --format json
+
+# 每次更改时执行命令（例如重载 Nginx）
+synx watch config.synx --exec "nginx -s reload"
+```
+
+### `synx schema` — 从约束提取 JSON Schema
+
+```bash
+synx schema config.synx
+# 基于 [required, min:N, max:N, type:T, enum:A|B, pattern:R] 输出 JSON Schema
+```
+
+---
+
+## 📤 导出格式（JS/TS API）
+
+> 在 v3.1.3 中添加。
+
+将已解析的 SYNX 对象转换为 JSON、YAML、TOML 或 .env：
+
+```typescript
+import Synx from '@aperturesyndicate/synx';
+
+const config = Synx.loadSync('config.synx');
+
+// JSON
+const json = Synx.toJSON(config);          // 格式化
+const compact = Synx.toJSON(config, false); // 紧凑
+
+// YAML
+const yaml = Synx.toYAML(config);
+
+// TOML
+const toml = Synx.toTOML(config);
+
+// .env（KEY=VALUE 格式）
+const env = Synx.toEnv(config);            // APP_NAME=TotalWario
+const prefixed = Synx.toEnv(config, 'APP'); // APP_APP_NAME=TotalWario
+```
+
+---
+
+## 📋 Schema 导出
+
+> 在 v3.1.3 中添加。
+
+将 SYNX 约束提取为 JSON Schema 对象：
+
+```typescript
+const schema = Synx.schema(`
+!active
+app_name[required, min:3, max:30] TotalWario
+volume[min:0, max:100, type:int] 75
+theme[enum:light|dark|auto] dark
+`);
+```
+
+结果：
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "app_name": { "minimum": 3, "maximum": 30, "required": true },
+    "volume": { "type": "integer", "minimum": 0, "maximum": 100 },
+    "theme": { "enum": ["light", "dark", "auto"] }
+  },
+  "required": ["app_name"]
+}
+```
+
+---
+
+## 👁 文件监视器
+
+> 在 v3.1.3 中添加。
+
+监视 `.synx` 文件，每次更改时获取更新的配置：
+
+```typescript
+const handle = Synx.watch('config.synx', (config, error) => {
+  if (error) {
+    console.error('配置重载失败:', error.message);
+    return;
+  }
+  console.log('配置已更新:', config.server.port);
+}, { strict: true });
+
+// 停止监视
+handle.close();
+```
+
+---
+
+## 🐳 部署指南
+
+> 在 v3.1.3 中添加。
+
+### Docker + Docker Compose
+
+SYNX 作为所有服务配置的**唯一真实来源**。需要自己配置格式的服务（Nginx、Redis 等）在启动时接收生成的配置。
+
+**模式：**
+
+```
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│   config.synx   │────▶│  启动脚本       │────▶│  nginx.conf     │
+│ （单一文件）      │     │  或 CLI convert  │     │  .env           │
+│  :env :default  │     │                 │     │  redis.conf     │
+│  :template      │     │                 │     │  应用设置        │
+└─────────────────┘     └─────────────────┘     └─────────────────┘
+```
+
+**步骤 1 — 编写配置：**
+
+```synx
+!active
+
+app
+  name my-service
+  port:env:default:3000 APP_PORT
+  host:env:default:0.0.0.0 APP_HOST
+
+database
+  host:env:default:postgres DB_HOST
+  port:env:default:5432 DB_PORT
+  name:env:default:mydb DB_NAME
+  user:env:default:app DB_USER
+  password:env DB_PASSWORD
+
+redis
+  host:env:default:redis REDIS_HOST
+  port:env:default:6379 REDIS_PORT
+  url:template redis://{redis.host}:{redis.port}/0
+```
+
+**步骤 2 — 为 Docker Compose 生成 .env：**
+
+```bash
+synx convert config.synx --format env > .env
+```
+
+**步骤 3 — 在 docker-compose.yml 中使用：**
+
+```yaml
+services:
+  web:
+    image: node:20-alpine
+    env_file: .env
+    ports:
+      - "${APP_PORT}:${APP_PORT}"
+
+  redis:
+    image: redis:7-alpine
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${DB_NAME}
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+```
+
+### Nginx 配置生成
+
+使用模板+启动脚本从 SYNX 生成 `nginx.conf`：
+
+```javascript
+const Synx = require('@aperturesyndicate/synx');
+const fs = require('fs');
+
+const config = Synx.loadSync('/config/app.synx', {
+  env: process.env,
+  strict: true,
+});
+
+const nginxConf = `
+server {
+  listen ${config.nginx.listen};
+  location / {
+    proxy_pass http://${config.nginx.upstream_host}:${config.nginx.upstream_port};
+  }
+}`;
+
+fs.writeFileSync('/etc/nginx/conf.d/default.conf', nginxConf);
+```
+
+### Redis 连接
+
+```synx
+!active
+
+redis
+  host:env:default:localhost REDIS_HOST
+  port:env:default:6379 REDIS_PORT
+  db:default 0
+  ttl:default 3600
+  password:env REDIS_PASSWORD
+  url:template redis://{redis.host}:{redis.port}/{redis.db}
+```
+
+```javascript
+const config = Synx.loadSync('config.synx', { env: process.env, strict: true });
+const redis = new Redis(config.redis.url);
+```
+
+### PostgreSQL 连接
+
+```synx
+!active
+
+db
+  host:env:default:localhost DATABASE_HOST
+  port:env:default:5432 DATABASE_PORT
+  name:env:default:mydb DATABASE_NAME
+  user:env:default:app DATABASE_USER
+  password:env DATABASE_PASSWORD
+  url:template postgresql://{db.user}:{db.password}@{db.host}:{db.port}/{db.name}
+  pool_min:default 5
+  pool_max:default 20
+```
+
+```javascript
+const config = Synx.loadSync('config.synx', { env: process.env, strict: true });
+const pool = new Pool({ connectionString: config.db.url });
+```
+
+### Kubernetes Secrets
+
+K8s 将密钥挂载为 `/run/secrets/` 下的文件。使用 `:watch` 读取：
+
+```synx
+!active
+
+db_password:watch /run/secrets/db-password
+api_key:watch /run/secrets/api-key
+```
+
+Docker Secrets 工作方式相同 — 挂载在 `/run/secrets/`。
+
+### HashiCorp Vault
+
+使用 Vault Agent 将密钥写入文件，然后用 `:watch` 读取：
+
+```synx
+!active
+
+db_creds:watch:password /vault/secrets/database
+api_key:watch:key /vault/secrets/api-key
+```
+
+或使用 Vault Agent 的 `env_template` 通过环境变量注入：
+
+```synx
+!active
+
+db_password:env VAULT_DB_PASSWORD
+api_key:env VAULT_API_KEY
+```
+
+### Helm / Kubernetes
+
+将 SYNX 转换为 YAML 用作 Helm values：
+
+```bash
+synx convert config.synx --format yaml > helm/values.yaml
+helm upgrade my-release ./chart -f helm/values.yaml
+```
+
+### Terraform
+
+Terraform 接受 JSON 变量文件：
+
+```bash
+synx convert config.synx --format json > terraform.tfvars.json
+terraform apply -var-file=terraform.tfvars.json
+```
+
+### CI/CD 管道验证
+
+添加到 CI 管道中，在部署前检测配置错误：
+
+```yaml
+# GitHub Actions 示例
+- name: 验证 SYNX 配置
+  run: npx @aperturesyndicate/synx validate config.synx --strict
+```
+
+---
+
+## �💻 代码示例
 
 ### JavaScript / TypeScript
 

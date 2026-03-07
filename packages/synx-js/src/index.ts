@@ -14,7 +14,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { parseData } from './parser';
 import { resolve } from './engine';
-import type { SynxObject, SynxOptions, SynxValue } from './types';
+import type { SynxObject, SynxOptions, SynxValue, SynxMetaMap } from './types';
 
 export type { SynxObject, SynxOptions, SynxValue, SynxArray, SynxPrimitive } from './types';
 
@@ -25,7 +25,7 @@ const NATIVE_THRESHOLD = 5120; // 5 KB
 interface NativeBinding {
   parse(text: string): unknown;
   parseToJson(text: string): string;
-  parseActive(text: string): unknown;
+  parseActive(text: string, options?: SynxOptions): unknown;
 }
 
 let nativeBinding: NativeBinding | null | false = null; // null = not tried, false = unavailable
@@ -43,6 +43,37 @@ function tryLoadNative(): NativeBinding | false {
   } catch { /* native not available */ }
   nativeBinding = false;
   return false;
+}
+
+const RUNTIME_ERROR_PREFIXES = [
+  'INCLUDE_ERR:',
+  'WATCH_ERR:',
+  'CALC_ERR:',
+  'CONSTRAINT_ERR:',
+] as const;
+
+function assertNoRuntimeErrors(value: unknown, path = 'root'): void {
+  if (typeof value === 'string') {
+    for (const prefix of RUNTIME_ERROR_PREFIXES) {
+      if (value.startsWith(prefix)) {
+        throw new Error(`SYNX strict mode error at \"${path}\": ${value}`);
+      }
+    }
+    return;
+  }
+
+  if (Array.isArray(value)) {
+    for (let i = 0; i < value.length; i++) {
+      assertNoRuntimeErrors(value[i], `${path}[${i}]`);
+    }
+    return;
+  }
+
+  if (value && typeof value === 'object') {
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      assertNoRuntimeErrors(v, `${path}.${k}`);
+    }
+  }
 }
 
 class Synx {
@@ -66,8 +97,11 @@ class Synx {
         const isActive = /(?:^|\n)\s*!active\s*(?:\r?\n|$)/.test(text) ||
                          /(?:^|\n)\s*#!mode:active/.test(text);
         const result = isActive
-          ? native.parseActive(text)
+          ? native.parseActive(text, options)
           : native.parse(text);
+        if (options.strict) {
+          assertNoRuntimeErrors(result);
+        }
         return result as T;
       }
     }
@@ -84,6 +118,9 @@ class Synx {
         writable: false,
         configurable: false,
       });
+    }
+    if (options.strict) {
+      assertNoRuntimeErrors(root);
     }
     return root as T;
   }
@@ -310,6 +347,93 @@ class Synx {
     out += fmtEmit(nodes, 0).trimEnd();
     return out + '\n';
   }
+
+  // ─── Export Converters ──────────────────────────────────
+
+  /** Convert a parsed SYNX object to JSON string. @since 3.1.3 */
+  static toJSON(obj: SynxObject, pretty = true): string {
+    return toJSONString(obj, pretty);
+  }
+
+  /** Convert a parsed SYNX object to YAML string. @since 3.1.3 */
+  static toYAML(obj: SynxObject): string {
+    return toYAMLString(obj);
+  }
+
+  /** Convert a parsed SYNX object to TOML string. @since 3.1.3 */
+  static toTOML(obj: SynxObject): string {
+    return toTOMLString(obj as Record<string, unknown>);
+  }
+
+  /** Convert a parsed SYNX object to .env format (KEY=VALUE lines). @since 3.1.3 */
+  static toEnv(obj: SynxObject, prefix = ''): string {
+    return toEnvString(obj as Record<string, unknown>, prefix);
+  }
+
+  /** Watch a .synx file for changes. Re-parses and calls callback on change. @since 3.1.3 */
+  static watch(filePath: string, callback: WatchCallback, options: SynxOptions = {}): WatchHandle {
+    if (!fs) throw new Error('Synx.watch() is not supported in browser');
+    const absPath = path.resolve(filePath);
+    const opts = options.basePath ? options : { ...options, basePath: path.dirname(absPath) };
+
+    try {
+      const text = fs.readFileSync(absPath, 'utf-8');
+      const config = Synx.parse(text, opts);
+      callback(config);
+    } catch (e: any) {
+      callback({}, e);
+    }
+
+    const watcher = fs.watch(absPath, { persistent: true }, (_event) => {
+      try {
+        const text = fs.readFileSync(absPath, 'utf-8');
+        const config = Synx.parse(text, opts);
+        callback(config);
+      } catch (e: any) {
+        callback({}, e);
+      }
+    });
+
+    return { close: () => watcher.close() };
+  }
+
+  /** Extract a JSON Schema from SYNX constraints. @since 3.1.3 */
+  static schema(text: string): SynxSchema {
+    const { root } = parseData(text);
+    const metaMap: SynxMetaMap | undefined = (root as any).__synx;
+    const properties: Record<string, SynxSchemaProperty> = {};
+    const required: string[] = [];
+
+    if (metaMap) {
+      for (const [key, meta] of Object.entries(metaMap)) {
+        if (!meta.constraints) continue;
+        const c = meta.constraints;
+        const prop: SynxSchemaProperty = {};
+        if (c.type) {
+          const typeMap: Record<string, string> = {
+            int: 'integer', float: 'number', bool: 'boolean', string: 'string',
+          };
+          prop.type = typeMap[c.type] || c.type;
+        }
+        if (c.min !== undefined) prop.minimum = c.min;
+        if (c.max !== undefined) prop.maximum = c.max;
+        if (c.pattern) prop.pattern = c.pattern;
+        if (c.enum) prop.enum = c.enum;
+        if (c.required) {
+          prop.required = true;
+          required.push(key);
+        }
+        properties[key] = prop;
+      }
+    }
+
+    return {
+      $schema: 'https://json-schema.org/draft/2020-12/schema',
+      type: 'object',
+      properties,
+      required,
+    };
+  }
 }
 
 // ─── Serializer ───────────────────────────────────────────
@@ -415,6 +539,179 @@ function fmtEmit(nodes: FmtNode[], indent: number): string {
     if (indent === 0 && (n.children.length > 0 || n.listItems.length > 0)) out += '\n';
   }
   return out;
+}
+
+// ─── Export Converters ────────────────────────────────────
+
+function toJSONString(obj: SynxObject, pretty = true): string {
+  return pretty ? JSON.stringify(obj, null, 2) : JSON.stringify(obj);
+}
+
+function toYAMLString(value: unknown, indent = 0): string {
+  const sp = ' '.repeat(indent);
+  if (value === null || value === undefined) return `${sp}null\n`;
+  if (typeof value === 'boolean' || typeof value === 'number') return `${sp}${value}\n`;
+  if (typeof value === 'string') {
+    if (value.includes('\n') || value.includes(':') || value.includes('#') ||
+        value.startsWith('{') || value.startsWith('[') || value.startsWith('"') ||
+        value.startsWith("'") || /^(true|false|null|yes|no|on|off)$/i.test(value) ||
+        value === '') {
+      return `${sp}${JSON.stringify(value)}\n`;
+    }
+    return `${sp}${value}\n`;
+  }
+  if (Array.isArray(value)) {
+    if (value.length === 0) return `${sp}[]\n`;
+    let out = '';
+    for (const item of value) {
+      if (item && typeof item === 'object' && !Array.isArray(item)) {
+        out += `${sp}- `;
+        const entries = Object.entries(item as Record<string, unknown>);
+        if (entries.length > 0) {
+          const [fk, fv] = entries[0];
+          out += `${fk}: ${toYAMLValue(fv)}\n`;
+          for (let i = 1; i < entries.length; i++) {
+            out += `${sp}  ${entries[i][0]}: ${toYAMLValue(entries[i][1])}\n`;
+          }
+        }
+      } else {
+        out += `${sp}- ${toYAMLValue(item)}\n`;
+      }
+    }
+    return out;
+  }
+  if (typeof value === 'object') {
+    let out = '';
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      if (k.startsWith('__synx')) continue;
+      if (v && typeof v === 'object') {
+        out += `${sp}${k}:\n`;
+        out += Array.isArray(v)
+          ? toYAMLString(v, indent + 2)
+          : toYAMLString(v, indent + 2);
+      } else {
+        out += `${sp}${k}: ${toYAMLValue(v)}\n`;
+      }
+    }
+    return out;
+  }
+  return `${sp}${String(value)}\n`;
+}
+
+function toYAMLValue(v: unknown): string {
+  if (v === null || v === undefined) return 'null';
+  if (typeof v === 'boolean' || typeof v === 'number') return String(v);
+  if (typeof v === 'string') {
+    if (v.includes('\n') || v.includes(':') || v.includes('#') ||
+        v.startsWith('{') || v.startsWith('[') || v.startsWith('"') ||
+        v.startsWith("'") || /^(true|false|null|yes|no|on|off)$/i.test(v) ||
+        v === '') {
+      return JSON.stringify(v);
+    }
+    return v;
+  }
+  return JSON.stringify(v);
+}
+
+function toTOMLString(obj: Record<string, unknown>, prefix = ''): string {
+  let out = '';
+  const simple: [string, unknown][] = [];
+  const tables: [string, Record<string, unknown>][] = [];
+  const arrays: [string, unknown[]][] = [];
+
+  for (const [k, v] of Object.entries(obj)) {
+    if (k.startsWith('__synx')) continue;
+    if (Array.isArray(v)) {
+      const allObjects = v.length > 0 && v.every(i => i && typeof i === 'object' && !Array.isArray(i));
+      if (allObjects) {
+        arrays.push([k, v]);
+      } else {
+        simple.push([k, v]);
+      }
+    } else if (v && typeof v === 'object') {
+      tables.push([k, v as Record<string, unknown>]);
+    } else {
+      simple.push([k, v]);
+    }
+  }
+
+  for (const [k, v] of simple) {
+    out += `${k} = ${toTOMLValue(v)}\n`;
+  }
+
+  for (const [k, v] of tables) {
+    const path = prefix ? `${prefix}.${k}` : k;
+    out += `\n[${path}]\n`;
+    out += toTOMLString(v, path);
+  }
+
+  for (const [k, arr] of arrays) {
+    const path = prefix ? `${prefix}.${k}` : k;
+    for (const item of arr) {
+      out += `\n[[${path}]]\n`;
+      out += toTOMLString(item as Record<string, unknown>, path);
+    }
+  }
+
+  return out;
+}
+
+function toTOMLValue(v: unknown): string {
+  if (v === null || v === undefined) return '""';
+  if (typeof v === 'boolean') return String(v);
+  if (typeof v === 'number') {
+    if (Number.isInteger(v)) return String(v);
+    const s = String(v);
+    return s.includes('.') ? s : `${s}.0`;
+  }
+  if (typeof v === 'string') return JSON.stringify(v);
+  if (Array.isArray(v)) return `[${v.map(toTOMLValue).join(', ')}]`;
+  return JSON.stringify(v);
+}
+
+function toEnvString(obj: Record<string, unknown>, prefix = ''): string {
+  let out = '';
+  for (const [k, v] of Object.entries(obj)) {
+    if (k.startsWith('__synx')) continue;
+    const envKey = prefix ? `${prefix}_${k}`.toUpperCase() : k.toUpperCase();
+    if (v && typeof v === 'object' && !Array.isArray(v)) {
+      out += toEnvString(v as Record<string, unknown>, envKey);
+    } else if (Array.isArray(v)) {
+      out += `${envKey}=${v.map(String).join(',')}\n`;
+    } else if (v === null) {
+      out += `${envKey}=\n`;
+    } else {
+      const s = String(v);
+      out += s.includes(' ') || s.includes('"') ? `${envKey}="${s}"\n` : `${envKey}=${s}\n`;
+    }
+  }
+  return out;
+}
+
+// ─── Watch ────────────────────────────────────────────────
+
+type WatchCallback = (config: SynxObject, error?: Error) => void;
+
+interface WatchHandle {
+  close(): void;
+}
+
+// ─── Schema ───────────────────────────────────────────────
+
+interface SynxSchemaProperty {
+  type?: string;
+  minimum?: number;
+  maximum?: number;
+  pattern?: string;
+  enum?: string[];
+  required?: boolean;
+}
+
+interface SynxSchema {
+  $schema: string;
+  type: 'object';
+  properties: Record<string, SynxSchemaProperty>;
+  required: string[];
 }
 
 // ─── Exports ──────────────────────────────────────────────
