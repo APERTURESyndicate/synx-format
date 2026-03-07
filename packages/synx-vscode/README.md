@@ -233,17 +233,50 @@ password[required, min:8, max:64, type:string] MyP@ssw0rd
 
 ---
 
+<details>
+  <summary><strong>LLM Compatibility Notes (250 tests)</strong></summary>
+
+Benchmark scope used for SYNX/LLM compatibility:
+- 125 parsing tests (`SYNX -> JSON`)
+- 125 generation tests (`Description -> SYNX`)
+- Total: 250 cases per model
+
+Failed-case analysis shows that models usually fail due to habits transferred from YAML/JSON/TOML, not because SYNX is inherently difficult.
+
+1. **Syntactic Interference**
+The model adds `:` after keys and unnecessary quotes around plain strings.
+Example: `server host localhost` -> `server: host: "localhost"`.
+
+2. **Indentation Flattening**
+Nested blocks are flattened into one level and structure is lost.
+
+3. **Array Shape Drift**
+The model rewrites SYNX arrays in YAML/JSON style or mixes syntax styles.
+
+4. **Type Coercion Bias**
+`true`, `42`, `3.14`, and `~` are sometimes interpreted as strings instead of bool/number/null.
+
+5. **Marker/Template Normalization**
+SYNX-specific constructs are simplified into a more familiar format, losing original semantics.
+
+6. **Over-Helpful Rewriting**
+The model adds wrappers, comments, and readability edits that break strict validation.
+
+</details>
+
+---
+
 ## Full Specification
 
 - **Specifications**
 - **[SPECIFICATION_EN.md (English)](https://github.com/kaiserrberg/synx-format/blob/main/packages/synx-js/SPECIFICATION_EN.md)**
-- **[SPECIFICATION_RU.md (Русский)](https://github.com/kaiserrberg/synx-format/blob/main/packages/synx-js/SPECIFICATION_RU.md)**
+- **[SPECIFICATION_RU.md (Russian)](https://github.com/kaiserrberg/synx-format/blob/main/packages/synx-js/SPECIFICATION_RU.md)**
 - **Guides (All Languages)**
 - **[GUIDE.md (English)](https://github.com/kaiserrberg/synx-format/blob/main/_guides/GUIDE.md)**
-- **[GUIDE_RU.md (Русский)](https://github.com/kaiserrberg/synx-format/blob/main/_guides/GUIDE_RU.md)**
-- **[GUIDE_ZH.md (中文)](https://github.com/kaiserrberg/synx-format/blob/main/_guides/GUIDE_ZH.md)**
+- **[GUIDE_RU.md (Russian)](https://github.com/kaiserrberg/synx-format/blob/main/_guides/GUIDE_RU.md)**
+- **[GUIDE_ZH.md (Chinese)](https://github.com/kaiserrberg/synx-format/blob/main/_guides/GUIDE_ZH.md)**
 - **[GUIDE_ES.md (Español)](https://github.com/kaiserrberg/synx-format/blob/main/_guides/GUIDE_ES.md)**
-- **[GUIDE_JA.md (日本語)](https://github.com/kaiserrberg/synx-format/blob/main/_guides/GUIDE_JA.md)**
+- **[GUIDE_JA.md (Japanese)](https://github.com/kaiserrberg/synx-format/blob/main/_guides/GUIDE_JA.md)**
 - **[GUIDE_DE.md (Deutsch)](https://github.com/kaiserrberg/synx-format/blob/main/_guides/GUIDE_DE.md)**
 
 ---

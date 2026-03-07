@@ -636,7 +636,7 @@ dependencies = [
 
 [[package]]
 name = "synx-core"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "itoa",
  "memchr",
@@ -655,7 +655,7 @@ dependencies = [
 
 [[package]]
 name = "synx-python"
-version = "3.0.0"
+version = "3.1.0"
 dependencies = [
  "pyo3",
  "synx-core",
@@ -663,7 +663,7 @@ dependencies = [
 
 [[package]]
 name = "synx-wasm"
-version = "3.0.0"
+version = "3.1.0"
 dependencies = [
  "synx-core",
  "wasm-bindgen",

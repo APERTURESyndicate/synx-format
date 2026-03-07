@@ -146,10 +146,101 @@ SYNX v3.0 uses a unified Rust core with native bindings. Real benchmark results 
 
 > SYNX parses **67× faster** than YAML in Python. In Node.js, the pure TS parser matches Rust direct speed at ~39 µs.
 
----
+## LLM SYNX Format Compatibility
+
+How well different LLM models understand and work with SYNX format:
+
+### Parsing & Generation Tests
+
+We benchmark how well LLMs can:
+- **Parse**: Read SYNX format and convert to JSON
+- **Generate**: Create SYNX from English descriptions
+
+Test corpus now has **250 total cases**:
+- **125 parsing tests** (`SYNX -> JSON`)
+- **125 generation tests** (`Description -> SYNX`)
+
+What is inside the test texts:
+- Parsing texts include simple key-value pairs, nested blocks (2-4 levels), arrays, mixed scalar types, null values, comments (`//`, `/* */`), strings with spaces, and configuration-like documents (service/database/deployment shapes).
+- Generation prompts include practical tasks: app/service configs, ports, replicas, regions, booleans, arrays of features, and nested objects with explicit required fields.
+- Many cases are near-duplicates with controlled value changes (names, numbers, ports, regions) to test consistency instead of single-shot luck.
+- Expected outputs are checked structurally: exact JSON equality for parsing tests and required token/key presence for generation tests.
+
+Example compatibility snapshot (illustrative):
+
+```
+gemini-2.0-flash
+→ Parsing      ████████████████████  100.0% (125/125)
+→ Generation   ████████████████████  100.0% (125/125)
+
+claude-opus
+  Parsing      ███████████████████░   96.0% (120/125)
+  Generation   ██████████████████░░   88.0% (110/125)
+
+claude-sonnet
+  Parsing      ██████████████████░░   90.4% (113/125)
+  Generation   ████████████████████  100.0% (125/125)
+
+gemini-1.5-pro
+  Parsing      ███████████████████░   96.0% (120/125)
+  Generation   ██████████████████░░   88.0% (110/125)
+
+gpt-4o
+  Parsing      ██████████████████░░   90.4% (113/125)
+  Generation   ██████████████████░░   88.0% (110/125)
+
+claude-haiku-4-5
+  Parsing      ████████████████░░░░   80.0% (100/125)
+  Generation   ███████████████░░░░░   76.0% (95/125)
+```
+
+### Failed Test Analysis (Typical LLM Errors)
+
+Analysis of failed cases (usually the remaining 4-12%) shows that errors are mostly caused by cross-format habits from YAML/JSON/TOML, not by SYNX complexity itself.
+
+1. **Syntactic Interference**
+Problem: the model hallucinates `:` after keys and adds unnecessary quotes in YAML/JSON style.
+Example: `server host localhost` becomes `server: host: "localhost"`.
+
+2. **Indentation Flattening**
+Problem: nested SYNX blocks are flattened into one level, which breaks the structure.
+Example: `database -> connection -> port` is emitted as sibling top-level keys.
+
+3. **Array Shape Drift**
+Problem: arrays are rewritten using another format (`- item`, JSON-like lists with quotes/commas, or mixed syntax).
+
+4. **Type Coercion Bias**
+Problem: `true`, `42`, `3.14`, and `~` are sometimes interpreted as strings instead of bool/number/null depending on prompt wording.
+
+5. **Marker/Template Normalization**
+Problem: SYNX-specific constructs are "normalized" into familiar syntax and lose their intended semantics.
+
+6. **Over-Helpful Rewriting**
+Problem: the model adds wrappers, comments, and readability edits that fail strict structural validation.
+
+### Run Your Own Benchmarks
+
+Test any LLM against SYNX format. See [benchmarks/llm-tests/README.md](benchmarks/llm-tests/README.md) for details:
+
+```bash
+cd benchmarks/llm-tests
+pip install -r requirements.txt
+
+# Set your API keys (one time setup)
+export ANTHROPIC_API_KEY=your_key
+export GOOGLE_API_KEY=your_key
+export OPENAI_API_KEY=your_key
+
+# Run full benchmark suite
+python llm_benchmark.py
+
+# Format and pretty-print results
+python format_results.py llm_results.json
+```
+
+**See [LLM_BENCHMARK_GUIDE.md](benchmarks/LLM_BENCHMARK_GUIDE.md) for advanced options and detailed results interpretation.**
 
 ## Quick SYNX Syntax Reference
-
 ### Basic (always works)
 
 ```synx
@@ -161,8 +252,6 @@ phrase I love programming!
 # Nesting (2-space indent)
 server
   host 0.0.0.0
-  port 8080
-
 # Lists
 inventory
   - Sword
@@ -170,11 +259,7 @@ inventory
 
 # Type casting
 zip_code(string) 90210
-id(int) 007
-
 # Multiline text
-description |
-  This is a long description
   that spans multiple lines.
 
 # Comments
@@ -221,17 +306,13 @@ currency:geo
 ```synx
 !active
 
-app_name[min:3, max:30] TotalWario
 volume[min:1, max:100] 75
 api_key[required]:env API_KEY
 max_players[type:int] 16
-theme[enum:light|dark|auto] dark
 country_code[pattern:^[A-Z]{2}$] US
 version[readonly] 3.0.0
 password[required, min:8, max:64, type:string] MyP@ssw0rd
 ```
-
----
 
 ## 📖 Documentation / Guides
 
@@ -240,20 +321,17 @@ Complete SYNX guides with all 20 markers, benchmarks, code examples, and archite
 | Language | Guide |
 |---|---|
 | 🇬🇧 **English** | [GUIDE.md](_guides/GUIDE.md) |
-| 🇷🇺 **Русский** | [GUIDE_RU.md](_guides/GUIDE_RU.md) |
-| 🇨🇳 **中文** | [GUIDE_ZH.md](_guides/GUIDE_ZH.md) |
+| 🇷🇺 **Russian** | [GUIDE_RU.md](_guides/GUIDE_RU.md) |
+| 🇨🇳 **Chinese** | [GUIDE_ZH.md](_guides/GUIDE_ZH.md) |
 | 🇪🇸 **Español** | [GUIDE_ES.md](_guides/GUIDE_ES.md) |
-| 🇯🇵 **日本語** | [GUIDE_JA.md](_guides/GUIDE_JA.md) |
+| 🇯🇵 **Japanese** | [GUIDE_JA.md](_guides/GUIDE_JA.md) |
 | 🇩🇪 **Deutsch** | [GUIDE_DE.md](_guides/GUIDE_DE.md) |
-
----
 
 ## Full Specification
 
 - **[SPECIFICATION.md (English)](https://github.com/kaiserrberg/synx-format/blob/main/SPECIFICATION_EN.md)**
-- **[SPECIFICATION_RU.md (Русский)](https://github.com/kaiserrberg/synx-format/blob/main/SPECIFICATION_RU.md)**
+- **[SPECIFICATION_RU.md (Russian)](https://github.com/kaiserrberg/synx-format/blob/main/SPECIFICATION_RU.md)**
 
----
 
 ## Links
 
@@ -263,7 +341,6 @@ Complete SYNX guides with all 20 markers, benchmarks, code examples, and archite
 - [crates.io — synx-core](https://crates.io/crates/synx-core)
 - [APERTURESyndicate](https://aperturesyndicate.com)
 
----
 
 <p align="center">
   MIT — © <a href="https://github.com/kaiserrberg">APERTURESyndicate</a>

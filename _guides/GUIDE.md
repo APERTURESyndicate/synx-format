@@ -1031,12 +1031,10 @@ created_at:once timestamp
 
 **First parse** — generates and writes to `.synx.lock`:
 
-```json
-{
-  "session_id": "a3b1f4e2-7c89-4d12-b456-1234abcd5678",
-  "app_seed": "1847362951",
-  "created_at": "1741305600000"
-}
+```
+session_id a3b1f4e2-7c89-4d12-b456-1234abcd5678
+app_seed 1847362951
+created_at 1741305600000
 ```
 
 **Every subsequent parse** — reads the same values from `.synx.lock`.

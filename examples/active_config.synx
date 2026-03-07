@@ -48,4 +48,4 @@ credits
   studio APERTURESyndicate
   year 2026
   // Ссылка — contact будет равен значению lead_dev
-  contact:alias lead_dev
+  contact lead_dev

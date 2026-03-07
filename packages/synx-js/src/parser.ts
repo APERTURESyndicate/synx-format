@@ -39,8 +39,8 @@ function castType(val: string): SynxValue {
       const hint = val.substring(1, closeIdx);
       const raw = val.substring(closeIdx + 1);
       switch (hint) {
-        case 'int': return parseInt(raw, 10) || 0;
-        case 'float': return parseFloat(raw) || 0;
+        case 'int': { const n = parseInt(raw, 10); return isNaN(n) ? 0 : n; }
+        case 'float': { const n = parseFloat(raw); return isNaN(n) ? 0 : n; }
         case 'bool': return raw.trim() === 'true';
         case 'string': return raw;
         case 'random': return Math.floor(Math.random() * 2147483647);
@@ -223,8 +223,7 @@ export function parseData(text: string): SynxParseResult {
 
     // ── Continue multiline block ──
     if (currentBlock && indent > currentBlock.indent) {
-      let line = trimmed;
-      if (line.indexOf('/n') !== -1) line = line.replace(/\/n/g, '\n');
+      const line = trimmed;
       currentBlock.obj[currentBlock.key] +=
         (currentBlock.obj[currentBlock.key] ? '\n' : '') + line;
       continue;
@@ -235,8 +234,7 @@ export function parseData(text: string): SynxParseResult {
     // ── List items: '- ' ──
     if (fc === 45 && trimmedLen > 1 && trimmed.charCodeAt(1) === 32) {
       if (currentList && indent > currentList.indent) {
-        let val = stripInlineComment(trimmed.substring(2).trim());
-        if (val.indexOf('/n') !== -1) val = val.replace(/\/n/g, '\n');
+        const val = stripInlineComment(trimmed.substring(2).trim());
 
         // Check if this list item has sub-keys (peek next line)
         let nextNonEmpty = i + 1;

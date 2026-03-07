@@ -2,6 +2,19 @@
 
 All notable changes to the `synx-vscode` extension are documented in this file.
 
+## [3.2.0] - 2026-03-07
+
+### Fixed
+- Removed `iconThemes` contribution from `package.json`. The extension was prompting users to switch their entire file icon theme on install. The SYNX file icon now uses the `languages[].icon` API (overlay) instead, which works with any existing icon theme without prompting.
+- VSCode parser: `resolveActive()` was a no-op. Replaced with `resolveWithNodes()` that correctly applies `:env`, `:default`, `:alias`, `:calc`, `:random`, and `:clamp` markers during preview and hover.
+- VSCode parser: Added `#!mode:active` detection alongside `!active` for shebang-style mode declarations.
+- VSCode diagnostics: `getParentPath()` was a stub always returning `''`. Implemented via `dotPath.lastIndexOf('.')` using the new `dotPath` field on `SynxNode`. This fixed false-positive "Key not defined" errors for `:alias` references inside nested scopes.
+- VSCode diagnostics: `:alias` check now looks in both root scope and sibling scope (parent path + ref), eliminating false positives for nested aliases.
+- Added `dotPath` field to all `SynxNode` construction sites in the parser (regular nodes, list-of-objects items, plain list items).
+
+### Changed
+- `safeCalc` variable substitution in VSCode parser no longer builds a `new RegExp()` per variable. Uses a char-by-char word-boundary replacement helper instead.
+
 ## [3.1.0] - 2026-03-06
 
 ### Added

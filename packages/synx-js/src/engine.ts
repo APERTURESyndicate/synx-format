@@ -21,19 +21,11 @@ try {
 
 // ─── Secret wrapper ───────────────────────────────────────
 
-const SECRET_TAG = Symbol('synx:secret');
-
 class SynxSecret {
   private _value: string;
 
   constructor(value: string) {
     this._value = value;
-    Object.defineProperty(this, SECRET_TAG, { value: true, enumerable: false });
-  }
-
-  /** Returns the real value (for code usage) */
-  valueOf(): string {
-    return this._value;
   }
 
   toString(): string {
@@ -151,7 +143,10 @@ export function resolve(
     // ── :calc ──
     if (markers.includes('calc') && typeof obj[key] === 'string') {
       let expr = obj[key] as string;
-      // Collect numeric variables from root + local scope
+      // Collect already-resolved numeric variables from root + local scope.
+      // Keys that appear later in iteration order and still hold a marker
+      // value (e.g. an unresolved :env string) are not yet numbers and will
+      // be absent from vars — place :calc keys after their dependencies.
       const vars = new Map<string, string>();
       for (const rKey of Object.keys(root)) {
         if (typeof root[rKey] === 'number') vars.set(rKey, String(root[rKey]));
@@ -541,14 +536,11 @@ function extractFromFileContent(content: string, keyPath: string, ext: string): 
       return keyPath.split('.').reduce((o: any, k) => o?.[k], obj) ?? null;
     } catch { return null; }
   }
-  // SYNX key lookup
-  for (const line of content.split(/\r?\n/)) {
-    const trimmed = line.trimStart();
-    if (trimmed.startsWith(keyPath + ' ')) {
-      return castPrimitive(trimmed.substring(keyPath.length + 1).trimStart());
-    }
-  }
-  return null;
+  // SYNX key lookup — parse the file and do a deep-get by dot-path
+  try {
+    const { root: parsed } = parseData(content);
+    return deepGet(parsed, keyPath) ?? null;
+  } catch { return null; }
 }
 
 // ─── Helpers ──────────────────────────────────────────────

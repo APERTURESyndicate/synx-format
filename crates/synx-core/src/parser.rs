@@ -67,11 +67,10 @@ pub fn parse(text: &str) -> ParseResult {
         // Continue multiline block
         if let Some(ref mut blk) = block {
             if indent > blk.indent {
-                let line = trimmed.replace("/n", "\n");
                 if !blk.content.is_empty() {
                     blk.content.push('\n');
                 }
-                blk.content.push_str(&line);
+                blk.content.push_str(trimmed);
                 i += 1;
                 continue;
             } else {
@@ -88,7 +87,6 @@ pub fn parse(text: &str) -> ParseResult {
             if let Some(ref mut lst) = list {
                 if indent > lst.indent {
                     let val_str = strip_comment(trimmed[2..].trim());
-                    let val_str = val_str.replace("/n", "\n");
                     lst.items.push(cast(&val_str));
                     i += 1;
                     continue;
