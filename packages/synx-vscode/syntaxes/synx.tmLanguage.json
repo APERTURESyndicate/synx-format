@@ -107,10 +107,10 @@
     "key-with-markers": {
       "match": "^(\\s*)([^\\s\\[:#/!\\-(][^\\s\\[:(]*)(\\(\\w+\\))?(\\[[^\\]]*\\])?((?::[a-zA-Z_]\\w*)+)\\s+(.*?)\\s*$",
       "captures": {
-        "2": { "name": "entity.name.tag.synx" },
-        "3": { "name": "storage.type.synx" },
-        "4": { "name": "support.type.property-name.synx" },
-        "5": { "name": "entity.name.function.synx" },
+        "2": { "name": "entity.name.tag.cold.synx" },
+        "3": { "name": "storage.type.cast.synx" },
+        "4": { "name": "support.type.constraint.synx" },
+        "5": { "name": "keyword.control.marker.synx" },
         "6": {
           "patterns": [
             { "include": "#template-placeholder" },
@@ -122,9 +122,9 @@
     "key-with-type": {
       "match": "^(\\s*)([^\\s\\[:#/!\\-(][^\\s\\[:(]*)(\\(\\w+\\))(\\[[^\\]]*\\])?\\s+(.*?)\\s*$",
       "captures": {
-        "2": { "name": "entity.name.tag.synx" },
-        "3": { "name": "storage.type.synx" },
-        "4": { "name": "support.type.property-name.synx" },
+        "2": { "name": "entity.name.tag.cold.synx" },
+        "3": { "name": "storage.type.cast.synx" },
+        "4": { "name": "support.type.constraint.synx" },
         "5": {
           "patterns": [
             { "include": "#values" }
@@ -135,7 +135,7 @@
     "key-simple": {
       "match": "^(\\s*)([^\\s\\[:#/!\\-(][^\\s\\[:(]*)\\s+(.*?)\\s*$",
       "captures": {
-        "2": { "name": "entity.name.tag.synx" },
+        "2": { "name": "entity.name.tag.cold.synx" },
         "3": {
           "patterns": [
             { "include": "#values" }
@@ -146,7 +146,7 @@
     "parent-key": {
       "match": "^(\\s*)([^\\s\\[:#/!\\-(][^\\s\\[:(]*)\\s*$",
       "captures": {
-        "2": { "name": "entity.name.section.synx" }
+        "2": { "name": "entity.name.section.group.synx" }
       }
     },
     "block-pipe": {
