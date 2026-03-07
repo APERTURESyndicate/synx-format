@@ -175,5 +175,6 @@ pub struct ParseResult {
 pub struct Options {
     pub env: Option<HashMap<String, String>>,
     pub region: Option<String>,
+    pub lang: Option<String>,
     pub base_path: Option<String>,
 }

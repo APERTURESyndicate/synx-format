@@ -232,9 +232,33 @@ export function resolveToObject(doc: ParsedDoc): Record<string, SynxVal> {
   const root: Record<string, SynxVal> = {};
   buildObject(doc.nodes, root);
   if (doc.mode === 'active') {
+    applyInheritance(doc.nodes, root);
     resolveWithNodes(doc.nodes, root, root);
+    for (const k of Object.keys(root)) {
+      if (k.startsWith('_')) delete root[k];
+    }
   }
   return root;
+}
+
+function applyInheritance(nodes: SynxNode[], obj: Record<string, SynxVal>) {
+  for (const n of nodes) {
+    if (n.isListItem) continue;
+    const inhIdx = n.markers.indexOf('inherit');
+    if (inhIdx === -1) continue;
+    const parentName = n.markers[inhIdx + 1];
+    if (!parentName) continue;
+    const parent = obj[parentName];
+    const child = obj[n.key];
+    if (parent && typeof parent === 'object' && !Array.isArray(parent) &&
+        child && typeof child === 'object' && !Array.isArray(child)) {
+      const parentObj = parent as Record<string, SynxVal>;
+      const childObj = child as Record<string, SynxVal>;
+      for (const [pk, pv] of Object.entries(parentObj)) {
+        if (!(pk in childObj)) childObj[pk] = pv;
+      }
+    }
+  }
 }
 
 function buildObject(nodes: SynxNode[], target: Record<string, SynxVal>) {
@@ -304,6 +328,40 @@ function resolveWithNodes(nodes: SynxNode[], obj: Record<string, SynxVal>, root:
           let cur: any = root;
           for (const p of parts) cur = (cur as any)?.[p];
           if (cur !== undefined) obj[n.key] = cur;
+          break;
+        }
+        case 'ref': {
+          const refTarget = String(obj[n.key] ?? '');
+          const refParts = refTarget.split('.');
+          let refCur: any = root;
+          for (const p of refParts) refCur = (refCur as any)?.[p];
+          if (refCur !== undefined) {
+            obj[n.key] = refCur;
+            // If :calc follows with shorthand, apply it
+            const calcMi = n.markers.indexOf('calc');
+            if (calcMi !== -1 && typeof refCur === 'number' && n.markers.length > calcMi + 1) {
+              const calcExpr = n.markers[calcMi + 1];
+              const first = calcExpr?.charAt(0) ?? '';
+              if ('+-*/%'.includes(first)) {
+                const expr = `${refCur} ${calcExpr}`;
+                const vars: Record<string, number> = {};
+                for (const [k, v] of Object.entries(root)) {
+                  if (typeof v === 'number') vars[k] = v as number;
+                }
+                const result = safeCalc(expr, vars);
+                if (result !== null) obj[n.key] = result;
+              }
+            }
+          }
+          break;
+        }
+        case 'i18n': {
+          const i18nVal = obj[n.key];
+          if (i18nVal && typeof i18nVal === 'object' && !Array.isArray(i18nVal)) {
+            const translations = i18nVal as Record<string, SynxVal>;
+            const lang = 'en'; // VSCode preview defaults to 'en'
+            obj[n.key] = translations[lang] ?? Object.values(translations)[0] ?? null;
+          }
           break;
         }
         case 'calc': {

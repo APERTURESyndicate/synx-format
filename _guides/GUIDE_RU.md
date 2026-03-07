@@ -50,6 +50,9 @@
   - [:calc](#calc--арифметическое-выражение)
   - [:random](#random--случайный-выбор)
   - [:alias](#alias--ссылка-на-другой-ключ)
+  - [:ref](#ref--ссылка-с-цепочкой)
+  - [:inherit](#inherit--наследование-блоков)
+  - [:i18n](#i18n--мультиязычные-значения)
   - [:secret](#secret--скрытое-значение)
   - [:template](#template--интерполяция-строк)
   - [:include](#include--импорт-внешнего-файла)
@@ -602,6 +605,64 @@ loot:random 70 20 10
 
 admin_email alex@example.com
 complaints_email:alias admin_email
+```
+
+---
+
+### `:ref` — Ссылка с цепочкой
+
+Как `:alias`, но передаёт разрешённое значение дальше по цепочке маркеров. Поддерживает сокращённые вычисления.
+
+```synx
+!active
+
+base_rate 50
+quick_rate:ref base_rate
+double_rate:ref:calc:*2 base_rate
+boosted_rate:ref:calc:+25 base_rate
+```
+
+Сокращение `:ref:calc:*2` разрешает ссылку, затем применяет арифметическую операцию к значению.
+
+---
+
+### `:inherit` — Наследование блоков
+
+Объединяет все поля родительского блока с дочерним. Значения дочернего блока имеют приоритет. Префикс `_` делает блок приватным — он исключается из итогового результата.
+
+```synx
+!active
+
+_base_resource
+  weight 10
+  stackable true
+  category misc
+
+steel:inherit:_base_resource
+  weight 25
+  material metal
+```
+
+Блок `_base_resource` не попадает в результат, так как его имя начинается с `_`.
+
+---
+
+### `:i18n` — Мультиязычные значения
+
+Выбирает локализованное значение из вложенных ключей-языков. Передайте `lang` в опциях для выбора языка. Откат: `en` → первое доступное.
+
+```synx
+!active
+
+title:i18n
+  en Hello World
+  ru Привет мир
+  de Hallo Welt
+```
+
+```javascript
+const config = Synx.parse(text, { lang: 'ru' });
+// config.title → "Привет мир"
 ```
 
 ---

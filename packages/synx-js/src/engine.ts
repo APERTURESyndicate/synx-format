@@ -54,7 +54,15 @@ export function resolve(
   options: SynxOptions = {},
   root?: SynxObject,
 ): SynxObject {
-  if (!root) root = obj;
+  if (!root) {
+    root = obj;
+    // ── :inherit pre-pass (only at root level) ──
+    applyInheritance(obj);
+    // Remove private blocks (keys starting with _)
+    for (const k of Object.keys(obj)) {
+      if (k.startsWith('_')) delete obj[k];
+    }
+  }
 
   const metaMap: SynxMetaMap | undefined = (obj as any).__synx;
 
@@ -141,6 +149,46 @@ export function resolve(
         // Equal probability
         obj[key] = arr[Math.floor(Math.random() * arr.length)];
       }
+    }
+
+    // ── :ref ──
+    // Like :alias but feeds the resolved value into subsequent markers.
+    // Supports :ref:calc shorthand: key:ref:calc:*2 base_rate → resolves base_rate, then applies "VALUE * 2".
+    if (markers.includes('ref') && typeof obj[key] === 'string') {
+      const target = obj[key] as string;
+      const resolved = deepGet(root, target) ?? deepGet(obj, target);
+      if (resolved !== undefined) {
+        obj[key] = resolved;
+        // If :calc follows, prepend the resolved value to the calc expression
+        if (markers.includes('calc')) {
+          const calcIdx = markers.indexOf('calc');
+          const calcExpr = markers[calcIdx + 1] ?? '';
+          if (calcExpr && typeof resolved === 'number') {
+            // Shorthand: :ref:calc:*2 → VALUE * 2, :ref:calc:+10 → VALUE + 10
+            const first = calcExpr.charAt(0);
+            if ('+-*/%'.includes(first)) {
+              const fullExpr = `${resolved} ${calcExpr}`;
+              try {
+                obj[key] = safeCalc(fullExpr);
+              } catch {
+                obj[key] = resolved;
+              }
+            }
+          }
+        }
+      } else {
+        obj[key] = null;
+      }
+    }
+
+    // ── :i18n ──
+    // Selects a localized value from a nested object based on options.lang.
+    // Syntax: name:i18n\n  en Plains\n  ru Равнины
+    if (markers.includes('i18n') && obj[key] && typeof obj[key] === 'object' && !Array.isArray(obj[key])) {
+      const translations = obj[key] as SynxObject;
+      const lang = options.lang || 'en';
+      const val = translations[lang] ?? translations['en'] ?? Object.values(translations)[0] ?? null;
+      obj[key] = val;
     }
 
     // ── :calc ──
@@ -383,6 +431,45 @@ export function resolve(
   }
 
   return obj;
+}
+
+// ─── Inheritance pre-pass ─────────────────────────────────
+
+function applyInheritance(obj: SynxObject): void {
+  const metaMap: SynxMetaMap | undefined = (obj as any).__synx;
+  if (!metaMap) return;
+
+  for (const key of Object.keys(obj)) {
+    if (key === '__synx') continue;
+    const meta = metaMap[key];
+    if (!meta || !meta.markers.includes('inherit')) continue;
+
+    const idx = meta.markers.indexOf('inherit');
+    const parentName = meta.markers[idx + 1];
+    if (!parentName) continue;
+
+    const parentObj = obj[parentName];
+    if (!parentObj || typeof parentObj !== 'object' || Array.isArray(parentObj)) continue;
+
+    const childObj = obj[key];
+    if (!childObj || typeof childObj !== 'object' || Array.isArray(childObj)) continue;
+
+    // Merge: parent fields first, child fields override
+    const merged: SynxObject = { ...(parentObj as SynxObject), ...(childObj as SynxObject) };
+    // Copy over __synx metadata from both parent and child
+    const parentMeta: SynxMetaMap | undefined = (parentObj as any).__synx;
+    const childMeta: SynxMetaMap | undefined = (childObj as any).__synx;
+    if (parentMeta || childMeta) {
+      const mergedMeta = { ...(parentMeta || {}), ...(childMeta || {}) };
+      Object.defineProperty(merged, '__synx', {
+        value: mergedMeta,
+        enumerable: false,
+        writable: true,
+        configurable: true,
+      });
+    }
+    obj[key] = merged;
+  }
 }
 
 // ─── Constraint enforcement ───────────────────────────────────────────────

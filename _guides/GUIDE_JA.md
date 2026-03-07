@@ -50,6 +50,9 @@
   - [:calc — 算術式](#calc--算術式)
   - [:random — ランダム選択](#random--ランダム選択)
   - [:alias — 別キーの参照](#alias--別キーの参照)
+  - [:ref — チェーン付き参照](#ref--チェーン付き参照)
+  - [:inherit — ブロック継承](#inherit--ブロック継承)
+  - [:i18n — 多言語値](#i18n--多言語値)
   - [:secret — 隠し値](#secret--隠し値)
   - [:template — 文字列補間](#template--文字列補間)
   - [:include — 外部ファイルの読み込み](#include--外部ファイルの読み込み)
@@ -483,6 +486,60 @@ loot:random 70 20 10
 admin_email alex@example.com
 billing:alias admin_email
 ```
+
+### `:ref` — チェーン付き参照
+
+`:alias`と同様ですが、解決された値を後続のマーカーに渡します。省略形計算をサポート。
+
+```synx
+!active
+
+base_rate 50
+quick_rate:ref base_rate
+double_rate:ref:calc:*2 base_rate
+```
+
+`:ref:calc:*2` は参照を解決し、その値に算術演算を適用します。
+
+---
+
+### `:inherit` — ブロック継承
+
+親ブロックの全フィールドを子ブロックにマージします。子の値が優先されます。`_` プレフィックスはプライベートブロック—出力から除外されます。
+
+```synx
+!active
+
+_base_resource
+  weight 10
+  stackable true
+
+steel:inherit:_base_resource
+  weight 25
+  material metal
+```
+
+---
+
+### `:i18n` — 多言語値
+
+ネストされた言語キーからローカライズされた値を選択します。オプションで `lang` を渡します。フォールバック: `en` → 最初の利用可能な値。
+
+```synx
+!active
+
+title:i18n
+  en Hello World
+  ja こんにちは世界
+  ru Привет мир
+```
+
+```javascript
+const config = Synx.parse(text, { lang: 'ja' });
+// config.title → "こんにちは世界"
+```
+
+---
 
 ### `:secret` — 隠し値
 

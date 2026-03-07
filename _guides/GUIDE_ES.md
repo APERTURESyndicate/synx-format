@@ -50,6 +50,9 @@
   - [:calc — Expresiones Aritméticas](#calc--expresiones-aritméticas)
   - [:random — Selección Aleatoria](#random--selección-aleatoria)
   - [:alias — Referencia a Otra Clave](#alias--referencia-a-otra-clave)
+  - [:ref — Referencia con Encadenamiento](#ref--referencia-con-encadenamiento)
+  - [:inherit — Herencia de Bloques](#inherit--herencia-de-bloques)
+  - [:i18n — Valores Multilingües](#i18n--valores-multilingües)
   - [:secret — Valor Oculto](#secret--valor-oculto)
   - [:template — Interpolación de Cadenas](#template--interpolación-de-cadenas)
   - [:include — Importar Archivo Externo](#include--importar-archivo-externo)
@@ -484,6 +487,60 @@ loot:random 70 20 10
 admin_email alex@example.com
 billing:alias admin_email
 ```
+
+### `:ref` — Referencia con Encadenamiento
+
+Como `:alias`, pero pasa el valor resuelto a los marcadores siguientes. Soporta cálculos abreviados.
+
+```synx
+!active
+
+base_rate 50
+quick_rate:ref base_rate
+double_rate:ref:calc:*2 base_rate
+```
+
+La abreviatura `:ref:calc:*2` resuelve la referencia y aplica la operación aritmética al valor.
+
+---
+
+### `:inherit` — Herencia de Bloques
+
+Combina todos los campos de un bloque padre con un bloque hijo. Los valores del hijo tienen prioridad. El prefijo `_` hace el bloque privado — se excluye de la salida.
+
+```synx
+!active
+
+_base_resource
+  weight 10
+  stackable true
+
+steel:inherit:_base_resource
+  weight 25
+  material metal
+```
+
+---
+
+### `:i18n` — Valores Multilingües
+
+Selecciona un valor localizado de claves de idioma anidadas. Pase `lang` en las opciones. Respaldo: `en` → primer valor disponible.
+
+```synx
+!active
+
+title:i18n
+  en Hello World
+  es Hola Mundo
+  ru Привет мир
+```
+
+```javascript
+const config = Synx.parse(text, { lang: 'es' });
+// config.title → "Hola Mundo"
+```
+
+---
 
 ### `:secret` — Valor Oculto
 

@@ -50,6 +50,9 @@
   - [:calc — 算术表达式](#calc--算术表达式)
   - [:random — 随机选择](#random--随机选择)
   - [:alias — 引用另一个键](#alias--引用另一个键)
+  - [:ref — 链式引用](#ref--链式引用)
+  - [:inherit — 块继承](#inherit--块继承)
+  - [:i18n — 多语言值](#i18n--多语言值)
   - [:secret — 隐藏值](#secret--隐藏值)
   - [:template — 字符串插值](#template--字符串插值)
   - [:include — 导入外部文件](#include--导入外部文件)
@@ -483,6 +486,60 @@ loot:random 70 20 10
 admin_email alex@example.com
 billing:alias admin_email
 ```
+
+### `:ref` — 链式引用
+
+类似 `:alias`，但将解析后的值传递给后续标记。支持简写计算。
+
+```synx
+!active
+
+base_rate 50
+quick_rate:ref base_rate
+double_rate:ref:calc:*2 base_rate
+```
+
+简写 `:ref:calc:*2` 解析引用，然后将算术运算应用于该值。
+
+---
+
+### `:inherit` — 块继承
+
+将父块的所有字段合并到子块中。子块的值优先。`_` 前缀表示私有块——从输出中排除。
+
+```synx
+!active
+
+_base_resource
+  weight 10
+  stackable true
+
+steel:inherit:_base_resource
+  weight 25
+  material metal
+```
+
+---
+
+### `:i18n` — 多语言值
+
+从嵌套的语言键中选择本地化的值。在选项中传递 `lang`。回退: `en` → 第一个可用值。
+
+```synx
+!active
+
+title:i18n
+  en Hello World
+  zh 你好世界
+  ru Привет мир
+```
+
+```javascript
+const config = Synx.parse(text, { lang: 'zh' });
+// config.title → "你好世界"
+```
+
+---
 
 ### `:secret` — 隐藏值
 

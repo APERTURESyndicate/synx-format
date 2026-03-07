@@ -53,6 +53,9 @@
   - [:calc](#calc--arithmetic-expression)
   - [:random](#random--random-selection)
   - [:alias](#alias--reference-another-key)
+  - [:ref](#ref--reference-with-chaining)
+  - [:inherit](#inherit--block-inheritance)
+  - [:i18n](#i18n--multilingual-values)
   - [:secret](#secret--hidden-value)
   - [:template](#template--string-interpolation)
   - [:include](#include--import-external-file)
@@ -710,6 +713,103 @@ billing_email:alias admin_email
 ```
 
 Change `admin_email` once — all aliases update automatically.
+
+---
+
+### `:ref` — Reference with Chaining
+
+Like `:alias`, but feeds the resolved value into subsequent markers. Supports shorthand calc expressions.
+
+```synx
+!active
+
+base_rate 50
+quick_rate:ref base_rate
+double_rate:ref:calc:*2 base_rate
+boosted_rate:ref:calc:+25 base_rate
+```
+
+```json
+{
+  "base_rate": 50,
+  "quick_rate": 50,
+  "double_rate": 100,
+  "boosted_rate": 75
+}
+```
+
+The shorthand `:ref:calc:*2` resolves the reference, then applies the arithmetic operator to the resolved value. Supported operators: `+`, `-`, `*`, `/`, `%`.
+
+---
+
+### `:inherit` — Block Inheritance
+
+Merges all fields from a parent block into a child block. Child values override inherited ones. Use `_` prefix for private template blocks — they are excluded from the final output.
+
+```synx
+!active
+
+_base_resource
+  weight 10
+  stackable true
+  category misc
+
+steel:inherit:_base_resource
+  weight 25
+  material metal
+
+wood:inherit:_base_resource
+  material organic
+```
+
+```json
+{
+  "steel": {
+    "weight": 25,
+    "stackable": true,
+    "category": "misc",
+    "material": "metal"
+  },
+  "wood": {
+    "weight": 10,
+    "stackable": true,
+    "category": "misc",
+    "material": "organic"
+  }
+}
+```
+
+Note: `_base_resource` is not included in the output because its name starts with `_`.
+
+---
+
+### `:i18n` — Multilingual Values
+
+Selects a localized value from nested language keys. Pass `lang` in options to choose the language. Falls back to `en`, then the first available value.
+
+```synx
+!active
+
+title:i18n
+  en Hello World
+  ru Привет мир
+  de Hallo Welt
+  ja こんにちは世界
+
+description:i18n
+  en A great application
+  ru Отличное приложение
+```
+
+```javascript
+const config = Synx.parse(text, { lang: 'ru' });
+// config.title → "Привет мир"
+// config.description → "Отличное приложение"
+
+const configDe = Synx.parse(text, { lang: 'de' });
+// configDe.title → "Hallo Welt"
+// configDe.description → "A great application" (fallback to 'en')
+```
 
 ---
 

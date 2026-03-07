@@ -249,6 +249,65 @@ db:include ./__missing__.synx
       `, { strict: true });
     }).toThrow(/SYNX strict mode error/);
   });
+
+  test(':ref resolves reference', () => {
+    const data = Synx.parse(`
+!active
+base_rate 50
+quick_rate:ref base_rate
+    `);
+    expect(data.quick_rate).toBe(50);
+  });
+
+  test(':ref:calc with shorthand expression', () => {
+    const data = Synx.parse(`
+!active
+base_rate 50
+double_rate:ref:calc:*2 base_rate
+    `);
+    expect(data.double_rate).toBe(100);
+  });
+
+  test(':inherit merges parent fields', () => {
+    const data = Synx.parse(`
+!active
+_base_resource
+  weight 10
+  stackable true
+  category misc
+steel:inherit:_base_resource
+  weight 25
+  material metal
+    `);
+    expect(data.steel).toBeDefined();
+    expect((data.steel as any).weight).toBe(25);
+    expect((data.steel as any).stackable).toBe(true);
+    expect((data.steel as any).category).toBe('misc');
+    expect((data.steel as any).material).toBe('metal');
+    // Private blocks excluded from output
+    expect(data._base_resource).toBeUndefined();
+  });
+
+  test(':i18n selects language', () => {
+    const data = Synx.parse(`
+!active
+title:i18n
+  en Hello
+  ru Привет
+  de Hallo
+    `, { lang: 'ru' });
+    expect(data.title).toBe('Привет');
+  });
+
+  test(':i18n falls back to en', () => {
+    const data = Synx.parse(`
+!active
+title:i18n
+  en Hello
+  ru Привет
+    `, { lang: 'fr' });
+    expect(data.title).toBe('Hello');
+  });
 });
 
 // ─── Export format tests ─────────────────────────────────

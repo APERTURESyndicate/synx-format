@@ -50,6 +50,9 @@
   - [:calc — Arithmetische Ausdrücke](#calc--arithmetische-ausdrücke)
   - [:random — Zufällige Auswahl](#random--zufällige-auswahl)
   - [:alias — Verweis auf Anderen Schlüssel](#alias--verweis-auf-anderen-schlüssel)
+  - [:ref — Referenz mit Verkettung](#ref--referenz-mit-verkettung)
+  - [:inherit — Blockvererbung](#inherit--blockvererbung)
+  - [:i18n — Mehrsprachige Werte](#i18n--mehrsprachige-werte)
   - [:secret — Versteckter Wert](#secret--versteckter-wert)
   - [:template — String-Interpolation](#template--string-interpolation)
   - [:include — Externe Datei Importieren](#include--externe-datei-importieren)
@@ -484,6 +487,60 @@ loot:random 70 20 10
 admin_email alex@example.com
 billing:alias admin_email
 ```
+
+### `:ref` — Referenz mit Verkettung
+
+Wie `:alias`, gibt aber den aufgelösten Wert an nachfolgende Marker weiter. Unterstützt Kurzform-Berechnungen.
+
+```synx
+!active
+
+base_rate 50
+quick_rate:ref base_rate
+double_rate:ref:calc:*2 base_rate
+```
+
+Die Kurzform `:ref:calc:*2` löst die Referenz auf und wendet die arithmetische Operation auf den Wert an.
+
+---
+
+### `:inherit` — Blockvererbung
+
+Führt alle Felder eines Elternblocks mit einem Kindblock zusammen. Kindwerte haben Vorrang. Präfix `_` macht den Block privat — er wird aus der Ausgabe ausgeschlossen.
+
+```synx
+!active
+
+_base_resource
+  weight 10
+  stackable true
+
+steel:inherit:_base_resource
+  weight 25
+  material metal
+```
+
+---
+
+### `:i18n` — Mehrsprachige Werte
+
+Wählt einen lokalisierten Wert aus verschachtelten Sprachschlüsseln. Übergeben Sie `lang` in den Optionen. Fallback: `en` → erster verfügbarer Wert.
+
+```synx
+!active
+
+title:i18n
+  en Hello World
+  de Hallo Welt
+  ru Привет мир
+```
+
+```javascript
+const config = Synx.parse(text, { lang: 'de' });
+// config.title → "Hallo Welt"
+```
+
+---
 
 ### `:secret` — Versteckter Wert
 

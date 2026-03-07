@@ -14,6 +14,14 @@ pub fn resolve(result: &mut ParseResult, options: &Options) {
         return;
     }
     let metadata = std::mem::take(&mut result.metadata);
+
+    // ── :inherit pre-pass ──
+    apply_inheritance(&mut result.root, &metadata);
+    // Remove private blocks (keys starting with _)
+    if let Value::Object(ref mut root_map) = result.root {
+        root_map.retain(|k, _| !k.starts_with('_'));
+    }
+
     // SAFETY: `root_ptr` is a raw pointer to `result.root` used exclusively
     // for *immutable* read access inside marker handlers (:calc, :alias,
     // :map, :template, :watch) that need to look up other keys in the root
@@ -173,6 +181,66 @@ fn apply_markers(
                 arr[rng::random_usize(arr.len())].clone()
             };
             map.insert(key.to_string(), picked);
+        }
+    }
+
+    // ── :ref ──
+    // Like :alias but feeds the resolved value into subsequent markers.
+    // Supports :ref:calc shorthand: key:ref:calc:*2 base_rate → resolves base_rate, then applies "VALUE * 2".
+    if markers.contains(&"ref".to_string()) {
+        if let Some(Value::String(target)) = map.get(key) {
+            let root_ref = unsafe { &*root_ptr };
+            let resolved = deep_get(root_ref, target)
+                .or_else(|| map.get(target.as_str()).cloned())
+                .unwrap_or(Value::Null);
+
+            // If :calc follows with a shorthand expression
+            if markers.contains(&"calc".to_string()) {
+                if let Some(n) = value_as_number(&resolved) {
+                    let calc_idx = markers.iter().position(|m| m == "calc").unwrap();
+                    if let Some(calc_expr) = markers.get(calc_idx + 1) {
+                        let first = calc_expr.chars().next().unwrap_or(' ');
+                        if "+-*/%".contains(first) {
+                            let expr = format!("{} {}", format_number(n), calc_expr);
+                            match safe_calc(&expr) {
+                                Ok(result) => {
+                                    let v = if result.fract() == 0.0 && result.abs() < i64::MAX as f64 {
+                                        Value::Int(result as i64)
+                                    } else {
+                                        Value::Float(result)
+                                    };
+                                    map.insert(key.to_string(), v);
+                                }
+                                Err(e) => {
+                                    map.insert(key.to_string(), Value::String(format!("CALC_ERR: {}", e)));
+                                }
+                            }
+                        } else {
+                            map.insert(key.to_string(), resolved);
+                        }
+                    } else {
+                        map.insert(key.to_string(), resolved);
+                    }
+                } else {
+                    map.insert(key.to_string(), resolved);
+                }
+            } else {
+                map.insert(key.to_string(), resolved);
+            }
+        }
+    }
+
+    // ── :i18n ──
+    // Selects a localized value from a nested object based on options.lang.
+    if markers.contains(&"i18n".to_string()) {
+        if let Some(Value::Object(translations)) = map.get(key) {
+            let lang = options.lang.as_deref().unwrap_or("en");
+            let val = translations.get(lang)
+                .or_else(|| translations.get("en"))
+                .or_else(|| translations.values().next())
+                .cloned()
+                .unwrap_or(Value::Null);
+            map.insert(key.to_string(), val);
         }
     }
 
@@ -911,6 +979,49 @@ fn weighted_random(items: &[Value], weights: &[f64]) -> Value {
     items.last().cloned().unwrap_or(Value::Null)
 }
 
+// ─── Inheritance pre-pass ─────────────────────────────────
+
+fn apply_inheritance(root: &mut Value, metadata: &HashMap<String, MetaMap>) {
+    let root_meta = match metadata.get("") {
+        Some(m) => m.clone(),
+        None => return,
+    };
+
+    let root_map = match root.as_object_mut() {
+        Some(m) => m as *mut HashMap<String, Value>,
+        None => return,
+    };
+
+    // Collect inherit targets first to avoid borrow issues
+    let mut inherits: Vec<(String, String)> = Vec::new();
+    for (key, meta) in &root_meta {
+        if meta.markers.contains(&"inherit".to_string()) {
+            let idx = meta.markers.iter().position(|m| m == "inherit").unwrap();
+            if let Some(parent_name) = meta.markers.get(idx + 1) {
+                inherits.push((key.clone(), parent_name.clone()));
+            }
+        }
+    }
+
+    let map = unsafe { &mut *root_map };
+    for (child_key, parent_name) in &inherits {
+        let parent_fields: HashMap<String, Value> = match map.get(parent_name) {
+            Some(Value::Object(p)) => p.clone(),
+            _ => continue,
+        };
+        let child_fields: HashMap<String, Value> = match map.get(child_key) {
+            Some(Value::Object(c)) => c.clone(),
+            _ => continue,
+        };
+        // Merge: parent fields first, child overrides
+        let mut merged = parent_fields;
+        for (k, v) in child_fields {
+            merged.insert(k, v);
+        }
+        map.insert(child_key.clone(), Value::Object(merged));
+    }
+}
+
 fn deep_get(root: &Value, path: &str) -> Option<Value> {
     // Try direct key
     if let Value::Object(map) = root {
@@ -969,4 +1080,56 @@ fn resolve_template(tpl: &str, root: &Value, local_map: &HashMap<String, Value>)
         i += 1;
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{parse, Options, Value};
+    use super::resolve;
+
+    #[test]
+    fn test_ref_simple() {
+        let mut r = parse("!active\nbase_rate 50\nquick_rate:ref base_rate");
+        resolve(&mut r, &Options::default());
+        let map = r.root.as_object().unwrap();
+        assert_eq!(map["quick_rate"], Value::Int(50));
+    }
+
+    #[test]
+    fn test_ref_calc_shorthand() {
+        let mut r = parse("!active\nbase_rate 50\ndouble_rate:ref:calc:*2 base_rate");
+        resolve(&mut r, &Options::default());
+        let map = r.root.as_object().unwrap();
+        assert_eq!(map["double_rate"], Value::Int(100));
+    }
+
+    #[test]
+    fn test_inherit() {
+        let mut r = parse("!active\n_base\n  weight 10\n  stackable true\nsteel:inherit:_base\n  weight 25\n  material metal");
+        resolve(&mut r, &Options::default());
+        let map = r.root.as_object().unwrap();
+        assert!(!map.contains_key("_base"));
+        let steel = map["steel"].as_object().unwrap();
+        assert_eq!(steel["weight"], Value::Int(25));
+        assert_eq!(steel["stackable"], Value::Bool(true));
+        assert_eq!(steel["material"], Value::String("metal".into()));
+    }
+
+    #[test]
+    fn test_i18n_select_lang() {
+        let mut r = parse("!active\ntitle:i18n\n  en Hello\n  ru Привет\n  de Hallo");
+        let opts = Options { lang: Some("ru".into()), ..Default::default() };
+        resolve(&mut r, &opts);
+        let map = r.root.as_object().unwrap();
+        assert_eq!(map["title"], Value::String("Привет".into()));
+    }
+
+    #[test]
+    fn test_i18n_fallback_en() {
+        let mut r = parse("!active\ntitle:i18n\n  en Hello\n  ru Привет");
+        let opts = Options { lang: Some("fr".into()), ..Default::default() };
+        resolve(&mut r, &opts);
+        let map = r.root.as_object().unwrap();
+        assert_eq!(map["title"], Value::String("Hello".into()));
+    }
 }

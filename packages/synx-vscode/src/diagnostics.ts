@@ -8,7 +8,7 @@ import * as path from 'path';
 import { parseSynx, ParsedDoc, SynxNode, safeCalc } from './parser';
 
 const KNOWN_MARKERS = new Set([
-  'random', 'calc', 'env', 'alias', 'secret', 'default',
+  'random', 'calc', 'env', 'alias', 'ref', 'inherit', 'i18n', 'secret', 'default',
   'unique', 'include', 'geo', 'template', 'split', 'join',
   'clamp', 'round', 'map', 'format', 'fallback', 'once', 'version', 'watch',
 ]);

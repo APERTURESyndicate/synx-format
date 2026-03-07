@@ -26,6 +26,9 @@ export type SynxMarker =
   | 'calc'
   | 'env'
   | 'alias'
+  | 'ref'
+  | 'inherit'
+  | 'i18n'
   | 'secret'
   | 'default'
   | 'unique'
@@ -82,6 +85,8 @@ export interface SynxOptions {
   env?: Record<string, string>;
   /** Region code for :geo (e.g. "RU", "US") */
   region?: string;
+  /** Language code for :i18n (e.g. "en", "ru", "de") */
+  lang?: string;
   /** Throw if marker resolution produces runtime error strings (INCLUDE_ERR, WATCH_ERR, etc.) */
   strict?: boolean;
 }
