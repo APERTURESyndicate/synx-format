@@ -62,7 +62,18 @@ function runValidation(doc: vscode.TextDocument, collection: vscode.DiagnosticCo
   const keysByScope = new Map<string, Map<string, number>>();
 
   for (const node of parsed.allNodes) {
-    if (node.isListItem) continue;
+    if (node.isListItem) {
+      // Each list item starts a new scope for its children —
+      // clear tracked keys at deeper indent levels so the next item's
+      // sub-keys are not reported as duplicates.
+      for (const [sk] of keysByScope) {
+        const colonIdx = sk.indexOf(':');
+        if (parseInt(sk.substring(0, colonIdx)) > node.indent) {
+          keysByScope.delete(sk);
+        }
+      }
+      continue;
+    }
     const raw = lines[node.line];
     const trimmed = raw.trim();
     if (!trimmed) continue;

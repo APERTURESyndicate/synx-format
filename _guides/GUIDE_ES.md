@@ -324,7 +324,18 @@ description |
 # Comentario con almohadilla
 // Comentario con barras
 name John  # Comentario en línea
+
+###
+Esto es un comentario de bloque.
+Todo entre ### se ignora.
+###
 ```
+
+En la extensión de VSCode, se admite formato en comentarios:
+- `*cursiva*` — verde
+- `**negrita**` — morado
+- `***negrita+cursiva***` — dorado
+- `` `código` `` — naranja con fondo
 
 ---
 

@@ -59,6 +59,7 @@ export interface SynxMeta {
   markers: string[];
   args?: string[];          // e.g. percentages for :random
   constraints?: SynxConstraints;
+  typeHint?: string;        // e.g. 'string', 'int', 'float'
 }
 
 /** Map of key → metadata for a single object level */

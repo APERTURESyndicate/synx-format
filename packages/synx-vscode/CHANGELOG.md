@@ -2,7 +2,7 @@
 
 All notable changes to the `synx-vscode` extension are documented in this file.
 
-## [3.2.0] - 2026-03-07
+## [3.1.1] - 2026-03-07
 
 ### Fixed
 - Removed `iconThemes` contribution from `package.json`. The extension was prompting users to switch their entire file icon theme on install. The SYNX file icon now uses the `languages[].icon` API (overlay) instead, which works with any existing icon theme without prompting.

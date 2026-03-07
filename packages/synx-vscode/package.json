@@ -2,7 +2,7 @@
   "name": "synx-vscode",
   "displayName": "SYNX \u2014 Active Data Format",
   "description": "Syntax highlighting, IntelliSense, diagnostics, navigation, formatting, and tools for .synx files. By APERTURESyndicate.",
-  "version": "3.1.0",
+  "version": "3.1.2",
   "publisher": "APERTURESyndicate",
   "icon": "icon.png",
   "engines": {

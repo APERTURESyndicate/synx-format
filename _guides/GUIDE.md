@@ -426,7 +426,7 @@ query |
 
 ### Comments
 
-Two styles — both are ignored by the parser:
+Three styles — all are ignored by the parser:
 
 ```synx
 # This is a hash comment
@@ -434,7 +434,19 @@ Two styles — both are ignored by the parser:
 
 name John  # inline comment after value
 port 8080  // another inline comment
+
+###
+This is a block comment.
+Everything between ### fences is ignored.
+No need to prefix each line.
+###
 ```
+
+Inside comments, the VSCode extension highlights markdown-like formatting:
+- `*italic*` — green italic
+- `**bold**` — purple bold
+- `***bold+italic***` — gold bold italic
+- `` `code` `` — orange with background
 
 ---
 

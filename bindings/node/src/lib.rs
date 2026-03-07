@@ -48,11 +48,34 @@ pub fn parse_to_json(text: String) -> String {
 }
 
 /// Parse a SYNX string with active mode engine resolution.
+/// Optionally accepts an options object with `env` (Record<string, string>).
 #[napi]
-pub fn parse_active(env: Env, text: String) -> Result<JsUnknown> {
+pub fn parse_active(env: Env, text: String, options: Option<napi::JsObject>) -> Result<JsUnknown> {
     let mut result = synx_core::parse(&text);
     if result.mode == Mode::Active {
-        synx_core::resolve(&mut result, &Options::default());
+        let mut opts = Options::default();
+        if let Some(ref js_opts) = options {
+            // Read env: Record<string, string>
+            if let Ok(env_obj) = js_opts.get_named_property::<napi::JsObject>("env") {
+                let mut hm = std::collections::HashMap::new();
+                let keys = napi::JsObject::keys(&env_obj)?;
+                for key in keys {
+                    if let Ok(val) = env_obj.get_named_property::<napi::JsString>(&key) {
+                        if let Ok(s) = val.into_utf8() {
+                            hm.insert(key, s.as_str()?.to_string());
+                        }
+                    }
+                }
+                opts.env = Some(hm);
+            }
+            // Read basePath: string
+            if let Ok(bp) = js_opts.get_named_property::<napi::JsString>("basePath") {
+                if let Ok(s) = bp.into_utf8() {
+                    opts.base_path = Some(s.as_str()?.to_string());
+                }
+            }
+        }
+        synx_core::resolve(&mut result, &opts);
     }
     value_to_js(&env, &result.root)
 }

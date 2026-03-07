@@ -14,6 +14,8 @@ import {
 import { createFormattingProvider } from './formatter';
 import { createColorProvider } from './colors';
 import { createInlayHintsProvider } from './inlay-hints';
+import { activateNestingColors } from './nesting-colors';
+import { activateCommentStyling } from './comment-styles';
 import {
   registerConvertToJson,
   registerConvertFromJson,
@@ -42,6 +44,12 @@ export function activate(ctx: vscode.ExtensionContext): void {
 
   // ─── Inlay Hints ─────────────────────────────────────────────────────────
   ctx.subscriptions.push(createInlayHintsProvider());
+
+  // ─── Nesting Colors ────────────────────────────────────────────────────
+  activateNestingColors(ctx);
+
+  // ─── Comment Styling ───────────────────────────────────────────────────
+  activateCommentStyling(ctx);
 
   // ─── Commands ────────────────────────────────────────────────────────────
   registerConvertToJson(ctx);

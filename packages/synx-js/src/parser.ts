@@ -135,9 +135,10 @@ function saveMeta(
   args: string[],
   constraints: SynxConstraints | undefined,
   mode: SynxMode,
+  typeHint?: string,
 ): void {
   if (mode !== 'active') return;
-  if (markers.length === 0 && !constraints) return;
+  if (markers.length === 0 && !constraints && !typeHint) return;
 
   let metaMap: SynxMetaMap;
   if ((obj as any).__synx) {
@@ -155,11 +156,12 @@ function saveMeta(
   const meta: SynxMeta = { markers };
   if (args.length > 0) meta.args = args;
   if (constraints) meta.constraints = constraints;
+  if (typeHint) meta.typeHint = typeHint;
   metaMap[key] = meta;
 }
 
 // ─── Fallback regex for complex lines (type hints, constraints, markers) ──
-const LINE_REGEX = /^([^\s\[:\-#/(][^\s\[:(]*)(?:\(([\w:]+)\))?(?:\[([^\]]*)\])?(?::([\w:]+))?\s*(.*)$/;
+const LINE_REGEX = /^([^\s\[:\-#/(][^\s\[:(]*)(?:\(([\w:]+)\))?(?:\[([^\]]*)\])?(?::([^\s]+))?\s*(.*)$/;
 
 // ─── Parser ───────────────────────────────────────────────
 
@@ -174,6 +176,7 @@ export function parseData(text: string): SynxParseResult {
   let locked = false;
   let currentBlock: { indent: number; obj: SynxObject; key: string } | null = null;
   let currentList: { indent: number; arr: SynxArray } | null = null;
+  let inBlockComment = false;
 
   for (let i = 0; i < lines.length; i++) {
     const rawLine = lines[i];
@@ -191,6 +194,16 @@ export function parseData(text: string): SynxParseResult {
     if (indent === rawLen) continue;
 
     const fc = rawLine.charCodeAt(indent); // first non-whitespace char
+
+    // ── Block comment toggle: ### ──
+    if (fc === 35) {
+      const rest = rawLine.substring(indent).trimEnd();
+      if (rest === '###') {
+        inBlockComment = !inBlockComment;
+        continue;
+      }
+    }
+    if (inBlockComment) continue;
 
     // ── Comments: # or // ──
     if (fc === 35) { // #
@@ -364,14 +377,14 @@ export function parseData(text: string): SynxParseResult {
       // Multiline block
       parent[key] = '';
       currentBlock = { indent, obj: parent, key };
-      saveMeta(parent, key, markers, markerArgs, constraints, mode);
+      saveMeta(parent, key, markers, markerArgs, constraints, mode, typeHint);
     } else if (!rawValue && markers.length > 0 &&
                (markers.includes('random') || markers.includes('unique') ||
                 markers.includes('geo') || markers.includes('join'))) {
       // List with markers (items follow with -)
       parent[key] = [];
       currentList = { indent, arr: parent[key] as SynxArray };
-      saveMeta(parent, key, markers, markerArgs, constraints, mode);
+      saveMeta(parent, key, markers, markerArgs, constraints, mode, typeHint);
     } else if (!rawValue) {
       // No value → nested object (group) OR plain list
       parent[key] = {};
@@ -395,11 +408,11 @@ export function parseData(text: string): SynxParseResult {
           currentList = { indent, arr: parent[key] as SynxArray };
         }
       }
-      saveMeta(parent, key, markers, markerArgs, constraints, mode);
+      saveMeta(parent, key, markers, markerArgs, constraints, mode, typeHint);
     } else {
       // Simple key-value
       parent[key] = castType(rawValue);
-      saveMeta(parent, key, markers, markerArgs, constraints, mode);
+      saveMeta(parent, key, markers, markerArgs, constraints, mode, typeHint);
     }
   }
 

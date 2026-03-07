@@ -6,6 +6,7 @@
     { "include": "#mode-declaration" },
     { "include": "#lock-declaration" },
     { "include": "#static-declaration" },
+    { "include": "#comment-block" },
     { "include": "#comment-hash" },
     { "include": "#comment-slash" },
     { "include": "#list-item" },
@@ -34,13 +35,63 @@
         "1": { "name": "keyword.control.mode.synx" }
       }
     },
+    "comment-block": {
+      "name": "comment.block.synx",
+      "begin": "^\\s*###\\s*$",
+      "end": "^\\s*###\\s*$",
+      "patterns": [
+        { "include": "#comment-formatting" }
+      ]
+    },
     "comment-hash": {
       "match": "^\\s*(#)(.*)$",
-      "name": "comment.line.hash.synx"
+      "name": "comment.line.hash.synx",
+      "captures": {
+        "2": {
+          "patterns": [
+            { "include": "#comment-formatting" }
+          ]
+        }
+      }
     },
     "comment-slash": {
       "match": "^\\s*(//)(.*)$",
-      "name": "comment.line.double-slash.synx"
+      "name": "comment.line.double-slash.synx",
+      "captures": {
+        "2": {
+          "patterns": [
+            { "include": "#comment-formatting" }
+          ]
+        }
+      }
+    },
+    "comment-formatting": {
+      "patterns": [
+        {
+          "match": "\\*\\*\\*([^*]+)\\*\\*\\*",
+          "captures": {
+            "1": { "name": "markup.bold.italic.synx" }
+          }
+        },
+        {
+          "match": "\\*\\*([^*]+)\\*\\*",
+          "captures": {
+            "1": { "name": "markup.bold.synx" }
+          }
+        },
+        {
+          "match": "\\*([^*]+)\\*",
+          "captures": {
+            "1": { "name": "markup.italic.synx" }
+          }
+        },
+        {
+          "match": "`([^`]+)`",
+          "captures": {
+            "1": { "name": "markup.inline.raw.synx" }
+          }
+        }
+      ]
     },
     "list-item": {
       "match": "^(\\s*)(-)\\s+(.*)",

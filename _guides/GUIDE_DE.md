@@ -324,7 +324,18 @@ description |
 # Hash-Kommentar
 // Schrägstrich-Kommentar
 name John  # Inline-Kommentar
+
+###
+Dies ist ein Blockkommentar.
+Alles zwischen ### wird ignoriert.
+###
 ```
+
+In der VSCode-Erweiterung wird Formatierung in Kommentaren unterstützt:
+- `*kursiv*` — grün
+- `**fett**` — lila
+- `***fett+kursiv***` — gold
+- `` `code` `` — orange mit Hintergrund
 
 ---
 

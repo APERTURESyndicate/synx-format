@@ -39,7 +39,7 @@ export interface ParsedDoc {
 
 // ─── Regex ───────────────────────────────────────────────────────────────────
 
-const LINE_RE = /^([^\s\[:\-#/(][^\s\[:(]*)(?:\(([\w:]+)\))?(?:\[([^\]]*)\])?(?::([\w:]+))?\s*(.*)$/;
+const LINE_RE = /^([^\s\[:\-#/(][^\s\[:(]*)(?:\(([\w:]+)\))?(?:\[([^\]]*)\])?(?::([^\s]+))?\s*(.*)$/;
 
 // ─── Cast ────────────────────────────────────────────────────────────────────
 
@@ -84,10 +84,18 @@ export function parseSynx(text: string): ParsedDoc {
 
   let block: { node: SynxNode; indent: number } | null = null;
   let listTarget: { indent: number; arr: SynxNode } | null = null;
+  let inBlockComment = false;
 
   for (let i = 0; i < lines.length; i++) {
     const raw = lines[i];
     const trimmed = raw.trim();
+
+    // Block comment toggle: ###
+    if (trimmed === '###') {
+      inBlockComment = !inBlockComment;
+      continue;
+    }
+    if (inBlockComment) continue;
 
     // Mode
     if (trimmed === '!active' || trimmed === '#!mode:active') {
@@ -267,14 +275,25 @@ function resolveWithNodes(nodes: SynxNode[], obj: Record<string, SynxVal>, root:
           const envVal = (typeof process !== 'undefined' && process.env)
             ? process.env[varName]
             : undefined;
-          if (envVal !== undefined) obj[n.key] = cast(envVal, n.typeHint || undefined);
+          if (envVal !== undefined) {
+            obj[n.key] = cast(envVal, n.typeHint || undefined);
+          } else {
+            // Check for :default in the remaining marker chain
+            const defIdx = n.markers.indexOf('default', mi);
+            if (defIdx !== -1 && n.markers.length > defIdx + 1) {
+              const defVal = n.markers.slice(defIdx + 1).join(':');
+              obj[n.key] = cast(defVal, n.typeHint || undefined);
+            }
+          }
           break;
         }
         case 'default': {
           const cur = obj[n.key];
           if (cur === null || cur === undefined || cur === '') {
-            // Arg may be embedded in marker chain as next entry (e.g. :default:8080)
-            const defVal = n.markers[mi + 1] ?? n.markerArgs[0] ?? '';
+            // Join all remaining markers after 'default' to preserve IPs, compound values
+            const defVal = n.markers.length > mi + 1
+              ? n.markers.slice(mi + 1).join(':')
+              : (n.markerArgs[0] ?? '');
             obj[n.key] = cast(defVal, n.typeHint || undefined);
           }
           break;

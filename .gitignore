@@ -1,0 +1,49 @@
+# JavaScript / Node.js
+dist/
+node_modules/
+*.js
+!jest.config.js
+*.d.ts
+*.map
+*.vsix
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+build/
+*.whl
+*.tar.gz
+.coverage
+htmlcov/
+
+# Rust
+target/
+.cargo/
+
+# Environment
+.venv/
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Scripts (local build/publish helpers)
+*.bat
+
+# Logs
+*.log
+
+# Claude
+.claudeignore

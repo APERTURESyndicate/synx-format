@@ -130,12 +130,26 @@ fn apply_markers(
                 std::env::var(var_name).ok()
             };
 
+            let force_string = meta.type_hint.as_deref() == Some("string");
             let default_idx = markers.iter().position(|m| m == "default");
             if let Some(val) = env_val.filter(|v| !v.is_empty()) {
-                map.insert(key.to_string(), cast_primitive(&val));
+                let resolved = if force_string {
+                    Value::String(val)
+                } else {
+                    cast_primitive(&val)
+                };
+                map.insert(key.to_string(), resolved);
             } else if let Some(di) = default_idx {
                 if markers.len() > di + 1 {
-                    map.insert(key.to_string(), cast_primitive(&markers[di + 1]));
+                    // Join all parts after 'default' back with ':'
+                    // to preserve IPs (0.0.0.0) and compound values
+                    let fallback = markers[di + 1..].join(":");
+                    let resolved = if force_string {
+                        Value::String(fallback)
+                    } else {
+                        cast_primitive(&fallback)
+                    };
+                    map.insert(key.to_string(), resolved);
                 } else {
                     map.insert(key.to_string(), Value::Null);
                 }
@@ -326,7 +340,13 @@ fn apply_markers(
         if is_empty {
             let di = markers.iter().position(|m| m == "default").unwrap();
             if markers.len() > di + 1 {
-                map.insert(key.to_string(), cast_primitive(&markers[di + 1]));
+                let fallback = markers[di + 1..].join(":");
+                let resolved = if meta.type_hint.as_deref() == Some("string") {
+                    Value::String(fallback)
+                } else {
+                    cast_primitive(&fallback)
+                };
+                map.insert(key.to_string(), resolved);
             }
         }
     }

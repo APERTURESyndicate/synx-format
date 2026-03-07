@@ -26,6 +26,7 @@ pub fn parse(text: &str) -> ParseResult {
 
     let mut block: Option<BlockState> = None;
     let mut list: Option<ListState> = None;
+    let mut in_block_comment = false;
 
     let mut i = 0;
     while i < line_count {
@@ -52,6 +53,17 @@ pub fn parse(text: &str) -> ParseResult {
         if trimmed.starts_with("#!mode:") {
             let declared = trimmed.splitn(2, ':').nth(1).unwrap_or("static").trim();
             mode = if declared == "active" { Mode::Active } else { Mode::Static };
+            i += 1;
+            continue;
+        }
+
+        // Block comment toggle: ###
+        if trimmed == "###" {
+            in_block_comment = !in_block_comment;
+            i += 1;
+            continue;
+        }
+        if in_block_comment {
             i += 1;
             continue;
         }

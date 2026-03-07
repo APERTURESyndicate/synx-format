@@ -111,12 +111,15 @@ export function resolve(
 
       // Check for :default in the marker chain
       const defaultIdx = markers.indexOf('default');
+      // Check if key has (string) type hint — if so, skip auto-detection
+      const forceString = metaMap[key]?.typeHint === 'string';
       if (envVal !== undefined && envVal !== '') {
-        obj[key] = isNaN(Number(envVal)) ? envVal : Number(envVal);
+        obj[key] = forceString ? envVal : (isNaN(Number(envVal)) ? envVal : Number(envVal));
       } else if (defaultIdx !== -1 && markers.length > defaultIdx + 1) {
-        // :env:default:VALUE — the value after default is the fallback
-        const fallback = markers[defaultIdx + 1];
-        obj[key] = isNaN(Number(fallback)) ? fallback : Number(fallback);
+        // :env:default:VALUE — join all parts after 'default' back with ':'
+        // to preserve IPs (0.0.0.0) and compound values
+        const fallback = markers.slice(defaultIdx + 1).join(':');
+        obj[key] = forceString ? fallback : (isNaN(Number(fallback)) ? fallback : Number(fallback));
       } else {
         obj[key] = null;
       }
@@ -234,8 +237,9 @@ export function resolve(
       if (obj[key] === null || obj[key] === undefined || obj[key] === '') {
         const defaultIdx = markers.indexOf('default');
         if (defaultIdx !== -1 && markers.length > defaultIdx + 1) {
-          const fallback = markers[defaultIdx + 1];
-          obj[key] = isNaN(Number(fallback)) ? fallback : Number(fallback);
+          const fallback = markers.slice(defaultIdx + 1).join(':');
+          const forceStr = metaMap[key]?.typeHint === 'string';
+          obj[key] = forceStr ? fallback : (isNaN(Number(fallback)) ? fallback : Number(fallback));
         }
       }
     }
