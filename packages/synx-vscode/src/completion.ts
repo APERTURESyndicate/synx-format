@@ -15,17 +15,18 @@ interface MarkerInfo {
 }
 
 const MARKERS: MarkerInfo[] = [
-  { label: 'calc', detail: 'Arithmetic expression', docs: 'Evaluates a math expression. References other numeric keys by name.\n\n```synx\ntax:calc price * 0.2\ntotal:calc price + tax\n```\n\nOperators: `+` `-` `*` `/` `%` `(` `)`\n\n**Safe evaluator** — no `eval()`.', snippet: 'calc' },
+  { label: 'calc', detail: 'Arithmetic expression', docs: 'Evaluates a math expression. References numeric keys by name or dot-path.\n\n```synx\n!active\nstats\n  base_hp 150\n  multiplier 1.2\n\ntotal_hp:calc stats.base_hp * stats.multiplier\n```\n\nOperators: `+` `-` `*` `/` `%` `(` `)`\n\n**Safe evaluator** — no `eval()`.', snippet: 'calc' },
   { label: 'random', detail: 'Random selection', docs: 'Picks one random item from the list below.\n\n**Equal probability:**\n```synx\npick:random\n  - Alpha\n  - Beta\n```\n\n**Weighted:**\n```synx\nloot:random 70 20 10\n  - common\n  - rare\n  - legendary\n```', snippet: 'random' },
   { label: 'env', detail: 'Environment variable', docs: 'Reads a system environment variable.\n\n```synx\nport:env PORT\nport:env:default:8080 PORT\n```\n\nReturns `null` if not found (unless combined with `:default`).', snippet: 'env' },
   { label: 'alias', detail: 'Reference another key', docs: 'Copies the value of another key — no duplication.\n\n```synx\nadmin_email alex@example.com\ncomplaints_email:alias admin_email\n```', snippet: 'alias' },
   { label: 'ref', detail: 'Reference with chaining', docs: 'References another key and feeds the resolved value through the remaining marker chain.\n\n```synx\nbase_rate 50\nquick_rate:ref:calc:*2 base_rate\n```\n\nSimple reference: `pg_host:ref host` — same as `:alias` but chainable with `:calc`, `:template`, etc.', snippet: 'ref' },
-  { label: 'inherit', detail: 'Inherit block fields', docs: 'Copies all fields from a parent block into this block. Child fields override parent fields.\nBlocks starting with `_` are private and excluded from the final output.\n\n```synx\n_base_resource\n  depletion_chance 0.2\n  spawn_group false\n\nsteel:inherit:_base_resource\n  name Steel\n  rate_min 1\n```\n\nResult: `steel` has `depletion_chance`, `spawn_group`, `name`, `rate_min`.', snippet: 'inherit:${1:_parent}' },
-  { label: 'i18n', detail: 'Multilingual value', docs: 'Selects a localized value based on the `lang` option.\nChild keys are language codes.\n\n```synx\nname:i18n\n  en Plains\n  ru Равнины\n  de Ebenen\n```\n\n`Synx.parse(text, { lang: "ru" })` → `name = "Равнины"`', snippet: 'i18n' },
+  { label: 'inherit', detail: 'Inherit block fields', docs: 'Copies fields from one or more parent blocks into this block. Child fields override inherited fields.\n\n```synx\n_base_resource\n  hp 100\n\n_base_rare\n  rarity rare\n\nsteel:inherit:_base_resource:_base_rare\n  name Steel\n```\n\nParents merge left-to-right; later parents override earlier ones.', snippet: 'inherit:${1:_parent}:${2:_mixin}' },
+  { label: 'i18n', detail: 'Multilingual value', docs: 'Selects localized value by language. Optional count-field enables plural form selection.\n\n```synx\nitems_count 5\nitems_label:i18n:items_count\n  en\n    one {count} item\n    other {count} items\n```\n\nWith `:i18n:COUNT_FIELD`, the correct plural category is selected and `{count}` is replaced.', snippet: 'i18n:${1:count_field}' },
   { label: 'secret', detail: 'Hidden value', docs: 'Readable by your code but hidden in logs, `toString()`, `JSON.stringify()`.\n\nUse `.reveal()` to access the real value.\n\n```synx\napi_key:secret sk-abc123\n```\n\n```javascript\ndata.api_key.reveal() // "sk-abc123"\n```', snippet: 'secret' },
   { label: 'default', detail: 'Fallback value', docs: 'Sets a fallback if the main value is empty or not found.\n\nMost often combined with `:env`.\n\n```synx\nport:env:default:8080 PORT\ntheme:default dark\n```', snippet: 'default' },
   { label: 'unique', detail: 'Deduplicate list', docs: 'Removes duplicate elements from a list.\n\n```synx\ntags:unique\n  - action\n  - rpg\n  - action\n```\n\nResult: `["action", "rpg"]`', snippet: 'unique' },
   { label: 'include', detail: 'Include external file', docs: 'Inserts contents of another `.synx` file.\nPath is relative to the current file.\n\n```synx\ndatabase:include ./db.synx\n```', snippet: 'include' },
+  { label: 'import', detail: 'Alias of :include', docs: 'Alias for `:include` (key-level file embedding).\n\n```synx\ndatabase:import ./db.synx\n```\n\nUse `:import` to avoid confusion with top-level directive `!include`.', snippet: 'import' },
   { label: 'geo', detail: 'Region-based selection', docs: 'Selects a value based on the user\'s region.\n\n```synx\ncurrency:geo\n  - US USD\n  - EU EUR\n  - GB GBP\n```\n\nRequires runtime region support.', snippet: 'geo' },
   { label: 'template', detail: 'String interpolation (legacy)', docs: '**Legacy marker** — `{}` interpolation now works automatically on all string values in `!active` mode.\nYou no longer need `:template`.\n\n```synx\nfirst_name John\ngreeting Hello, {first_name}!\n```', snippet: 'template' },
   { label: 'split', detail: 'Split string → array', docs: 'Splits a string by delimiter into an array.\n\nDefault: comma. Keywords: `space`, `pipe`, `dash`, `dot`, `semi`, `tab`.\n\n```synx\ncolors:split red, green, blue\nwords:split:space hello world foo\n```', snippet: 'split' },
@@ -160,6 +161,18 @@ export function createCompletionProvider(): vscode.Disposable {
             item.detail = `Key at line ${node.line + 1}`;
             items.push(item);
           }
+        }
+        return items;
+      }
+
+      // Inside :calc expression → suggest known keys (including dot-paths)
+      if (before.match(/:calc\s+[\w.]*$/)) {
+        const parsed = parseSynx(doc.getText());
+        const items: vscode.CompletionItem[] = [];
+        for (const [keyPath, node] of parsed.keyMap) {
+          const item = new vscode.CompletionItem(keyPath, vscode.CompletionItemKind.Variable);
+          item.detail = `Key at line ${node.line + 1}`;
+          items.push(item);
         }
         return items;
       }

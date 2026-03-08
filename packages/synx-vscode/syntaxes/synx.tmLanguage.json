@@ -44,12 +44,19 @@
       }
     },
     "comment-block": {
-      "name": "comment.block.synx",
       "begin": "^\\s*###\\s*$",
       "end": "^\\s*###\\s*$",
+      "beginCaptures": { "0": { "name": "comment.block.synx" } },
+      "endCaptures": { "0": { "name": "comment.block.synx" } },
       "contentName": "comment.block.synx",
       "patterns": [
-        { "include": "#comment-formatting" }
+        {
+          "match": "^.*$",
+          "name": "comment.block.synx",
+          "patterns": [
+            { "include": "#comment-formatting" }
+          ]
+        }
       ]
     },
     "comment-hash": {

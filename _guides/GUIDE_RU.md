@@ -58,7 +58,7 @@
   - [:i18n](#i18n--мультиязычные-значения)
   - [:secret](#secret--скрытое-значение)
   - [auto-{}](#auto---интерполяция-строк)
-  - [:include](#include--импорт-внешнего-файла)
+  - [:include / :import](#include--import--импорт-внешнего-файла)
   - [:unique](#unique--дедупликация-списка)
   - [:split](#split--строка-в-массив)
   - [:join](#join--массив-в-строку)
@@ -287,6 +287,30 @@ empty_value
 ```
 
 > Числа, булевы значения (`true`/`false`) и `null` определяются автоматически. Всё остальное — строка.
+
+> **Значения в кавычках** не приводятся автоматически: `"null"`, `"true"`, `"42"` остаются строками.
+
+Правила авто-определения типа парсером (если нет явного `(type)`):
+
+1. Точное `true`/`false` -> Bool
+2. Точное `null` -> Null
+3. Паттерн целого числа -> Int
+4. Паттерн десятичного числа -> Float
+5. Иначе -> String
+
+```synx
+status "null"
+enabled "true"
+count "42"
+```
+
+```json
+{
+  "status": "null",
+  "enabled": "true",
+  "count": "42"
+}
+```
 
 ---
 
@@ -589,6 +613,28 @@ total:calc base_price + tax
 { "tax": 20, "total": 120 }
 ```
 
+Поддерживается доступ к вложенным полям через dot-path:
+
+```synx
+!active
+
+stats
+  base_hp 100
+  multiplier 3
+  armor 25
+
+total_hp:calc stats.base_hp * stats.multiplier
+effective_hp:calc total_hp + stats.armor
+```
+
+```json
+{
+  "stats": { "base_hp": 100, "multiplier": 3, "armor": 25 },
+  "total_hp": 300,
+  "effective_hp": 325
+}
+```
+
 Операторы: `+` `-` `*` `/` `%` `(` `)`.
 
 > **Безопасный вычислитель** — без `eval()`. Только арифметика.
@@ -694,6 +740,29 @@ steel:inherit:_base_resource
   material metal
 ```
 
+Поддерживается наследование от нескольких родителей. Родители применяются слева направо: более правый родитель переопределяет более левый, а дочерний блок переопределяет всех.
+
+```synx
+!active
+
+_movable
+  speed 10
+  can_move true
+
+_damageable
+  hp 100
+  armor 5
+
+_attackable
+  damage 15
+  range 1
+
+tank:inherit:_movable:_damageable:_attackable
+  name Tank
+  armor 50
+  damage 120
+```
+
 **Многоуровневое наследование:**
 
 ```synx
@@ -733,6 +802,34 @@ title:i18n
 const config = Synx.parse(text, { lang: 'ru' });
 // config.title → "Привет мир"
 ```
+
+Плюрализация: укажи поле-счётчик через `:i18n:COUNT_FIELD`.
+
+```synx
+!active
+
+item_count 5
+
+label:i18n:item_count
+  en
+    one {count} item found
+    other {count} items found
+  ru
+    one {count} предмет найден
+    few {count} предмета найдено
+    many {count} предметов найдено
+    other {count} предметов найдено
+```
+
+```javascript
+const en = Synx.parse(text, { lang: 'en' });
+// en.label -> "5 items found"
+
+const ru = Synx.parse(text, { lang: 'ru' });
+// ru.label -> "5 предметов найдено"
+```
+
+`{count}` подставляется автоматически.
 
 ---
 
@@ -785,15 +882,25 @@ conn_string postgresql://{host:db}:{port:db}/{name:db}
 
 ---
 
-### `:include` — Импорт внешнего файла
+### `:include / :import` — Импорт внешнего файла
 
-Импортирует содержимое другого `.synx` файла. Путь относительный.
+Импортирует содержимое другого `.synx` файла как дочерний объект. Путь относительный.
+
+`:import` — алиас `:include` (поведение одинаковое), добавлен для снижения путаницы с директивой `!include`.
 
 ```synx
 !active
 
-database:include ./db.synx
+database:import ./db.synx
+logging:include ./logging.synx
 ```
+
+Сравнение механизмов импорта:
+
+| Механизм | Где используется | Что делает |
+|---|---|---|
+| `!include ./file.synx [alias]` | директива вверху файла | делает ключи доступными для `{key:alias}` интерполяции |
+| `key:include ./file.synx` / `key:import ./file.synx` | маркер на ключе | встраивает файл как дочерний объект по ключу |
 
 ---
 

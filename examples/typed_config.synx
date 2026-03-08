@@ -1,0 +1,49 @@
+!active
+
+# Global type validation example — 3.2.2 feature
+# Once you define hp(int), speed(float), name(string), etc.,
+# the engine validates that ALL uses of these fields match the type.
+
+_base_unit
+  hp(int) 1000
+  atk(int) 50
+  speed(float) 2.5
+  name(string) Base Unit
+  is_available(bool) true
+  description(string) A generic unit for testing
+
+infantry:inherit:_base_unit
+  # These automatically get the same types from _base_unit
+  hp 800              # ✓ Valid: int
+  atk 45              # ✓ Valid: int
+  speed 3.0           # ✓ Valid: float
+  name Infantry       # ✓ Valid: string
+  icon army/infantry.png
+  cost_per_unit 100   # ✓ Valid: auto-detects as int
+
+motorized:inherit:_base_unit
+  hp 1200             # ✓ Valid: int
+  atk 60              # ✓ Valid: int
+  speed 5.5           # ✓ Valid: float
+  name Motorized
+  fuel_per_turn 15    # ✓ Valid: int
+  description Faster, higher HP variant
+
+cavalry:inherit:_base_unit
+  hp 900              # ✓ Valid: int
+  atk 55              # ✓ Valid: int
+  speed 4.8           # ✓ Valid: float
+  name Cavalry
+  morale_bonus(float) 1.15  # ✓ New sub-field with explicit type
+
+# If someone tries to assign wrong type:
+# ranger:inherit:_base_unit
+#   hp bad_value      # ✗ TYPE_ERR: 'hp' expected int but got string
+#   speed not_a_float # ✗ TYPE_ERR: 'speed' expected float but got string
+
+# stats_summary shows how fields with same name maintain type consistency
+stats_summary
+  total_hp 3900             # ✓ int (all hp values summed)
+  avg_speed 3.45            # ✓ float
+  unit_count(int) 3         # ✓ int
+  prepared(bool) true       # ✓ bool

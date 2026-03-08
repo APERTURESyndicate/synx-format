@@ -44,6 +44,12 @@ const LINE_RE = /^([^\s\[:\-#/(][^\s\[:(]*)(?:\(([\w:]+)\))?(?:\[([^\]]*)\])?(?:
 // ─── Cast ────────────────────────────────────────────────────────────────────
 
 function cast(val: string, hint?: string): SynxVal {
+  const quoted =
+    val.length >= 2 &&
+    ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'")));
+  if (quoted) {
+    return val.slice(1, -1);
+  }
   if (hint === 'string') return val;
   if (hint === 'int') return parseInt(val, 10) || 0;
   if (hint === 'float') return parseFloat(val) || 0;
@@ -249,18 +255,23 @@ function applyInheritance(nodes: SynxNode[], obj: Record<string, SynxVal>) {
     if (n.isListItem) continue;
     const inhIdx = n.markers.indexOf('inherit');
     if (inhIdx === -1) continue;
-    const parentName = n.markers[inhIdx + 1];
-    if (!parentName) continue;
-    const parent = obj[parentName];
+    const parentNames = n.markers.slice(inhIdx + 1).filter(Boolean);
+    if (parentNames.length === 0) continue;
+
     const child = obj[n.key];
-    if (parent && typeof parent === 'object' && !Array.isArray(parent) &&
-        child && typeof child === 'object' && !Array.isArray(child)) {
-      const parentObj = parent as Record<string, SynxVal>;
-      const childObj = child as Record<string, SynxVal>;
-      for (const [pk, pv] of Object.entries(parentObj)) {
-        if (!(pk in childObj)) childObj[pk] = pv;
+    if (!child || typeof child !== 'object' || Array.isArray(child)) continue;
+
+    let mergedParents: Record<string, SynxVal> = {};
+    for (const parentName of parentNames) {
+      const parent = deepGet(obj, parentName) ?? obj[parentName];
+      if (parent && typeof parent === 'object' && !Array.isArray(parent)) {
+        // Left-to-right merge: later parents override earlier ones.
+        mergedParents = { ...mergedParents, ...(parent as Record<string, SynxVal>) };
       }
     }
+
+    // Child always has final priority over merged parents.
+    obj[n.key] = { ...mergedParents, ...(child as Record<string, SynxVal>) };
   }
 }
 
@@ -363,18 +374,35 @@ function resolveWithNodes(nodes: SynxNode[], obj: Record<string, SynxVal>, root:
           if (i18nVal && typeof i18nVal === 'object' && !Array.isArray(i18nVal)) {
             const translations = i18nVal as Record<string, SynxVal>;
             const lang = 'en'; // VSCode preview defaults to 'en'
-            obj[n.key] = translations[lang] ?? Object.values(translations)[0] ?? null;
+            const selected = translations[lang] ?? translations.en ?? Object.values(translations)[0] ?? null;
+            const countField = n.markers[mi + 1];
+
+            if (
+              countField &&
+              selected &&
+              typeof selected === 'object' &&
+              !Array.isArray(selected)
+            ) {
+              const countRaw = deepGet(root, countField);
+              const count = typeof countRaw === 'number' ? countRaw : Number(countRaw);
+              const pluralForms = selected as Record<string, SynxVal>;
+              const category = getPluralCategory(lang, count);
+              const picked = pluralForms[category] ?? pluralForms.other ?? Object.values(pluralForms)[0] ?? null;
+              obj[n.key] =
+                typeof picked === 'string'
+                  ? picked.replace(/\{count\}/g, String(count))
+                  : picked;
+            } else {
+              obj[n.key] = selected;
+            }
           }
           break;
         }
         case 'calc': {
           const expr = String(obj[n.key] ?? '');
-          const vars: Record<string, number> = {};
-          for (const [k, v] of Object.entries(obj)) {
-            if (typeof v === 'number') vars[k] = v as number;
-          }
-          for (const [k, v] of Object.entries(root)) {
-            if (typeof v === 'number' && !(k in vars)) vars[k] = v as number;
+          const vars = collectNumericVars(root);
+          for (const [k, v] of Object.entries(collectNumericVars(obj))) {
+            if (!(k in vars)) vars[k] = v;
           }
           const result = safeCalc(expr, vars);
           if (result !== null) obj[n.key] = result;
@@ -449,6 +477,52 @@ export function safeCalc(expr: string, vars: Record<string, number>): number | n
   } catch {
     return null;
   }
+}
+
+function deepGet(obj: Record<string, SynxVal>, dotPath: string): SynxVal | undefined {
+  const parts = dotPath.split('.').filter(Boolean);
+  let cur: any = obj;
+  for (const part of parts) {
+    if (!cur || typeof cur !== 'object' || Array.isArray(cur)) return undefined;
+    cur = cur[part];
+  }
+  return cur as SynxVal;
+}
+
+function collectNumericVars(obj: Record<string, SynxVal>, prefix = ''): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const [key, value] of Object.entries(obj)) {
+    const path = prefix ? `${prefix}.${key}` : key;
+    if (typeof value === 'number') {
+      out[path] = value;
+      if (!prefix) {
+        out[key] = value;
+      }
+      continue;
+    }
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      Object.assign(out, collectNumericVars(value as Record<string, SynxVal>, path));
+    }
+  }
+  return out;
+}
+
+function getPluralCategory(lang: string, count: number): string {
+  if (!Number.isFinite(count)) return 'other';
+  const abs = Math.abs(count);
+  const isInt = Number.isInteger(abs);
+  const n10 = abs % 10;
+  const n100 = abs % 100;
+
+  if (['ru', 'uk', 'be'].includes(lang)) {
+    if (!isInt) return 'other';
+    if (n10 === 1 && n100 !== 11) return 'one';
+    if (n10 >= 2 && n10 <= 4 && !(n100 >= 12 && n100 <= 14)) return 'few';
+    if (n10 === 0 || (n10 >= 5 && n10 <= 9) || (n100 >= 11 && n100 <= 14)) return 'many';
+    return 'other';
+  }
+
+  return abs === 1 ? 'one' : 'other';
 }
 
 function evalExpr(s: string): number {

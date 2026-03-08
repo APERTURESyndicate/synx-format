@@ -58,7 +58,7 @@
   - [:i18n — Mehrsprachige Werte](#i18n--mehrsprachige-werte)
   - [:secret — Versteckter Wert](#secret--versteckter-wert)
   - [auto-{} — String-Interpolation](#auto---string-interpolation)
-  - [:include — Externe Datei Importieren](#include--externe-datei-importieren)
+  - [:include / :import — Externe Datei Importieren](#include--import--externe-datei-importieren)
   - [:unique — Duplikate Entfernen](#unique--duplikate-entfernen)
   - [:split — String zu Array](#split--string-zu-array)
   - [:join — Array zu String](#join--array-zu-string)
@@ -243,6 +243,16 @@ empty_value
 ```
 
 > Zahlen, Booleans (`true`/`false`) und `null` werden automatisch erkannt. Alles andere ist String.
+
+> **Werte in Anfuhrungszeichen** werden als Literal-String behandelt: `"null"`, `"true"`, `"42"` bleiben Strings.
+
+Parser-Typerkennung (ohne expliziten `(type)`-Hint):
+
+1. Exakt `true`/`false` -> Bool
+2. Exakt `null` -> Null
+3. Ganzzahlmuster -> Int
+4. Dezimalmuster -> Float
+5. Sonst -> String
 
 ---
 
@@ -494,6 +504,17 @@ total:calc base_price + tax
 
 Operatoren: `+` `-` `*` `/` `%` `(` `)`
 
+Dot-Path fur verschachtelte Werte wird unterstutzt:
+
+```synx
+!active
+stats
+  base_hp 100
+  multiplier 3
+
+total_hp:calc stats.base_hp * stats.multiplier
+```
+
 ### `:random` — Zufällige Auswahl
 
 ```synx
@@ -569,6 +590,19 @@ steel:inherit:_base_resource
   material metal
 ```
 
+Mehrere Elternblöcke sind moglich. Reihenfolge: links -> rechts, Kind uberschreibt alle Eltern.
+
+```synx
+!active
+_movable
+  speed 10
+_damageable
+  hp 100
+
+tank:inherit:_movable:_damageable
+  hp 150
+```
+
 **Mehrstufige Vererbung:**
 
 ```synx
@@ -609,6 +643,18 @@ const config = Synx.parse(text, { lang: 'de' });
 // config.title → "Hallo Welt"
 ```
 
+Pluralisierung wird unterstutzt uber `:i18n:COUNT_FIELD`:
+
+```synx
+!active
+count 5
+
+label:i18n:count
+  en
+    one {count} item
+    other {count} items
+```
+
 ---
 
 ### `:secret` — Versteckter Wert
@@ -646,12 +692,19 @@ Syntax: `{key}` für lokale Schlüssel, `{key:alias}` für inkludierte Dateien, 
 
 > **Legacy:** Der `:template`-Marker funktioniert weiterhin, ist aber nicht mehr nötig.
 
-### `:include` — Externe Datei Importieren
+### `:include / :import` — Externe Datei Importieren
 
 ```synx
 !active
-database:include ./db.synx
+database:import ./db.synx
 ```
+
+`:import` ist ein Alias von `:include` (identisches Verhalten).
+
+| Mechanismus | Ort | Verhalten |
+|---|---|---|
+| `!include ./file.synx [alias]` | Datei-Direktive | macht Werte fur `{key:alias}` verfugbar |
+| `key:include ./file.synx` / `key:import ./file.synx` | Marker am Schlussel | bettet Datei als Kindobjekt ein |
 
 ### `:unique` — Duplikate Entfernen
 

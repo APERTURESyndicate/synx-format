@@ -1,6 +1,6 @@
 [package]
 name = "synx-c"
-version = "3.2.1"
+version = "3.3.0"
 edition = "2021"
 authors = ["APERTURESyndicate <support@aperturesyndicate.com>"]
 description = "SYNX C FFI — shared library for embedding SYNX in any language"

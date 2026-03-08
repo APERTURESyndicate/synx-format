@@ -58,7 +58,7 @@
   - [:i18n — 多语言值](#i18n--多语言值)
   - [:secret — 隐藏值](#secret--隐藏值)
   - [auto-{} — 字符串插值](#auto---字符串插值)
-  - [:include — 导入外部文件](#include--导入外部文件)
+  - [:include / :import — 导入外部文件](#include--import--导入外部文件)
   - [:unique — 列表去重](#unique--列表去重)
   - [:split — 字符串转数组](#split--字符串转数组)
   - [:join — 数组转字符串](#join--数组转字符串)
@@ -242,6 +242,16 @@ empty_value
 ```
 
 > 数字、布尔值（`true`/`false`）和 `null` 会自动检测。其他所有内容都是字符串。
+
+> **带引号的值**会被保留为字符串字面量：`"null"`、`"true"`、`"42"` 都保持为字符串。
+
+解析器类型推断规则（未显式写 `(type)` 时）:
+
+1. 完全匹配 `true`/`false` -> Bool
+2. 完全匹配 `null` -> Null
+3. 整数模式 -> Int
+4. 小数模式 -> Float
+5. 其他情况 -> String
 
 ---
 
@@ -493,6 +503,17 @@ total:calc base_price + tax
 
 运算符：`+` `-` `*` `/` `%` `(` `)`
 
+支持 dot-path 访问嵌套键:
+
+```synx
+!active
+stats
+  base_hp 100
+  multiplier 3
+
+total_hp:calc stats.base_hp * stats.multiplier
+```
+
 ### `:random` — 随机选择
 
 ```synx
@@ -568,6 +589,19 @@ steel:inherit:_base_resource
   material metal
 ```
 
+支持多父继承。应用顺序为从左到右，子块最终覆盖所有父块字段。
+
+```synx
+!active
+_movable
+  speed 10
+_damageable
+  hp 100
+
+tank:inherit:_movable:_damageable
+  hp 150
+```
+
 **多级继承:**
 
 ```synx
@@ -608,6 +642,18 @@ const config = Synx.parse(text, { lang: 'zh' });
 // config.title → "你好世界"
 ```
 
+支持复数规则：使用 `:i18n:COUNT_FIELD`。
+
+```synx
+!active
+count 5
+
+label:i18n:count
+  en
+    one {count} item
+    other {count} items
+```
+
 ---
 
 ### `:secret` — 隐藏值
@@ -645,12 +691,19 @@ conn_string postgresql://{host:db}:{port:db}/{name:db}
 
 > **兼容性:** `:template` 标记仍然有效，但不再需要。
 
-### `:include` — 导入外部文件
+### `:include / :import` — 导入外部文件
 
 ```synx
 !active
-database:include ./db.synx
+database:import ./db.synx
 ```
+
+`:import` 是 `:include` 的别名（行为一致）。
+
+| 机制 | 使用位置 | 作用 |
+|---|---|---|
+| `!include ./file.synx [alias]` | 文件级指令 | 提供 `{key:alias}` 插值数据 |
+| `key:include ./file.synx` / `key:import ./file.synx` | 键级标记 | 将文件嵌入为子对象 |
 
 ### `:unique` — 列表去重
 

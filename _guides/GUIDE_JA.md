@@ -58,7 +58,7 @@
   - [:i18n — 多言語値](#i18n--多言語値)
   - [:secret — 隠し値](#secret--隠し値)
   - [auto-{} — 文字列補間](#auto---文字列補間)
-  - [:include — 外部ファイルの読み込み](#include--外部ファイルの読み込み)
+  - [:include / :import — 外部ファイルの読み込み](#include--import--外部ファイルの読み込み)
   - [:unique — リストの重複排除](#unique--リストの重複排除)
   - [:split — 文字列を配列に](#split--文字列を配列に)
   - [:join — 配列を文字列に](#join--配列を文字列に)
@@ -242,6 +242,16 @@ empty_value
 ```
 
 > 数値、ブーリアン（`true`/`false`）、`null` は自動検出されます。それ以外はすべて文字列です。
+
+> **引用符付きの値**はリテラル文字列として保持されます：`"null"`、`"true"`、`"42"` は文字列のままです。
+
+パーサーの型推論（明示的な `(type)` がない場合）:
+
+1. 完全一致 `true`/`false` -> Bool
+2. 完全一致 `null` -> Null
+3. 整数パターン -> Int
+4. 小数パターン -> Float
+5. それ以外 -> String
 
 ---
 
@@ -493,6 +503,17 @@ total:calc base_price + tax
 
 演算子：`+` `-` `*` `/` `%` `(` `)`
 
+入れ子キーの dot-path をサポートします:
+
+```synx
+!active
+stats
+  base_hp 100
+  multiplier 3
+
+total_hp:calc stats.base_hp * stats.multiplier
+```
+
 ### `:random` — ランダム選択
 
 ```synx
@@ -568,6 +589,19 @@ steel:inherit:_base_resource
   material metal
 ```
 
+複数親継承をサポートします。適用順序は左から右、子ブロックが最終的に上書きします。
+
+```synx
+!active
+_movable
+  speed 10
+_damageable
+  hp 100
+
+tank:inherit:_movable:_damageable
+  hp 150
+```
+
 **多段階継承:**
 
 ```synx
@@ -608,6 +642,18 @@ const config = Synx.parse(text, { lang: 'ja' });
 // config.title → "こんにちは世界"
 ```
 
+複数形は `:i18n:COUNT_FIELD` でサポートされます:
+
+```synx
+!active
+count 5
+
+label:i18n:count
+  en
+    one {count} item
+    other {count} items
+```
+
 ---
 
 ### `:secret` — 隠し値
@@ -645,12 +691,19 @@ conn_string postgresql://{host:db}:{port:db}/{name:db}
 
 > **レガシー:** `:template` マーカーは引き続き機能しますが、もはや不要です。
 
-### `:include` — 外部ファイルの読み込み
+### `:include / :import` — 外部ファイルの読み込み
 
 ```synx
 !active
-database:include ./db.synx
+database:import ./db.synx
 ```
+
+`:import` は `:include` のエイリアスです（挙動は同じ）。
+
+| 仕組み | 使用場所 | 動作 |
+|---|---|---|
+| `!include ./file.synx [alias]` | ファイル先頭ディレクティブ | `{key:alias}` 補間用の値を公開 |
+| `key:include ./file.synx` / `key:import ./file.synx` | キー上のマーカー | ファイルを子オブジェクトとして埋め込み |
 
 ### `:unique` — リストの重複排除
 

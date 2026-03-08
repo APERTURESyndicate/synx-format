@@ -9,7 +9,7 @@ import { parseSynx, ParsedDoc, SynxNode, safeCalc } from './parser';
 
 const KNOWN_MARKERS = new Set([
   'random', 'calc', 'env', 'alias', 'ref', 'inherit', 'i18n', 'secret', 'default',
-  'unique', 'include', 'geo', 'template', 'split', 'join',
+  'unique', 'include', 'import', 'geo', 'template', 'split', 'join',
   'clamp', 'round', 'map', 'format', 'fallback', 'once', 'version', 'watch',
 ]);
 
@@ -148,33 +148,84 @@ function runValidation(doc: vscode.TextDocument, collection: vscode.DiagnosticCo
       // ── :calc → check variable references ──
       if (node.markers.includes('calc') && node.rawValue && parsed.mode === 'active') {
         const expr = node.rawValue;
-        const identifiers = expr.match(/[a-zA-Z_]\w*/g) || [];
+        const identifiers = expr.match(/[a-zA-Z_]\w*(?:\.[a-zA-Z_]\w*)*/g) || [];
         for (const id of identifiers) {
-          if (!parsed.keyMap.has(id)) {
-            // Check parent scope too
-            const parentPath = getParentPath(node);
-            const fullPath = parentPath ? `${parentPath}.${id}` : id;
-            if (!parsed.keyMap.has(fullPath) && !parsed.keyMap.has(id)) {
-              const vpos = raw.indexOf(id, raw.indexOf(expr));
-              if (vpos !== -1) {
-                diagnostics.push(mkDiag(node.line, vpos, vpos + id.length,
-                  `Undefined key "${id}" in calc expression`, vscode.DiagnosticSeverity.Warning));
-              }
+          if (parsed.keyMap.has(id)) {
+            continue;
+          }
+
+          // Dot paths are always absolute; plain keys can be resolved in parent scope.
+          const parentPath = getParentPath(node);
+          const fullPath = parentPath && !id.includes('.') ? `${parentPath}.${id}` : id;
+          if (!parsed.keyMap.has(fullPath) && !parsed.keyMap.has(id)) {
+            const vpos = raw.indexOf(id, raw.indexOf(expr));
+            if (vpos !== -1) {
+              diagnostics.push(mkDiag(node.line, vpos, vpos + id.length,
+                `Undefined key "${id}" in calc expression`, vscode.DiagnosticSeverity.Warning));
             }
           }
         }
       }
 
-      // ── :include → check file exists ──
-      if (node.markers.includes('include') && node.rawValue && parsed.mode === 'active') {
-        const filePath = node.rawValue.trim();
+      // ── :include / :import → check file exists ──
+      const includePath = getFileMarkerArg(node, ['include', 'import']);
+      if (includePath && parsed.mode === 'active') {
         const docDir = path.dirname(doc.uri.fsPath);
-        const resolved = path.resolve(docDir, filePath);
+        const resolved = path.resolve(docDir, includePath);
         if (!fs.existsSync(resolved)) {
-          const vpos = raw.lastIndexOf(filePath);
+          const vpos = raw.lastIndexOf(includePath);
           if (vpos !== -1) {
-            diagnostics.push(mkDiag(node.line, vpos, vpos + filePath.length,
-              `File "${filePath}" not found`, vscode.DiagnosticSeverity.Error));
+            diagnostics.push(mkDiag(node.line, vpos, vpos + includePath.length,
+              `File "${includePath}" not found`, vscode.DiagnosticSeverity.Error));
+          }
+        }
+      }
+
+      // ── :inherit → check all parent references exist ──
+      if (node.markers.includes('inherit') && parsed.mode === 'active') {
+        const refs = getInheritRefs(node);
+        const parentPath = getParentPath(node);
+        for (const ref of refs) {
+          const siblingPath = parentPath ? `${parentPath}.${ref}` : ref;
+          if (!parsed.keyMap.has(ref) && !parsed.keyMap.has(siblingPath)) {
+            const vpos = raw.lastIndexOf(ref);
+            if (vpos !== -1) {
+              diagnostics.push(mkDiag(node.line, vpos, vpos + ref.length,
+                `Key "${ref}" used in :inherit is not defined`, vscode.DiagnosticSeverity.Error));
+            }
+          }
+
+          if (ref === node.key || ref === node.dotPath) {
+            const vpos = raw.lastIndexOf(ref);
+            if (vpos !== -1) {
+              diagnostics.push(mkDiag(node.line, vpos, vpos + ref.length,
+                'Self-inheritance is not allowed', vscode.DiagnosticSeverity.Error));
+            }
+          }
+        }
+      }
+
+      // ── :i18n:COUNT_FIELD → validate count field and plural maps ──
+      if (node.markers.includes('i18n') && parsed.mode === 'active') {
+        const countField = getMarkerSingleArg(node, 'i18n');
+        if (countField) {
+          const parentPath = getParentPath(node);
+          const siblingPath = parentPath ? `${parentPath}.${countField}` : countField;
+          if (!parsed.keyMap.has(countField) && !parsed.keyMap.has(siblingPath)) {
+            const vpos = raw.lastIndexOf(countField);
+            if (vpos !== -1) {
+              diagnostics.push(mkDiag(node.line, vpos, vpos + countField.length,
+                `Count field "${countField}" used in :i18n is not defined`, vscode.DiagnosticSeverity.Warning));
+            }
+          }
+
+          for (const langNode of node.children) {
+            if (langNode.children.length === 0) continue;
+            const hasOther = langNode.children.some(c => c.key === 'other');
+            if (!hasOther) {
+              diagnostics.push(mkDiag(langNode.line, langNode.column, langNode.column + langNode.key.length,
+                `Plural map for "${langNode.key}" should include "other"`, vscode.DiagnosticSeverity.Warning));
+            }
           }
         }
       }
@@ -261,4 +312,41 @@ function mkDiag(line: number, startCol: number, endCol: number, msg: string, sev
     msg,
     severity,
   );
+}
+
+function getMarkerSingleArg(node: SynxNode, marker: string): string {
+  const idx = node.markers.indexOf(marker);
+  if (idx === -1) return '';
+  const inlineArg = node.markers[idx + 1] ?? '';
+  if (inlineArg && !KNOWN_MARKERS.has(inlineArg)) return inlineArg;
+  const rawArg = node.rawValue?.trim() ?? '';
+  return rawArg;
+}
+
+function getFileMarkerArg(node: SynxNode, markerNames: string[]): string {
+  for (const marker of markerNames) {
+    const idx = node.markers.indexOf(marker);
+    if (idx === -1) continue;
+    const inlineArg = node.markers[idx + 1] ?? '';
+    if (inlineArg && !KNOWN_MARKERS.has(inlineArg)) return inlineArg;
+    if (node.rawValue?.trim()) return node.rawValue.trim();
+  }
+  return '';
+}
+
+function getInheritRefs(node: SynxNode): string[] {
+  const idx = node.markers.indexOf('inherit');
+  if (idx === -1) return [];
+
+  const refs: string[] = [];
+  for (const token of node.markers.slice(idx + 1)) {
+    if (!token || KNOWN_MARKERS.has(token)) break;
+    refs.push(token);
+  }
+
+  if (refs.length > 0) return refs;
+
+  const raw = node.rawValue?.trim() ?? '';
+  if (!raw) return [];
+  return raw.split(/\s+/).filter(Boolean);
 }

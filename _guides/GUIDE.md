@@ -59,7 +59,7 @@
   - [:i18n](#i18n--multilingual-values)
   - [:secret](#secret--hidden-value)
   - [auto-{}](#auto---string-interpolation)
-  - [:include](#include--import-external-file)
+  - [:include / :import](#include--import--import-external-file)
   - [:unique](#unique--deduplicate-list)
   - [:split](#split--string-to-array)
   - [:join](#join--array-to-string)
@@ -288,6 +288,17 @@ empty_value
 
 > Numbers, booleans (`true`/`false`), and `null` are auto-detected. Everything else is a string.
 
+> **Quoted values**: To force a literal string and bypass auto-casting, wrap the value in double or single quotes:
+> `status "null"` → `"null"` (string, not null), `enabled "true"` → `"true"` (string, not boolean), `count "42"` → `"42"` (string, not integer).
+
+Parser type detection order (when no explicit `(type)` hint is used):
+
+1. Exact `true`/`false` -> Bool
+2. Exact `null` -> Null
+3. Integer pattern -> Int
+4. Decimal pattern -> Float
+5. Otherwise -> String
+
 ---
 
 ### Nesting
@@ -382,6 +393,66 @@ enabled(bool) 1
 ```
 
 Available casts: `int`, `float`, `bool`, `string`.
+
+#### Type Validation (Active Mode)
+
+In **active mode** (`!active`), types are not just hints — they're **globally enforced**. Once you define a field with a type like `hp(int)`, the system ensures all uses of that field across the entire document are integers:
+
+```synx
+!active
+
+_base_unit
+  hp(int) 1000
+  speed(float) 2.5
+  name(string) Basic Unit
+  is_available(bool) true
+
+infantry:inherit:_base_unit
+  hp 800          # ✓ Valid: integer
+  speed 3.0       # ✓ Valid: float
+  name Infantry   # ✓ Valid: string
+
+ranger:inherit:_base_unit
+  hp 600          # ✓ Valid: integer
+  # hp abc        # ✗ Would error: type mismatch (expected int, got string)
+```
+
+**Benefits:**
+- **Consistency**: Ensures all uses of a field have the same type across blocks
+- **Early error detection**: Type mismatches are caught during resolution
+- **Self-documenting**: Type hints serve as inline documentation
+
+If a type mismatch is detected, the value is replaced with a `TYPE_ERR` message:
+```json
+{
+  "hp": "TYPE_ERR: 'hp' expected int but got string"
+}
+```
+
+#### Constraint Validation (`[]`) in Active Mode
+
+Square-bracket constraints are also enforced globally for matching field names. This includes `required`, `min`, `max`, `type`, and `enum`.
+
+```synx
+!active
+
+_base_unit
+  hp(int)[required, min:1, max:50000] 1000
+  tier[type:string, enum:common|elite|boss] common
+
+infantry:inherit:_base_unit
+  hp 1200
+  tier elite
+
+tank:inherit:_base_unit
+  hp 90000   # -> CONSTRAINT_ERR (exceeds max)
+  tier rare  # -> CONSTRAINT_ERR (not in enum)
+```
+
+Notes:
+- `required` fails on `null` or empty strings.
+- `min` / `max` apply to numbers, and to string length for string values.
+- `type:...` in `[]` works independently from `key(type)` and can be combined with it.
 
 #### Random Value Generation
 
@@ -676,7 +747,7 @@ db_host:env:default:localhost DATABASE_HOST
 
 ### `:calc` — Arithmetic Expression
 
-Evaluates a math expression. References other numeric keys by name.
+Evaluates a math expression. References other numeric keys by name, including nested keys via dot-path.
 
 ```synx
 !active
@@ -697,6 +768,28 @@ final:calc total - discount
   "total": 120,
   "discount": 12,
   "final": 108
+}
+```
+
+**Dot-path references** — access nested values in calc expressions:
+
+```synx
+!active
+
+stats
+  base_hp 100
+  multiplier 3
+  armor 25
+
+total_hp:calc stats.base_hp * stats.multiplier
+effective_hp:calc total_hp + stats.armor
+```
+
+```json
+{
+  "stats": { "base_hp": 100, "multiplier": 3, "armor": 25 },
+  "total_hp": 300,
+  "effective_hp": 325
 }
 ```
 
@@ -819,7 +912,7 @@ nightmare_hp:ref:calc:*4 base_hp
 
 ### `:inherit` — Block Inheritance
 
-Merges all fields from a parent block into a child block. Child values override inherited ones. Use `_` prefix for private template blocks — they are excluded from the final output.
+Merges all fields from one or more parent blocks into a child block. Child values override inherited ones. Use `_` prefix for private template blocks — they are excluded from the final output.
 
 ```synx
 !active
@@ -856,7 +949,48 @@ wood:inherit:_base_resource
 
 Note: `_base_resource` is not included in the output because its name starts with `_`.
 
-**Multi-block inheritance — game entities:**
+**Multi-parent inheritance:**
+
+A single block can inherit from multiple parents. Parents merge left-to-right (later parents override earlier ones), and child fields override all.
+
+```synx
+!active
+
+_movable
+  speed 10
+  can_move true
+
+_damageable
+  hp 100
+  armor 5
+
+_attackable
+  damage 15
+  range 1
+
+tank:inherit:_movable:_damageable:_attackable
+  name Tank
+  armor 50
+  damage 120
+```
+
+```json
+{
+  "tank": {
+    "speed": 10,
+    "can_move": true,
+    "hp": 100,
+    "armor": 50,
+    "damage": 120,
+    "range": 1,
+    "name": "Tank"
+  }
+}
+```
+
+`tank` inherits `speed` and `can_move` from `_movable`, `hp` from `_damageable`, `range` from `_attackable`, and overrides `armor` (50 instead of 5) and `damage` (120 instead of 15).
+
+**Multi-block inheritance chains — game entities:**
 
 ```synx
 !active
@@ -917,6 +1051,47 @@ const configDe = Synx.parse(text, { lang: 'de' });
 // configDe.title → "Hallo Welt"
 // configDe.description → "A great application" (fallback to 'en')
 ```
+
+**Pluralization — `:i18n:COUNT_FIELD`**
+
+When a count field name is specified after `:i18n`, the engine uses CLDR plural rules to select the correct plural form. The language entry must contain plural category keys (`one`, `few`, `many`, `other`, etc.).
+
+```synx
+!active
+
+item_count 5
+
+label:i18n:item_count
+  en
+    one {count} item found
+    other {count} items found
+  ru
+    one {count} предмет найден
+    few {count} предмета найдено
+    many {count} предметов найдено
+    other {count} предметов найдено
+```
+
+```javascript
+const config = Synx.parse(text, { lang: 'en' });
+// config.label → "5 items found"
+
+const configRu = Synx.parse(text, { lang: 'ru' });
+// configRu.label → "5 предметов найдено"
+```
+
+`{count}` in the plural string is automatically replaced with the actual count value.
+
+**Supported plural categories by language:**
+
+| Language | Categories |
+|----------|-----------|
+| English, German, Spanish, Italian (`en`, `de`, `es`, `it`) | `one` (1), `other` |
+| Russian, Ukrainian, Polish (`ru`, `uk`, `pl`) | `one`, `few`, `many` |
+| Czech, Slovak (`cs`, `sk`) | `one`, `few`, `other` |
+| French, Portuguese (`fr`, `pt`) | `one` (0–1), `other` |
+| Arabic (`ar`) | `zero`, `one`, `two`, `few`, `many`, `other` |
+| Japanese, Chinese, Korean (`ja`, `zh`, `ko`) | `other` (no plural forms) |
 
 ---
 
@@ -982,16 +1157,16 @@ Syntax: `{key}` for local keys, `{key:alias}` for included file keys, `{key:incl
 
 ---
 
-### `:include` — Import External File
+### `:include` / `:import` — Import External File
 
-Inserts the contents of another `.synx` file. Path is relative to the current file.
+Inserts the contents of another `.synx` file as a child block. Path is relative to the current file. `:import` is an alias for `:include` — they work identically. Use `:import` to avoid confusion with the `!include` directive.
 
 ```synx
 !active
 
 app_name MyApp
-database:include ./db.synx
-logging:include ./logging.synx
+database:import ./db.synx
+logging:import ./logging.synx
 ```
 
 Contents of `db.synx`:
@@ -1016,6 +1191,16 @@ name mydb
 ```
 
 If the included file also has `!active`, its markers are resolved too.
+
+**Import comparison matrix:**
+
+| Feature | `!include` (directive) | `:include` / `:import` (marker) |
+|---|---|---|
+| **Syntax** | `!include ./file.synx [alias]` | `key:import ./file.synx` |
+| **Where** | Top of file, before keys | On any key line |
+| **Result** | Makes keys available for `{key:alias}` interpolation | Embeds file contents as a nested object under the key |
+| **Use case** | String interpolation across files | Structured config composition |
+| **Multiple files** | Yes, each gets an alias | Yes, one per key |
 
 ---
 

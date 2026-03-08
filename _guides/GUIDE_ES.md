@@ -58,7 +58,7 @@
   - [:i18n — Valores Multilingües](#i18n--valores-multilingües)
   - [:secret — Valor Oculto](#secret--valor-oculto)
   - [auto-{} — Interpolación de Cadenas](#auto---interpolación-de-cadenas)
-  - [:include — Importar Archivo Externo](#include--importar-archivo-externo)
+  - [:include / :import — Importar Archivo Externo](#include--import--importar-archivo-externo)
   - [:unique — Eliminar Duplicados](#unique--eliminar-duplicados)
   - [:split — Cadena a Arreglo](#split--cadena-a-arreglo)
   - [:join — Arreglo a Cadena](#join--arreglo-a-cadena)
@@ -242,7 +242,17 @@ phrase ¡Me encanta programar!
 empty_value
 ```
 
-> Los números, booleanos (`true`/`false`) y `null` se detectan automáticamente. Todo lo demás es cadena.
+> Los numeros, booleanos (`true`/`false`) y `null` se detectan automaticamente. Todo lo demas es cadena.
+
+> **Valores entre comillas** se tratan como string literal: `"null"`, `"true"`, `"42"` permanecen strings.
+
+Deteccion de tipos del parser (sin `(type)` explicito):
+
+1. Exacto `true`/`false` -> Bool
+2. Exacto `null` -> Null
+3. Patron entero -> Int
+4. Patron decimal -> Float
+5. En cualquier otro caso -> String
 
 ---
 
@@ -494,6 +504,17 @@ total:calc base_price + tax
 
 Operadores: `+` `-` `*` `/` `%` `(` `)`
 
+Soporta dot-path para valores anidados:
+
+```synx
+!active
+stats
+  base_hp 100
+  multiplier 3
+
+total_hp:calc stats.base_hp * stats.multiplier
+```
+
 ### `:random` — Selección Aleatoria
 
 ```synx
@@ -569,6 +590,19 @@ steel:inherit:_base_resource
   material metal
 ```
 
+Se admite herencia de multiples padres. Orden: izquierda -> derecha, y el hijo sobrescribe a todos.
+
+```synx
+!active
+_movable
+  speed 10
+_damageable
+  hp 100
+
+tank:inherit:_movable:_damageable
+  hp 150
+```
+
 **Herencia multinivel:**
 
 ```synx
@@ -609,6 +643,18 @@ const config = Synx.parse(text, { lang: 'es' });
 // config.title → "Hola Mundo"
 ```
 
+Pluralizacion soportada via `:i18n:COUNT_FIELD`:
+
+```synx
+!active
+count 5
+
+label:i18n:count
+  en
+    one {count} item
+    other {count} items
+```
+
 ---
 
 ### `:secret` — Valor Oculto
@@ -646,12 +692,19 @@ Sintaxis: `{clave}` para claves locales, `{clave:alias}` para archivos incluidos
 
 > **Legacy:** El marcador `:template` sigue funcionando, pero ya no es necesario.
 
-### `:include` — Importar Archivo Externo
+### `:include / :import` — Importar Archivo Externo
 
 ```synx
 !active
-database:include ./db.synx
+database:import ./db.synx
 ```
+
+`:import` es alias de `:include` (mismo comportamiento).
+
+| Mecanismo | Donde se usa | Que hace |
+|---|---|---|
+| `!include ./file.synx [alias]` | directiva de archivo | habilita `{key:alias}` para interpolacion |
+| `key:include ./file.synx` / `key:import ./file.synx` | marcador en clave | incrusta el archivo como objeto hijo |
 
 ### `:unique` — Eliminar Duplicados
 

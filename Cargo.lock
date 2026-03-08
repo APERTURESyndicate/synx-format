@@ -640,7 +640,7 @@ dependencies = [
 
 [[package]]
 name = "synx-c"
-version = "3.2.1"
+version = "3.3.0"
 dependencies = [
  "serde_json",
  "synx-core",
@@ -648,7 +648,7 @@ dependencies = [
 
 [[package]]
 name = "synx-core"
-version = "3.2.1"
+version = "3.3.0"
 dependencies = [
  "itoa",
  "memchr",
@@ -658,7 +658,7 @@ dependencies = [
 
 [[package]]
 name = "synx-node"
-version = "3.2.1"
+version = "3.3.0"
 dependencies = [
  "napi",
  "napi-build",
@@ -668,7 +668,7 @@ dependencies = [
 
 [[package]]
 name = "synx-python"
-version = "3.2.1"
+version = "3.3.0"
 dependencies = [
  "pyo3",
  "synx-core",
@@ -676,7 +676,7 @@ dependencies = [
 
 [[package]]
 name = "synx-wasm"
-version = "3.2.1"
+version = "3.3.0"
 dependencies = [
  "serde-wasm-bindgen",
  "serde_json",

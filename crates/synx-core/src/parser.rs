@@ -425,6 +425,17 @@ fn parse_constraints(raw: &str) -> Constraints {
 // ─── Value casting ───────────────────────────────────────
 
 fn cast(val: &str) -> Value {
+    // Quoted strings preserve literal value (bypass auto-casting)
+    // "null" → String("null"), "true" → String("true"), "123" → String("123")
+    if val.len() >= 2 {
+        let bytes = val.as_bytes();
+        if (bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"')
+            || (bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\'')
+        {
+            return Value::String(val[1..val.len() - 1].to_string());
+        }
+    }
+
     match val {
         "true" => Value::Bool(true),
         "false" => Value::Bool(false),

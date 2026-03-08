@@ -26,6 +26,11 @@ pub fn resolve(result: &mut ParseResult, options: &Options) {
         root_map.retain(|k, _| !k.starts_with('_'));
     }
 
+    // ── Build type registry ──
+    let type_registry = build_type_registry(&metadata);
+    // ── Build constraint registry ──
+    let constraint_registry = build_constraint_registry(&metadata);
+
     // SAFETY: `root_ptr` is a raw pointer to `result.root` used exclusively
     // for *immutable* read access inside marker handlers (:calc, :alias,
     // :map, :watch) that need to look up other keys in the root
@@ -37,6 +42,13 @@ pub fn resolve(result: &mut ParseResult, options: &Options) {
     //   3. The pointer is valid for the entire duration of `resolve_value`.
     let root_ptr = &mut result.root as *mut Value;
     resolve_value(&mut result.root, root_ptr, options, &metadata, "", &includes_map);
+
+    // ── Validate field constraints (global, by field name) ──
+    validate_field_constraints(&mut result.root, &constraint_registry);
+    
+    // ── Validate field types ──
+    validate_field_types(&mut result.root, &type_registry, "");
+    
     result.metadata = metadata;
     result.includes = includes_directives;
 }
@@ -119,8 +131,8 @@ fn apply_markers(
 ) {
     let markers = &meta.markers;
 
-    // ── :include ──
-    if markers.contains(&"include".to_string()) {
+    // ── :include / :import ──
+    if markers.contains(&"include".to_string()) || markers.contains(&"import".to_string()) {
         if let Some(Value::String(file_path)) = map.get(key) {
             let base = options
                 .base_path
@@ -253,6 +265,17 @@ fn apply_markers(
 
     // ── :i18n ──
     // Selects a localized value from a nested object based on options.lang.
+    // Supports pluralization: key:i18n:COUNT_FIELD
+    //   When count field is specified, the language entry must contain plural forms:
+    //   title:i18n:item_count
+    //     en
+    //       one {count} item
+    //       other {count} items
+    //     ru
+    //       one {count} предмет
+    //       few {count} предмета
+    //       many {count} предметов
+    //       other {count} предметов
     if markers.contains(&"i18n".to_string()) {
         if let Some(Value::Object(translations)) = map.get(key) {
             let lang = options.lang.as_deref().unwrap_or("en");
@@ -261,7 +284,38 @@ fn apply_markers(
                 .or_else(|| translations.values().next())
                 .cloned()
                 .unwrap_or(Value::Null);
-            map.insert(key.to_string(), val);
+
+            // Check for pluralization: i18n:count_field
+            let i18n_idx = markers.iter().position(|m| m == "i18n").unwrap();
+            let count_field = markers.get(i18n_idx + 1).cloned();
+
+            if let (Some(ref cf), Value::Object(ref plural_forms)) = (&count_field, &val) {
+                // Look up count value from current map or root
+                let count_val = map.get(cf)
+                    .and_then(value_as_number)
+                    .or_else(|| {
+                        let root_ref = unsafe { &*root_ptr };
+                        deep_get(root_ref, cf).and_then(|v| value_as_number(&v))
+                    })
+                    .unwrap_or(0.0) as i64;
+
+                let category = plural_category(lang, count_val);
+                let chosen = plural_forms.get(category)
+                    .or_else(|| plural_forms.get("other"))
+                    .or_else(|| plural_forms.values().next())
+                    .cloned()
+                    .unwrap_or(Value::Null);
+
+                // Substitute {count} in the result string
+                if let Value::String(ref s) = chosen {
+                    let replaced = s.replace("{count}", &count_val.to_string());
+                    map.insert(key.to_string(), Value::String(replaced));
+                } else {
+                    map.insert(key.to_string(), chosen);
+                }
+            } else {
+                map.insert(key.to_string(), val);
+            }
         }
     }
 
@@ -270,7 +324,7 @@ fn apply_markers(
         if let Some(Value::String(expr)) = map.get(key) {
             let mut resolved = expr.clone();
 
-            // Substitute variables from root
+            // Substitute variables from root (flat keys)
             let root_ref = unsafe { &*root_ptr };
             if let Value::Object(ref root_map) = root_ref {
                 for (rk, rv) in root_map {
@@ -280,7 +334,7 @@ fn apply_markers(
                 }
             }
 
-            // Substitute from current object
+            // Substitute from current object (flat keys)
             for (rk, rv) in map.iter() {
                 if rk != key {
                     if let Some(n) = value_as_number(rv) {
@@ -288,6 +342,37 @@ fn apply_markers(
                     }
                 }
             }
+
+            // Substitute dot-path references (e.g., base.hp, server.port)
+            let root_ref2 = unsafe { &*root_ptr };
+            let mut dot_resolved = String::new();
+            let bytes = resolved.as_bytes();
+            let len = bytes.len();
+            let mut i = 0;
+            while i < len {
+                if is_word_char(bytes[i]) {
+                    let start = i;
+                    let mut has_dot = false;
+                    while i < len && (is_word_char(bytes[i]) || bytes[i] == b'.') {
+                        if bytes[i] == b'.' { has_dot = true; }
+                        i += 1;
+                    }
+                    let token = &resolved[start..i];
+                    if has_dot && token.contains('.') {
+                        if let Some(val) = deep_get(root_ref2, token) {
+                            if let Some(n) = value_as_number(&val) {
+                                dot_resolved.push_str(&format_number(n));
+                                continue;
+                            }
+                        }
+                    }
+                    dot_resolved.push_str(token);
+                } else {
+                    dot_resolved.push(bytes[i] as char);
+                    i += 1;
+                }
+            }
+            resolved = dot_resolved;
 
             match safe_calc(&resolved) {
                 Ok(result) => {
@@ -866,6 +951,15 @@ fn extract_from_file_content(content: &str, key_path: &str, ext: &str) -> Option
 // ─── Helpers ─────────────────────────────────────────────
 
 fn cast_primitive(val: &str) -> Value {
+    // Quoted strings preserve literal value
+    if val.len() >= 2 {
+        let bytes = val.as_bytes();
+        if (bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"')
+            || (bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\'')
+        {
+            return Value::String(val[1..val.len() - 1].to_string());
+        }
+    }
     match val {
         "true" => Value::Bool(true),
         "false" => Value::Bool(false),
@@ -1006,31 +1100,35 @@ fn apply_inheritance(root: &mut Value, metadata: &HashMap<String, MetaMap>) {
         None => return,
     };
 
-    // Collect inherit targets first to avoid borrow issues
-    let mut inherits: Vec<(String, String)> = Vec::new();
+    // Collect inherit targets: child_key → [parent1, parent2, ...]
+    let mut inherits: Vec<(String, Vec<String>)> = Vec::new();
     for (key, meta) in &root_meta {
         if meta.markers.contains(&"inherit".to_string()) {
             let idx = meta.markers.iter().position(|m| m == "inherit").unwrap();
-            if let Some(parent_name) = meta.markers.get(idx + 1) {
-                inherits.push((key.clone(), parent_name.clone()));
+            // All markers after "inherit" are parent names (multi-parent support)
+            let parents: Vec<String> = meta.markers[idx + 1..].to_vec();
+            if !parents.is_empty() {
+                inherits.push((key.clone(), parents));
             }
         }
     }
 
     let map = unsafe { &mut *root_map };
-    for (child_key, parent_name) in &inherits {
-        let parent_fields: HashMap<String, Value> = match map.get(parent_name) {
-            Some(Value::Object(p)) => p.clone(),
-            _ => continue,
-        };
-        let child_fields: HashMap<String, Value> = match map.get(child_key) {
-            Some(Value::Object(c)) => c.clone(),
-            _ => continue,
-        };
-        // Merge: parent fields first, child overrides
-        let mut merged = parent_fields;
-        for (k, v) in child_fields {
-            merged.insert(k, v);
+    for (child_key, parents) in &inherits {
+        // Merge parents left-to-right: first parent is base, each subsequent overrides
+        let mut merged: HashMap<String, Value> = HashMap::new();
+        for parent_name in parents {
+            if let Some(Value::Object(p)) = map.get(parent_name) {
+                for (k, v) in p {
+                    merged.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        // Child fields override all parents
+        if let Some(Value::Object(c)) = map.get(child_key) {
+            for (k, v) in c {
+                merged.insert(k.clone(), v.clone());
+            }
         }
         map.insert(child_key.clone(), Value::Object(merged));
     }
@@ -1153,6 +1251,242 @@ fn load_includes(
     map
 }
 
+// ─── Type validation ──────────────────────────────────────
+
+/// Build a global type registry from all metadata.
+/// Maps field name → expected type (e.g., "hp" → "int").
+fn build_type_registry(metadata: &HashMap<String, MetaMap>) -> HashMap<String, String> {
+    let mut registry: HashMap<String, String> = HashMap::new();
+
+    for meta_map in metadata.values() {
+        for (key, meta) in meta_map {
+            if let Some(ref type_hint) = meta.type_hint {
+                // If type already registered, check for conflict
+                if let Some(existing) = registry.get(key) {
+                    if existing != type_hint {
+                        // Type conflict: same field defined with different types
+                        // For now, first definition wins; could also log error
+                    }
+                } else {
+                    registry.insert(key.clone(), type_hint.clone());
+                }
+            }
+        }
+    }
+
+    registry
+}
+
+/// Build a global constraint registry from all metadata.
+/// Maps field name → merged constraints from [] declarations.
+fn build_constraint_registry(metadata: &HashMap<String, MetaMap>) -> HashMap<String, Constraints> {
+    let mut registry: HashMap<String, Constraints> = HashMap::new();
+
+    for meta_map in metadata.values() {
+        for (key, meta) in meta_map {
+            if let Some(ref constraints) = meta.constraints {
+                registry
+                    .entry(key.clone())
+                    .and_modify(|existing| merge_constraints(existing, constraints))
+                    .or_insert_with(|| constraints.clone());
+            }
+        }
+    }
+
+    registry
+}
+
+/// Merge constraints when the same field is declared multiple times.
+/// Strategy is intentionally strict to keep schemas consistent across templates.
+fn merge_constraints(base: &mut Constraints, incoming: &Constraints) {
+    if incoming.required {
+        base.required = true;
+    }
+    if incoming.readonly {
+        base.readonly = true;
+    }
+
+    // Stricter numeric bounds win.
+    base.min = match (base.min, incoming.min) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (None, Some(b)) => Some(b),
+        (a, None) => a,
+    };
+    base.max = match (base.max, incoming.max) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (None, Some(b)) => Some(b),
+        (a, None) => a,
+    };
+
+    // Keep first non-empty type/pattern/enum declaration.
+    if base.type_name.is_none() {
+        base.type_name = incoming.type_name.clone();
+    }
+    if base.pattern.is_none() {
+        base.pattern = incoming.pattern.clone();
+    }
+    if base.enum_values.is_none() {
+        base.enum_values = incoming.enum_values.clone();
+    }
+}
+
+/// Validate [] constraints recursively for all object fields that have
+/// a registered constraint rule.
+fn validate_field_constraints(value: &mut Value, registry: &HashMap<String, Constraints>) {
+    if let Value::Object(ref mut map) = value {
+        let keys: Vec<String> = map.keys().cloned().collect();
+        for key in &keys {
+            if let Some(constraints) = registry.get(key) {
+                validate_constraints(map, key, constraints);
+            }
+
+            if let Some(child) = map.get_mut(key) {
+                match child {
+                    Value::Object(_) => validate_field_constraints(child, registry),
+                    Value::Array(arr) => {
+                        for item in arr.iter_mut() {
+                            if let Value::Object(_) = item {
+                                validate_field_constraints(item, registry);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+/// Validate that all values in the tree match their registered types.
+fn validate_field_types(value: &mut Value, registry: &HashMap<String, String>, path: &str) {
+    match value {
+        Value::Object(ref mut map) => {
+            let keys: Vec<String> = map.keys().cloned().collect();
+            for key in &keys {
+                if let Some(expected_type) = registry.get(key) {
+                    if let Some(val) = map.get(key) {
+                        if !value_matches_type(val, expected_type) {
+                            // Type mismatch: replace with error string
+                            let current_type = value_type_name(val);
+                            map.insert(key.clone(), Value::String(
+                                format!("TYPE_ERR: '{}' expected {} but got {}", key, expected_type, current_type)
+                            ));
+                        }
+                    }
+                }
+                
+                // Recurse into nested objects and arrays
+                if let Some(child) = map.get_mut(key) {
+                    match child {
+                        Value::Object(_) => {
+                            let child_path = if path.is_empty() {
+                                key.clone()
+                            } else {
+                                format!("{}.{}", path, key)
+                            };
+                            validate_field_types(child, registry, &child_path);
+                        }
+                        Value::Array(ref mut arr) => {
+                            for item in arr.iter_mut() {
+                                if let Value::Object(_) = item {
+                                    validate_field_types(item, registry, path);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Check if a value matches an expected type.
+fn value_matches_type(value: &Value, expected_type: &str) -> bool {
+    match expected_type {
+        "int" => matches!(value, Value::Int(_)),
+        "float" => matches!(value, Value::Float(_) | Value::Int(_)),
+        "bool" => matches!(value, Value::Bool(_)),
+        "string" => matches!(value, Value::String(_) | Value::Secret(_)),
+        "array" => matches!(value, Value::Array(_)),
+        "object" => matches!(value, Value::Object(_)),
+        _ => true, // Unknown types are accepted
+    }
+}
+
+/// Get the human-readable name of a value's type.
+fn value_type_name(value: &Value) -> String {
+    match value {
+        Value::Int(_) => "int".to_string(),
+        Value::Float(_) => "float".to_string(),
+        Value::Bool(_) => "bool".to_string(),
+        Value::String(_) => "string".to_string(),
+        Value::Secret(_) => "secret".to_string(),
+        Value::Array(_) => "array".to_string(),
+        Value::Object(_) => "object".to_string(),
+        Value::Null => "null".to_string(),
+    }
+}
+
+// ─── CLDR plural rules ───────────────────────────────────
+
+/// Return the CLDR plural category for a given language and integer count.
+/// Categories: "zero", "one", "two", "few", "many", "other".
+fn plural_category(lang: &str, n: i64) -> &'static str {
+    let abs_n = n.unsigned_abs();
+    let n10 = abs_n % 10;
+    let n100 = abs_n % 100;
+
+    match lang {
+        // East Slavic: Russian, Ukrainian, Belarusian
+        "ru" | "uk" | "be" => {
+            if n10 == 1 && n100 != 11 {
+                "one"
+            } else if (2..=4).contains(&n10) && !(12..=14).contains(&n100) {
+                "few"
+            } else {
+                "many"
+            }
+        }
+        // West/South Slavic: Polish
+        "pl" => {
+            if n10 == 1 && n100 != 11 {
+                "one"
+            } else if (2..=4).contains(&n10) && !(12..=14).contains(&n100) {
+                "few"
+            } else {
+                "many"
+            }
+        }
+        // Czech, Slovak
+        "cs" | "sk" => {
+            if abs_n == 1 { "one" }
+            else if (2..=4).contains(&abs_n) { "few" }
+            else { "other" }
+        }
+        // Arabic
+        "ar" => {
+            if abs_n == 0 { "zero" }
+            else if abs_n == 1 { "one" }
+            else if abs_n == 2 { "two" }
+            else if (3..=10).contains(&n100) { "few" }
+            else if (11..=99).contains(&n100) { "many" }
+            else { "other" }
+        }
+        // French, Portuguese (Brazilian) — 0 and 1 are "one"
+        "fr" | "pt" => {
+            if abs_n <= 1 { "one" } else { "other" }
+        }
+        // Japanese, Chinese, Korean, Vietnamese, Thai — no plural forms
+        "ja" | "zh" | "ko" | "vi" | "th" => "other",
+        // English, German, Spanish, Italian, Dutch, Swedish, Norwegian, Danish, etc.
+        _ => {
+            if abs_n == 1 { "one" } else { "other" }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{parse, Options, Value};
@@ -1226,5 +1560,204 @@ mod tests {
         resolve(&mut r, &Options::default());
         let map = r.root.as_object().unwrap();
         assert_eq!(map["greeting"], Value::String("Hello, Wario!".into()));
+    }
+
+    #[test]
+    fn test_type_validation() {
+        // Test that type validation works: hp(int) defined in _base_unit,
+        // then used in other places with correct type
+        let mut r = parse(
+            "!active\n\
+            _base_unit\n  \
+              hp(int) 100\n  \
+              speed(float) 1.5\n\
+            infantry:inherit:_base_unit\n  \
+              name Infantry\n  \
+              hp 80"
+        );
+        resolve(&mut r, &Options::default());
+        let map = r.root.as_object().unwrap();
+        
+        // _base_unit should be removed (private)
+        assert!(!map.contains_key("_base_unit"));
+        
+        // infantry should exist with correct types
+        let infantry = map["infantry"].as_object().unwrap();
+        assert_eq!(infantry["hp"], Value::Int(80));  // Correct: int
+        assert_eq!(infantry["speed"], Value::Float(1.5));  // Correct: float
+    }
+
+    #[test]
+    fn test_type_validation_error() {
+        // Test that type mismatch is detected and replaced with error
+        let mut r = parse(
+            "!active\n\
+            _base_unit\n  \
+              hp(int) 100\n\
+            infantry:inherit:_base_unit\n  \
+              hp hello"  // Type mismatch: string instead of int
+        );
+        resolve(&mut r, &Options::default());
+        let map = r.root.as_object().unwrap();
+        
+        let infantry = map["infantry"].as_object().unwrap();
+        // Should be replaced with error message
+        if let Value::String(s) = &infantry["hp"] {
+            assert!(s.contains("TYPE_ERR"));
+        } else {
+            panic!("Expected error string for type mismatch");
+        }
+    }
+
+    #[test]
+    fn test_constraint_validation_inherited_range() {
+        let mut r = parse(
+            "!active\n\
+            _base_unit\n  \
+              hp[min:1, max:50000] 1000\n\
+            infantry:inherit:_base_unit\n  \
+              hp 60000"
+        );
+        resolve(&mut r, &Options::default());
+        let map = r.root.as_object().unwrap();
+        let infantry = map["infantry"].as_object().unwrap();
+
+        if let Value::String(s) = &infantry["hp"] {
+            assert!(s.contains("CONSTRAINT_ERR"));
+            assert!(s.contains("exceeds max"));
+        } else {
+            panic!("Expected constraint error string");
+        }
+    }
+
+    #[test]
+    fn test_constraint_validation_required() {
+        let mut r = parse(
+            "!active\n\
+            _base_unit\n  \
+                            description[type:string, required] hello\n\
+            scout:inherit:_base_unit\n  \
+                            description null"
+        );
+        resolve(&mut r, &Options::default());
+        let map = r.root.as_object().unwrap();
+        let scout = map["scout"].as_object().unwrap();
+
+        if let Value::String(s) = &scout["description"] {
+            assert!(s.contains("CONSTRAINT_ERR"));
+            assert!(s.contains("required"));
+        } else {
+            panic!("Expected required-constraint error string");
+        }
+    }
+
+    #[test]
+    fn test_multi_parent_inherit() {
+        let mut r = parse(
+            "!active\n\
+            _movable\n  \
+              speed 10\n  \
+              can_move true\n\
+            _damageable\n  \
+              hp 100\n  \
+              armor 5\n\
+            tank:inherit:_movable:_damageable\n  \
+              name Tank\n  \
+              armor 20"
+        );
+        resolve(&mut r, &Options::default());
+        let map = r.root.as_object().unwrap();
+
+        assert!(!map.contains_key("_movable"));
+        assert!(!map.contains_key("_damageable"));
+
+        let tank = map["tank"].as_object().unwrap();
+        assert_eq!(tank["speed"], Value::Int(10));        // from _movable
+        assert_eq!(tank["can_move"], Value::Bool(true));   // from _movable
+        assert_eq!(tank["hp"], Value::Int(100));           // from _damageable
+        assert_eq!(tank["armor"], Value::Int(20));         // child overrides _damageable's 5
+        assert_eq!(tank["name"], Value::String("Tank".into()));
+    }
+
+    #[test]
+    fn test_calc_dot_path() {
+        let mut r = parse(
+            "!active\n\
+            stats\n  \
+              base_hp 100\n  \
+              multiplier 3\n\
+            total_hp:calc stats.base_hp * stats.multiplier"
+        );
+        resolve(&mut r, &Options::default());
+        let map = r.root.as_object().unwrap();
+        assert_eq!(map["total_hp"], Value::Int(300));
+    }
+
+    #[test]
+    fn test_i18n_plural_en() {
+        let mut r = parse(
+            "!active\n\
+            count 5\n\
+            items:i18n:count\n  \
+              en\n    \
+                one item\n    \
+                other items"
+        );
+        let opts = Options { lang: Some("en".into()), ..Default::default() };
+        resolve(&mut r, &opts);
+        let map = r.root.as_object().unwrap();
+        assert_eq!(map["items"], Value::String("items".into()));
+    }
+
+    #[test]
+    fn test_i18n_plural_en_one() {
+        let mut r = parse(
+            "!active\n\
+            count 1\n\
+            items:i18n:count\n  \
+              en\n    \
+                one {count} item\n    \
+                other {count} items"
+        );
+        let opts = Options { lang: Some("en".into()), ..Default::default() };
+        resolve(&mut r, &opts);
+        let map = r.root.as_object().unwrap();
+        assert_eq!(map["items"], Value::String("1 item".into()));
+    }
+
+    #[test]
+    fn test_i18n_plural_ru() {
+        let mut r = parse(
+            "!active\n\
+            count 3\n\
+            items:i18n:count\n  \
+              ru\n    \
+                one предмет\n    \
+                few предмета\n    \
+                many предметов\n    \
+                other предметов"
+        );
+        let opts = Options { lang: Some("ru".into()), ..Default::default() };
+        resolve(&mut r, &opts);
+        let map = r.root.as_object().unwrap();
+        assert_eq!(map["items"], Value::String("предмета".into()));
+    }
+
+    #[test]
+    fn test_quoted_null_preserved() {
+        let r = parse("status \"null\"\nenabled \"true\"\ncount \"42\"");
+        let map = r.root.as_object().unwrap();
+        assert_eq!(map["status"], Value::String("null".into()));
+        assert_eq!(map["enabled"], Value::String("true".into()));
+        assert_eq!(map["count"], Value::String("42".into()));
+    }
+
+    #[test]
+    fn test_unquoted_null_is_null() {
+        let r = parse("status null\nenabled true\ncount 42");
+        let map = r.root.as_object().unwrap();
+        assert_eq!(map["status"], Value::Null);
+        assert_eq!(map["enabled"], Value::Bool(true));
+        assert_eq!(map["count"], Value::Int(42));
     }
 }

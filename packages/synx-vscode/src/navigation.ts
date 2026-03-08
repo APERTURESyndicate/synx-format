@@ -108,10 +108,13 @@ export function createDefinitionProvider(): vscode.Disposable {
 
       // :calc <expression with key names> → go to referenced key
       if (currentNode?.markers.includes('calc') && currentNode.rawValue) {
-        const wordR = doc.getWordRangeAtPosition(position, /[a-zA-Z_]\w*/);
+        const wordR = doc.getWordRangeAtPosition(position, /[a-zA-Z_]\w*(?:\.[a-zA-Z_]\w*)*/);
         if (wordR) {
           const word = doc.getText(wordR);
-          const target = parsed.keyMap.get(word);
+          const parentPath = currentNode.dotPath.includes('.')
+            ? currentNode.dotPath.substring(0, currentNode.dotPath.lastIndexOf('.'))
+            : '';
+          const target = parsed.keyMap.get(word) ?? (parentPath ? parsed.keyMap.get(`${parentPath}.${word}`) : undefined);
           if (target) {
             return new vscode.Location(doc.uri,
               new vscode.Position(target.line, target.column));
@@ -119,11 +122,27 @@ export function createDefinitionProvider(): vscode.Disposable {
         }
       }
 
-      // :include <path> → go to file
-      if (currentNode?.markers.includes('include') && currentNode.rawValue) {
-        const vpos = line.lastIndexOf(currentNode.rawValue);
-        if (vpos !== -1 && position.character >= vpos) {
-          const filePath = currentNode.rawValue.trim();
+      // :inherit[:parent...] → go to parent definition under cursor
+      if (currentNode?.markers.includes('inherit')) {
+        const wordR = doc.getWordRangeAtPosition(position, /[a-zA-Z_]\w*(?:\.[a-zA-Z_]\w*)*/);
+        if (wordR) {
+          const word = doc.getText(wordR);
+          const parentPath = currentNode.dotPath.includes('.')
+            ? currentNode.dotPath.substring(0, currentNode.dotPath.lastIndexOf('.'))
+            : '';
+          const target = parsed.keyMap.get(word) ?? (parentPath ? parsed.keyMap.get(`${parentPath}.${word}`) : undefined);
+          if (target) {
+            return new vscode.Location(doc.uri,
+              new vscode.Position(target.line, target.column));
+          }
+        }
+      }
+
+      // :include / :import <path> → go to file
+      if ((currentNode?.markers.includes('include') || currentNode?.markers.includes('import')) && currentNode.rawValue) {
+        const filePath = currentNode.rawValue.trim();
+        const vpos = line.lastIndexOf(filePath);
+        if (vpos !== -1 && position.character >= vpos && position.character <= vpos + filePath.length) {
           const resolved = vscode.Uri.joinPath(
             vscode.Uri.file(doc.uri.fsPath).with({ path: doc.uri.fsPath.replace(/[^/\\]+$/, '') }),
             filePath

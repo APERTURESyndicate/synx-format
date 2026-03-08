@@ -1,6 +1,6 @@
 {
   "name": "@aperturesyndicate/synx",
-  "version": "3.2.1",
+  "version": "3.3.0",
   "description": "SYNX: The Active Data Format. Faster than JSON, cheaper for AI tokens, built-in logic.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
