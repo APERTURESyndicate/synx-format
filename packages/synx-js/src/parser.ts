@@ -14,6 +14,7 @@ import type {
   SynxValue,
   SynxMode,
   SynxParseResult,
+  SynxInclude,
   SynxMeta,
   SynxMetaMap,
   SynxConstraints,
@@ -174,6 +175,7 @@ export function parseData(text: string): SynxParseResult {
 
   let mode: SynxMode = 'static';
   let locked = false;
+  const includes: SynxInclude[] = [];
   let currentBlock: { indent: number; obj: SynxObject; key: string } | null = null;
   let currentList: { indent: number; arr: SynxArray } | null = null;
   let inBlockComment = false;
@@ -228,10 +230,17 @@ export function parseData(text: string): SynxParseResult {
     const trimmed = rawLine.substring(indent, trimEndPos);
     const trimmedLen = trimmed.length;
 
-    // ── Mode declaration: !active / !lock ──
+    // ── Mode declaration: !active / !lock / !include ──
     if (fc === 33) {
       if (trimmed === '!active') { mode = 'active'; continue; }
       if (trimmed === '!lock') { locked = true; continue; }
+      if (trimmed.startsWith('!include ')) {
+        const parts = trimmed.substring(9).trim().split(/\s+/);
+        const inclPath = parts[0];
+        const alias = parts[1] || inclPath.replace(/^.*[\/\\]/, '').replace(/\.synx$/i, '');
+        includes.push({ path: inclPath, alias });
+        continue;
+      }
     }
 
     // ── Continue multiline block ──
@@ -416,5 +425,5 @@ export function parseData(text: string): SynxParseResult {
     }
   }
 
-  return { root, mode, locked };
+  return { root, mode, locked, includes: includes.length > 0 ? includes : undefined };
 }

@@ -1,6 +1,6 @@
 [package]
 name = "synx-core"
-version = "3.2.0"
+version = "3.2.1"
 edition = "2021"
 authors = ["APERTURESyndicate <support@aperturesyndicate.com>"]
 description = "SYNX — The Active Data Format. Core parser + engine with full !active support."
@@ -13,6 +13,11 @@ categories = ["parser-implementations", "config"]
 memchr = "2"
 itoa = "1"
 ryu = "1"
+serde = { version = "1", features = ["derive"], optional = true }
+
+[features]
+default = []
+serde = ["dep:serde"]
 
 [dev-dependencies]
 

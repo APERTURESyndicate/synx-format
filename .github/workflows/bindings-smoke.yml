@@ -1,0 +1,77 @@
+name: bindings-smoke
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  rust-and-bindings:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - check: core-tests
+            os: ubuntu-latest
+          - check: python-smoke
+            os: ubuntu-latest
+          - check: c-smoke
+            os: ubuntu-latest
+          - check: wasm-smoke
+            os: ubuntu-latest
+          - check: node-smoke
+            os: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Python
+        if: matrix.check == 'python-smoke'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Core tests
+        if: matrix.check == 'core-tests'
+        run: cargo test -p synx-core
+
+      - name: Python smoke (Rust unit tests)
+        if: matrix.check == 'python-smoke'
+        env:
+          PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
+        run: cargo test -p synx-python --lib
+
+      - name: C FFI smoke (Rust unit tests)
+        if: matrix.check == 'c-smoke'
+        run: cargo test -p synx-c --lib
+
+      - name: WASM smoke (Rust unit tests)
+        if: matrix.check == 'wasm-smoke'
+        run: cargo test -p synx-wasm --lib
+
+      - name: Setup Node
+        if: matrix.check == 'node-smoke'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Build Node binding
+        if: matrix.check == 'node-smoke'
+        run: cargo build --release -p synx-node
+
+      - name: Prepare Node addon artifact path
+        if: matrix.check == 'node-smoke'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path bindings/node/target/release | Out-Null
+          Copy-Item target/release/synx_node.dll bindings/node/target/release/synx_node.dll -Force
+
+      - name: Node smoke
+        if: matrix.check == 'node-smoke'
+        run: |
+          cd bindings/node
+          npm run smoke

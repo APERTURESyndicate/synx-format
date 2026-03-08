@@ -240,7 +240,27 @@ python format_results.py llm_results.json
 
 **See [LLM_BENCHMARK_GUIDE.md](benchmarks/LLM_BENCHMARK_GUIDE.md) for advanced options and detailed results interpretation.**
 
+## Binding API Parity (v3.2.1)
+
+Unified API surface across runtimes:
+
+| Binding | `parse` | `parse_active` | `stringify` | `format` | Notes |
+|---|---|---|---|---|---|
+| Rust core (`synx-core`) | ✅ | ✅ | ✅ | ✅ | Full options support via `Options` |
+| JavaScript (`packages/synx-js`) | ✅ | ✅ | ✅ | ✅ | Pure TypeScript implementation |
+| Python (`synx_native`) | ✅ | ✅ | ✅ | ✅ | `parse_active(text, env=None, base_path=None)` |
+| Node native (`bindings/node`) | ✅ | ✅ | ✅ | ✅ | `parseActive(text, { env, basePath })` |
+| WebAssembly (`bindings/wasm`) | ✅ | ✅ | ✅ | ✅ | Also provides `parse_object` / `parse_active_object` |
+| C FFI (`bindings/c-header`) | ✅ | ✅ | ✅ | ✅ | Returned strings must be freed with `synx_free()` |
+
+Behavior notes:
+
+- Browser WASM runs without host filesystem/env integration by default.
+- C FFI and WASM `stringify` use JSON input for stable cross-language interop.
+- This table documents API compatibility only; it does not change parser performance characteristics.
+
 ## Quick SYNX Syntax Reference
+
 ### Basic (always works)
 
 ```synx

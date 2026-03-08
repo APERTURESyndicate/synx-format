@@ -27,7 +27,7 @@ const MARKERS: MarkerInfo[] = [
   { label: 'unique', detail: 'Deduplicate list', docs: 'Removes duplicate elements from a list.\n\n```synx\ntags:unique\n  - action\n  - rpg\n  - action\n```\n\nResult: `["action", "rpg"]`', snippet: 'unique' },
   { label: 'include', detail: 'Include external file', docs: 'Inserts contents of another `.synx` file.\nPath is relative to the current file.\n\n```synx\ndatabase:include ./db.synx\n```', snippet: 'include' },
   { label: 'geo', detail: 'Region-based selection', docs: 'Selects a value based on the user\'s region.\n\n```synx\ncurrency:geo\n  - US USD\n  - EU EUR\n  - GB GBP\n```\n\nRequires runtime region support.', snippet: 'geo' },
-  { label: 'template', detail: 'String interpolation', docs: 'Substitutes `{placeholder}` with values from other keys.\nSupports dot-path for nested access.\n\n```synx\nfirst_name John\nlast_name Doe\ngreeting:template Hello, {first_name} {last_name}!\n\ndb_url:template http://{server.host}:{server.port}/db\n```', snippet: 'template' },
+  { label: 'template', detail: 'String interpolation (legacy)', docs: '**Legacy marker** — `{}` interpolation now works automatically on all string values in `!active` mode.\nYou no longer need `:template`.\n\n```synx\nfirst_name John\ngreeting Hello, {first_name}!\n```', snippet: 'template' },
   { label: 'split', detail: 'Split string → array', docs: 'Splits a string by delimiter into an array.\n\nDefault: comma. Keywords: `space`, `pipe`, `dash`, `dot`, `semi`, `tab`.\n\n```synx\ncolors:split red, green, blue\nwords:split:space hello world foo\n```', snippet: 'split' },
   { label: 'join', detail: 'Join array → string', docs: 'Joins list elements into a string with a delimiter.\n\nDefault: comma. Keywords: `space`, `pipe`, `dash`, `slash`.\n\n```synx\npath:join:slash\n  - home\n  - user\n  - documents\n```\n\nResult: `"home/user/documents"`', snippet: 'join' },
   { label: 'clamp', detail: 'Clamp number to range', docs: 'Clamps a numeric value to `[min, max]`.\n\n```synx\n!active\nvolume:clamp:0:100 75\nepsilon:clamp:0.0:1.0 1.5\n```\n\nMin and max are specified in the marker chain.', snippet: 'clamp:${1:0}:${2:100}' },
@@ -99,7 +99,7 @@ export function createCompletionProvider(): vscode.Disposable {
         const activeItem = new vscode.CompletionItem('!active', vscode.CompletionItemKind.Keyword);
         activeItem.detail = 'Enable active mode (functions + constraints)';
         activeItem.documentation = new vscode.MarkdownString(
-          'First line of the file. Enables `:calc`, `:random`, `:env`, `:template`, and other markers.\n\n' +
+          'First line of the file. Enables `:calc`, `:random`, `:env`, `{}` interpolation, and other markers.\n\n' +
           'Without `!active` — all markers are treated as plain text.'
         );
         if (before.trim() === '!') {
@@ -121,11 +121,24 @@ export function createCompletionProvider(): vscode.Disposable {
         }
         items.push(lockItem);
 
+        const includeItem = new vscode.CompletionItem('!include', vscode.CompletionItemKind.Keyword);
+        includeItem.detail = 'Include external file for {} references';
+        includeItem.documentation = new vscode.MarkdownString(
+          'Imports another `.synx` file, making its keys available for `{key:alias}` interpolation.\n\n' +
+          '```synx\n!active\n!include ./db.synx db\n\nurl http://{host:db}:{port:db}/mydb\n```'
+        );
+        if (before.trim() === '!') {
+          includeItem.insertText = 'include ${1:./file.synx} ${2:alias}';
+          includeItem.insertText = new vscode.SnippetString('include ${1:./file.synx} ${2:alias}');
+          includeItem.range = new vscode.Range(position.line, position.character, position.line, position.character);
+        }
+        items.push(includeItem);
+
         return items;
       }
 
-      // Inside :template → suggest known keys as {key}
-      if (before.includes(':template') || line.match(/:\w*template/)) {
+      // Inside {} (auto-interpolation) → suggest known keys
+      if (before.match(/\{[\w.]*$/) || before.includes(':template') || line.match(/:\w*template/)) {
         const parsed = parseSynx(doc.getText());
         const items: vscode.CompletionItem[] = [];
         for (const [keyPath] of parsed.keyMap) {

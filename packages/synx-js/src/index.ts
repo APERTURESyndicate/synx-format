@@ -107,9 +107,9 @@ class Synx {
     }
 
     // Small files or no native binding → pure JS
-    const { root, mode, locked } = parseData(text);
+    const { root, mode, locked, includes } = parseData(text);
     if (mode === 'active') {
-      resolve(root, options);
+      resolve(root, { ...options, _includes: includes } as any);
     }
     if (locked) {
       Object.defineProperty(root, '__synx_locked', {

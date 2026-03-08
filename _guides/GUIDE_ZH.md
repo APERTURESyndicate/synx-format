@@ -44,6 +44,9 @@
   - [多行文本](#多行文本)
   - [注释](#注释)
 - [活动模式 (`!active`)](#-活动模式-active)
+- [锁定模式 (`!lock`)](#-锁定模式-lock)
+- [Include指令 (`!include`)](#-include指令-include)
+- [规范格式 (`format`)](#-规范格式-format)
 - [标记完整参考](#-标记完整参考)
   - [:env — 环境变量](#env--环境变量)
   - [:default — 默认值](#default--默认值)
@@ -54,7 +57,7 @@
   - [:inherit — 块继承](#inherit--块继承)
   - [:i18n — 多语言值](#i18n--多语言值)
   - [:secret — 隐藏值](#secret--隐藏值)
-  - [:template — 字符串插值](#template--字符串插值)
+  - [auto-{} — 字符串插值](#auto---字符串插值)
   - [:include — 导入外部文件](#include--导入外部文件)
   - [:unique — 列表去重](#unique--列表去重)
   - [:split — 字符串转数组](#split--字符串转数组)
@@ -381,6 +384,27 @@ console.log(config.max_players); // ✅ 100（读取始终允许）
 
 ---
 
+## 📎 Include指令 (`!include`)
+
+`!include` 指令导入另一个 `.synx` 文件的键用于 `{key:alias}` 插值。与 `:include` 标记（将文件作为子块嵌入）不同，`!include` 使顶层键可用于字符串插值。
+
+```synx
+!active
+!include ./db.synx
+!include ./cache.synx redis
+
+db_url postgresql://{host:db}:{port:db}/{name:db}
+cache_url redis://{host:redis}:{port:redis}
+```
+
+| 指令 | 别名 | 访问 |
+|---|---|---|
+| `!include ./db.synx` | `db`（自动） | `{host:db}` |
+| `!include ./cache.synx redis` | `redis`（显式） | `{host:redis}` |
+| `!include ./config.synx`（唯一include） | — | `{host:include}` |
+
+---
+
 ## 🧹 规范格式 (`format`)
 
 `Synx.format()` 将任意 `.synx` 字符串重写为唯一的规范化形式。
@@ -481,15 +505,28 @@ loot:random 70 20 10
 
 ### `:alias` — 引用另一个键
 
+复制另一个键的解析值。修改源一次——所有别名自动更新。
+
 ```synx
 !active
 admin_email alex@example.com
 billing:alias admin_email
+complaints:alias admin_email
 ```
+
+`:alias` 先解析源，因此可以引用带有其他标记的键：
+
+```synx
+!active
+base_port:env:default:3000 PORT
+api_port:alias base_port
+```
+
+> **`:alias` vs `:ref`:** 两者都复制值，但 `:alias` 是终端操作。需要链式标记时使用 `:ref`（例如 `:ref:calc:*2`）。
 
 ### `:ref` — 链式引用
 
-类似 `:alias`，但将解析后的值传递给后续标记。支持简写计算。
+类似 `:alias`，但将解析后的值传递给后续标记。
 
 ```synx
 !active
@@ -499,7 +536,19 @@ quick_rate:ref base_rate
 double_rate:ref:calc:*2 base_rate
 ```
 
-简写 `:ref:calc:*2` 解析引用，然后将算术运算应用于该值。
+**简写语法:** `:ref:calc:*2` 解析引用并应用运算符。支持: `+`, `-`, `*`, `/`, `%`。
+
+**示例——难度缩放:**
+
+```synx
+!active
+
+base_hp 100
+easy_hp:ref:calc:*0.5 base_hp
+hard_hp:ref:calc:*2 base_hp
+```
+
+> **何时用 `:ref`，何时用 `:alias`:** 需要进一步处理值时用 `:ref`。简单复制用 `:alias`。
 
 ---
 
@@ -518,6 +567,26 @@ steel:inherit:_base_resource
   weight 25
   material metal
 ```
+
+**多级继承:**
+
+```synx
+!active
+
+_entity
+  visible true
+  layer world
+
+_enemy:inherit:_entity
+  hostile true
+  ai patrol
+
+goblin:inherit:_enemy
+  hp 30
+  damage 5
+```
+
+继承链生效: `_entity` → `_enemy` → `goblin`。私有块从输出中排除。
 
 ---
 
@@ -548,13 +617,33 @@ const config = Synx.parse(text, { lang: 'zh' });
 api_key:secret sk-1234567890
 ```
 
-### `:template` — 字符串插值
+### Auto-`{}` — 字符串插值
+
+在 `!active` 模式下，任何包含 `{key}` 的字符串值都会自动插值——无需标记。
 
 ```synx
 !active
 name John
-greeting:template 你好，{name}！
+greeting 你好，{name}！
+
+server
+  host api.example.com
+  port 443
+api_url https://{server.host}:{server.port}/v1
 ```
+
+**使用 `!include` 跨文件插值:**
+
+```synx
+!active
+!include ./db.synx
+
+conn_string postgresql://{host:db}:{port:db}/{name:db}
+```
+
+语法: `{key}` 本地键，`{key:alias}` 包含文件，`{key:include}` 唯一包含文件。
+
+> **兼容性:** `:template` 标记仍然有效，但不再需要。
 
 ### `:include` — 导入外部文件
 

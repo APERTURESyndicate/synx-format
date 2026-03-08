@@ -2,12 +2,33 @@
 
 All notable changes to this repository are documented in this file.
 
+## [3.2.1] - 2026-03-08
+
+### Added
+- **Python binding: `parse_active` now accepts options** — `env` (dict) and `base_path` (str) parameters for `:env` and `:include` marker resolution. Previously `parse_active` used only defaults.
+- **Python binding: `stringify`** — converts a Python dict/list back to SYNX format text.
+- **Python binding: `format`** — reformats SYNX text into canonical form (sorted keys, normalized indentation).
+- **Node.js binding: `stringify`** — converts a JS object back to SYNX format text.
+- **Node.js binding: `format`** — reformats SYNX text into canonical form.
+- **WASM binding: `parse_object` / `parse_active_object`** — returns JS objects directly via `serde_wasm_bindgen`, eliminating the need for `JSON.parse()` on the consumer side.
+- **WASM binding: `stringify`** — converts JSON string to SYNX format text.
+- **WASM binding: `format`** — reformats SYNX text into canonical form.
+- **C FFI binding: `synx_stringify`** — converts JSON string to SYNX format text. Caller must free with `synx_free`.
+- **C FFI binding: `synx_format`** — reformats SYNX text into canonical form. Caller must free with `synx_free`.
+- **`serde` feature on `synx-core`** — optional `Serialize`/`Deserialize` derives on `Value` enum (used by WASM and C FFI bindings for JSON round-tripping).
+- **Binding API parity table in README** — documented function availability and behavior notes for Rust core, JS package, Python, Node native, WASM, and C FFI.
+- **Bindings smoke tests** — lightweight smoke coverage for Python/C/Node/WASM binding surfaces (`parse`, `parse_active`, `stringify`, `format`) without adding runtime overhead to production code paths.
+- **CI check matrix** — new GitHub Actions workflow `.github/workflows/bindings-smoke.yml` to run binding-level checks on each push/PR.
+- **C header ownership docs** — `bindings/c-header/include/synx.h` now explicitly documents allocation/free contract and NULL-on-error behavior for FFI consumers.
+
 ## [3.2.0] - 2026-03-09
 
 ### Added
 - **`:ref` marker** (JS + Rust + VSCode): Value reference with marker chaining. Like `:alias` but feeds the resolved value into subsequent markers. Supports shorthand calc: `rate:ref:calc:*2 base_rate` resolves `base_rate` (50), then computes `50 * 2 = 100`.
 - **`:inherit` marker** (JS + Rust + VSCode): Block-level field inheritance. Merges all fields from a parent block into the child, with child values taking priority. Use `_` prefix for private template blocks excluded from output: `_base_resource` defines defaults, `steel:inherit:_base_resource` inherits them.
 - **`:i18n` marker** (JS + Rust + VSCode): Multilingual values with language selection. Nested keys are language codes (`en`, `ru`, `de`), selected via `options.lang`. Falls back to `en`, then first available value. Syntax: `title:i18n` with child keys per language.
+- **Auto-`{}` interpolation** (JS + Rust): In `!active` mode, any string value containing `{key}` is automatically interpolated — no `:template` marker needed. Supports dot-path for nested access (`{server.host}`). The `:template` marker is kept as a recognized no-op for backward compatibility.
+- **`!include` directive** (JS + Rust + VSCode): File-level directive `!include ./file.synx [alias]` imports another file's top-level keys for use in `{key:alias}` interpolation. Alias is auto-derived from filename if not provided. Supports `{key:alias}` for named includes and `{key:include}` shorthand when only one file is included.
 - **Comment string highlighting** (VSCode extension): Double-quoted `"strings"` and single-quoted `'strings'` inside comments now have distinct colors — orange for `""`, light blue for `''`.
 
 ### Fixed

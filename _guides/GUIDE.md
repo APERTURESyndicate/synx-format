@@ -46,6 +46,7 @@
   - [Comments](#comments)
 - [Active Mode (`!active`)](#-active-mode-active)
 - [Lock Mode (`!lock`)](#-lock-mode-lock)
+- [Include Directive (`!include`)](#-include-directive-include)
 - [Canonical Format (`format`)](#-canonical-format-format)
 - [Markers — Full Reference](#-markers--full-reference)
   - [:env](#env--environment-variable)
@@ -57,7 +58,7 @@
   - [:inherit](#inherit--block-inheritance)
   - [:i18n](#i18n--multilingual-values)
   - [:secret](#secret--hidden-value)
-  - [:template](#template--string-interpolation)
+  - [auto-{}](#auto---string-interpolation)
   - [:include](#include--import-external-file)
   - [:unique](#unique--deduplicate-list)
   - [:split](#split--string-to-array)
@@ -497,6 +498,50 @@ Use `Synx.isLocked(config)` to check if a config is locked.
 
 ---
 
+## 📎 Include Directive (`!include`)
+
+The `!include` directive imports another `.synx` file's keys for use in `{key:alias}` interpolation. Unlike the `:include` marker (which embeds a file as a child block), `!include` makes the target file's top-level keys available for string interpolation across the current file.
+
+```synx
+!active
+!include ./db.synx
+!include ./cache.synx redis
+
+app_name MyApp
+db_url postgresql://{host:db}:{port:db}/{name:db}
+cache_url redis://{host:redis}:{port:redis}
+```
+
+Contents of `db.synx`:
+
+```synx
+host localhost
+port 5432
+name mydb
+```
+
+**Result:**
+
+```json
+{
+  "app_name": "MyApp",
+  "db_url": "postgresql://localhost:5432/mydb",
+  "cache_url": "redis://cache-server:6379"
+}
+```
+
+**Alias rules:**
+
+| Directive | Alias | Access |
+|---|---|---|
+| `!include ./db.synx` | `db` (auto from filename) | `{host:db}` |
+| `!include ./cache.synx redis` | `redis` (explicit) | `{host:redis}` |
+| `!include ./config.synx` (only one include) | — | `{host:include}` shorthand |
+
+If the file has only one `!include`, you can use `{key:include}` as a shorthand instead of `{key:alias}`.
+
+---
+
 ## 🧹 Canonical Format (`format`)
 
 `Synx.format()` rewrites any `.synx` string into a single, normalized form.
@@ -694,7 +739,7 @@ loot:random 70 20 10
 
 ### `:alias` — Reference Another Key
 
-Copies the value of another key without duplication.
+Copies the resolved value of another key. Change the source once — all aliases follow.
 
 ```synx
 !active
@@ -712,13 +757,25 @@ billing_email:alias admin_email
 }
 ```
 
-Change `admin_email` once — all aliases update automatically.
+`:alias` resolves its source first, so you can alias keys that use other markers:
+
+```synx
+!active
+
+base_port:env:default:3000 PORT
+api_port:alias base_port
+metrics_port:alias base_port
+```
+
+All three keys will have the same value — the resolved result of `:env:default:3000`.
+
+> **`:alias` vs `:ref`:** Both copy a value, but `:alias` is a terminal operation — no further markers run after it. Use `:ref` when you need to chain markers (e.g., `:ref:calc:*2`).
 
 ---
 
 ### `:ref` — Reference with Chaining
 
-Like `:alias`, but feeds the resolved value into subsequent markers. Supports shorthand calc expressions.
+Like `:alias`, but feeds the resolved value into subsequent markers. This makes it possible to reference a key and then transform the result.
 
 ```synx
 !active
@@ -738,7 +795,25 @@ boosted_rate:ref:calc:+25 base_rate
 }
 ```
 
-The shorthand `:ref:calc:*2` resolves the reference, then applies the arithmetic operator to the resolved value. Supported operators: `+`, `-`, `*`, `/`, `%`.
+**Shorthand calc syntax:** `:ref:calc:*2` resolves the reference, then applies the operator. Supported: `+`, `-`, `*`, `/`, `%`.
+
+**Practical example — difficulty scaling:**
+
+```synx
+!active
+
+base_hp 100
+easy_hp:ref:calc:*0.5 base_hp
+normal_hp:ref base_hp
+hard_hp:ref:calc:*2 base_hp
+nightmare_hp:ref:calc:*4 base_hp
+```
+
+```json
+{ "easy_hp": 50, "normal_hp": 100, "hard_hp": 200, "nightmare_hp": 400 }
+```
+
+> **When to use `:ref` vs `:alias`:** Use `:ref` when you need to chain additional markers after the reference. If you just need a copy of the value, `:alias` is simpler and more explicit.
 
 ---
 
@@ -780,6 +855,38 @@ wood:inherit:_base_resource
 ```
 
 Note: `_base_resource` is not included in the output because its name starts with `_`.
+
+**Multi-block inheritance — game entities:**
+
+```synx
+!active
+
+_entity
+  visible true
+  layer world
+
+_enemy:inherit:_entity
+  hostile true
+  ai patrol
+
+goblin:inherit:_enemy
+  hp 30
+  damage 5
+
+dragon:inherit:_enemy
+  hp 500
+  damage 80
+  ai aggressive
+```
+
+```json
+{
+  "goblin": { "visible": true, "layer": "world", "hostile": true, "ai": "patrol", "hp": 30, "damage": 5 },
+  "dragon": { "visible": true, "layer": "world", "hostile": true, "ai": "aggressive", "hp": 500, "damage": 80 }
+}
+```
+
+Inheritance chains work: `_entity` → `_enemy` → `goblin`. Private blocks (`_entity`, `_enemy`) are excluded from the output.
 
 ---
 
@@ -834,21 +941,21 @@ JSON.stringify(config);               // api_key: "[SECRET]"
 
 ---
 
-### `:template` — String Interpolation
+### Auto-`{}` — String Interpolation
 
-Substitutes `{placeholder}` with values from other keys. Supports dot-path for nested access.
+In `!active` mode, any string value containing `{key}` is automatically interpolated — no marker needed. Supports dot-path for nested access.
 
 ```synx
 !active
 
 first_name John
 last_name Doe
-greeting:template Hello, {first_name} {last_name}!
+greeting Hello, {first_name} {last_name}!
 
 server
   host api.example.com
   port 443
-api_url:template https://{server.host}:{server.port}/v1
+api_url https://{server.host}:{server.port}/v1
 ```
 
 ```json
@@ -857,6 +964,21 @@ api_url:template https://{server.host}:{server.port}/v1
   "api_url": "https://api.example.com:443/v1"
 }
 ```
+
+**Cross-file interpolation with `!include`:**
+
+When you use the `!include` directive (see below), you can reference keys from included files:
+
+```synx
+!active
+!include ./db.synx
+
+conn_string postgresql://{host:db}:{port:db}/{name:db}
+```
+
+Syntax: `{key}` for local keys, `{key:alias}` for included file keys, `{key:include}` for the first/only included file.
+
+> **Legacy:** The `:template` marker still works for backward compatibility but is no longer needed — auto-`{}` handles interpolation automatically.
 
 ---
 

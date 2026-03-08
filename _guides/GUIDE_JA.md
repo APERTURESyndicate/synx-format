@@ -44,6 +44,9 @@
   - [複数行テキスト](#複数行テキスト)
   - [コメント](#コメント)
 - [アクティブモード (`!active`)](#-アクティブモード-active)
+- [ロックモード (`!lock`)](#-ロックモード-lock)
+- [Includeディレクティブ (`!include`)](#-includeディレクティブ-include)
+- [正規フォーマット (`format`)](#-正規フォーマット-format)
 - [マーカー完全リファレンス](#-マーカー完全リファレンス)
   - [:env — 環境変数](#env--環境変数)
   - [:default — デフォルト値](#default--デフォルト値)
@@ -54,7 +57,7 @@
   - [:inherit — ブロック継承](#inherit--ブロック継承)
   - [:i18n — 多言語値](#i18n--多言語値)
   - [:secret — 隠し値](#secret--隠し値)
-  - [:template — 文字列補間](#template--文字列補間)
+  - [auto-{} — 文字列補間](#auto---文字列補間)
   - [:include — 外部ファイルの読み込み](#include--外部ファイルの読み込み)
   - [:unique — リストの重複排除](#unique--リストの重複排除)
   - [:split — 文字列を配列に](#split--文字列を配列に)
@@ -381,6 +384,27 @@ console.log(config.max_players); // ✅ 100（読み取りは常に許可）
 
 ---
 
+## 📎 Includeディレクティブ (`!include`)
+
+`!include` ディレクティブは、別の `.synx` ファイルのキーを `{key:alias}` 補間用にインポートします。`:include` マーカー（ファイルを子ブロックとして埋め込む）とは異なり、`!include` はトップレベルのキーを文字列補間に利用可能にします。
+
+```synx
+!active
+!include ./db.synx
+!include ./cache.synx redis
+
+db_url postgresql://{host:db}:{port:db}/{name:db}
+cache_url redis://{host:redis}:{port:redis}
+```
+
+| ディレクティブ | エイリアス | アクセス |
+|---|---|---|
+| `!include ./db.synx` | `db`（自動） | `{host:db}` |
+| `!include ./cache.synx redis` | `redis`（明示的） | `{host:redis}` |
+| `!include ./config.synx`（唯一のinclude） | — | `{host:include}` |
+
+---
+
 ## 🧹 正規フォーマット (`format`)
 
 `Synx.format()` は任意の `.synx` 文字列を唯一の正規化された形式に書き直します。
@@ -481,15 +505,28 @@ loot:random 70 20 10
 
 ### `:alias` — 別キーの参照
 
+別のキーの解決済み値をコピーします。ソースを一度変更すれば、すべてのエイリアスが更新されます。
+
 ```synx
 !active
 admin_email alex@example.com
 billing:alias admin_email
+complaints:alias admin_email
 ```
+
+`:alias` はソースを先に解決するため、他のマーカーを持つキーも参照できます：
+
+```synx
+!active
+base_port:env:default:3000 PORT
+api_port:alias base_port
+```
+
+> **`:alias` vs `:ref`:** 両方とも値をコピーしますが、`:alias` は終端操作です。マーカーをチェーンする場合は `:ref` を使用します（例: `:ref:calc:*2`）。
 
 ### `:ref` — チェーン付き参照
 
-`:alias`と同様ですが、解決された値を後続のマーカーに渡します。省略形計算をサポート。
+`:alias`と同様ですが、解決された値を後続のマーカーに渡します。
 
 ```synx
 !active
@@ -499,7 +536,19 @@ quick_rate:ref base_rate
 double_rate:ref:calc:*2 base_rate
 ```
 
-`:ref:calc:*2` は参照を解決し、その値に算術演算を適用します。
+**省略形構文:** `:ref:calc:*2` は参照を解決し、演算子を適用します。サポート: `+`, `-`, `*`, `/`, `%`。
+
+**例 — 難易度スケーリング:**
+
+```synx
+!active
+
+base_hp 100
+easy_hp:ref:calc:*0.5 base_hp
+hard_hp:ref:calc:*2 base_hp
+```
+
+> **`:ref` と `:alias` の使い分け:** 値をさらに処理する場合は `:ref`。単純なコピーには `:alias`。
 
 ---
 
@@ -518,6 +567,26 @@ steel:inherit:_base_resource
   weight 25
   material metal
 ```
+
+**多段階継承:**
+
+```synx
+!active
+
+_entity
+  visible true
+  layer world
+
+_enemy:inherit:_entity
+  hostile true
+  ai patrol
+
+goblin:inherit:_enemy
+  hp 30
+  damage 5
+```
+
+継承チェーンが機能します: `_entity` → `_enemy` → `goblin`。プライベートブロックは出力から除外されます。
 
 ---
 
@@ -548,13 +617,33 @@ const config = Synx.parse(text, { lang: 'ja' });
 api_key:secret sk-1234567890
 ```
 
-### `:template` — 文字列補間
+### Auto-`{}` — 文字列補間
+
+`!active` モードでは、`{key}` を含む文字列値は自動的に補間されます—マーカー不要。
 
 ```synx
 !active
 name John
-greeting:template こんにちは、{name}さん！
+greeting こんにちは、{name}さん！
+
+server
+  host api.example.com
+  port 443
+api_url https://{server.host}:{server.port}/v1
 ```
+
+**`!include` によるクロスファイル補間:**
+
+```synx
+!active
+!include ./db.synx
+
+conn_string postgresql://{host:db}:{port:db}/{name:db}
+```
+
+構文: `{key}` ローカル、`{key:alias}` インクルードファイル、`{key:include}` 唯一のインクルードファイル。
+
+> **レガシー:** `:template` マーカーは引き続き機能しますが、もはや不要です。
 
 ### `:include` — 外部ファイルの読み込み
 

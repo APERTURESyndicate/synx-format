@@ -5,7 +5,7 @@
  * in a parsed SYNX object tree. Only runs in !active mode.
  */
 
-import type { SynxObject, SynxValue, SynxMetaMap, SynxOptions } from './types';
+import type { SynxObject, SynxValue, SynxMetaMap, SynxOptions, SynxInclude } from './types';
 import { safeCalc } from './calc';
 import { parseData } from './parser';
 
@@ -53,6 +53,7 @@ export function resolve(
   obj: SynxObject,
   options: SynxOptions = {},
   root?: SynxObject,
+  includesMap?: Map<string, SynxObject>,
 ): SynxObject {
   if (!root) {
     root = obj;
@@ -61,6 +62,10 @@ export function resolve(
     // Remove private blocks (keys starting with _)
     for (const k of Object.keys(obj)) {
       if (k.startsWith('_')) delete obj[k];
+    }
+    // ── Load !include directives ──
+    if (!includesMap && (options as any)._includes) {
+      includesMap = loadIncludes((options as any)._includes as SynxInclude[], options);
     }
   }
 
@@ -73,14 +78,14 @@ export function resolve(
 
     // Recurse into nested objects
     if (value && typeof value === 'object' && !Array.isArray(value)) {
-      resolve(value as SynxObject, options, root);
+      resolve(value as SynxObject, options, root, includesMap);
     }
 
     // Recurse into arrays of objects
     if (Array.isArray(value)) {
       for (const item of value) {
         if (item && typeof item === 'object' && !Array.isArray(item)) {
-          resolve(item as SynxObject, options, root);
+          resolve(item as SynxObject, options, root, includesMap);
         }
       }
     }
@@ -254,15 +259,7 @@ export function resolve(
       }
     }
 
-    // ── :template ──
-    if (markers.includes('template') && typeof obj[key] === 'string') {
-      let tpl = obj[key] as string;
-      tpl = tpl.replace(/\{(\w+(?:\.\w+)*)\}/g, (_match, ref: string) => {
-        const val = deepGet(root, ref) ?? deepGet(obj, ref);
-        return val != null ? String(val) : `{${ref}}`;
-      });
-      obj[key] = tpl;
-    }
+    // ── :template (legacy — handled by auto-{} below) ──
 
     // ── :split ──
     if (markers.includes('split') && typeof obj[key] === 'string') {
@@ -430,6 +427,14 @@ export function resolve(
     }
   }
 
+  // ── Auto-{} interpolation (separate pass, runs on ALL string values) ──
+  for (const key of Object.keys(obj)) {
+    if (key === '__synx') continue;
+    if (typeof obj[key] === 'string' && (obj[key] as string).includes('{')) {
+      obj[key] = resolveInterpolation(obj[key] as string, root, obj, includesMap);
+    }
+  }
+
   return obj;
 }
 
@@ -470,6 +475,71 @@ function applyInheritance(obj: SynxObject): void {
     }
     obj[key] = merged;
   }
+}
+
+// ─── Auto-{} interpolation ───────────────────────────────
+
+/**
+ * Resolve {key}, {key.nested}, {key:alias}, {key:include} placeholders.
+ * - {key}           — look up in root, then local scope
+ * - {key:alias}     — look up in included file with that alias
+ * - {key:include}   — look up in the first (only) included file
+ */
+function resolveInterpolation(
+  tpl: string,
+  root: SynxObject,
+  local: SynxObject,
+  includesMap?: Map<string, SynxObject>,
+): string {
+  return tpl.replace(/\{(\w+(?:\.\w+)*)(?::(\w+(?:[./\\][\w./\\]*)?))?\}/g, (_match, ref: string, scope: string | undefined) => {
+    if (scope) {
+      // {key:alias} or {key:include}
+      if (scope === 'include') {
+        if (!includesMap || includesMap.size === 0) return _match;
+        if (includesMap.size > 1) return 'INCLUDE_ERR: multiple !include — specify alias';
+        const firstInclude = includesMap.values().next().value!;
+        const val = deepGet(firstInclude, ref);
+        return val != null ? String(val) : _match;
+      }
+      // Look up by alias
+      if (includesMap) {
+        const incl = includesMap.get(scope);
+        if (incl) {
+          const val = deepGet(incl, ref);
+          return val != null ? String(val) : _match;
+        }
+      }
+      return _match;
+    }
+    // {key} — local file
+    const val = deepGet(root, ref) ?? deepGet(local, ref);
+    return val != null ? String(val) : _match;
+  });
+}
+
+// ─── !include loader ──────────────────────────────────────
+
+function loadIncludes(
+  includes: SynxInclude[],
+  options: SynxOptions,
+): Map<string, SynxObject> {
+  const map = new Map<string, SynxObject>();
+  if (!fs || !pathModule) return map;
+  const basePath = options.basePath || (typeof process !== 'undefined' ? process.cwd() : '.');
+  for (const inc of includes) {
+    const fullPath = pathModule.resolve(basePath, inc.path);
+    try {
+      const text = fs.readFileSync(fullPath, 'utf-8');
+      const { root, mode } = parseData(text);
+      if (mode === 'active') {
+        resolve(root, { ...options, basePath: pathModule.dirname(fullPath) }, undefined, map);
+      }
+      map.set(inc.alias, root);
+    } catch (e: any) {
+      // Include loading failed — skip silently
+    }
+  }
+  return map;
 }
 
 // ─── Constraint enforcement ───────────────────────────────────────────────

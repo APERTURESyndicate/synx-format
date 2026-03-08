@@ -23,6 +23,7 @@ pub fn parse(text: &str) -> ParseResult {
     let mut mode = Mode::Static;
     let mut locked = false;
     let mut metadata: HashMap<String, MetaMap> = HashMap::new();
+    let mut includes: Vec<IncludeDirective> = Vec::new();
 
     let mut block: Option<BlockState> = None;
     let mut list: Option<ListState> = None;
@@ -47,6 +48,19 @@ pub fn parse(text: &str) -> ParseResult {
         }
         if trimmed == "!lock" {
             locked = true;
+            i += 1;
+            continue;
+        }
+        if trimmed.starts_with("!include ") {
+            let rest = trimmed[9..].trim();
+            let mut parts = rest.splitn(2, char::is_whitespace);
+            let path = parts.next().unwrap_or("").to_string();
+            let alias = parts.next().map(|s| s.trim().to_string()).unwrap_or_else(|| {
+                // Auto-derive alias from filename
+                let name = path.rsplit(&['/', '\\'][..]).next().unwrap_or(&path);
+                name.strip_suffix(".synx").or_else(|| name.strip_suffix(".SYNX")).unwrap_or(name).to_string()
+            });
+            includes.push(IncludeDirective { path, alias });
             i += 1;
             continue;
         }
@@ -248,6 +262,7 @@ pub fn parse(text: &str) -> ParseResult {
         mode,
         locked,
         metadata,
+        includes,
     }
 }
 

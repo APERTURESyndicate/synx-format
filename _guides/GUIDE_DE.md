@@ -44,6 +44,9 @@
   - [Mehrzeiliger Text](#mehrzeiliger-text)
   - [Kommentare](#kommentare)
 - [Aktiver Modus (`!active`)](#-aktiver-modus-active)
+- [Sperrmodus (`!lock`)](#-sperrmodus-lock)
+- [Include-Direktive (`!include`)](#-include-direktive-include)
+- [Kanonisches Format (`format`)](#-kanonisches-format-format)
 - [Vollständige Marker-Referenz](#-vollständige-marker-referenz)
   - [:env — Umgebungsvariablen](#env--umgebungsvariablen)
   - [:default — Standardwert](#default--standardwert)
@@ -54,7 +57,7 @@
   - [:inherit — Blockvererbung](#inherit--blockvererbung)
   - [:i18n — Mehrsprachige Werte](#i18n--mehrsprachige-werte)
   - [:secret — Versteckter Wert](#secret--versteckter-wert)
-  - [:template — String-Interpolation](#template--string-interpolation)
+  - [auto-{} — String-Interpolation](#auto---string-interpolation)
   - [:include — Externe Datei Importieren](#include--externe-datei-importieren)
   - [:unique — Duplikate Entfernen](#unique--duplikate-entfernen)
   - [:split — String zu Array](#split--string-zu-array)
@@ -382,6 +385,27 @@ Verwende `Synx.isLocked(config)` zur Überprüfung.
 
 ---
 
+## 📎 Include-Direktive (`!include`)
+
+Die `!include`-Direktive importiert Schlüssel einer anderen `.synx`-Datei für die `{key:alias}`-Interpolation. Anders als der `:include`-Marker (einbettet eine Datei als Kindblock) macht `!include` die Top-Level-Schlüssel für String-Interpolation verfügbar.
+
+```synx
+!active
+!include ./db.synx
+!include ./cache.synx redis
+
+db_url postgresql://{host:db}:{port:db}/{name:db}
+cache_url redis://{host:redis}:{port:redis}
+```
+
+| Direktive | Alias | Zugriff |
+|---|---|---|
+| `!include ./db.synx` | `db` (auto) | `{host:db}` |
+| `!include ./cache.synx redis` | `redis` (explizit) | `{host:redis}` |
+| `!include ./config.synx` (einziges Include) | — | `{host:include}` |
+
+---
+
 ## 🧹 Kanonisches Format (`format`)
 
 `Synx.format()` schreibt jede `.synx`-Datei in eine einzige, normalisierte Form um.
@@ -482,15 +506,28 @@ loot:random 70 20 10
 
 ### `:alias` — Verweis auf Anderen Schlüssel
 
+Kopiert den aufgelösten Wert eines anderen Schlüssels. Ändere die Quelle einmal — alle Aliase folgen.
+
 ```synx
 !active
 admin_email alex@example.com
 billing:alias admin_email
+complaints:alias admin_email
 ```
+
+`:alias` löst die Quelle zuerst auf, daher kann man auf Schlüssel mit anderen Markern verweisen:
+
+```synx
+!active
+base_port:env:default:3000 PORT
+api_port:alias base_port
+```
+
+> **`:alias` vs `:ref`:** Beide kopieren einen Wert, aber `:alias` ist terminal. Verwende `:ref`, wenn weitere Marker folgen sollen (z.B. `:ref:calc:*2`).
 
 ### `:ref` — Referenz mit Verkettung
 
-Wie `:alias`, gibt aber den aufgelösten Wert an nachfolgende Marker weiter. Unterstützt Kurzform-Berechnungen.
+Wie `:alias`, gibt aber den aufgelösten Wert an nachfolgende Marker weiter.
 
 ```synx
 !active
@@ -500,7 +537,19 @@ quick_rate:ref base_rate
 double_rate:ref:calc:*2 base_rate
 ```
 
-Die Kurzform `:ref:calc:*2` löst die Referenz auf und wendet die arithmetische Operation auf den Wert an.
+**Kurzform-Syntax:** `:ref:calc:*2` löst die Referenz auf und wendet den Operator an. Unterstützt: `+`, `-`, `*`, `/`, `%`.
+
+**Beispiel — Schwierigkeitsskalierung:**
+
+```synx
+!active
+
+base_hp 100
+easy_hp:ref:calc:*0.5 base_hp
+hard_hp:ref:calc:*2 base_hp
+```
+
+> **Wann `:ref`, wann `:alias`:** Verwende `:ref`, wenn der Wert weiter verarbeitet werden soll. Für einfache Kopien — `:alias`.
 
 ---
 
@@ -519,6 +568,26 @@ steel:inherit:_base_resource
   weight 25
   material metal
 ```
+
+**Mehrstufige Vererbung:**
+
+```synx
+!active
+
+_entity
+  visible true
+  layer world
+
+_enemy:inherit:_entity
+  hostile true
+  ai patrol
+
+goblin:inherit:_enemy
+  hp 30
+  damage 5
+```
+
+Vererbungsketten funktionieren: `_entity` → `_enemy` → `goblin`. Private Blöcke werden ausgeschlossen.
 
 ---
 
@@ -549,13 +618,33 @@ const config = Synx.parse(text, { lang: 'de' });
 api_key:secret sk-1234567890
 ```
 
-### `:template` — String-Interpolation
+### Auto-`{}` — String-Interpolation
+
+Im `!active`-Modus wird jeder Stringwert mit `{key}` automatisch interpoliert — kein Marker nötig.
 
 ```synx
 !active
 name John
-greeting:template Hallo, {name}!
+greeting Hallo, {name}!
+
+server
+  host api.example.com
+  port 443
+api_url https://{server.host}:{server.port}/v1
 ```
+
+**Dateiübergreifende Interpolation mit `!include`:**
+
+```synx
+!active
+!include ./db.synx
+
+conn_string postgresql://{host:db}:{port:db}/{name:db}
+```
+
+Syntax: `{key}` für lokale Schlüssel, `{key:alias}` für inkludierte Dateien, `{key:include}` für die einzige inkludierte Datei.
+
+> **Legacy:** Der `:template`-Marker funktioniert weiterhin, ist aber nicht mehr nötig.
 
 ### `:include` — Externe Datei Importieren
 

@@ -70,11 +70,18 @@ export interface SynxMetaMap {
   [key: string]: SynxMeta;
 }
 
+/** Include directive parsed from !include */
+export interface SynxInclude {
+  path: string;
+  alias: string;
+}
+
 /** Raw parse result before engine resolution */
 export interface SynxParseResult {
   mode: SynxMode;
   root: SynxObject;
   locked?: boolean;
+  includes?: SynxInclude[];
 }
 
 /** Options for Synx.parse() / Synx.load() */

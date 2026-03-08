@@ -14,6 +14,10 @@ pub fn resolve(result: &mut ParseResult, options: &Options) {
         return;
     }
     let metadata = std::mem::take(&mut result.metadata);
+    let includes_directives = std::mem::take(&mut result.includes);
+
+    // ── Load !include files ──
+    let includes_map = load_includes(&includes_directives, options);
 
     // ── :inherit pre-pass ──
     apply_inheritance(&mut result.root, &metadata);
@@ -24,7 +28,7 @@ pub fn resolve(result: &mut ParseResult, options: &Options) {
 
     // SAFETY: `root_ptr` is a raw pointer to `result.root` used exclusively
     // for *immutable* read access inside marker handlers (:calc, :alias,
-    // :map, :template, :watch) that need to look up other keys in the root
+    // :map, :watch) that need to look up other keys in the root
     // while also holding a mutable reference to a child object.
     // The invariants that keep this sound:
     //   1. We never write through `root_ptr` — only reads via `&*root_ptr`.
@@ -32,8 +36,9 @@ pub fn resolve(result: &mut ParseResult, options: &Options) {
     //      always a distinct subtree from what we read via `root_ptr`.
     //   3. The pointer is valid for the entire duration of `resolve_value`.
     let root_ptr = &mut result.root as *mut Value;
-    resolve_value(&mut result.root, root_ptr, options, &metadata, "");
+    resolve_value(&mut result.root, root_ptr, options, &metadata, "", &includes_map);
     result.metadata = metadata;
+    result.includes = includes_directives;
 }
 
 fn resolve_value(
@@ -42,6 +47,7 @@ fn resolve_value(
     options: &Options,
     metadata: &HashMap<String, MetaMap>,
     path: &str,
+    includes: &HashMap<String, Value>,
 ) {
     let meta_map = metadata.get(path).cloned();
 
@@ -59,12 +65,12 @@ fn resolve_value(
             if let Some(child) = map.get_mut(key) {
                 match child {
                     Value::Object(_) => {
-                        resolve_value(child, root_ptr, options, metadata, &child_path);
+                        resolve_value(child, root_ptr, options, metadata, &child_path, includes);
                     }
                     Value::Array(arr) => {
                         for item in arr.iter_mut() {
                             if let Value::Object(_) = item {
-                                resolve_value(item, root_ptr, options, metadata, &child_path);
+                                resolve_value(item, root_ptr, options, metadata, &child_path, includes);
                             }
                         }
                     }
@@ -81,7 +87,21 @@ fn resolve_value(
                     None => continue,
                 };
 
-                apply_markers(map, key, &meta, root_ptr, options, path, metadata);
+                apply_markers(map, key, &meta, root_ptr, options, path, metadata, includes);
+            }
+        }
+
+        // Third pass: auto-{} interpolation on all string values
+        let keys2: Vec<String> = map.keys().cloned().collect();
+        for key in &keys2 {
+            if let Some(Value::String(s)) = map.get(key) {
+                if s.contains('{') {
+                    let root_ref = unsafe { &*root_ptr };
+                    let result = resolve_interpolation(s, root_ref, map, includes);
+                    if result != *s {
+                        map.insert(key.to_string(), Value::String(result));
+                    }
+                }
             }
         }
     }
@@ -95,6 +115,7 @@ fn apply_markers(
     options: &Options,
     _path: &str,
     _metadata: &HashMap<String, MetaMap>,
+    _includes: &HashMap<String, Value>,
 ) {
     let markers = &meta.markers;
 
@@ -352,14 +373,7 @@ fn apply_markers(
         }
     }
 
-    // ── :template ──
-    if markers.contains(&"template".to_string()) {
-        if let Some(Value::String(tpl)) = map.get(key) {
-            let root_ref = unsafe { &*root_ptr };
-            let result = resolve_template(tpl, root_ref, map);
-            map.insert(key.to_string(), Value::String(result));
-        }
-    }
+    // ── :template (legacy — handled by auto-{} in resolve_value) ──
 
     // ── :split ──
     if markers.contains(&"split".to_string()) {
@@ -1045,7 +1059,13 @@ fn deep_get(root: &Value, path: &str) -> Option<Value> {
 }
 
 /// Resolve {placeholder} references in a template string.
-fn resolve_template(tpl: &str, root: &Value, local_map: &HashMap<String, Value>) -> String {
+/// Supports: {key}, {key.nested}, {key:alias}, {key:include}
+fn resolve_interpolation(
+    tpl: &str,
+    root: &Value,
+    local_map: &HashMap<String, Value>,
+    includes: &HashMap<String, Value>,
+) -> String {
     let bytes = tpl.as_bytes();
     let len = bytes.len();
     let mut result = String::with_capacity(len);
@@ -1054,25 +1074,52 @@ fn resolve_template(tpl: &str, root: &Value, local_map: &HashMap<String, Value>)
     while i < len {
         if bytes[i] == b'{' {
             if let Some(close) = tpl[i + 1..].find('}') {
-                let ref_name = &tpl[i + 1..i + 1 + close];
-                // Only resolve if it looks like a valid reference
-                if ref_name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.') {
-                    let resolved = deep_get(root, ref_name).or_else(|| {
-                        if let Value::Object(m) = root {
-                            // try local
-                            let _ = m;
+                let inner = &tpl[i + 1..i + 1 + close];
+                // Check for scope separator ':'
+                if let Some(colon) = inner.find(':') {
+                    let ref_name = &inner[..colon];
+                    let scope = &inner[colon + 1..];
+                    // Valid ref name?
+                    if ref_name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.') {
+                        let resolved = if scope == "include" {
+                            // {key:include} — first/only include
+                            if includes.len() == 1 {
+                                let first = includes.values().next().unwrap();
+                                deep_get(first, ref_name)
+                            } else {
+                                None
+                            }
+                        } else {
+                            // {key:alias} — look up by alias
+                            includes.get(scope).and_then(|inc| deep_get(inc, ref_name))
+                        };
+                        if let Some(val) = resolved {
+                            result.push_str(&value_to_string(&val));
+                        } else {
+                            result.push('{');
+                            result.push_str(inner);
+                            result.push('}');
                         }
-                        local_map.get(ref_name).cloned()
-                    });
-                    if let Some(val) = resolved {
-                        result.push_str(&value_to_string(&val));
-                    } else {
-                        result.push('{');
-                        result.push_str(ref_name);
-                        result.push('}');
+                        i += 2 + close;
+                        continue;
                     }
-                    i += 2 + close;
-                    continue;
+                } else {
+                    // {key} — local
+                    let ref_name = inner;
+                    if ref_name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.') {
+                        let resolved = deep_get(root, ref_name).or_else(|| {
+                            local_map.get(ref_name).cloned()
+                        });
+                        if let Some(val) = resolved {
+                            result.push_str(&value_to_string(&val));
+                        } else {
+                            result.push('{');
+                            result.push_str(ref_name);
+                            result.push('}');
+                        }
+                        i += 2 + close;
+                        continue;
+                    }
                 }
             }
         }
@@ -1080,6 +1127,30 @@ fn resolve_template(tpl: &str, root: &Value, local_map: &HashMap<String, Value>)
         i += 1;
     }
     result
+}
+
+/// Load !include files into a map<alias, Value>.
+fn load_includes(
+    directives: &[IncludeDirective],
+    options: &Options,
+) -> HashMap<String, Value> {
+    let mut map = HashMap::new();
+    let base = options.base_path.as_deref().unwrap_or(".");
+    for inc in directives {
+        let full = std::path::Path::new(base).join(&inc.path);
+        if let Ok(text) = std::fs::read_to_string(&full) {
+            let mut included = parser::parse(&text);
+            if included.mode == Mode::Active {
+                let mut child_opts = options.clone();
+                if let Some(parent) = full.parent() {
+                    child_opts.base_path = Some(parent.to_string_lossy().into_owned());
+                }
+                resolve(&mut included, &child_opts);
+            }
+            map.insert(inc.alias.clone(), included.root);
+        }
+    }
+    map
 }
 
 #[cfg(test)]
@@ -1131,5 +1202,29 @@ mod tests {
         resolve(&mut r, &opts);
         let map = r.root.as_object().unwrap();
         assert_eq!(map["title"], Value::String("Hello".into()));
+    }
+
+    #[test]
+    fn test_auto_interpolation_simple() {
+        let mut r = parse("!active\nname Wario\ngreeting Hello, {name}!");
+        resolve(&mut r, &Options::default());
+        let map = r.root.as_object().unwrap();
+        assert_eq!(map["greeting"], Value::String("Hello, Wario!".into()));
+    }
+
+    #[test]
+    fn test_auto_interpolation_nested() {
+        let mut r = parse("!active\nserver\n  host localhost\n  port 8080\nurl http://{server.host}:{server.port}/api");
+        resolve(&mut r, &Options::default());
+        let map = r.root.as_object().unwrap();
+        assert_eq!(map["url"], Value::String("http://localhost:8080/api".into()));
+    }
+
+    #[test]
+    fn test_template_legacy_still_works() {
+        let mut r = parse("!active\nname Wario\ngreeting:template Hello, {name}!");
+        resolve(&mut r, &Options::default());
+        let map = r.root.as_object().unwrap();
+        assert_eq!(map["greeting"], Value::String("Hello, Wario!".into()));
     }
 }

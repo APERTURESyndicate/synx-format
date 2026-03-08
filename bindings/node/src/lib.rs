@@ -1,4 +1,4 @@
-//! SYNX Node.js binding — exposes parse/parseActive/stringify to JS via napi-rs.
+//! SYNX Node.js binding — exposes parse/parseActive/stringify/format to JS via napi-rs.
 
 use napi::bindgen_prelude::*;
 use napi::JsUnknown;
@@ -30,6 +30,52 @@ fn value_to_js(env: &Env, val: &Value) -> Result<JsUnknown> {
             }
             Ok(obj.into_unknown())
         }
+    }
+}
+
+/// Convert a JS value back to synx_core::Value.
+fn js_to_value(env: &Env, val: JsUnknown) -> Result<Value> {
+    match val.get_type()? {
+        napi::ValueType::Null | napi::ValueType::Undefined => Ok(Value::Null),
+        napi::ValueType::Boolean => {
+            let b: napi::JsBoolean = val.try_into()?;
+            Ok(Value::Bool(b.get_value()?))
+        }
+        napi::ValueType::Number => {
+            let n: napi::JsNumber = val.try_into()?;
+            let f = n.get_double()?;
+            if f.fract() == 0.0 && f >= i64::MIN as f64 && f <= i64::MAX as f64 {
+                Ok(Value::Int(f as i64))
+            } else {
+                Ok(Value::Float(f))
+            }
+        }
+        napi::ValueType::String => {
+            let s: napi::JsString = val.try_into()?;
+            Ok(Value::String(s.into_utf8()?.as_str()?.to_string()))
+        }
+        napi::ValueType::Object => {
+            // Check if it's an array
+            let obj: napi::JsObject = val.try_into()?;
+            if obj.is_array()? {
+                let len = obj.get_array_length()?;
+                let mut arr = Vec::with_capacity(len as usize);
+                for i in 0..len {
+                    let item: JsUnknown = obj.get_element(i)?;
+                    arr.push(js_to_value(env, item)?);
+                }
+                Ok(Value::Array(arr))
+            } else {
+                let keys = napi::JsObject::keys(&obj)?;
+                let mut map = std::collections::HashMap::new();
+                for key in keys {
+                    let v: JsUnknown = obj.get_named_property(&key)?;
+                    map.insert(key, js_to_value(env, v)?);
+                }
+                Ok(Value::Object(map))
+            }
+        }
+        _ => Ok(Value::Null),
     }
 }
 
@@ -78,4 +124,33 @@ pub fn parse_active(env: Env, text: String, options: Option<napi::JsObject>) -> 
         synx_core::resolve(&mut result, &opts);
     }
     value_to_js(&env, &result.root)
+}
+
+/// Convert a JS object back to a SYNX string.
+#[napi]
+pub fn stringify(env: Env, obj: JsUnknown) -> Result<String> {
+    let val = js_to_value(&env, obj)?;
+    Ok(synx_core::Synx::stringify(&val))
+}
+
+/// Reformat a SYNX string into canonical form (sorted keys, normalized indentation).
+#[napi]
+pub fn format(text: String) -> String {
+    synx_core::Synx::format(&text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn smoke_parse_to_json_and_format() {
+        let text = "name John\nage 25\n".to_string();
+        let json = parse_to_json(text);
+        assert!(json.contains("\"name\":\"John\""));
+
+        let formatted = format("b 2\na 1\n".to_string());
+        assert!(formatted.contains("a 1"));
+        assert!(formatted.contains("b 2"));
+    }
 }

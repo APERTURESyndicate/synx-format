@@ -4,6 +4,8 @@ use std::collections::HashMap;
 
 /// SYNX value types.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(untagged))]
 pub enum Value {
     String(std::string::String),
     Int(i64),
@@ -159,6 +161,13 @@ pub struct Constraints {
 /// Map of key → metadata for one object level.
 pub type MetaMap = HashMap<String, Meta>;
 
+/// Include directive: !include path [alias]
+#[derive(Debug, Clone)]
+pub struct IncludeDirective {
+    pub path: String,
+    pub alias: String,
+}
+
 /// Full parse result with metadata.
 #[derive(Debug)]
 pub struct ParseResult {
@@ -168,6 +177,8 @@ pub struct ParseResult {
     /// Metadata for each nesting level, keyed by dot-path prefix.
     /// "" = root level, "server" = server sub-object, etc.
     pub metadata: HashMap<String, MetaMap>,
+    /// !include directives parsed from the file.
+    pub includes: Vec<IncludeDirective>,
 }
 
 /// Options for active mode resolution.

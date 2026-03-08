@@ -44,6 +44,9 @@
   - [Texto Multilínea](#texto-multilínea)
   - [Comentarios](#comentarios)
 - [Modo Activo (`!active`)](#-modo-activo-active)
+- [Modo Bloqueo (`!lock`)](#-modo-bloqueo-lock)
+- [Directiva `!include`](#-directiva-include)
+- [Formato Canónico (`format`)](#-formato-canónico-format)
 - [Referencia de Marcadores](#-referencia-completa-de-marcadores)
   - [:env — Variables de Entorno](#env--variables-de-entorno)
   - [:default — Valor por Defecto](#default--valor-por-defecto)
@@ -54,7 +57,7 @@
   - [:inherit — Herencia de Bloques](#inherit--herencia-de-bloques)
   - [:i18n — Valores Multilingües](#i18n--valores-multilingües)
   - [:secret — Valor Oculto](#secret--valor-oculto)
-  - [:template — Interpolación de Cadenas](#template--interpolación-de-cadenas)
+  - [auto-{} — Interpolación de Cadenas](#auto---interpolación-de-cadenas)
   - [:include — Importar Archivo Externo](#include--importar-archivo-externo)
   - [:unique — Eliminar Duplicados](#unique--eliminar-duplicados)
   - [:split — Cadena a Arreglo](#split--cadena-a-arreglo)
@@ -382,6 +385,27 @@ Usa `Synx.isLocked(config)` para verificar el estado.
 
 ---
 
+## 📎 Directiva `!include`
+
+La directiva `!include` importa las claves de otro archivo `.synx` para uso en interpolación `{clave:alias}`. A diferencia del marcador `:include` (que incrusta un archivo como bloque hijo), `!include` hace disponibles las claves de nivel superior para interpolación de cadenas.
+
+```synx
+!active
+!include ./db.synx
+!include ./cache.synx redis
+
+db_url postgresql://{host:db}:{port:db}/{name:db}
+cache_url redis://{host:redis}:{port:redis}
+```
+
+| Directiva | Alias | Acceso |
+|---|---|---|
+| `!include ./db.synx` | `db` (auto) | `{host:db}` |
+| `!include ./cache.synx redis` | `redis` (explícito) | `{host:redis}` |
+| `!include ./config.synx` (único include) | — | `{host:include}` |
+
+---
+
 ## 🧹 Formato Canónico (`format`)
 
 `Synx.format()` reescribe cualquier archivo `.synx` en una forma única y normalizada.
@@ -482,15 +506,28 @@ loot:random 70 20 10
 
 ### `:alias` — Referencia a Otra Clave
 
+Copia el valor resuelto de otra clave. Cambia la fuente una vez — todos los alias se actualizan.
+
 ```synx
 !active
 admin_email alex@example.com
 billing:alias admin_email
+complaints:alias admin_email
 ```
+
+`:alias` resuelve la fuente primero, por lo que puedes referenciar claves con otros marcadores:
+
+```synx
+!active
+base_port:env:default:3000 PORT
+api_port:alias base_port
+```
+
+> **`:alias` vs `:ref`:** Ambos copian un valor, pero `:alias` es terminal. Usa `:ref` cuando necesites encadenar marcadores (ej. `:ref:calc:*2`).
 
 ### `:ref` — Referencia con Encadenamiento
 
-Como `:alias`, pero pasa el valor resuelto a los marcadores siguientes. Soporta cálculos abreviados.
+Como `:alias`, pero pasa el valor resuelto a los marcadores siguientes.
 
 ```synx
 !active
@@ -500,7 +537,19 @@ quick_rate:ref base_rate
 double_rate:ref:calc:*2 base_rate
 ```
 
-La abreviatura `:ref:calc:*2` resuelve la referencia y aplica la operación aritmética al valor.
+**Sintaxis abreviada:** `:ref:calc:*2` resuelve la referencia y aplica el operador. Soporta: `+`, `-`, `*`, `/`, `%`.
+
+**Ejemplo — escalado de dificultad:**
+
+```synx
+!active
+
+base_hp 100
+easy_hp:ref:calc:*0.5 base_hp
+hard_hp:ref:calc:*2 base_hp
+```
+
+> **Cuándo `:ref`, cuándo `:alias`:** Usa `:ref` cuando el valor necesite procesamiento adicional. Para copias simples — `:alias`.
 
 ---
 
@@ -519,6 +568,26 @@ steel:inherit:_base_resource
   weight 25
   material metal
 ```
+
+**Herencia multinivel:**
+
+```synx
+!active
+
+_entity
+  visible true
+  layer world
+
+_enemy:inherit:_entity
+  hostile true
+  ai patrol
+
+goblin:inherit:_enemy
+  hp 30
+  damage 5
+```
+
+Las cadenas de herencia funcionan: `_entity` → `_enemy` → `goblin`. Los bloques privados se excluyen de la salida.
 
 ---
 
@@ -549,13 +618,33 @@ const config = Synx.parse(text, { lang: 'es' });
 api_key:secret sk-1234567890
 ```
 
-### `:template` — Interpolación de Cadenas
+### Auto-`{}` — Interpolación de Cadenas
+
+En modo `!active`, cualquier valor de cadena con `{clave}` se interpola automáticamente — no se necesita marcador.
 
 ```synx
 !active
 name John
-greeting:template ¡Hola, {name}!
+greeting ¡Hola, {name}!
+
+server
+  host api.example.com
+  port 443
+api_url https://{server.host}:{server.port}/v1
 ```
+
+**Interpolación entre archivos con `!include`:**
+
+```synx
+!active
+!include ./db.synx
+
+conn_string postgresql://{host:db}:{port:db}/{name:db}
+```
+
+Sintaxis: `{clave}` para claves locales, `{clave:alias}` para archivos incluidos, `{clave:include}` para el único archivo incluido.
+
+> **Legacy:** El marcador `:template` sigue funcionando, pero ya no es necesario.
 
 ### `:include` — Importar Archivo Externo
 

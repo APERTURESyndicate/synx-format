@@ -106,6 +106,9 @@ export function parseSynx(text: string): ParsedDoc {
     if (trimmed === '!lock') {
       continue;
     }
+    if (trimmed.startsWith('!include ')) {
+      continue;
+    }
     if (!trimmed || trimmed.startsWith('#') || trimmed.startsWith('//')) continue;
 
     const indent = raw.search(/\S/);

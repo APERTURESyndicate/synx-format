@@ -167,7 +167,7 @@ key:secret my_api_key_123
     expect((data.key as any).reveal()).toBe('my_api_key_123');
   });
 
-  test(':template substitutes {placeholders}', () => {
+  test(':template substitutes {placeholders} (legacy marker)', () => {
     const data = Synx.parse(`
 !active
 name Wario
@@ -177,13 +177,34 @@ greeting:template Hello, {name}! You are {age} years old.
     expect(data.greeting).toBe('Hello, Wario! You are 30 years old.');
   });
 
-  test(':template with nested references', () => {
+  test(':template with nested references (legacy marker)', () => {
     const data = Synx.parse(`
 !active
 server
   host localhost
   port 8080
 url:template http://{server.host}:{server.port}/api
+    `);
+    expect(data.url).toBe('http://localhost:8080/api');
+  });
+
+  test('auto-{} interpolation without :template marker', () => {
+    const data = Synx.parse(`
+!active
+name Wario
+age 30
+greeting Hello, {name}! You are {age} years old.
+    `);
+    expect(data.greeting).toBe('Hello, Wario! You are 30 years old.');
+  });
+
+  test('auto-{} with nested dot-path references', () => {
+    const data = Synx.parse(`
+!active
+server
+  host localhost
+  port 8080
+url http://{server.host}:{server.port}/api
     `);
     expect(data.url).toBe('http://localhost:8080/api');
   });
