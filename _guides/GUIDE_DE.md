@@ -34,6 +34,7 @@
 - [Designphilosophie](#-designphilosophie)
 - [Demonstration](#-demonstration)
 - [Funktionsweise](#-funktionsweise)
+- [Sicherheitsmodell (v3.5.0+)](#-sicherheitsmodell-v350)
 - [Leistung und Benchmarks](#-leistung-und-benchmarks)
 - [Installation](#-installation)
 - [Syntax-Referenz](#-syntax-referenz)
@@ -165,6 +166,23 @@ Der Parser zeichnet Marker (`:env`, `:calc` usw.) als an jeden Schlüssel angeh�
 Wenn die Datei mit `!active` beginnt, durchläuft die **Engine** den geparsten Baum und löst jeden Marker auf.
 
 **Dateien ohne `!active` berühren die Engine nie.**
+
+---
+
+## Sicherheitsmodell (v3.5.0+)
+
+SYNX behält die volle Marker-Funktionalität und führt gleichzeitig Laufzeit-Schutzmechanismen für Datei- und Ausdrucksoperationen ein.
+
+- **Path Jail für Dateimarker**: `:include`, `:import`, `:watch`, `:fallback` werden nur innerhalb von `basePath` aufgelöst. Absolute Pfade und `../`-Traversal außerhalb der Basis werden blockiert.
+- **Tiefenlimit für verschachtelte Dateioperationen**: Include/Watch-Rekursion ist standardmäßig auf `16` Ebenen begrenzt (konfigurierbar).
+  Rust-Option: `max_include_depth`
+  JS-Option: `maxIncludeDepth`
+- **Dateigrößenlimit**: Dateien größer als `10 MB` werden vor dem Lesen abgelehnt.
+- **Grenze für `:calc`-Ausdrücke**: Ausdrücke länger als `4096` Zeichen werden abgelehnt.
+- **Engine-Verhalten**: Der Parser speichert weiterhin nur Metadaten; Marker-Handler laufen nur im `!active`-Modus.
+
+Sicherheitshinweis:
+- SYNX führt keinen beliebigen Code aus Konfigurationsdaten aus (keine YAML-artigen Objekt-Konstruktoren, kein `eval`).
 
 ---
 

@@ -34,6 +34,7 @@
 - [Philosophy](#-philosophy)
 - [See It in Action](#-see-it-in-action)
 - [How It Works](#-how-it-works)
+- [Security Model (v3.5.0+)](#-security-model-v350)
 - [Performance & Benchmarks](#-performance--benchmarks)
 - [Installation](#-installation)
 - [Grammar Reference](#-grammar-reference)
@@ -182,6 +183,23 @@ In Node.js, the library automatically selects the optimal engine:
 | ≥ 5 KB | Native Rust (NAPI) | Faster on large files (compiled code) |
 
 If the native Rust binding is not installed, it always falls back to pure TypeScript.
+
+---
+
+## Security Model (v3.5.0+)
+
+SYNX keeps full marker functionality while adding runtime guards for file and expression based features.
+
+- **Path jail for file markers**: `:include`, `:import`, `:watch`, `:fallback` are resolved inside `basePath` only. Absolute paths and path traversal (`../`) outside the base are rejected.
+- **Depth guard for nested file operations**: include/watch recursion is limited to `16` by default (configurable).
+  Rust option: `max_include_depth`
+  JS option: `maxIncludeDepth`
+- **File size guard**: files larger than `10 MB` are rejected before read.
+- **Calc expression guard**: `:calc` expressions longer than `4096` chars are rejected.
+- **Engine behavior**: parser still only records metadata; marker handlers execute only in `!active` mode.
+
+Security note:
+- SYNX does not execute arbitrary code from config data (no YAML-style object constructors, no `eval`).
 
 ---
 

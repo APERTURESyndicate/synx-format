@@ -8,6 +8,7 @@ Quick reference of what was modified in recent versions:
 
 | Version | Components Modified |
 |---------|---|
+| **3.5.0** | synx-core (path jail, depth limit, file size limit, calc length limit), synx-js (same), LICENSE (ethical use clause) |
 | **3.4.0** | synx-core (`:spam` rate-limit marker), synx-js (`:spam` + strict error sync), VSCode (diagnostics/completion/navigation/preview for `:spam`), guides (all languages), version sync |
 | **3.3.0** | synx-core (multi-parent inherit, calc dot-path, i18n plural, quoted strings, :import alias), VSCode (diagnostics/completion/navigation sync), documentation |
 | **3.2.3** | synx-core (global [] constraints), documentation, version sync |
@@ -17,6 +18,28 @@ Quick reference of what was modified in recent versions:
 | **3.1.3** | VSCode extension, JS/TS API, documentation (6 guides), CLI tool, deployment examples |
 | **3.1.2** | JS parser, Rust parser, VSCode extension, Node.js binding (napi), all guides |
 | **3.1.0** | JS/TS API (runtime manipulation), Rust engine, VSCode extension, all guides |
+
+---
+
+## [3.5.0] - 2026-03-08
+
+### Security Hardening
+
+All engines (Rust core + JS/TS) now include built-in security protections. No functionality is removed — safe defaults are applied automatically.
+
+- **Path jail (filesystem sandbox)**: `:include`, `:import`, `:watch`, `:fallback` file paths are resolved relative to `basePath` and cannot escape it. Absolute paths and `../` traversal beyond the project root are rejected.
+- **Include depth limit**: Nested `:include`/`:import`/`:watch` calls are limited to 16 levels deep (configurable via `maxIncludeDepth` / `max_include_depth`). Prevents infinite recursion and circular include DoS.
+- **File size limit**: Included/watched files larger than 10 MB are rejected to prevent memory exhaustion.
+- **Calc expression length limit**: `:calc` expressions longer than 4096 characters are rejected to prevent parser abuse.
+- **Env isolation**: When `env` option is provided explicitly, only that map is used — no fallthrough to `process.env` / `std::env`.
+
+### Added
+- `max_include_depth` option (Rust `Options`) and `maxIncludeDepth` option (JS `SynxOptions`) — configurable max nesting depth for file operations (default: 16).
+- `jail_path()` / `jailPath()` internal helpers — canonicalize and validate paths against base directory.
+- `check_file_size()` / `checkFileSize()` internal helpers — reject files exceeding 10 MB.
+
+### Changed
+- **LICENSE**: Added ethical use notice — SYNX must not be used for unauthorized data exfiltration, credential theft, or causing harm.
 
 ---
 

@@ -188,4 +188,8 @@ pub struct Options {
     pub region: Option<String>,
     pub lang: Option<String>,
     pub base_path: Option<String>,
+    /// Maximum depth for nested :include / :import / :watch file reads (default: 16).
+    pub max_include_depth: Option<usize>,
+    /// Internal counter — do not set manually.
+    pub _include_depth: usize,
 }

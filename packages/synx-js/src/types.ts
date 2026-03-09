@@ -96,4 +96,6 @@ export interface SynxOptions {
   lang?: string;
   /** Throw if marker resolution produces runtime error strings (INCLUDE_ERR, WATCH_ERR, etc.) */
   strict?: boolean;
+  /** Maximum include/import nesting depth (default: 16) */
+  maxIncludeDepth?: number;
 }

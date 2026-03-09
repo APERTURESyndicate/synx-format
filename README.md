@@ -347,6 +347,40 @@ Complete SYNX guides with all 20 markers, benchmarks, code examples, and archite
 | 🇯🇵 **Japanese** | [GUIDE_JA.md](_guides/GUIDE_JA.md) |
 | 🇩🇪 **Deutsch** | [GUIDE_DE.md](_guides/GUIDE_DE.md) |
 
+## 🔒 Security
+
+SYNX is designed to be **safe by default** — no code execution, no eval, no network calls from the parser.
+
+### What SYNX does NOT do
+
+| Risk | SYNX | YAML |
+|---|---|---|
+| Code execution from config | **No** — no `!!python/object`, no eval, no constructors | Yes — `!!python/object/apply` can execute arbitrary code |
+| Network/HTTP calls | **No** — parser is offline-only | Depends on loader |
+| Shell command injection | **No** — `:calc` uses a safe recursive-descent parser with whitelist operators (`+ - * / %`) | Depends on loader |
+
+### Built-in protections (v3.5.0+)
+
+| Protection | Description |
+|---|---|
+| **Path jail** | `:include`, `:import`, `:watch`, `:fallback` paths cannot escape the project's base directory. Absolute paths and `../` traversal are blocked. |
+| **Include depth limit** | Nested includes are limited to 16 levels (configurable). Prevents infinite recursion. |
+| **File size limit** | Included files > 10 MB are rejected. Prevents memory exhaustion. |
+| **Calc expression limit** | Expressions longer than 4096 characters are rejected. |
+| **Env isolation** | When `env` option is provided, only that map is used — no fallthrough to `process.env`. |
+
+### Configuration
+
+```typescript
+// JS/TS
+Synx.parse(text, { maxIncludeDepth: 32 }); // default: 16
+```
+
+```rust
+// Rust
+Options { max_include_depth: Some(32), ..Default::default() }
+```
+
 ## Full Specification
 
 - **[SPECIFICATION.md (English)](https://github.com/kaiserrberg/synx-format/blob/main/SPECIFICATION_EN.md)**

@@ -19,6 +19,37 @@ try {
   // Browser environment — :include will not work
 }
 
+// ─── Security constants ───────────────────────────────────
+
+const MAX_CALC_EXPR_LEN = 4096;
+const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10 MB
+const DEFAULT_MAX_INCLUDE_DEPTH = 16;
+
+/** Ensure a file path stays inside the base directory (path jail). */
+function jailPath(base: string, filePath: string): string {
+  if (!pathModule) throw new Error('path module not available');
+  // Block absolute paths
+  if (pathModule.isAbsolute(filePath)) {
+    throw new Error(`absolute path not allowed: ${filePath}`);
+  }
+  const resolved = pathModule.resolve(base, filePath);
+  const normalizedBase = pathModule.resolve(base);
+  // Ensure resolved path starts with the base directory
+  if (!resolved.startsWith(normalizedBase + pathModule.sep) && resolved !== normalizedBase) {
+    throw new Error(`path escapes base directory: ${filePath}`);
+  }
+  return resolved;
+}
+
+/** Check that a file does not exceed MAX_FILE_SIZE. */
+function checkFileSize(filePath: string): void {
+  if (!fs) return;
+  const stat = fs.statSync(filePath);
+  if (stat.size > MAX_FILE_SIZE) {
+    throw new Error(`file too large (${stat.size} bytes, max ${MAX_FILE_SIZE})`);
+  }
+}
+
 // ─── Secret wrapper ───────────────────────────────────────
 
 class SynxSecret {
@@ -128,14 +159,21 @@ export function resolve(
         obj[key] = 'INCLUDE_ERR: :include is not supported in browser';
         continue;
       }
+      const maxDepth = options.maxIncludeDepth ?? DEFAULT_MAX_INCLUDE_DEPTH;
+      const currentDepth = (options as any)._includeDepth ?? 0;
+      if (currentDepth >= maxDepth) {
+        obj[key] = `INCLUDE_ERR: max include depth (${maxDepth}) exceeded`;
+        continue;
+      }
       const includePath = String(obj[key]);
       const basePath = options.basePath || (typeof process !== 'undefined' ? process.cwd() : '.');
-      const fullPath = pathModule.resolve(basePath, includePath);
       try {
+        const fullPath = jailPath(basePath, includePath);
+        checkFileSize(fullPath);
         const text = fs.readFileSync(fullPath, 'utf-8');
         const { root: included, mode: includedMode } = parseData(text);
         if (includedMode === 'active') {
-          resolve(included, { ...options, basePath: pathModule.dirname(fullPath) }, root);
+          resolve(included, { ...options, basePath: pathModule.dirname(fullPath), _includeDepth: currentDepth + 1 } as any, root);
         }
         obj[key] = included;
       } catch (e: any) {
@@ -227,6 +265,10 @@ export function resolve(
     // ── :calc ──
     if (markers.includes('calc') && typeof obj[key] === 'string') {
       let expr = obj[key] as string;
+      if (expr.length > MAX_CALC_EXPR_LEN) {
+        obj[key] = `CALC_ERR: expression too long (${expr.length} chars, max ${MAX_CALC_EXPR_LEN})`;
+        continue;
+      }
       // Collect already-resolved numeric variables from root + local scope.
       // Keys that appear later in iteration order and still hold a marker
       // value (e.g. an unresolved :env string) are not yet numbers and will
@@ -377,8 +419,12 @@ export function resolve(
       const current = obj[key];
       let useFallback = current === null || current === undefined || current === '';
       if (!useFallback && typeof current === 'string' && fs && pathModule && options.basePath) {
-        const fullPath = pathModule.resolve(options.basePath, current);
-        useFallback = !fs.existsSync(fullPath);
+        try {
+          const fullPath = jailPath(options.basePath, current);
+          useFallback = !fs.existsSync(fullPath);
+        } catch {
+          useFallback = true; // path escapes jail → treat as missing → use fallback
+        }
       }
       if (useFallback && defaultVal) {
         obj[key] = defaultVal;
@@ -430,21 +476,28 @@ export function resolve(
       if (!fs || !pathModule) {
         obj[key] = 'WATCH_ERR: not supported in browser';
       } else {
-        const filePath = obj[key] as string;
-        const basePath = options.basePath || (typeof process !== 'undefined' ? process.cwd() : '.');
-        const fullPath = pathModule.resolve(basePath, filePath);
-        const idx = markers.indexOf('watch');
-        const keyPath = markers[idx + 1];
-        try {
-          const content = fs.readFileSync(fullPath, 'utf-8');
-          const ext = pathModule.extname(fullPath).slice(1);
-          if (keyPath) {
-            obj[key] = extractFromFileContent(content, keyPath, ext) as any;
-          } else {
-            obj[key] = content.trim();
+        const maxDepth = options.maxIncludeDepth ?? DEFAULT_MAX_INCLUDE_DEPTH;
+        const currentDepth = (options as any)._includeDepth ?? 0;
+        if (currentDepth >= maxDepth) {
+          obj[key] = `WATCH_ERR: max include depth (${maxDepth}) exceeded`;
+        } else {
+          const filePath = obj[key] as string;
+          const basePath = options.basePath || (typeof process !== 'undefined' ? process.cwd() : '.');
+          const idx = markers.indexOf('watch');
+          const keyPath = markers[idx + 1];
+          try {
+            const fullPath = jailPath(basePath, filePath);
+            checkFileSize(fullPath);
+            const content = fs.readFileSync(fullPath, 'utf-8');
+            const ext = pathModule.extname(fullPath).slice(1);
+            if (keyPath) {
+              obj[key] = extractFromFileContent(content, keyPath, ext) as any;
+            } else {
+              obj[key] = content.trim();
+            }
+          } catch (e: any) {
+            obj[key] = `WATCH_ERR: ${e.message}`;
           }
-        } catch (e: any) {
-          obj[key] = `WATCH_ERR: ${e.message}`;
         }
       }
     }
@@ -554,13 +607,17 @@ function loadIncludes(
   const map = new Map<string, SynxObject>();
   if (!fs || !pathModule) return map;
   const basePath = options.basePath || (typeof process !== 'undefined' ? process.cwd() : '.');
+  const maxDepth = options.maxIncludeDepth ?? DEFAULT_MAX_INCLUDE_DEPTH;
+  const currentDepth = (options as any)._includeDepth ?? 0;
+  if (currentDepth >= maxDepth) return map;
   for (const inc of includes) {
-    const fullPath = pathModule.resolve(basePath, inc.path);
     try {
+      const fullPath = jailPath(basePath, inc.path);
+      checkFileSize(fullPath);
       const text = fs.readFileSync(fullPath, 'utf-8');
       const { root, mode } = parseData(text);
       if (mode === 'active') {
-        resolve(root, { ...options, basePath: pathModule.dirname(fullPath) }, undefined, map);
+        resolve(root, { ...options, basePath: pathModule.dirname(fullPath), _includeDepth: currentDepth + 1 } as any, undefined, map);
       }
       map.set(inc.alias, root);
     } catch (e: any) {

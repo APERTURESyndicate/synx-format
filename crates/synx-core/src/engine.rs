@@ -11,6 +11,53 @@ use crate::value::*;
 
 static SPAM_BUCKETS: OnceLock<Mutex<HashMap<String, Vec<Instant>>>> = OnceLock::new();
 
+/// Maximum expression length accepted by :calc (prevents ReDoS/stack abuse).
+const MAX_CALC_EXPR_LEN: usize = 4096;
+/// Maximum file size for :include / :watch reads (10 MB).
+const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
+/// Default maximum include depth.
+const DEFAULT_MAX_INCLUDE_DEPTH: usize = 16;
+
+/// Validate that `full` path stays within the `base` directory (jail).
+/// Returns `Ok(canonical)` or an `Err` describing the violation.
+fn jail_path(base: &str, file_path: &str) -> Result<std::path::PathBuf, String> {
+    // Block absolute paths in the value itself
+    let fp = std::path::Path::new(file_path);
+    if fp.is_absolute() {
+        return Err(format!("SECURITY: absolute paths are not allowed: '{}'", file_path));
+    }
+    let base_canonical = match std::fs::canonicalize(base) {
+        Ok(p) => p,
+        Err(_) => std::path::PathBuf::from(base),
+    };
+    let full = base_canonical.join(file_path);
+    let full_canonical = match std::fs::canonicalize(&full) {
+        Ok(p) => p,
+        Err(_) => {
+            // File may not exist yet — at least verify no ".." escapes
+            let normalized = full.to_string_lossy();
+            if normalized.contains("..") {
+                return Err(format!("SECURITY: path traversal detected: '{}'", file_path));
+            }
+            return Ok(full);
+        }
+    };
+    if !full_canonical.starts_with(&base_canonical) {
+        return Err(format!("SECURITY: path escapes base directory: '{}'", file_path));
+    }
+    Ok(full_canonical)
+}
+
+/// Check file size before reading.
+fn check_file_size(path: &std::path::Path) -> Result<(), String> {
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.len() > MAX_FILE_SIZE => {
+            Err(format!("SECURITY: file too large ({} bytes, max {})", meta.len(), MAX_FILE_SIZE))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Resolve all active-mode markers in a ParseResult.
 /// Returns the resolved root Value.
 pub fn resolve(result: &mut ParseResult, options: &Options) {
@@ -190,16 +237,35 @@ fn apply_markers(
     // ── :include / :import ──
     if markers.contains(&"include".to_string()) || markers.contains(&"import".to_string()) {
         if let Some(Value::String(file_path)) = map.get(key) {
+            let max_depth = options.max_include_depth.unwrap_or(DEFAULT_MAX_INCLUDE_DEPTH);
+            if options._include_depth >= max_depth {
+                map.insert(
+                    key.to_string(),
+                    Value::String(format!("INCLUDE_ERR: max include depth ({}) exceeded", max_depth)),
+                );
+                return;
+            }
             let base = options
                 .base_path
                 .as_deref()
                 .unwrap_or(".");
-            let full = std::path::Path::new(base).join(file_path);
+            let full = match jail_path(base, file_path) {
+                Ok(p) => p,
+                Err(e) => {
+                    map.insert(key.to_string(), Value::String(format!("INCLUDE_ERR: {}", e)));
+                    return;
+                }
+            };
+            if let Err(e) = check_file_size(&full) {
+                map.insert(key.to_string(), Value::String(format!("INCLUDE_ERR: {}", e)));
+                return;
+            }
             match std::fs::read_to_string(&full) {
                 Ok(text) => {
                     let mut included = parser::parse(&text);
                     if included.mode == Mode::Active {
                         let mut child_opts = options.clone();
+                        child_opts._include_depth += 1;
                         if let Some(parent) = full.parent() {
                             child_opts.base_path = Some(parent.to_string_lossy().into_owned());
                         }
@@ -378,6 +444,13 @@ fn apply_markers(
     // ── :calc ──
     if markers.contains(&"calc".to_string()) {
         if let Some(Value::String(expr)) = map.get(key) {
+            if expr.len() > MAX_CALC_EXPR_LEN {
+                map.insert(
+                    key.to_string(),
+                    Value::String(format!("CALC_ERR: expression too long ({} chars, max {})", expr.len(), MAX_CALC_EXPR_LEN)),
+                );
+                return;
+            }
             let mut resolved = expr.clone();
 
             // Substitute variables from root (flat keys)
@@ -679,7 +752,10 @@ fn apply_markers(
             Some(Value::String(s)) if s.is_empty() => true,
             Some(Value::String(s)) => {
                 let base = options.base_path.as_deref().unwrap_or(".");
-                !std::path::Path::new(base).join(s).exists()
+                match jail_path(base, s) {
+                    Ok(safe) => !safe.exists(),
+                    Err(_) => true, // path escapes jail → treat as missing → use fallback
+                }
             }
             _ => false,
         };
@@ -737,8 +813,26 @@ fn apply_markers(
     // Reads the referenced file at parse time. Optionally extracts a key path (JSON/SYNX).
     if markers.contains(&"watch".to_string()) {
         if let Some(Value::String(file_path)) = map.get(key) {
+            let max_depth = options.max_include_depth.unwrap_or(DEFAULT_MAX_INCLUDE_DEPTH);
+            if options._include_depth >= max_depth {
+                map.insert(
+                    key.to_string(),
+                    Value::String(format!("WATCH_ERR: max include depth ({}) exceeded", max_depth)),
+                );
+                return;
+            }
             let base = options.base_path.as_deref().unwrap_or(".");
-            let full = std::path::Path::new(base).join(file_path);
+            let full = match jail_path(base, file_path) {
+                Ok(p) => p,
+                Err(e) => {
+                    map.insert(key.to_string(), Value::String(format!("WATCH_ERR: {}", e)));
+                    return;
+                }
+            };
+            if let Err(e) = check_file_size(&full) {
+                map.insert(key.to_string(), Value::String(format!("WATCH_ERR: {}", e)));
+                return;
+            }
             let watch_idx = markers.iter().position(|m| m == "watch").unwrap();
             let key_path = markers.get(watch_idx + 1).cloned();
 
@@ -1319,12 +1413,23 @@ fn load_includes(
 ) -> HashMap<String, Value> {
     let mut map = HashMap::new();
     let base = options.base_path.as_deref().unwrap_or(".");
+    let max_depth = options.max_include_depth.unwrap_or(DEFAULT_MAX_INCLUDE_DEPTH);
+    if options._include_depth >= max_depth {
+        return map;
+    }
     for inc in directives {
-        let full = std::path::Path::new(base).join(&inc.path);
+        let full = match jail_path(base, &inc.path) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if check_file_size(&full).is_err() {
+            continue;
+        }
         if let Ok(text) = std::fs::read_to_string(&full) {
             let mut included = parser::parse(&text);
             if included.mode == Mode::Active {
                 let mut child_opts = options.clone();
+                child_opts._include_depth += 1;
                 if let Some(parent) = full.parent() {
                     child_opts.base_path = Some(parent.to_string_lossy().into_owned());
                 }

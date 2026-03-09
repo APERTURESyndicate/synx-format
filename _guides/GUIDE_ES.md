@@ -34,6 +34,7 @@
 - [Filosofía de Diseño](#-filosofía-de-diseño)
 - [Demostración](#-demostración)
 - [Cómo Funciona](#-cómo-funciona)
+- [Modelo de Seguridad (v3.5.0+)](#-modelo-de-seguridad-v350)
 - [Rendimiento y Benchmarks](#-rendimiento-y-benchmarks)
 - [Instalación](#-instalación)
 - [Referencia de Sintaxis](#-referencia-de-sintaxis)
@@ -165,6 +166,23 @@ El parser registra los marcadores (`:env`, `:calc`, etc.) como **metadatos** adj
 Si el archivo comienza con `!active`, el **motor** recorre el árbol parseado y resuelve cada marcador.
 
 **Los archivos sin `!active` nunca tocan el motor.**
+
+---
+
+## Modelo de Seguridad (v3.5.0+)
+
+SYNX mantiene toda la funcionalidad de marcadores y agrega protecciones de ejecucion para operaciones de archivos y expresiones.
+
+- **Path jail para marcadores de archivo**: `:include`, `:import`, `:watch`, `:fallback` solo se resuelven dentro de `basePath`. Se bloquean rutas absolutas y traversal `../` fuera de la base.
+- **Limite de profundidad para anidacion**: la recursion de include/watch se limita a `16` niveles por defecto (configurable).
+  Opcion Rust: `max_include_depth`
+  Opcion JS: `maxIncludeDepth`
+- **Limite de tamano de archivo**: se rechazan archivos mayores a `10 MB`.
+- **Limite de expresion en `:calc`**: se rechazan expresiones de mas de `4096` caracteres.
+- **Comportamiento del motor**: el parser solo guarda metadatos; los handlers de marcadores se ejecutan solo en `!active`.
+
+Nota de seguridad:
+- SYNX no ejecuta codigo arbitrario desde configuracion (sin constructores estilo YAML y sin `eval`).
 
 ---
 
