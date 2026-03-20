@@ -11,6 +11,7 @@ import { resolve } from './engine';
 import type { SynxObject, SynxOptions } from './types';
 
 export type { SynxObject, SynxOptions, SynxValue, SynxArray, SynxPrimitive } from './types';
+export { SynxError } from './types';
 
 class Synx {
   static parse<T extends SynxObject = SynxObject>(text: string, options: SynxOptions = {}): T {

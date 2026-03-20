@@ -91,6 +91,7 @@ export function resolve(
   root?: SynxObject,
   includesMap?: Map<string, SynxObject>,
   _resolveDepth = 0,
+  _currentPath = '',
 ): SynxObject {
   if (!root) {
     root = obj;
@@ -125,14 +126,14 @@ export function resolve(
 
     // Recurse into nested objects
     if (value && typeof value === 'object' && !Array.isArray(value)) {
-      resolve(value as SynxObject, options, root, includesMap, _resolveDepth + 1);
+      resolve(value as SynxObject, options, root, includesMap, _resolveDepth + 1, _currentPath ? `${_currentPath}.${key}` : key);
     }
 
     // Recurse into arrays of objects
     if (Array.isArray(value)) {
       for (const item of value) {
         if (item && typeof item === 'object' && !Array.isArray(item)) {
-          resolve(item as SynxObject, options, root, includesMap, _resolveDepth + 1);
+          resolve(item as SynxObject, options, root, includesMap, _resolveDepth + 1, _currentPath ? `${_currentPath}.${key}` : key);
         }
       }
     }
@@ -306,19 +307,28 @@ export function resolve(
     // ── :alias ──
     if (markers.includes('alias') && typeof obj[key] === 'string') {
       const target = obj[key] as string;
-      // Detect direct self-reference
-      if (target === key) {
-        obj[key] = `ALIAS_ERR: self-referential alias: ${key} → ${target}`;
+      // Detect direct self-reference (bare key or full dot-path)
+      const currentKeyPath = _currentPath ? `${_currentPath}.${key}` : key;
+      if (target === key || target === currentKeyPath) {
+        obj[key] = `ALIAS_ERR: self-referential alias: ${currentKeyPath} → ${target}`;
       } else {
         // Detect one-hop cycle: a → b → a
         // Only flag as cycle if the target key ALSO has an :alias marker.
         // Without this check, plain string values that happen to match the current
         // key name would produce false-positive ALIAS_ERR results.
         const targetVal = deepGet(root, target);
-        // Check if the target key has an :alias marker in metadata
-        const targetKeyName = target.includes('.') ? target.split('.').pop()! : target;
-        const rootMeta = (root as any).__synx as Record<string, any> | undefined;
-        const targetHasAlias: boolean = rootMeta?.[targetKeyName]?.markers?.includes('alias') ?? false;
+        // Check if the target key has an :alias marker in metadata.
+        // Must look up the target's PARENT object's __synx, not the root's,
+        // to correctly handle nested keys like "section.foo".
+        const lastDot = target.lastIndexOf('.');
+        const targetParentPath = lastDot >= 0 ? target.slice(0, lastDot) : '';
+        const targetLeafKey = lastDot >= 0 ? target.slice(lastDot + 1) : target;
+        const targetParentObj = targetParentPath ? deepGet(root, targetParentPath) : root;
+        const targetParentMeta = (targetParentObj != null && typeof targetParentObj === 'object')
+          ? (targetParentObj as any).__synx as Record<string, any> | undefined
+          : undefined;
+        const targetHasAlias: boolean =
+          targetParentMeta?.[targetLeafKey]?.markers?.includes('alias') ?? false;
         const isCycle = targetHasAlias && typeof targetVal === 'string' && targetVal === key;
         if (isCycle) {
           obj[key] = `ALIAS_ERR: circular alias detected: ${key} → ${target}`;
