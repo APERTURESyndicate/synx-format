@@ -193,7 +193,7 @@ fn apply_markers(
     meta: &Meta,
     root_ptr: *mut Value,
     options: &Options,
-    _path: &str,
+    path: &str,
     _metadata: &HashMap<String, MetaMap>,
     _includes: &HashMap<String, Value>,
 ) {
@@ -542,9 +542,38 @@ fn apply_markers(
     // ── :alias ──
     if markers.contains(&"alias".to_string()) {
         if let Some(Value::String(target)) = map.get(key) {
-            let root_ref = unsafe { &*root_ptr };
-            let val = deep_get(root_ref, target).unwrap_or(Value::Null);
-            map.insert(key.to_string(), val);
+            let target = target.clone();
+            // Build the full dot-path of the current key
+            let current_path = if path.is_empty() {
+                key.to_string()
+            } else {
+                format!("{}.{}", path, key)
+            };
+            // Detect direct self-reference: key:alias key
+            if target == key || target == current_path {
+                map.insert(
+                    key.to_string(),
+                    Value::String(format!("ALIAS_ERR: self-referential alias: {} → {}", current_path, target)),
+                );
+            } else {
+                // Detect one-hop cycle: a → b → a
+                let root_ref = unsafe { &*root_ptr };
+                let target_val = deep_get(root_ref, &target);
+                // If the target's current value equals the current key path, it's a cycle
+                let is_cycle = match &target_val {
+                    Some(Value::String(s)) => s == key || s == &current_path,
+                    _ => false,
+                };
+                if is_cycle {
+                    map.insert(
+                        key.to_string(),
+                        Value::String(format!("ALIAS_ERR: circular alias detected: {} → {}", current_path, target)),
+                    );
+                } else {
+                    let val = target_val.unwrap_or(Value::Null);
+                    map.insert(key.to_string(), val);
+                }
+            }
         }
     }
 
@@ -2045,5 +2074,42 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_circular_alias_returns_error() {
+        let mut r = parse("!active\na:alias b\nb:alias a");
+        resolve(&mut r, &Default::default());
+        let root = r.root.as_object().unwrap();
+        let a_val = root.get("a").unwrap();
+        let b_val = root.get("b").unwrap();
+        assert!(
+            matches!(a_val, Value::String(s) if s.starts_with("ALIAS_ERR:")),
+            "expected ALIAS_ERR for 'a', got: {:?}", a_val
+        );
+        assert!(
+            matches!(b_val, Value::String(s) if s.starts_with("ALIAS_ERR:")),
+            "expected ALIAS_ERR for 'b', got: {:?}", b_val
+        );
+    }
+
+    #[test]
+    fn test_self_alias_returns_error() {
+        let mut r = parse("!active\na:alias a");
+        resolve(&mut r, &Default::default());
+        let root = r.root.as_object().unwrap();
+        let a_val = root.get("a").unwrap();
+        assert!(
+            matches!(a_val, Value::String(s) if s.starts_with("ALIAS_ERR:")),
+            "expected ALIAS_ERR for self-alias, got: {:?}", a_val
+        );
+    }
+
+    #[test]
+    fn test_valid_alias_still_works() {
+        let mut r = parse("!active\nbase 42\ncopy:alias base");
+        resolve(&mut r, &Default::default());
+        let root = r.root.as_object().unwrap();
+        assert_eq!(root.get("copy"), Some(&Value::Int(42)));
     }
 }
