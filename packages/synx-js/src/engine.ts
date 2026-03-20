@@ -107,7 +107,7 @@ export function resolve(
   }
 
   // Guard: prevent stack overflow from deeply nested objects
-  if (_resolveDepth > MAX_RESOLVE_DEPTH) {
+  if (_resolveDepth >= MAX_RESOLVE_DEPTH) {
     for (const k of Object.keys(obj)) {
       if (k !== '__synx') {
         obj[k] = 'NESTING_ERR: maximum object nesting depth exceeded';

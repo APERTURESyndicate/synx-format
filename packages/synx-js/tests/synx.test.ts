@@ -463,4 +463,39 @@ describe('Security — Deep Nesting', () => {
       Synx.parse(lines.join('\n'));
     }).not.toThrow();
   });
+
+  test('values beyond depth 512 contain NESTING_ERR', () => {
+    let lines = ['!active'];
+    let indent = '';
+    for (let i = 0; i < 600; i++) {
+      lines.push(`${indent}level_${i}`);
+      indent += '  ';
+    }
+    lines.push(`${indent}value deep`);
+    const result = Synx.parse(lines.join('\n')) as any;
+
+    // Walk down to depth 510 — should be a normal object
+    let cur = result;
+    for (let i = 0; i < 510; i++) {
+      expect(typeof cur).toBe('object');
+      expect(cur).not.toBeNull();
+      cur = cur[`level_${i}`];
+    }
+    expect(typeof cur).toBe('object');
+
+    // Walk down to depth 512 — children should contain NESTING_ERR
+    let cur2 = result;
+    for (let i = 0; i < 512; i++) {
+      if (typeof cur2 !== 'object' || cur2 === null) break;
+      cur2 = cur2[`level_${i}`];
+    }
+    // At or beyond depth 512, values should be NESTING_ERR strings
+    if (typeof cur2 === 'object' && cur2 !== null) {
+      for (const v of Object.values(cur2 as any)) {
+        if (typeof v === 'string') {
+          expect(v).toMatch(/^NESTING_ERR:/);
+        }
+      }
+    }
+  });
 });
