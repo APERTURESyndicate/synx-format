@@ -306,7 +306,19 @@ export function resolve(
     // ── :alias ──
     if (markers.includes('alias') && typeof obj[key] === 'string') {
       const target = obj[key] as string;
-      obj[key] = deepGet(root, target) ?? null;
+      // Detect direct self-reference
+      if (target === key) {
+        obj[key] = `ALIAS_ERR: self-referential alias: ${key} → ${target}`;
+      } else {
+        // Detect one-hop cycle: a → b where b's current value is 'a'
+        const targetVal = deepGet(root, target);
+        const isCycle = typeof targetVal === 'string' && targetVal === key;
+        if (isCycle) {
+          obj[key] = `ALIAS_ERR: circular alias detected: ${key} → ${target}`;
+        } else {
+          obj[key] = targetVal ?? null;
+        }
+      }
     }
 
     // ── :secret ──

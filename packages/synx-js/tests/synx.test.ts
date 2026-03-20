@@ -344,6 +344,22 @@ access:spam:1:5 secret_token
     expect(String(second.access)).toContain('SPAM_ERR:');
   });
 
+  test('returns ALIAS_ERR for circular alias (a→b→a)', () => {
+    const data = Synx.parse('!active\na:alias b\nb:alias a') as any;
+    expect(data.a).toMatch(/^ALIAS_ERR:/);
+    expect(data.b).toMatch(/^ALIAS_ERR:/);
+  });
+
+  test('returns ALIAS_ERR for self-alias (a→a)', () => {
+    const data = Synx.parse('!active\na:alias a') as any;
+    expect(data.a).toMatch(/^ALIAS_ERR:/);
+  });
+
+  test('valid alias to another key still works after circular fix', () => {
+    const data = Synx.parse('!active\nbase 42\ncopy:alias base') as any;
+    expect(data.copy).toBe(42);
+  });
+
   test(':spam defaults window to 1 second when omitted', () => {
     const uniqueKey = `key_${Date.now()}`;
     const src = `
