@@ -360,6 +360,14 @@ access:spam:1:5 secret_token
     expect(data.copy).toBe(42);
   });
 
+  test('alias to string-valued key does not produce false ALIAS_ERR', () => {
+    // 'a' is a plain string "b". 'b' aliases 'a'. Should resolve to "b", not ALIAS_ERR.
+    const data = Synx.parse('!active\na b\nb:alias a') as any;
+    expect(data.b).toBe('b');
+    expect(typeof data.b).toBe('string');
+    expect(String(data.b)).not.toMatch(/^ALIAS_ERR:/);
+  });
+
   test(':spam defaults window to 1 second when omitted', () => {
     const uniqueKey = `key_${Date.now()}`;
     const src = `
