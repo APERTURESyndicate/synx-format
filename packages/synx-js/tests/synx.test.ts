@@ -268,7 +268,7 @@ db:include ./__missing__.synx
 !active
 db:include ./__missing__.synx
       `, { strict: true });
-    }).toThrow(/SYNX strict mode error/);
+    }).toThrow(/INCLUDE_ERR/);
   });
 
   test(':ref resolves reference', () => {
