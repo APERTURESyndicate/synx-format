@@ -310,9 +310,16 @@ export function resolve(
       if (target === key) {
         obj[key] = `ALIAS_ERR: self-referential alias: ${key} → ${target}`;
       } else {
-        // Detect one-hop cycle: a → b where b's current value is 'a'
+        // Detect one-hop cycle: a → b → a
+        // Only flag as cycle if the target key ALSO has an :alias marker.
+        // Without this check, plain string values that happen to match the current
+        // key name would produce false-positive ALIAS_ERR results.
         const targetVal = deepGet(root, target);
-        const isCycle = typeof targetVal === 'string' && targetVal === key;
+        // Check if the target key has an :alias marker in metadata
+        const targetKeyName = target.includes('.') ? target.split('.').pop()! : target;
+        const rootMeta = (root as any).__synx as Record<string, any> | undefined;
+        const targetHasAlias: boolean = rootMeta?.[targetKeyName]?.markers?.includes('alias') ?? false;
+        const isCycle = targetHasAlias && typeof targetVal === 'string' && targetVal === key;
         if (isCycle) {
           obj[key] = `ALIAS_ERR: circular alias detected: ${key} → ${target}`;
         } else {

@@ -73,6 +73,12 @@ describe('Security — Circular :alias', () => {
     const data = Synx.parse('!active\nbase 42\ncopy:alias base') as any;
     expect(data.copy).toBe(42);
   });
+
+  test('alias to string-valued key does not produce false ALIAS_ERR', () => {
+    const data = Synx.parse('!active\na b\nb:alias a') as any;
+    expect(data.b).toBe('b');
+    expect(String(data.b)).not.toMatch(/^ALIAS_ERR:/);
+  });
 });
 
 // ─── Circular :template ───────────────────────────────────

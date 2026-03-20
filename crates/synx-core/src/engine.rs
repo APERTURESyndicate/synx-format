@@ -194,7 +194,7 @@ fn apply_markers(
     root_ptr: *mut Value,
     options: &Options,
     path: &str,
-    _metadata: &HashMap<String, MetaMap>,
+    metadata: &HashMap<String, MetaMap>,
     _includes: &HashMap<String, Value>,
 ) {
     let markers = &meta.markers;
@@ -557,10 +557,23 @@ fn apply_markers(
                 );
             } else {
                 // Detect one-hop cycle: a → b → a
+                // Only flag as cycle if the target key ALSO has an :alias marker.
+                // Without this check, plain string values that happen to match the current
+                // key name would produce false-positive ALIAS_ERR results.
                 let root_ref = unsafe { &*root_ptr };
                 let target_val = deep_get(root_ref, &target);
-                // If the target's current value equals the current key path, it's a cycle
-                let is_cycle = match &target_val {
+                // Determine the metadata path of the target key
+                let (target_parent, target_key_name) = if let Some(dot) = target.rfind('.') {
+                    (target[..dot].to_string(), target[dot + 1..].to_string())
+                } else {
+                    (String::new(), target.clone())
+                };
+                let target_has_alias = metadata
+                    .get(&target_parent)
+                    .and_then(|mm| mm.get(&target_key_name))
+                    .map(|m| m.markers.contains(&"alias".to_string()))
+                    .unwrap_or(false);
+                let is_cycle = target_has_alias && match &target_val {
                     Some(Value::String(s)) => s == key || s == &current_path,
                     _ => false,
                 };
@@ -2111,5 +2124,19 @@ mod tests {
         resolve(&mut r, &Default::default());
         let root = r.root.as_object().unwrap();
         assert_eq!(root.get("copy"), Some(&Value::Int(42)));
+    }
+
+    #[test]
+    fn test_alias_to_string_valued_key_no_false_positive() {
+        // 'a' holds a literal string "b". 'b' aliases 'a'.
+        // b should resolve to "b" — NOT trigger ALIAS_ERR.
+        let mut r = parse("!active\na b\nb:alias a");
+        resolve(&mut r, &Default::default());
+        let root = r.root.as_object().unwrap();
+        assert_eq!(
+            root.get("b"),
+            Some(&Value::String("b".to_string())),
+            "alias to a string-valued key should not produce ALIAS_ERR"
+        );
     }
 }
