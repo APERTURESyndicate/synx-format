@@ -47,6 +47,8 @@ Quick reference of what was modified in recent versions:
 ### Fixed
 
 - **VS Code: `:template` false-positive warning for sibling keys.** The diagnostic `"Key referenced in template is not defined"` only checked root-level `keyMap` (dot-paths), so `{sibling}` inside a nested `:template` always flagged as missing. Now checks both root path and sibling scope (`parent.sibling`).
+- **Python binding CI smoke tests.** `pyo3`'s `extension-module` mode is now feature-gated so binding builds keep extension semantics by default, while `cargo test` in CI can run with `--no-default-features` and avoid unresolved embedded-Python entrypoints.
+- **Bindings workflow stability.** `bindings-smoke.yml` now runs the Python smoke job with `--no-default-features`, prints/verifies the built Node native artifact on Windows, and executes the Node smoke test from the binding directory directly instead of going through `npm run`.
 - **JS: Prototype pollution via `Synx.set()` / `Synx.add()` / `Synx.remove()`** (Security). Path segments `__proto__`, `constructor`, `prototype` are now rejected with an error.
 - **JS: `deepGet()` followed prototype chain** (Security). Lookups like `constructor` or `toString` could reach inherited properties. Now uses `hasOwnProperty` checks at every traversal step.
 - **JS: `__proto__` key injection in parser** (Security). A `.synx` file with a key named `__proto__` could corrupt the parsed object's prototype. Such keys are now silently skipped.

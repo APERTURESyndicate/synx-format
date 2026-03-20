@@ -137,43 +137,40 @@ fn synx_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use pyo3::types::PyDict;
-    use std::collections::HashMap;
-
     #[test]
     fn smoke_parse_to_json_and_format() {
         let text = "name John\nage 25\n";
-        let json = parse_to_json(text).expect("parse_to_json should succeed");
+        let json = super::parse_to_json(text).expect("parse_to_json should succeed");
         assert!(json.contains("\"name\":\"John\""));
 
-        let formatted = format("b 2\na 1\n").expect("format should succeed");
+        let formatted = super::format("b 2\na 1\n").expect("format should succeed");
         assert!(formatted.contains("a 1"));
         assert!(formatted.contains("b 2"));
     }
 
     #[test]
-    fn smoke_parse_active_and_stringify() {
-        Python::with_gil(|py| {
-            let parsed = parse_active(
-                py,
-                "!active\nname John\n",
-                Some(HashMap::new()),
-                Some(".".to_string()),
-            )
-            .expect("parse_active should succeed");
+    fn smoke_core_parse_active_and_stringify() {
+        // Test via synx-core directly (Python::with_gil requires auto-initialize
+        // which conflicts with extension-module)
+        let mut result = synx_core::parse("!active\nname John\n");
+        let opts = synx_core::Options {
+            env: Some(std::collections::HashMap::new()),
+            base_path: Some(".".into()),
+            ..Default::default()
+        };
+        synx_core::resolve(&mut result, &opts);
 
-            let dict = parsed.bind(py).downcast::<PyDict>().expect("dict expected");
-            let name: String = dict
-                .get_item("name")
-                .expect("name key must exist")
-                .expect("name value must be present")
-                .extract()
-                .expect("name must be string");
-            assert_eq!(name, "John");
+        match &result.root {
+            synx_core::Value::Object(map) => {
+                match map.get("name") {
+                    Some(synx_core::Value::String(s)) => assert_eq!(s, "John"),
+                    other => panic!("expected String(\"John\"), got {:?}", other),
+                }
+            }
+            _ => panic!("expected Object root"),
+        }
 
-            let out = stringify(py, dict.as_any()).expect("stringify should succeed");
-            assert!(out.contains("name John"));
-        });
+        let synx_text = synx_core::Synx::stringify(&result.root);
+        assert!(synx_text.contains("name John"));
     }
 }
