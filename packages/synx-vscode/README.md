@@ -10,7 +10,7 @@
   <img src="https://img.shields.io/visual-studio-marketplace/v/APERTURESyndicate.synx-vscode?label=version&color=5a6eff" />
   <img src="https://img.shields.io/visual-studio-marketplace/i/APERTURESyndicate.synx-vscode?color=5a6eff" />
   <img src="https://img.shields.io/badge/license-MIT-blue" />
-  <img src="https://img.shields.io/badge/format-SYNX%20v3.0-blueviolet" />
+  <img src="https://img.shields.io/badge/format-SYNX%20v3.5-blueviolet" />
 </p>
 
 ---
@@ -37,7 +37,7 @@ Add `!active` on the first line and your config comes alive — with logic built
 
 ## Features
 
-This extension provides complete SYNX v3.0 language support for Visual Studio Code:
+This extension provides complete SYNX v3.5 language support for Visual Studio Code:
 
 | Feature | Description |
 |---|---|
@@ -116,7 +116,7 @@ The extension validates your `.synx` files in real time:
 
 ## Performance
 
-SYNX v3.0 uses a unified Rust core with native bindings. Real benchmark results on a 110-key config (2.5 KB):
+SYNX v3.5 uses a unified Rust core with native bindings. Real benchmark results on a 110-key config (2.5 KB):
 
 ### Rust (criterion, direct)
 
