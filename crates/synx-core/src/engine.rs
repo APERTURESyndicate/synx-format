@@ -17,6 +17,8 @@ const MAX_CALC_EXPR_LEN: usize = 4096;
 const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
 /// Default maximum include depth.
 const DEFAULT_MAX_INCLUDE_DEPTH: usize = 16;
+/// Maximum object nesting depth for active-mode resolution (prevents stack overflow).
+const MAX_RESOLVE_DEPTH: usize = 512;
 
 /// Validate that `full` path stays within the `base` directory (jail).
 /// Returns `Ok(canonical)` or an `Err` describing the violation.
@@ -92,7 +94,7 @@ pub fn resolve(result: &mut ParseResult, options: &Options) {
     //      always a distinct subtree from what we read via `root_ptr`.
     //   3. The pointer is valid for the entire duration of `resolve_value`.
     let root_ptr = &mut result.root as *mut Value;
-    resolve_value(&mut result.root, root_ptr, options, &metadata, "", &includes_map);
+    resolve_value(&mut result.root, root_ptr, options, &metadata, "", &includes_map, 0);
 
     // ── Validate field constraints (global, by field name) ──
     validate_field_constraints(&mut result.root, &constraint_registry);
@@ -111,7 +113,20 @@ fn resolve_value(
     metadata: &HashMap<String, MetaMap>,
     path: &str,
     includes: &HashMap<String, Value>,
+    depth: usize,   // NEW
 ) {
+    // Guard: prevent stack overflow from deeply nested objects
+    if depth > MAX_RESOLVE_DEPTH {
+        if let Value::Object(ref mut map) = value {
+            for val in map.values_mut() {
+                *val = Value::String(
+                    "NESTING_ERR: maximum object nesting depth exceeded".to_string()
+                );
+            }
+        }
+        return;
+    }
+
     let meta_map = metadata.get(path).cloned();
 
     if let Value::Object(ref mut map) = value {
@@ -128,12 +143,12 @@ fn resolve_value(
             if let Some(child) = map.get_mut(key) {
                 match child {
                     Value::Object(_) => {
-                        resolve_value(child, root_ptr, options, metadata, &child_path, includes);
+                        resolve_value(child, root_ptr, options, metadata, &child_path, includes, depth + 1);
                     }
                     Value::Array(arr) => {
                         for item in arr.iter_mut() {
                             if let Value::Object(_) = item {
-                                resolve_value(item, root_ptr, options, metadata, &child_path, includes);
+                                resolve_value(item, root_ptr, options, metadata, &child_path, includes, depth + 1);
                             }
                         }
                     }
@@ -1977,5 +1992,19 @@ mod tests {
         resolve(&mut r, &Options::default());
         let map = r.root.as_object().unwrap();
         assert_eq!(map["x"], Value::Int(1));
+    }
+
+    #[test]
+    fn test_deep_nesting_does_not_overflow() {
+        let mut synx = String::from("!active\n");
+        let mut indent = String::new();
+        for i in 0..600 {
+            synx.push_str(&format!("{}level_{}\n", indent, i));
+            indent.push_str("  ");
+        }
+        synx.push_str(&format!("{}value deep\n", indent));
+        let mut result = parse(&synx);
+        resolve(&mut result, &Default::default());
+        assert!(matches!(result.root, Value::Object(_)));
     }
 }
