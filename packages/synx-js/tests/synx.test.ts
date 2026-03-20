@@ -449,3 +449,18 @@ describe('Safe Calculator', () => {
     expect(data.result).toBe(-2);
   });
 });
+
+describe('Security — Deep Nesting', () => {
+  test('does not stack overflow with 600 nesting levels', () => {
+    let lines = ['!active'];
+    let indent = '';
+    for (let i = 0; i < 600; i++) {
+      lines.push(`${indent}level_${i}`);
+      indent += '  ';
+    }
+    lines.push(`${indent}value deep`);
+    expect(() => {
+      Synx.parse(lines.join('\n'));
+    }).not.toThrow();
+  });
+});

@@ -25,6 +25,9 @@ const MAX_CALC_EXPR_LEN = 4096;
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10 MB
 const DEFAULT_MAX_INCLUDE_DEPTH = 16;
 
+/** Maximum object nesting depth for active-mode resolution (prevents stack overflow). */
+const MAX_RESOLVE_DEPTH = 512;
+
 /** Ensure a file path stays inside the base directory (path jail). */
 function jailPath(base: string, filePath: string): string {
   if (!pathModule) throw new Error('path module not available');
@@ -87,6 +90,7 @@ export function resolve(
   options: SynxOptions = {},
   root?: SynxObject,
   includesMap?: Map<string, SynxObject>,
+  _resolveDepth = 0,
 ): SynxObject {
   if (!root) {
     root = obj;
@@ -102,6 +106,16 @@ export function resolve(
     }
   }
 
+  // Guard: prevent stack overflow from deeply nested objects
+  if (_resolveDepth > MAX_RESOLVE_DEPTH) {
+    for (const k of Object.keys(obj)) {
+      if (k !== '__synx') {
+        obj[k] = 'NESTING_ERR: maximum object nesting depth exceeded';
+      }
+    }
+    return obj;
+  }
+
   const metaMap: SynxMetaMap | undefined = (obj as any).__synx;
 
   for (const key of Object.keys(obj)) {
@@ -111,14 +125,14 @@ export function resolve(
 
     // Recurse into nested objects
     if (value && typeof value === 'object' && !Array.isArray(value)) {
-      resolve(value as SynxObject, options, root, includesMap);
+      resolve(value as SynxObject, options, root, includesMap, _resolveDepth + 1);
     }
 
     // Recurse into arrays of objects
     if (Array.isArray(value)) {
       for (const item of value) {
         if (item && typeof item === 'object' && !Array.isArray(item)) {
-          resolve(item as SynxObject, options, root, includesMap);
+          resolve(item as SynxObject, options, root, includesMap, _resolveDepth + 1);
         }
       }
     }
