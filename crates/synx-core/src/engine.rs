@@ -113,10 +113,12 @@ fn resolve_value(
     metadata: &HashMap<String, MetaMap>,
     path: &str,
     includes: &HashMap<String, Value>,
-    depth: usize,   // NEW
+    depth: usize,
 ) {
     // Guard: prevent stack overflow from deeply nested objects
-    if depth > MAX_RESOLVE_DEPTH {
+    if depth >= MAX_RESOLVE_DEPTH {
+        // Safety: recursion only descends into Object variants (see lines below),
+        // so value is always an Object here. Non-Object values are safe to skip.
         if let Value::Object(ref mut map) = value {
             for val in map.values_mut() {
                 *val = Value::String(
@@ -1996,6 +1998,7 @@ mod tests {
 
     #[test]
     fn test_deep_nesting_does_not_overflow() {
+        // Build 600-level deep SYNX: each level has one child key
         let mut synx = String::from("!active\n");
         let mut indent = String::new();
         for i in 0..600 {
@@ -2003,8 +2006,44 @@ mod tests {
             indent.push_str("  ");
         }
         synx.push_str(&format!("{}value deep\n", indent));
+
+        // Must not crash
         let mut result = parse(&synx);
         resolve(&mut result, &Default::default());
         assert!(matches!(result.root, Value::Object(_)));
+
+        // Walk down to level 510 (should resolve normally)
+        let mut cur = &result.root;
+        for i in 0..510 {
+            match cur {
+                Value::Object(map) => {
+                    let key = format!("level_{}", i);
+                    cur = map.get(&key).expect(&format!("key '{}' should exist", key));
+                }
+                _ => panic!("expected object at level {}", i),
+            }
+        }
+        // At depth 510 we should still have an object (within limit)
+        assert!(matches!(cur, Value::Object(_)), "level_510 should be Object");
+
+        // Walk down to level 512 — this is the limit, its children should be NESTING_ERR
+        let mut cur2 = &result.root;
+        for i in 0..512 {
+            match cur2 {
+                Value::Object(map) => {
+                    let key = format!("level_{}", i);
+                    cur2 = map.get(&key).expect(&format!("key '{}' should exist", key));
+                }
+                _ => break,
+            }
+        }
+        // At or beyond depth 512, values should be NESTING_ERR strings
+        if let Value::Object(map) = cur2 {
+            for v in map.values() {
+                if let Value::String(s) = v {
+                    assert!(s.starts_with("NESTING_ERR:"), "expected NESTING_ERR at depth limit, got: {}", s);
+                }
+            }
+        }
     }
 }
