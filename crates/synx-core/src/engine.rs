@@ -911,6 +911,28 @@ fn apply_markers(
         }
     }
 
+    // ── :prompt ──
+    // Syntax: key:prompt:LABEL subtree
+    // Converts the resolved subtree (object) into a SYNX-formatted string
+    // wrapped in a labeled code fence, ready for LLM prompt embedding.
+    if markers.contains(&"prompt".to_string()) {
+        let prompt_idx = markers.iter().position(|m| m == "prompt").unwrap();
+        let label = markers.get(prompt_idx + 1).cloned().unwrap_or_else(|| key.to_string());
+        if let Some(val) = map.get(key) {
+            let synx_text = stringify_value(val, 0);
+            let block = format!("{} (SYNX):\n```synx\n{}```", label, synx_text);
+            map.insert(key.to_string(), Value::String(block));
+        }
+    }
+
+    // ── :vision ──
+    // Metadata-only marker. Recognized by the engine (no error), value passes through.
+    // Applications detect this marker via metadata to dispatch image generation.
+
+    // ── :audio ──
+    // Metadata-only marker. Recognized by the engine (no error), value passes through.
+    // Applications detect this marker via metadata to dispatch audio generation.
+
     // ── Constraint validation (always last, after all markers resolved) ──
     if let Some(ref c) = meta.constraints {
         validate_constraints(map, key, c);
@@ -1187,6 +1209,38 @@ fn extract_from_file_content(content: &str, key_path: &str, ext: &str) -> Option
 }
 
 // ─── Helpers ─────────────────────────────────────────────
+
+/// Serialize a Value to SYNX format string (for :prompt marker).
+fn stringify_value(value: &Value, indent: usize) -> String {
+    let spaces = " ".repeat(indent);
+    match value {
+        Value::Object(map) => {
+            let mut out = String::new();
+            let mut keys: Vec<&str> = map.keys().map(|k| k.as_str()).collect();
+            keys.sort_unstable();
+            for key in keys {
+                let val = &map[key];
+                match val {
+                    Value::Object(_) => {
+                        out.push_str(&format!("{}{}\n", spaces, key));
+                        out.push_str(&stringify_value(val, indent + 2));
+                    }
+                    Value::Array(arr) => {
+                        out.push_str(&format!("{}{}\n", spaces, key));
+                        for item in arr {
+                            out.push_str(&format!("{}  - {}\n", spaces, value_to_string(item)));
+                        }
+                    }
+                    _ => {
+                        out.push_str(&format!("{}{} {}\n", spaces, key, value_to_string(val)));
+                    }
+                }
+            }
+            out
+        }
+        _ => format!("{}{}\n", spaces, value_to_string(value)),
+    }
+}
 
 fn cast_primitive(val: &str) -> Value {
     // Quoted strings preserve literal value
@@ -2138,5 +2192,35 @@ mod tests {
             Some(&Value::String("b".to_string())),
             "alias to a string-valued key should not produce ALIAS_ERR"
         );
+    }
+
+    #[test]
+    fn test_prompt_marker() {
+        let mut r = parse("!active\nmemory:prompt:Core\n  identity ASAI\n  creator APERTURESyndicate");
+        resolve(&mut r, &Options::default());
+        let map = r.root.as_object().unwrap();
+        if let Value::String(s) = &map["memory"] {
+            assert!(s.starts_with("Core (SYNX):"));
+            assert!(s.contains("```synx"));
+            assert!(s.contains("identity ASAI"));
+        } else {
+            panic!("Expected :prompt to produce a string");
+        }
+    }
+
+    #[test]
+    fn test_vision_marker_passthrough() {
+        let mut r = parse("!active\nimage:vision Generate a sunset");
+        resolve(&mut r, &Options::default());
+        let map = r.root.as_object().unwrap();
+        assert_eq!(map["image"], Value::String("Generate a sunset".into()));
+    }
+
+    #[test]
+    fn test_audio_marker_passthrough() {
+        let mut r = parse("!active\nnarration:audio Read this summary aloud");
+        resolve(&mut r, &Options::default());
+        let map = r.root.as_object().unwrap();
+        assert_eq!(map["narration"], Value::String("Read this summary aloud".into()));
     }
 }

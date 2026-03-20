@@ -495,7 +495,7 @@ std::fs::write("config.synx", Synx::format(&raw)).unwrap();
 
 ## 🧩 Referencia Completa de Marcadores
 
-SYNX v3.0 proporciona **21 marcadores**. Cada marcador es una función que se adjunta a una clave mediante la sintaxis `:marcador`.
+SYNX v3.0 proporciona **24 marcadores**. Cada marcador es una función que se adjunta a una clave mediante la sintaxis `:marcador`.
 
 ### `:env` — Variables de Entorno
 
@@ -864,6 +864,55 @@ Cuando se supera el límite, el motor devuelve `SPAM_ERR: ...`.
 
 ---
 
+### `:prompt` — Formatear subárbol para prompt LLM
+
+Convierte un subárbol resuelto (objeto) en una cadena con formato SYNX envuelta en un bloque de código etiquetado, lista para insertar en un prompt de sistema LLM.
+
+Sintaxis: `:prompt:ETIQUETA`. Si se omite la etiqueta, se usa el nombre de la clave.
+
+```synx
+!active
+
+memory:prompt:Core
+  identity ASAI
+  version 3.0
+  creator APERTURESyndicate
+```
+
+Resultado — la clave `memory` se convierte en string: `Core (SYNX):\n```synx\n...\n````.
+
+---
+
+### `:vision` — Intención de generación de imagen
+
+Marcador de metadatos. El motor lo reconoce (sin error), pero el valor pasa sin cambios. Las aplicaciones detectan `:vision` a través de metadatos y envían la solicitud a una API de generación de imágenes.
+
+```synx
+!active
+
+cover:vision Atardecer sobre montañas
+diagram:vision Diagrama de arquitectura del sistema
+```
+
+El motor **NO** genera imágenes — anota el campo para procesamiento a nivel de aplicación.
+
+---
+
+### `:audio` — Intención de generación de audio
+
+Marcador de metadatos. Funciona de forma idéntica a `:vision`, pero para audio/TTS.
+
+```synx
+!active
+
+narration:audio Lee este resumen en voz alta
+sfx:audio Un acorde orquestal dramático
+```
+
+El motor **NO** genera audio — anota el campo para procesamiento a nivel de aplicación.
+
+---
+
 ## 🔒 Restricciones
 
 Las restricciones validan valores durante el parsing. Se definen en `[corchetes]` después del nombre de clave.
@@ -1028,7 +1077,32 @@ Resultado:
 
 ---
 
-## 👁 Observador de archivos
+## � Diff Estructural
+
+> Añadido en v3.5.2.
+
+Comparar dos objetos SYNX parseados y obtener un diff estructurado:
+
+```typescript
+const before = Synx.parse('name Alice\nage 30\nrole user');
+const after  = Synx.parse('name Bob\nage 30\nstatus active');
+const diff   = Synx.diff(before, after);
+```
+
+Resultado:
+
+```json
+{
+  "added":     { "status": "active" },
+  "removed":   { "role": "user" },
+  "changed":   { "name": { "from": "Alice", "to": "Bob" } },
+  "unchanged": ["age"]
+}
+```
+
+---
+
+## �👁 Observador de archivos
 
 > Añadido en v3.1.3.
 

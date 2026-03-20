@@ -136,7 +136,11 @@ impl ExprParser {
                 }
                 Token::Op(b'%') => {
                     self.pos += 1;
-                    left %= self.factor()?;
+                    let right = self.factor()?;
+                    if right == 0.0 {
+                        return Err("SYNX :calc — division by zero".into());
+                    }
+                    left %= right;
                 }
                 _ => break,
             }

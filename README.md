@@ -244,14 +244,14 @@ python format_results.py llm_results.json
 
 Unified API surface across runtimes:
 
-| Binding | `parse` | `parse_active` | `stringify` | `format` | Notes |
-|---|---|---|---|---|---|
-| Rust core (`synx-core`) | ✅ | ✅ | ✅ | ✅ | Full options support via `Options` |
-| JavaScript (`packages/synx-js`) | ✅ | ✅ | ✅ | ✅ | Pure TypeScript implementation |
-| Python (`synx_native`) | ✅ | ✅ | ✅ | ✅ | `parse_active(text, env=None, base_path=None)` |
-| Node native (`bindings/node`) | ✅ | ✅ | ✅ | ✅ | `parseActive(text, { env, basePath })` |
-| WebAssembly (`bindings/wasm`) | ✅ | ✅ | ✅ | ✅ | Also provides `parse_object` / `parse_active_object` |
-| C FFI (`bindings/c-header`) | ✅ | ✅ | ✅ | ✅ | Returned strings must be freed with `synx_free()` |
+| Binding | `parse` | `parse_active` | `stringify` | `format` | `diff` | Notes |
+|---|---|---|---|---|---|---|
+| Rust core (`synx-core`) | ✅ | ✅ | ✅ | ✅ | — | Full options support via `Options` |
+| JavaScript (`packages/synx-js`) | ✅ | ✅ | ✅ | ✅ | ✅ | Pure TypeScript implementation |
+| Python (`synx_native`) | ✅ | ✅ | ✅ | ✅ | — | `parse_active(text, env=None, base_path=None)` |
+| Node native (`bindings/node`) | ✅ | ✅ | ✅ | ✅ | — | `parseActive(text, { env, basePath })` |
+| WebAssembly (`bindings/wasm`) | ✅ | ✅ | ✅ | ✅ | — | Also provides `parse_object` / `parse_active_object` |
+| C FFI (`bindings/c-header`) | ✅ | ✅ | ✅ | ✅ | — | Returned strings must be freed with `synx_free()` |
 
 Behavior notes:
 
@@ -319,6 +319,11 @@ csv:join
 currency:geo
   - US USD
   - EU EUR
+prompt_block:prompt:AppConfig
+  app_name "MyCoolApp"
+  version "2.1.0"
+banner:vision "sunset landscape, 16:9"
+greeting:audio "Welcome to our app"
 ```
 
 ### Constraints (require `!active`)
@@ -336,7 +341,7 @@ password[required, min:8, max:64, type:string] MyP@ssw0rd
 
 ## 📖 Documentation / Guides
 
-Complete SYNX guides with all 20 markers, benchmarks, code examples, and architecture:
+Complete SYNX guides with all 24 markers, benchmarks, code examples, and architecture:
 
 | Language | Guide |
 |---|---|

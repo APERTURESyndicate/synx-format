@@ -44,7 +44,10 @@ export type SynxMarker =
   | 'fallback'
   | 'once'
   | 'version'
-  | 'watch';
+  | 'watch'
+  | 'prompt'
+  | 'vision'
+  | 'audio';
 
 /** Constraint types for [] validation */
 export interface SynxConstraints {
@@ -98,6 +101,14 @@ export interface SynxOptions {
   strict?: boolean;
   /** Maximum include/import nesting depth (default: 16) */
   maxIncludeDepth?: number;
+}
+
+/** Structural diff result from Synx.diff() */
+export interface SynxDiff {
+  added: Record<string, SynxValue>;
+  removed: Record<string, SynxValue>;
+  changed: Record<string, { from: SynxValue; to: SynxValue }>;
+  unchanged: string[];
 }
 
 /**

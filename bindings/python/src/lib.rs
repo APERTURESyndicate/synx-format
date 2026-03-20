@@ -109,6 +109,20 @@ fn format(text: &str) -> PyResult<String> {
     Ok(synx_core::Synx::format(text))
 }
 
+/// Wrap raw SYNX text in a labeled code block suitable for LLM system prompts.
+///
+/// Returns a string like:
+///   Core memory (SYNX):
+///   ```synx
+///   <text>
+///   ```
+#[pyfunction]
+#[pyo3(signature = (text, label="Memory"))]
+fn to_prompt_block(text: &str, label: &str) -> PyResult<String> {
+    let trimmed = text.trim();
+    Ok(format!("{label} (SYNX):\n```synx\n{trimmed}\n```"))
+}
+
 /// SYNX Python module.
 #[pymodule]
 fn synx_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -117,6 +131,7 @@ fn synx_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(parse_active, m)?)?;
     m.add_function(wrap_pyfunction!(stringify, m)?)?;
     m.add_function(wrap_pyfunction!(format, m)?)?;
+    m.add_function(wrap_pyfunction!(to_prompt_block, m)?)?;
     Ok(())
 }
 

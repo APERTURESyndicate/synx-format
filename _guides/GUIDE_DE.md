@@ -495,7 +495,7 @@ std::fs::write("config.synx", Synx::format(&raw)).unwrap();
 
 ## 🧩 Vollständige Marker-Referenz
 
-SYNX v3.0 bietet **21 Marker**. Jeder Marker ist eine Funktion, die über die `:marker`-Syntax an einen Schlüssel angehängt wird.
+SYNX v3.0 bietet **24 Marker**. Jeder Marker ist eine Funktion, die über die `:marker`-Syntax an einen Schlüssel angehängt wird.
 
 ### `:env` — Umgebungsvariablen
 
@@ -864,6 +864,55 @@ Bei Überschreitung wird `SPAM_ERR: ...` zurückgegeben.
 
 ---
 
+### `:prompt` — Teilbaum für LLM-Prompt formatieren
+
+Wandelt einen aufgelösten Teilbaum (Objekt) in einen SYNX-formatierten String um, eingepackt in einen beschrifteten Code-Block — bereit für die Einbettung in einen LLM-System-Prompt.
+
+Syntax: `:prompt:LABEL`. Ohne Label wird der Schlüsselname verwendet.
+
+```synx
+!active
+
+memory:prompt:Core
+  identity ASAI
+  version 3.0
+  creator APERTURESyndicate
+```
+
+Ergebnis — der `memory`-Schlüssel wird zum String: `Core (SYNX):\n```synx\n...\n````.
+
+---
+
+### `:vision` — Bildgenerierungs-Absicht
+
+Metadaten-Marker. Die Engine erkennt ihn (kein Fehler), aber der Wert bleibt unverändert. Anwendungen erkennen `:vision` über Metadaten und leiten den Auftrag an eine Bildgenerierungs-API weiter.
+
+```synx
+!active
+
+cover:vision Sonnenuntergang über Bergen
+diagram:vision Architekturdiagramm des Systems
+```
+
+Die Engine generiert **KEINE** Bilder — sie annotiert das Feld für die Verarbeitung auf Anwendungsebene.
+
+---
+
+### `:audio` — Audiogenerierungs-Absicht
+
+Metadaten-Marker. Funktioniert identisch zu `:vision`, signalisiert aber Audio-/TTS-Generierungsabsicht.
+
+```synx
+!active
+
+narration:audio Lies diese Zusammenfassung laut vor
+sfx:audio Ein dramatischer Orchesterakkord
+```
+
+Die Engine generiert **KEIN** Audio — sie annotiert das Feld für die Verarbeitung auf Anwendungsebene.
+
+---
+
 ## 🔒 Einschränkungen
 
 Einschränkungen validieren Werte beim Parsing. Sie werden in `[eckigen Klammern]` nach dem Schlüsselnamen definiert.
@@ -1028,7 +1077,32 @@ Ergebnis:
 
 ---
 
-## 👁 Dateiüberwachung
+## � Struktureller Diff
+
+> Hinzugefügt in v3.5.2.
+
+Zwei geparste SYNX-Objekte vergleichen und einen strukturierten Diff erhalten:
+
+```typescript
+const before = Synx.parse('name Alice\nage 30\nrole user');
+const after  = Synx.parse('name Bob\nage 30\nstatus active');
+const diff   = Synx.diff(before, after);
+```
+
+Ergebnis:
+
+```json
+{
+  "added":     { "status": "active" },
+  "removed":   { "role": "user" },
+  "changed":   { "name": { "from": "Alice", "to": "Bob" } },
+  "unchanged": ["age"]
+}
+```
+
+---
+
+## �👁 Dateiüberwachung
 
 > Hinzugefügt in v3.1.3.
 

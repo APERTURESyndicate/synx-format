@@ -1,0 +1,23 @@
+!active
+
+# ═══════════════════════════════════════════════════════════
+# SYNX AI Memory — Working State Template
+# Runtime memory updated by the model via tool calls.
+# !active enables markers: :default, :env, :template, :calc
+# ═══════════════════════════════════════════════════════════
+
+user_profile
+  name:default unknown
+  preferred_language:default english
+  interests:default ~
+  notes:default ~
+
+current_context
+  topic:default general
+  task:default ~
+  mood:default neutral
+
+session
+  message_count:default 0
+  last_interaction:default ~
+  archive_pending:default false
