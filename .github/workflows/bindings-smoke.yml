@@ -30,6 +30,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Setup Python
+        id: setup-python
         if: matrix.check == 'python-smoke'
         uses: actions/setup-python@v5
         with:
@@ -49,7 +50,7 @@ jobs:
         if: matrix.check == 'python-smoke'
         env:
           PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
-          PYO3_PYTHON: python
+          PYO3_PYTHON: ${{ steps.setup-python.outputs.python-path }}
         run: cargo test -p synx-python --lib
 
       - name: C FFI smoke (Rust unit tests)
@@ -69,13 +70,6 @@ jobs:
       - name: Build Node binding
         if: matrix.check == 'node-smoke'
         run: cargo build --release -p synx-node
-
-      - name: Prepare Node addon artifact path
-        if: matrix.check == 'node-smoke'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path bindings/node/target/release | Out-Null
-          Copy-Item target/release/synx_node.dll bindings/node/target/release/synx_node.dll -Force
 
       - name: Node smoke
         if: matrix.check == 'node-smoke'

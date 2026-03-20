@@ -545,6 +545,22 @@ export function resolve(
       }
     }
 
+    // ── :prompt ──
+    // Converts a subtree to a SYNX-formatted string wrapped in a labeled code fence.
+    if (markers.includes('prompt')) {
+      const idx = markers.indexOf('prompt');
+      const label = markers[idx + 1] ?? key;
+      const val = obj[key];
+      const synxText = stringifyValue(val, 0);
+      obj[key] = `${label} (SYNX):\n\`\`\`synx\n${synxText}\`\`\``;
+    }
+
+    // ── :vision ──
+    // Metadata-only marker. Recognized (no error), value passes through.
+
+    // ── :audio ──
+    // Metadata-only marker. Recognized (no error), value passes through.
+
     // ── Constraint validation (always last, after all markers resolved) ──
     if (metaMap && metaMap[key]?.constraints) {
       validateConstraints(obj, key, metaMap[key].constraints!);
@@ -723,8 +739,9 @@ function validateConstraints(obj: SynxObject, key: string, c: import('./types').
     }
   }
 
-  // pattern (regex match)
+  // pattern (regex match — reject pathological patterns to prevent ReDoS)
   if (c.pattern && typeof val === 'string') {
+    if (c.pattern.length > 128) return;
     try {
       if (!new RegExp(c.pattern).test(val)) {
         obj[key] = `CONSTRAINT_ERR: '${key}' does not match pattern /${c.pattern}/`;
@@ -834,6 +851,36 @@ function extractFromFileContent(content: string, keyPath: string, ext: string): 
 
 // ─── Helpers ──────────────────────────────────────────────
 
+/** Serialize a value to SYNX format string (for :prompt marker). */
+function stringifyValue(value: unknown, indent: number): string {
+  const sp = ' '.repeat(indent);
+  if (value === null || value === undefined) return `${sp}null\n`;
+  if (typeof value === 'boolean' || typeof value === 'number') return `${sp}${value}\n`;
+  if (typeof value === 'string') return `${sp}${value}\n`;
+  if (Array.isArray(value)) {
+    let out = '';
+    for (const item of value) out += `${sp}  - ${String(item)}\n`;
+    return out;
+  }
+  if (typeof value === 'object') {
+    let out = '';
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      if (k === '__synx') continue;
+      if (v && typeof v === 'object' && !Array.isArray(v)) {
+        out += `${sp}${k}\n`;
+        out += stringifyValue(v, indent + 2);
+      } else if (Array.isArray(v)) {
+        out += `${sp}${k}\n`;
+        for (const item of v) out += `${sp}  - ${String(item)}\n`;
+      } else {
+        out += `${sp}${k} ${v ?? 'null'}\n`;
+      }
+    }
+    return out;
+  }
+  return `${sp}${String(value)}\n`;
+}
+
 function castPrimitive(val: string): SynxValue {
   if (val === 'true') return true;
   if (val === 'false') return false;
@@ -926,19 +973,24 @@ function allowSpamAccess(bucketKey: string, maxCalls: number, windowSec: number)
     return false;
   }
 
+  if (filtered.length === 0 && calls.length > 0) {
+    SPAM_BUCKETS.delete(bucketKey);
+  }
+
   filtered.push(now);
   SPAM_BUCKETS.set(bucketKey, filtered);
   return true;
 }
 
 function deepGet(obj: SynxObject, path: string): SynxValue | undefined {
-  // Try direct key first
-  if (path in obj) return obj[path];
+  // Try direct key first (own property only)
+  if (Object.prototype.hasOwnProperty.call(obj, path)) return obj[path];
   // Try dot-path
   const parts = path.split('.');
   let current: any = obj;
   for (const part of parts) {
     if (current == null || typeof current !== 'object') return undefined;
+    if (!Object.prototype.hasOwnProperty.call(current, part)) return undefined;
     current = current[part];
   }
   return current;

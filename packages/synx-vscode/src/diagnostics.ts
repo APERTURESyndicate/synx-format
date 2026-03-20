@@ -11,6 +11,7 @@ const KNOWN_MARKERS = new Set([
   'random', 'calc', 'env', 'alias', 'ref', 'inherit', 'i18n', 'secret', 'default',
   'unique', 'include', 'import', 'geo', 'template', 'split', 'join',
   'clamp', 'round', 'map', 'format', 'fallback', 'once', 'version', 'watch', 'spam',
+  'prompt', 'vision', 'audio',
 ]);
 
 const KNOWN_CONSTRAINTS = new Set([
@@ -35,6 +36,7 @@ const ARG_MARKERS = new Set([
   'include',
   'import',
   'spam',
+  'prompt',
 ]);
 
 export function createDiagnostics(context: vscode.ExtensionContext): vscode.DiagnosticCollection {
@@ -304,7 +306,9 @@ function runValidation(doc: vscode.TextDocument, collection: vscode.DiagnosticCo
         const placeholders = node.rawValue.match(/\{(\w+(?:\.\w+)*)\}/g) || [];
         for (const ph of placeholders) {
           const ref = ph.slice(1, -1);
-          if (!parsed.keyMap.has(ref)) {
+          const parentPath = node.dotPath.includes('.') ? node.dotPath.slice(0, node.dotPath.lastIndexOf('.')) : '';
+          const siblingPath = parentPath ? `${parentPath}.${ref}` : ref;
+          if (!parsed.keyMap.has(ref) && !parsed.keyMap.has(siblingPath)) {
             const vpos = raw.indexOf(ph);
             if (vpos !== -1) {
               diagnostics.push(mkDiag(node.line, vpos, vpos + ph.length,

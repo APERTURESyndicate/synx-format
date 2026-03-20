@@ -8,6 +8,7 @@ Quick reference of what was modified in recent versions:
 
 | Version | Components Modified |
 |---------|---|
+| **3.5.2** | synx-core (`:prompt` marker, `:vision`/`:audio` metadata, calc modulo-by-zero fix), synx-js (same + `Synx.diff()` + prototype pollution fix + ReDoS guard + `deepGet`/parser hardening), synx-vscode (diagnostics/completion for 3 new markers + `:template` sibling-scope fix), all 6 guides |
 | **3.5.1** | synx-core (stack overflow guard, circular alias detection), synx-js (same + SynxError class + browser bundle export), synx-vscode (circular alias diagnostic), security tests |
 | **3.5.0** | synx-core (path jail, depth limit, file size limit, calc length limit), synx-js (same), LICENSE (ethical use clause) |
 | **3.4.0** | synx-core (`:spam` rate-limit marker), synx-js (`:spam` + strict error sync), VSCode (diagnostics/completion/navigation/preview for `:spam`), guides (all languages), version sync |
@@ -19,6 +20,39 @@ Quick reference of what was modified in recent versions:
 | **3.1.3** | VSCode extension, JS/TS API, documentation (6 guides), CLI tool, deployment examples |
 | **3.1.2** | JS parser, Rust parser, VSCode extension, Node.js binding (napi), all guides |
 | **3.1.0** | JS/TS API (runtime manipulation), Rust engine, VSCode extension, all guides |
+
+---
+
+## [3.5.2] — 2026-03-28
+
+### Added
+
+- **`:prompt` marker (Rust + JS):** Formats a subtree into a labeled SYNX code fence for LLM consumption. Usage: `key:prompt:Label` produces a string like `"Label (SYNX):\n\`\`\`synx\n...\n\`\`\`"`. No network calls — purely a serialization transform.
+- **`:vision` metadata marker (Rust + JS):** Marks a key as image-generation intent. Pass-through marker preserved for application-layer processing.
+- **`:audio` metadata marker (Rust + JS):** Marks a key as audio-generation intent. Pass-through marker preserved for application-layer processing.
+- **`Synx.diff(a, b)` (JS):** Static method that compares two parsed SYNX objects and returns a structured diff with `added`, `removed`, `changed` (with `from`/`to`), and `unchanged` fields.
+- **`SynxDiff` type (JS):** TypeScript interface for the diff result, exported from the package.
+- **VS Code:** IntelliSense autocomplete and documentation for `:prompt`, `:vision`, `:audio` markers.
+- **VS Code:** Diagnostics recognize `:prompt`, `:vision`, `:audio` as valid markers.
+- **Guides:** All 6 language guides (EN, RU, DE, ES, JA, ZH) updated with new marker documentation and `Synx.diff()` section.
+
+### Internal
+
+- `stringify_value()` helper added to Rust engine for `:prompt` serialization.
+- `stringifyValue()` helper added to JS engine for `:prompt` serialization.
+- `deepEqual()` helper added to JS for `Synx.diff()` value comparison.
+- 3 new Rust engine tests: `test_prompt_marker`, `test_vision_marker_passthrough`, `test_audio_marker_passthrough`.
+- Marker count updated from 21 to 24 across all documentation.
+
+### Fixed
+
+- **VS Code: `:template` false-positive warning for sibling keys.** The diagnostic `"Key referenced in template is not defined"` only checked root-level `keyMap` (dot-paths), so `{sibling}` inside a nested `:template` always flagged as missing. Now checks both root path and sibling scope (`parent.sibling`).
+- **JS: Prototype pollution via `Synx.set()` / `Synx.add()` / `Synx.remove()`** (Security). Path segments `__proto__`, `constructor`, `prototype` are now rejected with an error.
+- **JS: `deepGet()` followed prototype chain** (Security). Lookups like `constructor` or `toString` could reach inherited properties. Now uses `hasOwnProperty` checks at every traversal step.
+- **JS: `__proto__` key injection in parser** (Security). A `.synx` file with a key named `__proto__` could corrupt the parsed object's prototype. Such keys are now silently skipped.
+- **JS: ReDoS via constraint `[pattern:]`** (Security). User-supplied regex patterns longer than 128 characters are now rejected to prevent catastrophic backtracking.
+- **JS: SPAM_BUCKETS memory leak.** Expired bucket entries (empty timestamp arrays) are now removed from the map instead of persisting indefinitely.
+- **Rust + JS: `:calc` modulo by zero.** `expr % 0` now returns `CALC_ERR: division by zero` instead of producing `NaN` (JS) or `NaN` (Rust).
 
 ---
 

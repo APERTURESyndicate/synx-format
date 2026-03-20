@@ -494,7 +494,7 @@ std::fs::write("config.synx", Synx::format(&raw)).unwrap();
 
 ## 🧩 マーカー完全リファレンス
 
-SYNX v3.0は**21のマーカー**を提供します。各マーカーは `:マーカー` 構文でキーに付加される関数です。
+SYNX v3.0は**24のマーカー**を提供します。各マーカーは `:マーカー` 構文でキーに付加される関数です。
 
 ### `:env` — 環境変数
 
@@ -863,6 +863,62 @@ burst_access:spam:5 secret_token
 
 ---
 
+### `:prompt` — LLMプロンプトブロック
+
+> v3.5.2で追加。
+
+サブツリーをLLM用のラベル付きSYNXコードフェンスにフォーマットします。`:prompt:ラベル` のようにラベルを指定します。
+
+```synx
+!active
+app_name "MyCoolApp"
+version "2.1.0"
+
+prompt_block:prompt:AppConfig
+  app_name "MyCoolApp"
+  version "2.1.0"
+```
+
+解決後の結果：
+
+```json
+{
+  "app_name": "MyCoolApp",
+  "version": "2.1.0",
+  "prompt_block": "AppConfig (SYNX):\n```synx\napp_name \"MyCoolApp\"\nversion \"2.1.0\"\n```"
+}
+```
+
+AIパイプラインに最適 — 追加のシリアライズコード不要で構造化コンテキストをLLMに渡せます。
+
+---
+
+### `:vision` — 画像生成インテント
+
+> v3.5.2で追加。
+
+キーを画像生成インテントとしてマークするメタデータマーカーです。エンジンはパース時にこのマーカーをパススルーし、アプリケーション層で処理できるよう保持します。
+
+```synx
+!active
+banner:vision "sunset landscape, 16:9, photorealistic"
+```
+
+---
+
+### `:audio` — 音声生成インテント
+
+> v3.5.2で追加。
+
+キーを音声生成インテントとしてマークするメタデータマーカーです。`:vision` と同様にパススルーされます。
+
+```synx
+!active
+greeting:audio "Welcome to our application"
+```
+
+---
+
 ## 🔒 制約
 
 制約はパース時に値を検証します。キー名の後の `[角括弧]` 内に定義します。
@@ -1027,7 +1083,27 @@ theme[enum:light|dark|auto] dark
 
 ---
 
-## 👁 ファイルウォッチャー
+## � Synx.diff()
+
+> v3.5.2で追加。
+
+2つのパース済みSYNXオブジェクトを比較し、構造化された差分を返します：
+
+```typescript
+const old = Synx.parse('config_v1.synx');
+const next = Synx.parse('config_v2.synx');
+const diff = Synx.diff(old, next);
+// diff.added    — 新しいオブジェクトにのみ存在するキー
+// diff.removed  — 古いオブジェクトにのみ存在するキー
+// diff.changed  — 両方に存在するが値が異なるキー（{ from, to }）
+// diff.unchanged — 値が同一のキー一覧
+```
+
+設定のマイグレーション検証、監査ログ、CI差分チェックに活用できます。
+
+---
+
+## �👁 ファイルウォッチャー
 
 > v3.1.3で追加。
 
@@ -1386,7 +1462,7 @@ let config = Synx::parse("
 
 ### Visual Studio Code
 
-完全な言語サポート：シンタックスハイライト、IntelliSense（21マーカー）、リアルタイム診断（15項目チェック）、定義へジャンプ、フォーマット、カラープレビュー、`:calc` インラインヒント、ライブJSONプレビュー。
+完全な言語サポート：シンタックスハイライト、IntelliSense（24マーカー）、リアルタイム診断（15項目チェック）、定義へジャンプ、フォーマット、カラープレビュー、`:calc` インラインヒント、ライブJSONプレビュー。
 
 ### Visual Studio 2022
 

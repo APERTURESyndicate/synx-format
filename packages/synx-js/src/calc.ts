@@ -112,7 +112,10 @@ class ExprParser {
         if (right === 0) throw new Error('SYNX :calc — division by zero');
         left = left / right;
       }
-      else left = left % right;
+      else {
+        if (right === 0) throw new Error('SYNX :calc — division by zero');
+        left = left % right;
+      }
     }
     return left;
   }

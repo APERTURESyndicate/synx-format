@@ -707,7 +707,7 @@ std::fs::write("config.synx", canonical).unwrap();
 
 ## 🧩 Markers — Full Reference
 
-SYNX v3.0 ships with **21 markers**. Each marker is a function attached to a key with `:marker` syntax.
+SYNX v3.0 ships with **24 markers**. Each marker is a function attached to a key with `:marker` syntax.
 
 > **All markers require `!active` mode.**
 
@@ -1555,6 +1555,66 @@ When exceeded, engines return `SPAM_ERR: ...`.
 
 ---
 
+### `:prompt` — Format Subtree for LLM Prompt
+
+Converts a resolved subtree (object) into a SYNX-formatted string wrapped in a labeled code fence — ready for embedding in an LLM system prompt.
+
+Syntax: `:prompt:LABEL`. If `LABEL` is omitted, the key name is used.
+
+```synx
+!active
+
+memory:prompt:Core
+  identity ASAI
+  version 3.0
+  creator APERTURESyndicate
+```
+
+Result — the `memory` key becomes a string:
+
+```
+Core (SYNX):
+```synx
+creator APERTURESyndicate
+identity ASAI
+version 3.0
+```
+```
+
+This is designed for AI agents that need raw SYNX blocks in their context window.
+
+---
+
+### `:vision` — Image Generation Intent
+
+Metadata-only marker. The engine recognizes it (no "unknown marker" error) but the value passes through unchanged. Applications detect `:vision` via metadata to dispatch image generation.
+
+```synx
+!active
+
+cover:vision A sunset over mountains
+diagram:vision Architecture diagram of the system
+```
+
+The engine does **NOT** generate images. It annotates the field so your application layer can route it to an image generation API.
+
+---
+
+### `:audio` — Audio Generation Intent
+
+Metadata-only marker. Works identically to `:vision` but signals audio/TTS generation intent.
+
+```synx
+!active
+
+narration:audio Read this summary aloud
+sfx:audio A dramatic orchestral sting
+```
+
+The engine does **NOT** generate audio. It annotates the field so your application layer can route it to a TTS or audio generation API.
+
+---
+
 ## 🔒 Constraints
 
 Constraints validate values at parse time. They're defined inside `[brackets]` after the key name.
@@ -1745,6 +1805,36 @@ Use in CI to validate configs before deployment:
 synx schema config.synx > schema.json
 # Feed into any JSON Schema validator
 ```
+
+---
+
+## 🔍 Structural Diff
+
+> Added in v3.5.2.
+
+Compare two parsed SYNX objects and get a structured diff:
+
+```typescript
+const before = Synx.parse('name Alice\nage 30\nrole user');
+const after  = Synx.parse('name Bob\nage 30\nstatus active');
+const diff   = Synx.diff(before, after);
+```
+
+Result:
+
+```json
+{
+  "added":     { "status": "active" },
+  "removed":   { "role": "user" },
+  "changed":   { "name": { "from": "Alice", "to": "Bob" } },
+  "unchanged": ["age"]
+}
+```
+
+Use cases:
+- **AI memory management** — detect what changed between conversation turns
+- **Config auditing** — log exactly which fields were modified
+- **Hot-reload** — only apply changed fields instead of replacing the entire config
 
 ---
 

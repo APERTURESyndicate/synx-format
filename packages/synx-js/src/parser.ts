@@ -381,6 +381,9 @@ export function parseData(text: string): SynxParseResult {
     }
     const parent = stack[stack.length - 1].obj as SynxObject;
 
+    // ── Reject prototype-polluting keys ──
+    if (key === '__proto__' || key === 'constructor' || key === 'prototype') continue;
+
     // ── Determine what this line creates ──
     if (rawValue === '|') {
       // Multiline block

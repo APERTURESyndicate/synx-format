@@ -14,15 +14,17 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { parseData } from './parser';
 import { resolve } from './engine';
-import type { SynxObject, SynxOptions, SynxValue, SynxMetaMap } from './types';
+import type { SynxObject, SynxOptions, SynxValue, SynxMetaMap, SynxDiff } from './types';
 import { SynxError } from './types';
 
-export type { SynxObject, SynxOptions, SynxValue, SynxArray, SynxPrimitive } from './types';
+export type { SynxObject, SynxOptions, SynxValue, SynxArray, SynxPrimitive, SynxDiff } from './types';
 export { SynxError } from './types';
 
 // ─── Native binding auto-detection ───────────────────────
 
 const NATIVE_THRESHOLD = 5120; // 5 KB
+
+const UNSAFE_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 
 interface NativeBinding {
   parse(text: string): unknown;
@@ -207,6 +209,7 @@ class Synx {
       throw new Error(`SYNX: Cannot set "${keyPath}" — config is locked (!lock)`);
     }
     const parts = keyPath.split('.');
+    for (const p of parts) if (UNSAFE_KEYS.has(p)) throw new Error(`SYNX: unsafe key "${p}"`);
     let current: any = obj;
     for (let i = 0; i < parts.length - 1; i++) {
       if (current[parts[i]] == null || typeof current[parts[i]] !== 'object') {
@@ -230,6 +233,7 @@ class Synx {
     let current: any = obj;
     for (const part of parts) {
       if (current == null || typeof current !== 'object') return undefined;
+      if (!Object.prototype.hasOwnProperty.call(current, part)) return undefined;
       current = current[part];
     }
     return current;
@@ -251,6 +255,7 @@ class Synx {
       throw new Error(`SYNX: Cannot add to "${keyPath}" — config is locked (!lock)`);
     }
     const parts = keyPath.split('.');
+    for (const p of parts) if (UNSAFE_KEYS.has(p)) throw new Error(`SYNX: unsafe key "${p}"`);
     let current: any = obj;
     for (let i = 0; i < parts.length - 1; i++) {
       if (current[parts[i]] == null || typeof current[parts[i]] !== 'object') {
@@ -283,6 +288,7 @@ class Synx {
       throw new Error(`SYNX: Cannot remove "${keyPath}" — config is locked (!lock)`);
     }
     const parts = keyPath.split('.');
+    for (const p of parts) if (UNSAFE_KEYS.has(p)) throw new Error(`SYNX: unsafe key "${p}"`);
     let current: any = obj;
     for (let i = 0; i < parts.length - 1; i++) {
       if (current == null || typeof current !== 'object') return;
@@ -439,6 +445,79 @@ class Synx {
       required,
     };
   }
+
+  /**
+   * Structural diff between two parsed SYNX objects.
+   * Compares top-level keys and returns added, removed, changed, and unchanged.
+   *
+   * @param a - First object (before).
+   * @param b - Second object (after).
+   * @returns A SynxDiff describing the structural differences.
+   *
+   * @since 3.5.2
+   *
+   * @example
+   * ```ts
+   * const before = Synx.parse('name Alice\nage 30');
+   * const after  = Synx.parse('name Bob\nage 30\nrole admin');
+   * const diff   = Synx.diff(before, after);
+   * // diff.added   → { role: 'admin' }
+   * // diff.removed → {}
+   * // diff.changed → { name: { from: 'Alice', to: 'Bob' } }
+   * // diff.unchanged → ['age']
+   * ```
+   */
+  static diff(a: SynxObject, b: SynxObject): SynxDiff {
+    const added: Record<string, SynxValue> = {};
+    const removed: Record<string, SynxValue> = {};
+    const changed: Record<string, { from: SynxValue; to: SynxValue }> = {};
+    const unchanged: string[] = [];
+
+    const aKeys = new Set(Object.keys(a));
+    const bKeys = new Set(Object.keys(b));
+
+    for (const key of aKeys) {
+      if (!bKeys.has(key)) {
+        removed[key] = a[key];
+      } else if (deepEqual(a[key], b[key])) {
+        unchanged.push(key);
+      } else {
+        changed[key] = { from: a[key], to: b[key] };
+      }
+    }
+
+    for (const key of bKeys) {
+      if (!aKeys.has(key)) {
+        added[key] = b[key];
+      }
+    }
+
+    return { added, removed, changed, unchanged };
+  }
+}
+
+// ─── Deep equality helper ─────────────────────────────────
+
+function deepEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (a === null || b === null) return false;
+  if (typeof a !== typeof b) return false;
+
+  if (Array.isArray(a) && Array.isArray(b)) {
+    if (a.length !== b.length) return false;
+    return a.every((item, i) => deepEqual(item, b[i]));
+  }
+
+  if (typeof a === 'object' && typeof b === 'object') {
+    const aObj = a as Record<string, unknown>;
+    const bObj = b as Record<string, unknown>;
+    const aKeys = Object.keys(aObj);
+    const bKeys = Object.keys(bObj);
+    if (aKeys.length !== bKeys.length) return false;
+    return aKeys.every(k => deepEqual(aObj[k], bObj[k]));
+  }
+
+  return false;
 }
 
 // ─── Serializer ───────────────────────────────────────────

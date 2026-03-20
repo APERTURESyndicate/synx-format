@@ -8,6 +8,7 @@ Quick reference of what was modified in recent versions:
 
 | Version | Components Modified |
 |---------|---|
+| **3.5.2** | VSCode (diagnostics/completion for `:prompt`, `:vision`, `:audio` markers; `:template` sibling-scope fix) |
 | **3.4.0** | synx-core (`:spam` rate-limit marker), synx-js (`:spam` + strict error sync), VSCode (`:spam` diagnostics/completion/navigation/preview), guides (all languages), version sync |
 | **3.3.0** | synx-core (multi-parent inherit, calc dot-path, i18n plural, quoted strings, :import alias), VSCode (diagnostics/completion/navigation sync), documentation |
 | **3.2.3** | synx-core (global [] constraints), documentation, version sync |
@@ -17,6 +18,19 @@ Quick reference of what was modified in recent versions:
 | **3.1.3** | VSCode extension, JS/TS API, documentation (6 guides), CLI tool, deployment examples |
 | **3.1.2** | JS parser, Rust parser, VSCode extension, Node.js binding (napi), all guides |
 | **3.1.0** | JS/TS API (runtime manipulation), Rust engine, VSCode extension, all guides |
+
+---
+
+## [3.5.2] — 2026-03-28
+
+### Added
+- **`:prompt` marker** recognized in diagnostics and IntelliSense with snippet `prompt:Label`.
+- **`:vision` marker** recognized in diagnostics and IntelliSense.
+- **`:audio` marker** recognized in diagnostics and IntelliSense.
+- Marker count updated to 24.
+
+### Fixed
+- **`:template` false-positive warning for sibling keys.** `{issued_date}` inside a nested block (e.g. under `MEMBER`) was flagged as undefined because the diagnostic only checked root-level dot-paths in `keyMap`. Now checks sibling scope (`parent.key`) so nested `:template` placeholders correctly resolve siblings.
 
 ---
 

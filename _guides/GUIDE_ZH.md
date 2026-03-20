@@ -494,7 +494,7 @@ std::fs::write("config.synx", Synx::format(&raw)).unwrap();
 
 ## 🧩 标记完整参考
 
-SYNX v3.0 提供 **21 个标记**。每个标记都是通过 `:标记` 语法附加到键的函数。
+SYNX v3.0 提供 **24 个标记**。每个标记都是通过 `:标记` 语法附加到键的函数。
 
 ### `:env` — 环境变量
 
@@ -863,6 +863,62 @@ burst_access:spam:5 secret_token
 
 ---
 
+### `:prompt` — LLM 提示块
+
+> 在 v3.5.2 中添加。
+
+将子树格式化为带标签的 SYNX 代码围栏，供 LLM 使用。通过 `:prompt:标签` 指定标签。
+
+```synx
+!active
+app_name "MyCoolApp"
+version "2.1.0"
+
+prompt_block:prompt:AppConfig
+  app_name "MyCoolApp"
+  version "2.1.0"
+```
+
+解析结果：
+
+```json
+{
+  "app_name": "MyCoolApp",
+  "version": "2.1.0",
+  "prompt_block": "AppConfig (SYNX):\n```synx\napp_name \"MyCoolApp\"\nversion \"2.1.0\"\n```"
+}
+```
+
+非常适合 AI 管道 — 无需额外序列化代码即可将结构化上下文传递给 LLM。
+
+---
+
+### `:vision` — 图像生成意图
+
+> 在 v3.5.2 中添加。
+
+元数据标记，将键标记为图像生成意图。引擎在解析时会透传此标记，保留供应用层处理。
+
+```synx
+!active
+banner:vision "sunset landscape, 16:9, photorealistic"
+```
+
+---
+
+### `:audio` — 音频生成意图
+
+> 在 v3.5.2 中添加。
+
+元数据标记，将键标记为音频生成意图。与 `:vision` 相同，该标记会被透传。
+
+```synx
+!active
+greeting:audio "Welcome to our application"
+```
+
+---
+
 ## 🔒 约束
 
 约束在解析时验证值。定义在键名后的 `[方括号]` 中。
@@ -1027,7 +1083,27 @@ theme[enum:light|dark|auto] dark
 
 ---
 
-## 👁 文件监视器
+## � Synx.diff()
+
+> 在 v3.5.2 中添加。
+
+比较两个已解析的 SYNX 对象，返回结构化差异：
+
+```typescript
+const old = Synx.parse('config_v1.synx');
+const next = Synx.parse('config_v2.synx');
+const diff = Synx.diff(old, next);
+// diff.added    — 仅存在于新对象中的键
+// diff.removed  — 仅存在于旧对象中的键
+// diff.changed  — 两者都存在但值不同的键（{ from, to }）
+// diff.unchanged — 值相同的键列表
+```
+
+适用于配置迁移验证、审计日志、CI 差异检查。
+
+---
+
+## �👁 文件监视器
 
 > 在 v3.1.3 中添加。
 
@@ -1386,7 +1462,7 @@ let config = Synx::parse("
 
 ### Visual Studio Code
 
-完整语言支持：语法高亮、IntelliSense（21个标记）、实时诊断（15项检查）、跳转到定义、格式化、颜色预览、`:calc` 内联提示、实时 JSON 预览。
+完整语言支持：语法高亮、IntelliSense（24个标记）、实时诊断（15项检查）、跳转到定义、格式化、颜色预览、`:calc` 内联提示、实时 JSON 预览。
 
 ### Visual Studio 2022
 
