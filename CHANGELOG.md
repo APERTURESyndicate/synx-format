@@ -21,6 +21,29 @@ Quick reference of what was modified in recent versions:
 
 ---
 
+## [3.5.1] — 2026-03-20
+
+### Fixed
+
+- **engine (Rust + JS):** Prevent stack overflow when parsing objects with more than 512 levels of nesting. Values beyond the limit are replaced with `NESTING_ERR: maximum object nesting depth exceeded`.
+- **engine (Rust + JS):** `:alias` markers now detect self-referential and one-hop circular references. Circular aliases produce `ALIAS_ERR: circular alias detected: <key> → <target>` instead of silently returning wrong values.
+- **engine (Rust + JS):** Fixed false-positive `ALIAS_ERR` when a plain string value happened to equal the aliasing key's name. Cycle detection now uses metadata to confirm the target key is itself an alias.
+
+### Added
+
+- **JS:** `SynxError` typed class for strict mode. When `{ strict: true }` is passed, SYNX throws a `SynxError` (extends `Error`) with a `.code` field (e.g. `"CALC_ERR"`, `"ALIAS_ERR"`) instead of a generic `Error`.
+- **JS:** `ALIAS_ERR` and `NESTING_ERR` added to strict mode error prefix list.
+- **VS Code:** Circular alias diagnostic — editor now shows a warning when `:alias` references form a cycle, without needing to run the engine.
+- **Tests:** New `security.test.ts` with 31 edge-case and security tests covering deep nesting, circular aliases, empty input, Unicode, `:calc` limits, type casting, CRLF line endings.
+
+### Internal
+
+- `resolve_value` (Rust) takes `depth: usize` parameter and checks against `MAX_RESOLVE_DEPTH = 512`.
+- `resolve()` (JS) takes `_resolveDepth` parameter checked against `MAX_RESOLVE_DEPTH = 512`.
+- `apply_markers` (Rust) `_path` renamed to `path`, `_metadata` renamed to `metadata` for active use in alias cycle detection.
+
+---
+
 ## [3.5.0] - 2026-03-08
 
 ### Security Hardening
