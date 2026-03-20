@@ -51,7 +51,7 @@ jobs:
         env:
           PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
           PYO3_PYTHON: ${{ steps.setup-python.outputs.python-path }}
-        run: cargo test -p synx-python --lib
+        run: cargo test -p synx-python --lib --no-default-features
 
       - name: C FFI smoke (Rust unit tests)
         if: matrix.check == 'c-smoke'
@@ -71,8 +71,12 @@ jobs:
         if: matrix.check == 'node-smoke'
         run: cargo build --release -p synx-node
 
+      - name: Verify Node DLL
+        if: matrix.check == 'node-smoke'
+        shell: pwsh
+        run: Get-ChildItem target/release/synx_node* | Format-Table Name,Length
+
       - name: Node smoke
         if: matrix.check == 'node-smoke'
-        run: |
-          cd bindings/node
-          npm run smoke
+        working-directory: bindings/node
+        run: node smoke.js

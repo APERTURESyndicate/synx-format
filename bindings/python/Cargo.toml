@@ -10,6 +10,10 @@ license = "MIT"
 name = "synx_native"
 crate-type = ["cdylib"]
 
+[features]
+default = ["extension-module"]
+extension-module = ["pyo3/extension-module"]
+
 [dependencies]
 synx-core = { path = "../../crates/synx-core" }
-pyo3 = { version = "0.24", features = ["extension-module"] }
+pyo3 = { version = "0.24" }
