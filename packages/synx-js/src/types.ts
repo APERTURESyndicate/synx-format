@@ -99,3 +99,19 @@ export interface SynxOptions {
   /** Maximum include/import nesting depth (default: 16) */
   maxIncludeDepth?: number;
 }
+
+/**
+ * Typed error thrown by SYNX in strict mode.
+ * The `code` field contains the error prefix (e.g. "CALC_ERR", "ALIAS_ERR").
+ */
+export class SynxError extends Error {
+  readonly code: string;
+
+  constructor(message: string) {
+    super(message);
+    this.name = 'SynxError';
+    // Extract prefix up to first ':'
+    const colonIdx = message.indexOf(':');
+    this.code = colonIdx !== -1 ? message.slice(0, colonIdx) : 'SYNX_ERR';
+  }
+}

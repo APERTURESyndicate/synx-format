@@ -15,8 +15,10 @@ import * as path from 'path';
 import { parseData } from './parser';
 import { resolve } from './engine';
 import type { SynxObject, SynxOptions, SynxValue, SynxMetaMap } from './types';
+import { SynxError } from './types';
 
 export type { SynxObject, SynxOptions, SynxValue, SynxArray, SynxPrimitive } from './types';
+export { SynxError } from './types';
 
 // ─── Native binding auto-detection ───────────────────────
 
@@ -51,13 +53,15 @@ const RUNTIME_ERROR_PREFIXES = [
   'CALC_ERR:',
   'SPAM_ERR:',
   'CONSTRAINT_ERR:',
+  'ALIAS_ERR:',
+  'NESTING_ERR:',
 ] as const;
 
 function assertNoRuntimeErrors(value: unknown, path = 'root'): void {
   if (typeof value === 'string') {
     for (const prefix of RUNTIME_ERROR_PREFIXES) {
       if (value.startsWith(prefix)) {
-        throw new Error(`SYNX strict mode error at \"${path}\": ${value}`);
+        throw new SynxError(`${value}`);
       }
     }
     return;
@@ -722,3 +726,4 @@ export { Synx };
 module.exports = Synx;
 module.exports.default = Synx;
 module.exports.Synx = Synx;
+module.exports.SynxError = SynxError;
