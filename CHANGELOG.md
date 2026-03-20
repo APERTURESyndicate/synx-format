@@ -8,6 +8,7 @@ Quick reference of what was modified in recent versions:
 
 | Version | Components Modified |
 |---------|---|
+| **3.5.1** | synx-core (stack overflow guard, circular alias detection), synx-js (same + SynxError class + browser bundle export), synx-vscode (circular alias diagnostic), security tests |
 | **3.5.0** | synx-core (path jail, depth limit, file size limit, calc length limit), synx-js (same), LICENSE (ethical use clause) |
 | **3.4.0** | synx-core (`:spam` rate-limit marker), synx-js (`:spam` + strict error sync), VSCode (diagnostics/completion/navigation/preview for `:spam`), guides (all languages), version sync |
 | **3.3.0** | synx-core (multi-parent inherit, calc dot-path, i18n plural, quoted strings, :import alias), VSCode (diagnostics/completion/navigation sync), documentation |

@@ -648,7 +648,7 @@ dependencies = [
 
 [[package]]
 name = "synx-core"
-version = "3.5.0"
+version = "3.5.1"
 dependencies = [
  "itoa",
  "memchr",
@@ -668,7 +668,7 @@ dependencies = [
 
 [[package]]
 name = "synx-python"
-version = "3.5.0"
+version = "3.5.1"
 dependencies = [
  "pyo3",
  "synx-core",
