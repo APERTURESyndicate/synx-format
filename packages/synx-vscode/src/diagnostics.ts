@@ -162,6 +162,31 @@ function runValidation(doc: vscode.TextDocument, collection: vscode.DiagnosticCo
               `Key "${ref}" is not defined`, vscode.DiagnosticSeverity.Error));
           }
         }
+
+        // ── :alias → check for self-alias and circular (1-hop) alias cycles ──
+        const key = node.key;
+        const target = ref;
+        if (target === key) {
+          const vpos = raw.lastIndexOf(target);
+          if (vpos !== -1) {
+            diagnostics.push(mkDiag(node.line, vpos, vpos + target.length,
+              `Self-referential alias: '${key}' aliases itself`, vscode.DiagnosticSeverity.Warning));
+          }
+        } else {
+          // Look for the target node and check if it aliases back to key
+          const targetNode = parsed.allNodes.find(n =>
+            n.markers.includes('alias') &&
+            n.rawValue?.trim() === key &&
+            (n.key === target || n.dotPath === target || n.dotPath === siblingPath)
+          );
+          if (targetNode) {
+            const vpos = raw.lastIndexOf(target);
+            if (vpos !== -1) {
+              diagnostics.push(mkDiag(node.line, vpos, vpos + target.length,
+                `Circular alias: '${key}' → '${target}' forms a cycle`, vscode.DiagnosticSeverity.Warning));
+            }
+          }
+        }
       }
 
       // ── :calc → check variable references ──
