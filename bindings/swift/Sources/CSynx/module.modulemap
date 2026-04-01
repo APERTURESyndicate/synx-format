@@ -1,0 +1,5 @@
+module CSynx {
+    header "synx.h"
+    link "synx_c"
+    export *
+}

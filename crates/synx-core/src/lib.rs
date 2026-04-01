@@ -16,11 +16,18 @@ mod parser;
 mod engine;
 mod calc;
 pub(crate) mod rng;
+pub mod binary;
+pub mod diff;
+pub mod schema_json;
 
-pub use value::{Value, Mode, ParseResult, Meta, MetaMap, Options};
-pub use parser::parse;
+pub use value::{Value, Mode, ParseResult, Meta, MetaMap, Options, Constraints, IncludeDirective};
+pub use schema_json::{metadata_to_json_schema, value_to_json_value};
+#[cfg(feature = "jsonschema")]
+pub use schema_json::{validate_serde_json, validate_with_json_schema};
+pub use parser::{parse, reshape_tool_output};
 pub use engine::resolve;
 pub use calc::safe_calc;
+pub use diff::{diff as diff_objects, DiffResult, DiffChange, diff_to_value};
 
 /// Main entry point for the SYNX parser.
 pub struct Synx;
@@ -52,6 +59,22 @@ impl Synx {
         parse(text)
     }
 
+    /// Parse a `!tool` call: returns `{ tool: "name", params: { ... } }`.
+    ///
+    /// If the text is also `!active`, markers (`:env`, `:default`, etc.)
+    /// are resolved before reshaping.
+    pub fn parse_tool(text: &str, opts: &Options) -> std::collections::HashMap<String, Value> {
+        let mut result = parse(text);
+        if result.mode == Mode::Active {
+            resolve(&mut result, opts);
+        }
+        let shaped = reshape_tool_output(&result.root, result.schema);
+        match shaped {
+            Value::Object(map) => map,
+            _ => std::collections::HashMap::new(),
+        }
+    }
+
     /// Stringify a Value back to SYNX format.
     pub fn stringify(value: &Value) -> String {
         serialize(value, 0)
@@ -69,9 +92,69 @@ impl Synx {
     pub fn format(text: &str) -> String {
         fmt_canonical(text)
     }
+
+    /// Compile a `.synx` string into compact binary `.synxb` format.
+    ///
+    /// If `resolved` is true, active markers are resolved first (requires
+    /// `!active` mode) and metadata is stripped from the output.
+    pub fn compile(text: &str, resolved: bool) -> Vec<u8> {
+        let mut result = parse(text);
+        if resolved && result.mode == Mode::Active {
+            resolve(&mut result, &Options::default());
+        }
+        binary::compile(&result, resolved)
+    }
+
+    /// Decompile a `.synxb` binary back into a human-readable `.synx` string.
+    pub fn decompile(data: &[u8]) -> Result<String, String> {
+        let result = binary::decompile(data)?;
+        let mut out = String::new();
+        if result.tool {
+            out.push_str("!tool\n");
+        }
+        if result.schema {
+            out.push_str("!schema\n");
+        }
+        if result.llm {
+            out.push_str("!llm\n");
+        }
+        if result.mode == Mode::Active {
+            out.push_str("!active\n");
+        }
+        if result.locked {
+            out.push_str("!lock\n");
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&serialize(&result.root, 0));
+        Ok(out)
+    }
+
+    /// Check if data is a `.synxb` binary file.
+    pub fn is_synxb(data: &[u8]) -> bool {
+        binary::is_synxb(data)
+    }
+
+    /// Structural diff between two parsed SYNX objects.
+    ///
+    /// Returns added / removed / changed / unchanged keys.
+    pub fn diff(
+        a: &std::collections::HashMap<String, Value>,
+        b: &std::collections::HashMap<String, Value>,
+    ) -> DiffResult {
+        diff::diff(a, b)
+    }
 }
 
-fn serialize(value: &Value, indent: usize) -> String {
+/// Nesting depth for `serialize` / stringify (prevents stack blowup on pathological `Value` trees).
+const MAX_SERIALIZE_DEPTH: usize = 128;
+
+fn serialize(value: &Value, depth_lvl: usize) -> String {
+    if depth_lvl > MAX_SERIALIZE_DEPTH {
+        return "[synx:max-depth]\n".to_string();
+    }
+    let indent = depth_lvl * 2;
     match value {
         Value::Object(map) => {
             let mut out = String::new();
@@ -120,7 +203,7 @@ fn serialize(value: &Value, indent: usize) -> String {
                         out.push_str(&spaces);
                         out.push_str(key);
                         out.push('\n');
-                        out.push_str(&serialize(val, indent + 2));
+                        out.push_str(&serialize(val, depth_lvl + 1));
                     }
                     Value::String(s) if s.contains('\n') => {
                         out.push_str(&spaces);
@@ -167,8 +250,19 @@ fn format_primitive(value: &Value) -> String {
     }
 }
 
+/// Max nesting for JSON emission (matches stringify guard).
+const MAX_JSON_DEPTH: usize = 128;
+
 /// Write a Value as JSON string (for FFI output).
 pub fn write_json(out: &mut String, val: &Value) {
+    write_json_depth(out, val, 0);
+}
+
+fn write_json_depth(out: &mut String, val: &Value, depth: usize) {
+    if depth > MAX_JSON_DEPTH {
+        out.push_str("null");
+        return;
+    }
     match val {
         Value::Null => out.push_str("null"),
         Value::Bool(true) => out.push_str("true"),
@@ -202,7 +296,7 @@ pub fn write_json(out: &mut String, val: &Value) {
             out.push('[');
             for (i, item) in arr.iter().enumerate() {
                 if i > 0 { out.push(','); }
-                write_json(out, item);
+                write_json_depth(out, item, depth + 1);
             }
             out.push(']');
         }
@@ -232,7 +326,7 @@ pub fn write_json(out: &mut String, val: &Value) {
                     }
                 }
                 out.push_str("\":");
-                write_json(out, val);
+                write_json_depth(out, val, depth + 1);
             }
             out.push('}');
         }
@@ -259,7 +353,12 @@ fn fmt_indent(line: &str) -> usize {
     line.len() - line.trim_start().len()
 }
 
-fn fmt_parse(lines: &[&str], start: usize, base: usize) -> (Vec<FmtNode>, usize) {
+const MAX_FMT_PARSE_DEPTH: usize = 128;
+
+fn fmt_parse(lines: &[&str], start: usize, base: usize, depth: usize) -> (Vec<FmtNode>, usize) {
+    if depth > MAX_FMT_PARSE_DEPTH {
+        return (Vec::new(), start);
+    }
     let mut nodes = Vec::new();
     let mut i = start;
     while i < lines.len() {
@@ -290,7 +389,7 @@ fn fmt_parse(lines: &[&str], start: usize, base: usize) -> (Vec<FmtNode>, usize)
             } else if ct.starts_with('#') || ct.starts_with("//") {
                 i += 1;
             } else {
-                let (subs, ni) = fmt_parse(lines, i, ci);
+                let (subs, ni) = fmt_parse(lines, i, ci, depth + 1);
                 node.children.extend(subs);
                 i = ni;
             }
@@ -335,13 +434,20 @@ fn fmt_emit(nodes: &[FmtNode], indent: usize, out: &mut String) {
 }
 
 fn fmt_canonical(text: &str) -> String {
+    let text = parser::clamp_synx_text(text);
     let lines: Vec<&str> = text.lines().collect();
     let mut directives: Vec<&str> = Vec::new();
     let mut body_start = 0usize;
 
     for (i, &line) in lines.iter().enumerate() {
         let t = line.trim();
-        if t == "!active" || t == "!lock" || t == "#!mode:active" {
+        if t == "!active"
+            || t == "!lock"
+            || t == "!tool"
+            || t == "!schema"
+            || t == "!llm"
+            || t == "#!mode:active"
+        {
             directives.push(t);
             body_start = i + 1;
         } else if t.is_empty() || t.starts_with('#') || t.starts_with("//") {
@@ -351,10 +457,11 @@ fn fmt_canonical(text: &str) -> String {
         }
     }
 
-    let (mut nodes, _) = fmt_parse(&lines, body_start, 0);
+    let (mut nodes, _) = fmt_parse(&lines, body_start, 0, 0);
     fmt_sort(&mut nodes);
 
-    let mut out = String::with_capacity(text.len());
+    let cap = text.len().min(parser::MAX_SYNX_INPUT_BYTES).max(64);
+    let mut out = String::with_capacity(cap);
     if !directives.is_empty() {
         out.push_str(&directives.join("\n"));
         out.push_str("\n\n");

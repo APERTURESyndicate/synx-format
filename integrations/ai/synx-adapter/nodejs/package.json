@@ -1,0 +1,35 @@
+{
+  "name": "@aperturesyndicate/synx-format-adapter",
+  "version": "0.1.0",
+  "description": "Pack agent/tool context as SYNX for LLM prompts (token savings vs JSON in many cases).",
+  "type": "module",
+  "main": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./langchain": "./src/langchain.js",
+    "./anthropic": "./src/anthropicTools.js"
+  },
+  "bin": {
+    "synx-context": "./src/cli.js"
+  },
+  "keywords": ["synx", "langchain", "llm", "prompt", "tokens"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/APERTURESyndicate/synx-format"
+  },
+  "peerDependencies": {
+    "@aperturesyndicate/synx-format": "^3.6.0"
+  },
+  "peerDependenciesMeta": {
+    "@langchain/core": {
+      "optional": true
+    }
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
