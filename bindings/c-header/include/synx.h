@@ -1,6 +1,8 @@
 #ifndef SYNX_H
 #define SYNX_H
 
+#include <stddef.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -41,10 +43,52 @@ char* synx_stringify(const char* json_input);
 char* synx_format(const char* input);
 
 /**
+ * Parse a !tool SYNX string and return reshaped JSON.
+ * Call mode: { "tool": "name", "params": { ... } }
+ * Schema mode (!tool + !schema): { "tools": [ ... ] }
+ * Caller must free the result with synx_free().
+ */
+char* synx_parse_tool(const char* input);
+
+/**
  * Free a string returned by any synx_* function.
  * Passing NULL is allowed.
  */
 void synx_free(char* ptr);
+
+/**
+ * Free a byte buffer returned by synx_compile().
+ */
+void synx_free_bytes(unsigned char* ptr, size_t len);
+
+/**
+ * Compile a SYNX string into compact binary .synxb format.
+ * Sets *out_len to the byte count.
+ * Caller must free the result with synx_free_bytes().
+ * Returns NULL on error.
+ */
+unsigned char* synx_compile(const char* input, int resolved, size_t* out_len);
+
+/**
+ * Decompile a .synxb binary back into a SYNX string.
+ * Caller must free the result with synx_free().
+ * Returns NULL on error.
+ */
+char* synx_decompile(const unsigned char* data, size_t len);
+
+/**
+ * Check whether the given bytes start with the .synxb magic header.
+ * Returns non-zero (true) if the data is .synxb.
+ */
+int synx_is_synxb(const unsigned char* data, size_t len);
+
+/**
+ * Structural diff between two SYNX strings. Returns JSON:
+ * { "added": {...}, "removed": {...}, "changed": {...}, "unchanged": [...] }
+ * Caller must free the result with synx_free().
+ * Returns NULL on error.
+ */
+char* synx_diff(const char* input_a, const char* input_b);
 
 #ifdef __cplusplus
 }

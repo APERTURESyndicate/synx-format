@@ -2,15 +2,18 @@
 resolver = "2"
 members = [
     "crates/synx-core",
+    "crates/synx-format",
+    "crates/synx-cli",
+    "crates/synx-lsp",
     "bindings/c-header",
     "bindings/node",
     "bindings/python",
     "bindings/wasm",
-    "benchmarks/bench_rust",
+    "benchmarks/rust",
 ]
 
 [workspace.package]
-version = "3.5.2"
+version = "3.6.0"
 edition = "2021"
 license = "MIT"
 

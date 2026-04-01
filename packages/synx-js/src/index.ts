@@ -1,5 +1,5 @@
 /**
- * SYNX — @aperturesyndicate/synx
+ * SYNX — @aperturesyndicate/synx-format
  *
  * The Active Data Format.
  * Faster than JSON. Cheaper for AI tokens. Built-in logic.
@@ -172,6 +172,42 @@ class Synx {
     // Spread to avoid mutating the caller's options object
     const opts = options.basePath ? options : { ...options, basePath: path.dirname(absPath) };
     return Synx.parse<T>(text, opts);
+  }
+
+  /**
+   * Save a JS object to a .synx file synchronously.
+   *
+   * @param filePath - Path to the .synx file.
+   * @param obj      - The object to serialize and save.
+   * @param active   - If true, include `!active` directive.
+   *
+   * @example
+   * ```ts
+   * Synx.saveSync('config.synx', { app_name: 'TotalWario', port: 8080 });
+   * ```
+   */
+  static saveSync(filePath: string, obj: SynxObject, active: boolean = false): void {
+    const absPath = path.resolve(filePath);
+    const text = Synx.stringify(obj, active);
+    fs.writeFileSync(absPath, text, 'utf-8');
+  }
+
+  /**
+   * Save a JS object to a .synx file asynchronously.
+   *
+   * @param filePath - Path to the .synx file.
+   * @param obj      - The object to serialize and save.
+   * @param active   - If true, include `!active` directive.
+   *
+   * @example
+   * ```ts
+   * await Synx.save('config.synx', { app_name: 'TotalWario', port: 8080 });
+   * ```
+   */
+  static async save(filePath: string, obj: SynxObject, active: boolean = false): Promise<void> {
+    const absPath = path.resolve(filePath);
+    const text = Synx.stringify(obj, active);
+    await fs.promises.writeFile(absPath, text, 'utf-8');
   }
 
   /**
@@ -431,7 +467,6 @@ class Synx {
         if (c.pattern) prop.pattern = c.pattern;
         if (c.enum) prop.enum = c.enum;
         if (c.required) {
-          prop.required = true;
           required.push(key);
         }
         properties[key] = prop;
@@ -454,7 +489,7 @@ class Synx {
    * @param b - Second object (after).
    * @returns A SynxDiff describing the structural differences.
    *
-   * @since 3.5.2
+   * @since 3.6.0
    *
    * @example
    * ```ts
@@ -786,9 +821,10 @@ interface SynxSchemaProperty {
   type?: string;
   minimum?: number;
   maximum?: number;
+  minLength?: number;
+  maxLength?: number;
   pattern?: string;
   enum?: string[];
-  required?: boolean;
 }
 
 interface SynxSchema {

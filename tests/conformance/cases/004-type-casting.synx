@@ -1,0 +1,4 @@
+zip_code(string) 90210
+count(int) 42
+ratio(float) 3.14
+flag(bool) true

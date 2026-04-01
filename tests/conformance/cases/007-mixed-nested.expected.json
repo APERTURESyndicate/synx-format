@@ -1,0 +1,1 @@
+{"app_name":"MyApp","database":{"primary":{"host":"db.local","port":5432},"replicas":["replica1.local","replica2.local"]},"features":["auth","logging","metrics"],"server":{"host":"0.0.0.0","port":8080,"ssl":false},"version":"2.0.0"}
