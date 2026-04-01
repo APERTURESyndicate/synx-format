@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "synx-adapter"
+version = "0.1.0"
+description = "Pack agent/tool context as SYNX for LLM prompts — fewer tokens than JSON in many cases."
+readme = "../README.md"
+license = { text = "MIT" }
+authors = [{ name = "APERTURESyndicate", email = "support@aperturesyndicate.com" }]
+requires-python = ">=3.9"
+keywords = ["synx", "langchain", "llama-index", "llm", "prompt", "tokens"]
+classifiers = [
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+]
+
+dependencies = ["synx-format>=3.5.0"]
+
+[project.scripts]
+synx-context = "synx_adapter.cli_compress:main"
+
+[project.optional-dependencies]
+langchain = ["langchain-core>=0.2.0"]
+llama = ["llama-index-core>=0.10.57"]
+
+[project.urls]
+Homepage = "https://github.com/APERTURESyndicate/synx-format"
+Repository = "https://github.com/APERTURESyndicate/synx-format"

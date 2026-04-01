@@ -1,5 +1,5 @@
 /**
- * SYNX Browser Bundle — @aperturesyndicate/synx
+ * SYNX Browser Bundle — @aperturesyndicate/synx-format
  *
  * Lightweight browser-compatible build.
  * No Node.js dependencies (fs, path).

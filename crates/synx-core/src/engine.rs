@@ -13,12 +13,18 @@ static SPAM_BUCKETS: OnceLock<Mutex<HashMap<String, Vec<Instant>>>> = OnceLock::
 
 /// Maximum expression length accepted by :calc (prevents ReDoS/stack abuse).
 const MAX_CALC_EXPR_LEN: usize = 4096;
+/// Maximum resolved expression length produced by :calc substitutions.
+/// Prevents pathological inputs from growing the expression until OOM.
+const MAX_CALC_RESOLVED_LEN: usize = 64 * 1024;
 /// Maximum file size for :include / :watch reads (10 MB).
 const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
 /// Default maximum include depth.
 const DEFAULT_MAX_INCLUDE_DEPTH: usize = 16;
 /// Maximum object nesting depth for active-mode resolution (prevents stack overflow).
 const MAX_RESOLVE_DEPTH: usize = 512;
+
+/// Upper bound for single `String` scratch buffers built from hostile `:template` / replace paths.
+const MAX_ENGINE_SCRATCH_STRING: usize = 4 * 1024 * 1024;
 
 /// Validate that `full` path stays within the `base` directory (jail).
 /// Returns `Ok(canonical)` or an `Err` describing the violation.
@@ -476,6 +482,16 @@ fn apply_markers(
                 for (rk, rv) in root_map {
                     if let Some(n) = value_as_number(rv) {
                         resolved = replace_word(&resolved, rk, &format_number(n));
+                        if resolved.len() > MAX_CALC_RESOLVED_LEN {
+                            map.insert(
+                                key.to_string(),
+                                Value::String(format!(
+                                    "CALC_ERR: resolved expression too long (max {} bytes)",
+                                    MAX_CALC_RESOLVED_LEN
+                                )),
+                            );
+                            return;
+                        }
                     }
                 }
             }
@@ -485,6 +501,16 @@ fn apply_markers(
                 if rk != key {
                     if let Some(n) = value_as_number(rv) {
                         resolved = replace_word(&resolved, rk, &format_number(n));
+                        if resolved.len() > MAX_CALC_RESOLVED_LEN {
+                            map.insert(
+                                key.to_string(),
+                                Value::String(format!(
+                                    "CALC_ERR: resolved expression too long (max {} bytes)",
+                                    MAX_CALC_RESOLVED_LEN
+                                )),
+                            );
+                            return;
+                        }
                     }
                 }
             }
@@ -508,14 +534,44 @@ fn apply_markers(
                         if let Some(val) = deep_get(root_ref2, token) {
                             if let Some(n) = value_as_number(&val) {
                                 dot_resolved.push_str(&format_number(n));
+                                if dot_resolved.len() > MAX_CALC_RESOLVED_LEN {
+                                    map.insert(
+                                        key.to_string(),
+                                        Value::String(format!(
+                                            "CALC_ERR: resolved expression too long (max {} bytes)",
+                                            MAX_CALC_RESOLVED_LEN
+                                        )),
+                                    );
+                                    return;
+                                }
                                 continue;
                             }
                         }
                     }
                     dot_resolved.push_str(token);
+                    if dot_resolved.len() > MAX_CALC_RESOLVED_LEN {
+                        map.insert(
+                            key.to_string(),
+                            Value::String(format!(
+                                "CALC_ERR: resolved expression too long (max {} bytes)",
+                                MAX_CALC_RESOLVED_LEN
+                            )),
+                        );
+                        return;
+                    }
                 } else {
                     dot_resolved.push(bytes[i] as char);
                     i += 1;
+                    if dot_resolved.len() > MAX_CALC_RESOLVED_LEN {
+                        map.insert(
+                            key.to_string(),
+                            Value::String(format!(
+                                "CALC_ERR: resolved expression too long (max {} bytes)",
+                                MAX_CALC_RESOLVED_LEN
+                            )),
+                        );
+                        return;
+                    }
                 }
             }
             resolved = dot_resolved;
@@ -1057,14 +1113,19 @@ fn apply_format_pattern(pattern: &str, value: &Value) -> String {
 }
 
 fn format_int_pattern(pattern: &str, n: i64) -> String {
+    // Guardrail: user-controlled width can be enormous (esp. under fuzzing).
+    // Large widths can cause pathological allocations or panics in formatting internals.
+    const MAX_FMT_WIDTH: usize = 4096;
     if let Some(s) = pattern.strip_prefix('%') {
         if let Some(inner) = s.strip_suffix('d').or_else(|| s.strip_suffix('i')) {
             if let Some(w) = inner.strip_prefix('0') {
                 if let Ok(width) = w.parse::<usize>() {
+                    let width = width.min(MAX_FMT_WIDTH);
                     return format!("{:0>width$}", n, width = width);
                 }
             }
             if let Ok(width) = inner.parse::<usize>() {
+                let width = width.min(MAX_FMT_WIDTH);
                 return format!("{:>width$}", n, width = width);
             }
         }
@@ -1073,10 +1134,13 @@ fn format_int_pattern(pattern: &str, n: i64) -> String {
 }
 
 fn format_float_pattern(pattern: &str, f: f64) -> String {
+    // Same rationale as MAX_FMT_WIDTH: avoid pathological precision values.
+    const MAX_FMT_PREC: usize = 1024;
     if let Some(s) = pattern.strip_prefix('%') {
         if let Some(inner) = s.strip_suffix('f').or_else(|| s.strip_suffix('e')) {
             if let Some(prec_s) = inner.strip_prefix('.') {
                 if let Ok(prec) = prec_s.parse::<usize>() {
+                    let prec = prec.min(MAX_FMT_PREC);
                     return format!("{:.prec$}", f, prec = prec);
                 }
             }
@@ -1320,23 +1384,33 @@ fn replace_word(haystack: &str, word: &str, replacement: &str) -> String {
         return haystack.to_string();
     }
 
-    let mut result = String::with_capacity(hay_len);
+    let mut result = String::with_capacity(hay_len.min(MAX_ENGINE_SCRATCH_STRING));
     let mut i = 0;
 
     while i <= hay_len - word_len {
+        if result.len() >= MAX_ENGINE_SCRATCH_STRING {
+            break;
+        }
         if &hay_bytes[i..i + word_len] == word_bytes {
             let before_ok = i == 0 || !is_word_char(hay_bytes[i - 1]);
             let after_ok = i + word_len >= hay_len || !is_word_char(hay_bytes[i + word_len]);
             if before_ok && after_ok {
-                result.push_str(replacement);
+                let room = MAX_ENGINE_SCRATCH_STRING.saturating_sub(result.len());
+                if room > 0 {
+                    let take = replacement.len().min(room);
+                    let end = replacement.floor_char_boundary(take);
+                    result.push_str(&replacement[..end]);
+                }
                 i += word_len;
                 continue;
             }
         }
-        result.push(hay_bytes[i] as char);
+        if result.len() < MAX_ENGINE_SCRATCH_STRING {
+            result.push(hay_bytes[i] as char);
+        }
         i += 1;
     }
-    while i < hay_len {
+    while i < hay_len && result.len() < MAX_ENGINE_SCRATCH_STRING {
         result.push(hay_bytes[i] as char);
         i += 1;
     }
@@ -1458,10 +1532,13 @@ fn resolve_interpolation(
 ) -> String {
     let bytes = tpl.as_bytes();
     let len = bytes.len();
-    let mut result = String::with_capacity(len);
+    let mut result = String::with_capacity(len.min(MAX_ENGINE_SCRATCH_STRING));
     let mut i = 0;
 
     while i < len {
+        if result.len() >= MAX_ENGINE_SCRATCH_STRING {
+            break;
+        }
         if bytes[i] == b'{' {
             if let Some(close) = tpl[i + 1..].find('}') {
                 let inner = &tpl[i + 1..i + 1 + close];
@@ -1484,11 +1561,23 @@ fn resolve_interpolation(
                             includes.get(scope).and_then(|inc| deep_get(inc, ref_name))
                         };
                         if let Some(val) = resolved {
-                            result.push_str(&value_to_string(&val));
+                            let s = value_to_string(&val);
+                            let room = MAX_ENGINE_SCRATCH_STRING.saturating_sub(result.len());
+                            if room > 0 {
+                                let take = s.len().min(room);
+                                let end = s.floor_char_boundary(take);
+                                result.push_str(&s[..end]);
+                            }
                         } else {
                             result.push('{');
-                            result.push_str(inner);
-                            result.push('}');
+                            let rem = MAX_ENGINE_SCRATCH_STRING.saturating_sub(result.len() + 1);
+                            if rem > 0 {
+                                let end = inner.floor_char_boundary(inner.len().min(rem));
+                                result.push_str(&inner[..end]);
+                            }
+                            if result.len() < MAX_ENGINE_SCRATCH_STRING {
+                                result.push('}');
+                            }
                         }
                         i += 2 + close;
                         continue;
@@ -1501,11 +1590,23 @@ fn resolve_interpolation(
                             local_map.get(ref_name).cloned()
                         });
                         if let Some(val) = resolved {
-                            result.push_str(&value_to_string(&val));
+                            let s = value_to_string(&val);
+                            let room = MAX_ENGINE_SCRATCH_STRING.saturating_sub(result.len());
+                            if room > 0 {
+                                let take = s.len().min(room);
+                                let end = s.floor_char_boundary(take);
+                                result.push_str(&s[..end]);
+                            }
                         } else {
                             result.push('{');
-                            result.push_str(ref_name);
-                            result.push('}');
+                            let rem = MAX_ENGINE_SCRATCH_STRING.saturating_sub(result.len() + 1);
+                            if rem > 0 {
+                                let end = ref_name.floor_char_boundary(ref_name.len().min(rem));
+                                result.push_str(&ref_name[..end]);
+                            }
+                            if result.len() < MAX_ENGINE_SCRATCH_STRING {
+                                result.push('}');
+                            }
                         }
                         i += 2 + close;
                         continue;
@@ -1513,7 +1614,9 @@ fn resolve_interpolation(
                 }
             }
         }
-        result.push(bytes[i] as char);
+        if result.len() < MAX_ENGINE_SCRATCH_STRING {
+            result.push(bytes[i] as char);
+        }
         i += 1;
     }
     result
@@ -2094,53 +2197,43 @@ mod tests {
 
     #[test]
     fn test_deep_nesting_does_not_overflow() {
-        // Build 600-level deep SYNX: each level has one child key
+        // Deep indentation chain: parser caps nesting (see `MAX_PARSE_NESTING_DEPTH` in parser);
+        // this test only checks resolve + navigation do not panic and yield a bounded tree.
         let mut synx = String::from("!active\n");
         let mut indent = String::new();
-        for i in 0..600 {
+        for i in 0..200 {
             synx.push_str(&format!("{}level_{}\n", indent, i));
             indent.push_str("  ");
         }
         synx.push_str(&format!("{}value deep\n", indent));
 
-        // Must not crash
         let mut result = parse(&synx);
         resolve(&mut result, &Default::default());
         assert!(matches!(result.root, Value::Object(_)));
 
-        // Walk down to level 510 (should resolve normally)
         let mut cur = &result.root;
-        for i in 0..510 {
-            match cur {
-                Value::Object(map) => {
-                    let key = format!("level_{}", i);
-                    cur = map.get(&key).expect(&format!("key '{}' should exist", key));
+        let mut depth = 0usize;
+        loop {
+            let Value::Object(map) = cur else { break };
+            let key = format!("level_{}", depth);
+            match map.get(&key) {
+                Some(next) => {
+                    cur = next;
+                    depth += 1;
                 }
-                _ => panic!("expected object at level {}", i),
+                None => break,
             }
         }
-        // At depth 510 we should still have an object (within limit)
-        assert!(matches!(cur, Value::Object(_)), "level_510 should be Object");
-
-        // Walk down to level 512 — this is the limit, its children should be NESTING_ERR
-        let mut cur2 = &result.root;
-        for i in 0..512 {
-            match cur2 {
-                Value::Object(map) => {
-                    let key = format!("level_{}", i);
-                    cur2 = map.get(&key).expect(&format!("key '{}' should exist", key));
-                }
-                _ => break,
-            }
-        }
-        // At or beyond depth 512, values should be NESTING_ERR strings
-        if let Value::Object(map) = cur2 {
-            for v in map.values() {
-                if let Value::String(s) = v {
-                    assert!(s.starts_with("NESTING_ERR:"), "expected NESTING_ERR at depth limit, got: {}", s);
-                }
-            }
-        }
+        assert!(
+            depth >= 100,
+            "expected at least 100 chained levels from parse, got {}",
+            depth
+        );
+        assert!(
+            depth <= 130,
+            "parser nesting cap should keep chain shallow, got {}",
+            depth
+        );
     }
 
     #[test]

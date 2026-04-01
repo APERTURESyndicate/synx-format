@@ -1,0 +1,66 @@
+name: "SYNX Validate"
+description: "Validate .synx files using the synx CLI"
+author: "APERTURESyndicate"
+
+inputs:
+  files:
+    description: "Glob pattern for .synx files to validate"
+    required: false
+    default: "**/*.synx"
+  strict:
+    description: "Treat marker resolution errors as failures"
+    required: false
+    default: "false"
+  version:
+    description: "synx-cli version to install (default: latest)"
+    required: false
+    default: "latest"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Install synx CLI
+      shell: bash
+      run: |
+        if [ "${{ inputs.version }}" = "latest" ]; then
+          cargo install synx-cli --locked
+        else
+          cargo install synx-cli@${{ inputs.version }} --locked
+        fi
+
+    - name: Validate .synx files
+      shell: bash
+      run: |
+        set -e
+        STRICT_FLAG=""
+        if [ "${{ inputs.strict }}" = "true" ]; then
+          STRICT_FLAG="--strict"
+        fi
+
+        FILES=$(find . -name '*.synx' -path '${{ inputs.files }}' 2>/dev/null || \
+                find . -name '*.synx' 2>/dev/null)
+
+        if [ -z "$FILES" ]; then
+          echo "No .synx files found matching '${{ inputs.files }}'"
+          exit 0
+        fi
+
+        FAILED=0
+        PASSED=0
+        for f in $FILES; do
+          if synx validate "$f" $STRICT_FLAG; then
+            PASSED=$((PASSED + 1))
+          else
+            FAILED=$((FAILED + 1))
+          fi
+        done
+
+        echo ""
+        echo "Results: $PASSED passed, $FAILED failed"
+
+        if [ "$FAILED" -gt 0 ]; then
+          exit 1
+        fi

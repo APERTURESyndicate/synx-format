@@ -1,17 +1,17 @@
-# SYNX for JS/TS — @aperturesyndicate/synx
+﻿# SYNX for JS/TS — @aperturesyndicate/synx-format
 
 The official JavaScript & TypeScript parser for the SYNX format.
 
 ## Install
 
 ```bash
-npm install @aperturesyndicate/synx
+npm install @aperturesyndicate/synx-format
 ```
 
 ## Usage
 
 ```javascript
-const Synx = require('@aperturesyndicate/synx');
+const Synx = require('@aperturesyndicate/synx-format');
 
 // Load from file
 const data = Synx.loadSync('config.synx');
@@ -25,7 +25,7 @@ console.log(data2.name); // "Wario"
 ### TypeScript
 
 ```typescript
-import Synx from '@aperturesyndicate/synx';
+import Synx from '@aperturesyndicate/synx-format';
 
 interface Config {
   server: { port: number; host: string };
@@ -63,7 +63,7 @@ console.log(data.server.port); // typed as number
 Install globally:
 
 ```bash
-npm install -g @aperturesyndicate/synx
+npm install -g @aperturesyndicate/synx-format
 ```
 
 ### Commands

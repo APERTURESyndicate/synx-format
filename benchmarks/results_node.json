@@ -1,0 +1,44 @@
+{
+  "platform": "win32",
+  "arch": "x64",
+  "node": "v24.13.0",
+  "iterations": 50000,
+  "sizes": {
+    "json": 3301,
+    "yaml": 2467,
+    "xml": 3579,
+    "synx": 2527
+  },
+  "results": [
+    {
+      "label": "JSON.parse (built-in)",
+      "totalMs": 295.487,
+      "perIterUs": 5.9097
+    },
+    {
+      "label": "YAML  (js-yaml)",
+      "totalMs": 3362.75,
+      "perIterUs": 67.255
+    },
+    {
+      "label": "XML   (fast-xml-parser)",
+      "totalMs": 8079.48,
+      "perIterUs": 161.5896
+    },
+    {
+      "label": "SYNX  (synx-js / pure JS)",
+      "totalMs": 999.509,
+      "perIterUs": 19.9902
+    },
+    {
+      "label": "SYNX  (synx-native / Rust)",
+      "totalMs": 4553.942,
+      "perIterUs": 91.0788
+    },
+    {
+      "label": "SYNX  (native parseToJson)",
+      "totalMs": 2241.096,
+      "perIterUs": 44.8219
+    }
+  ]
+}

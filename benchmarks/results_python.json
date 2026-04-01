@@ -1,0 +1,39 @@
+{
+  "platform": "Windows",
+  "arch": "AMD64",
+  "python": "3.11.9",
+  "iterations": 10000,
+  "sizes": {
+    "json": 3301,
+    "yaml": 2467,
+    "xml": 3579,
+    "synx": 2375
+  },
+  "results": [
+    {
+      "label": "json.loads (built-in)",
+      "total_ms": 129.436,
+      "per_us": 12.9436
+    },
+    {
+      "label": "yaml.safe_load (PyYAML)",
+      "total_ms": 40249.08,
+      "per_us": 4024.908
+    },
+    {
+      "label": "xml.etree (parse)",
+      "total_ms": 482.38,
+      "per_us": 48.2381
+    },
+    {
+      "label": "synx_native.parse (Rust)",
+      "total_ms": 464.886,
+      "per_us": 46.4886
+    },
+    {
+      "label": "synx_native.parseToJson",
+      "total_ms": 436.175,
+      "per_us": 43.6175
+    }
+  ]
+}

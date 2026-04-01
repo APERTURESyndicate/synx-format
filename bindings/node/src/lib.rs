@@ -126,6 +126,34 @@ pub fn parse_active(env: Env, text: String, options: Option<napi::JsObject>) -> 
     value_to_js(&env, &result.root)
 }
 
+/// Parse a `!tool` SYNX string. Returns `{ tool: "name", params: { ... } }` for calls,
+/// or `{ tools: [ { name, params } ] }` for schema definitions.
+/// If the text is also `!active`, markers are resolved before reshaping.
+#[napi]
+pub fn parse_tool(env: Env, text: String, options: Option<napi::JsObject>) -> Result<JsUnknown> {
+    let mut result = synx_core::parse(&text);
+    if result.mode == Mode::Active {
+        let mut opts = Options::default();
+        if let Some(ref js_opts) = options {
+            if let Ok(env_obj) = js_opts.get_named_property::<napi::JsObject>("env") {
+                let mut hm = std::collections::HashMap::new();
+                let keys = napi::JsObject::keys(&env_obj)?;
+                for key in keys {
+                    if let Ok(val) = env_obj.get_named_property::<napi::JsString>(&key) {
+                        if let Ok(s) = val.into_utf8() {
+                            hm.insert(key, s.as_str()?.to_string());
+                        }
+                    }
+                }
+                opts.env = Some(hm);
+            }
+        }
+        synx_core::resolve(&mut result, &opts);
+    }
+    let shaped = synx_core::reshape_tool_output(&result.root, result.schema);
+    value_to_js(&env, &shaped)
+}
+
 /// Convert a JS object back to a SYNX string.
 #[napi]
 pub fn stringify(env: Env, obj: JsUnknown) -> Result<String> {
@@ -137,6 +165,50 @@ pub fn stringify(env: Env, obj: JsUnknown) -> Result<String> {
 #[napi]
 pub fn format(text: String) -> String {
     synx_core::Synx::format(&text)
+}
+
+/// Compile a SYNX string into compact binary .synxb format.
+/// If `resolved` is true, metadata/includes are stripped and values are resolved.
+#[napi]
+pub fn compile(text: String, resolved: Option<bool>) -> Buffer {
+    let data = synx_core::Synx::compile(&text, resolved.unwrap_or(false));
+    Buffer::from(data)
+}
+
+/// Decompile a .synxb binary buffer back into a SYNX string.
+#[napi]
+pub fn decompile(data: Buffer) -> Result<String> {
+    synx_core::Synx::decompile(&data)
+        .map_err(|e| napi::Error::from_reason(e))
+}
+
+/// Check whether a buffer starts with the .synxb magic bytes.
+#[napi]
+pub fn is_synxb(data: Buffer) -> bool {
+    synx_core::Synx::is_synxb(&data)
+}
+
+/// Structural diff between two parsed SYNX objects.
+/// Returns `{ added, removed, changed, unchanged }`.
+#[napi]
+pub fn diff(env: Env, a: JsUnknown, b: JsUnknown) -> Result<JsUnknown> {
+    let val_a = js_to_value(&env, a)?;
+    let val_b = js_to_value(&env, b)?;
+    let map_a = match val_a { Value::Object(m) => m, _ => std::collections::HashMap::new() };
+    let map_b = match val_b { Value::Object(m) => m, _ => std::collections::HashMap::new() };
+    let result = synx_core::Synx::diff(&map_a, &map_b);
+    let val = synx_core::diff_to_value(&result);
+    value_to_js(&env, &val)
+}
+
+/// Structural diff between two SYNX strings. Returns JSON.
+#[napi]
+pub fn diff_json(text_a: String, text_b: String) -> String {
+    let map_a = synx_core::Synx::parse(&text_a);
+    let map_b = synx_core::Synx::parse(&text_b);
+    let result = synx_core::Synx::diff(&map_a, &map_b);
+    let val = synx_core::diff_to_value(&result);
+    synx_core::to_json(&val)
 }
 
 #[cfg(test)]

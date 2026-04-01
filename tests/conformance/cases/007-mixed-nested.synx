@@ -1,0 +1,17 @@
+app_name MyApp
+version 2.0.0
+server
+  host 0.0.0.0
+  port 8080
+  ssl false
+features
+  - auth
+  - logging
+  - metrics
+database
+  primary
+    host db.local
+    port 5432
+  replicas
+    - replica1.local
+    - replica2.local

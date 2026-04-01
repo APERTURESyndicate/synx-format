@@ -1,6 +1,6 @@
 [package]
 name = "synx-python"
-version = "3.5.2"
+version = "3.6.0"
 edition = "2021"
 authors = ["APERTURESyndicate <support@aperturesyndicate.com>"]
 description = "SYNX Python native module via PyO3"
@@ -15,5 +15,6 @@ default = ["extension-module"]
 extension-module = ["pyo3/extension-module"]
 
 [dependencies]
-synx-core = { path = "../../crates/synx-core" }
+synx-core = { path = "../../crates/synx-core", features = ["serde"] }
 pyo3 = { version = "0.24" }
+serde_json = "1"

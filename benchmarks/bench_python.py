@@ -10,9 +10,11 @@ Usage:
 
 import json
 import os
+import re
 import sys
 import time
 import platform
+import xml.etree.ElementTree as ET
 
 # ── Parsers ──────────────────────────────────────────────────────────────────
 
@@ -47,6 +49,40 @@ with open(os.path.join(_bench_dir, 'config.yaml'),  'r', encoding='utf-8') as f:
 with open(os.path.join(_bench_dir, 'config.synx'), 'r', encoding='utf-8') as f:
     SYNX_TEXT = f.read()
 
+
+def _safe_xml_tag(name: str) -> str:
+    s = re.sub(r'[^a-zA-Z0-9_.-]', '_', str(name))
+    return s if s else 'node'
+
+
+def _json_to_xml_element(obj, name: str) -> ET.Element:
+    tag = _safe_xml_tag(name)
+    if obj is None:
+        return ET.Element(tag)
+    if isinstance(obj, (str, int, float)):
+        el = ET.Element(tag)
+        el.text = str(obj)
+        return el
+    if isinstance(obj, bool):
+        el = ET.Element(tag)
+        el.text = 'true' if obj else 'false'
+        return el
+    if isinstance(obj, list):
+        root = ET.Element(tag)
+        for x in obj:
+            root.append(_json_to_xml_element(x, 'item'))
+        return root
+    root = ET.Element(tag)
+    for k, v in obj.items():
+        root.append(_json_to_xml_element(v, k))
+    return root
+
+
+_json_obj = json.loads(JSON_TEXT)
+XML_TEXT = '<?xml version="1.0" encoding="UTF-8"?>\n' + ET.tostring(
+    _json_to_xml_element(_json_obj, 'config'), encoding='unicode'
+)
+
 ITERATIONS = 10_000
 WARMUP     = 100
 
@@ -71,13 +107,14 @@ def bench(label: str, fn) -> dict:
 print("╔══════════════════════════════════════════════════════════════════╗")
 print(f"║         SYNX Benchmark — Python  ({ITERATIONS:,} iterations)           ║")
 print("╠══════════════════════════════════════════════════════════════════╣")
-print(f"║  Input sizes:  JSON {len(JSON_TEXT):<5}b   YAML {len(YAML_TEXT):<5}b   SYNX {len(SYNX_TEXT):<5}b          ║")
+print(f"║  Input sizes:  JSON {len(JSON_TEXT):<5}b   YAML {len(YAML_TEXT):<5}b   XML {len(XML_TEXT):<5}b   SYNX {len(SYNX_TEXT):<5}b   ║")
 print("╚══════════════════════════════════════════════════════════════════╝")
 print()
 
 results = [
     bench("json.loads (built-in)",       lambda: json.loads(JSON_TEXT)),
     bench("yaml.safe_load (PyYAML)",     lambda: yaml.safe_load(YAML_TEXT)),
+    bench("xml.etree (parse)",           lambda: ET.fromstring(XML_TEXT)),
     bench("synx_native.parse (Rust)",    lambda: _SynxNative.parse(SYNX_TEXT)),
     bench("synx_native.parseToJson",     lambda: _SynxNative.parse_to_json(SYNX_TEXT)),
 ]
@@ -116,6 +153,7 @@ with open(out_path, "w", encoding="utf-8") as f:
         "sizes": {
             "json": len(JSON_TEXT),
             "yaml": len(YAML_TEXT),
+            "xml": len(XML_TEXT),
             "synx": len(SYNX_TEXT),
         },
         "results": [

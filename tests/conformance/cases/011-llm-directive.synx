@@ -1,0 +1,4 @@
+!llm
+context
+  user_profile demo
+task summarize

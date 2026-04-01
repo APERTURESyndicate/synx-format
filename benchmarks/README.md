@@ -1,16 +1,17 @@
 # SYNX Benchmarks
 
-Performance comparison: **JSON · YAML · SYNX** across Rust, Node.js, and Python.
+Performance comparison: **JSON · YAML · XML · SYNX** across Rust, Node.js, and Python.
 
 All tests parse the same application config — ~110 keys, nested objects, arrays,
-booleans, numbers, and strings.
+booleans, numbers, and strings. **XML** is generated in-memory from the same `config.json` tree (generic element nesting + `item` list elements) so byte sizes stay comparable to other columns.
 
-**Input sizes:**
+**Input sizes (typical; exact XML length depends on generator):**
 
 | Format | Size  |
 |--------|------:|
 | JSON   | 3 301 b |
 | YAML   | 2 467 b |
+| XML    | ~3 579 b (generated from `config.json`; see `bench_node.js`) |
 | SYNX   | 2 527 b |
 
 ---
@@ -28,7 +29,7 @@ booleans, numbers, and strings.
 
 **Run:**
 ```bash
-cd benchmarks/bench_rust
+cd benchmarks/rust
 cargo bench
 ```
 
@@ -43,6 +44,7 @@ cargo bench
 | `JSON.parse` (built-in) ⭐     |    6.08 µs  |   304 ms   |   1.00×    |
 | `SYNX synx-js` (pure TS)      |   39.20 µs  |  1 960 ms  |   6.44×    |
 | `YAML js-yaml`                 |   82.85 µs  |  4 142 ms  |  13.62×    |
+| `XML fast-xml-parser`          | _run bench_ | _run bench_| _run bench_|
 | `SYNX native parseToJson`      |   86.29 µs  |  4 315 ms  |  14.18×    |
 | `SYNX native parse → JSObject` |  186.53 µs  |  9 327 ms  |  30.66×    |
 
@@ -121,7 +123,7 @@ benchmarks/
   config.yaml          ← YAML equivalent (auto-generated)
   bench_node.js        ← Node.js benchmark runner
   bench_python.py      ← Python benchmark runner
-  bench_rust/
+  rust/
     Cargo.toml
     benches/
       parse.rs         ← Criterion benchmarks

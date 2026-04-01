@@ -1,8 +1,6 @@
 # JavaScript / Node.js
 dist/
 node_modules/
-*.js
-!jest.config.js
 *.d.ts
 *.map
 *.vsix
@@ -23,6 +21,21 @@ htmlcov/
 target/
 .cargo/
 
+# Fuzzing (cargo-fuzz)
+**/fuzz/corpus/
+**/fuzz/artifacts/
+**/fuzz/coverage/
+**/fuzz/target/
+**/fuzz/.cxx/
+
+# synx-core local artifacts
+crates/synx-core/.synx.lock
+crates/synx-core/libclang.dll
+
+# Tree-sitter (generated)
+tree-sitter-synx/src/
+tree-sitter-synx/build/
+
 # Environment
 .venv/
 .env
@@ -31,6 +44,22 @@ target/
 # IDE
 .vscode/
 .idea/
+
+# Visual Studio extension
+**/integrations/visualstudio/**/bin/
+**/integrations/visualstudio/**/obj/
+**/packages/synx-visualstudio/**/bin/
+**/packages/synx-visualstudio/**/obj/
+
+# Local publish outputs (publish-*.bat)
+artifacts/
+
+# Kotlin / Gradle (bindings/kotlin)
+bindings/kotlin/.gradle/
+
+# .NET build outputs (parsers)
+parsers/**/bin/
+parsers/**/obj/
 *.swp
 *.swo
 *~
@@ -41,9 +70,16 @@ Thumbs.db
 
 # Scripts (local build/publish helpers)
 *.bat
+!publish-*.bat
 
 # Logs
 *.log
 
 # Claude
 .claudeignore
+
+# Integrations — local npm install (never commit)
+integrations/**/node_modules/
+
+# Accidental duplicate MCP folder at repo root (delete if present)
+/synx-mcp/

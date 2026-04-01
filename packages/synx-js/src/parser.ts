@@ -1,5 +1,5 @@
 /**
- * SYNX Parser — @aperturesyndicate/synx
+ * SYNX Parser — @aperturesyndicate/synx-format
  *
  * Converts raw .synx text into a structured object tree
  * with hidden metadata (__synx) for the Engine to resolve.
@@ -175,6 +175,7 @@ export function parseData(text: string): SynxParseResult {
 
   let mode: SynxMode = 'static';
   let locked = false;
+  let llm = false;
   const includes: SynxInclude[] = [];
   let currentBlock: { indent: number; obj: SynxObject; key: string } | null = null;
   let currentList: { indent: number; arr: SynxArray } | null = null;
@@ -234,6 +235,7 @@ export function parseData(text: string): SynxParseResult {
     if (fc === 33) {
       if (trimmed === '!active') { mode = 'active'; continue; }
       if (trimmed === '!lock') { locked = true; continue; }
+      if (trimmed === '!llm') { llm = true; continue; }
       if (trimmed.startsWith('!include ')) {
         const parts = trimmed.substring(9).trim().split(/\s+/);
         const inclPath = parts[0];
@@ -428,5 +430,11 @@ export function parseData(text: string): SynxParseResult {
     }
   }
 
-  return { root, mode, locked, includes: includes.length > 0 ? includes : undefined };
+  return {
+    root,
+    mode,
+    locked,
+    ...(llm ? { llm: true } : {}),
+    includes: includes.length > 0 ? includes : undefined,
+  };
 }
