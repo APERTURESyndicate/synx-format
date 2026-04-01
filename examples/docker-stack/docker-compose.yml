@@ -11,7 +11,7 @@ services:
       REDIS_PORT: "6379"
       NGINX_PORT: "8080"
     command: >
-      sh -c "npm --silent i @aperturesyndicate/synx && node scripts/render-nginx.js"
+      sh -c "npm --silent i @aperturesyndicate/synx-format && node scripts/render-nginx.js"
 
   web:
     image: hashicorp/http-echo:1.0.0

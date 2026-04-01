@@ -1,5 +1,5 @@
 /**
- * SYNX Safe Calculator — @aperturesyndicate/synx
+ * SYNX Safe Calculator — @aperturesyndicate/synx-format
  *
  * Evaluates arithmetic expressions WITHOUT eval() or new Function().
  * Supports: +, -, *, /, %, parentheses, and numeric literals.

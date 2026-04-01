@@ -1,6 +1,6 @@
 [package]
 name = "synx-node"
-version = "3.5.2"
+version = "3.6.0"
 edition = "2021"
 authors = ["APERTURESyndicate <support@aperturesyndicate.com>"]
 description = "SYNX Node.js native addon via napi-rs"

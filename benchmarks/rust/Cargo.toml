@@ -1,0 +1,15 @@
+[package]
+name = "synx-bench"
+version = "3.6.0"
+edition = "2021"
+publish = false
+
+[[bench]]
+name = "parse"
+harness = false
+
+[dependencies]
+synx-core = { path = "../../crates/synx-core" }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }

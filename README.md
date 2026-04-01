@@ -1,17 +1,33 @@
 <p align="center">
-  <img src="https://aperturesyndicate.com/branding/aperturesyndicate.png" alt="APERTURESyndicate" width="360" />
+  <img src="https://media.aperturesyndicate.com/asother/as/branding/png/aperturesyndicate.png" alt="APERTURESyndicate" width="360" />
 </p>
 
 <p align="center">
-  <strong>Better than JSON. Cheaper than YAML. Built for AI and humans.</strong>
+  <strong>Built for AI and humans by APERTURESyndicate.</strong>
 </p>
 
 <p align="center">
   <img src="https://img.shields.io/visual-studio-marketplace/v/APERTURESyndicate.synx-vscode?label=version&color=5a6eff" />
   <img src="https://img.shields.io/visual-studio-marketplace/i/APERTURESyndicate.synx-vscode?color=5a6eff" />
   <img src="https://img.shields.io/badge/license-MIT-blue" />
-  <img src="https://img.shields.io/badge/format-SYNX%20v3.5-blueviolet" />
+  <img src="https://img.shields.io/badge/format-SYNX%20v3.6-blueviolet" />
 </p>
+
+## Frozen reference (3.6.0)
+
+As of **April 2026**, **SYNX 3.6.0** is **frozen**: the normative definition is [`docs/spec/SYNX-3.6-NORMATIVE.md`](docs/spec/SYNX-3.6-NORMATIVE.md), and the reference implementation is **`synx-core` 3.6.x** checked by [`tests/conformance/`](tests/conformance/). **PATCH** releases may only restore that contract (bugs, spec alignment); new surface syntax stays **additive** until a new normative version (for example 3.7). Full policy: [`docs/spec/CORE-FREEZE.md`](docs/spec/CORE-FREEZE.md).
+
+---
+
+## Documentation and repo map
+
+- **[docs/SYNX_AT_A_GLANCE.md](docs/SYNX_AT_A_GLANCE.md)** — single-page overview: paths, parsers, fuzz/C#, AI/Claude, benchmarks, verification scripts  
+- **[docs/README.md](docs/README.md)** — index of guides, specification, and benchmark docs  
+- **[docs/repository-layout.md](docs/repository-layout.md)** — full tree (parsers, integrations, bindings)  
+- **[parsers/README.md](parsers/README.md)** — parser implementations (Rust, TS, C#, C++, Go cgo, Swift, Kotlin/JVM, Mojo↔Python, tree-sitter)  
+- **[integrations/README.md](integrations/README.md)** — VS Code, Visual Studio, Sublime, Neovim, MCP, LSP  
+- **[docs/claude.md](docs/claude.md)** — Claude Desktop (MCP), Anthropic prompt helpers, tokenizer notes  
+- **[docs/dev/plugins-roadmap.md](docs/dev/plugins-roadmap.md)** — planned registry / plugins (**stub only**; not shipped in the engine yet)  
 
 ---
 
@@ -37,7 +53,7 @@ Add `!active` on the first line and your config comes alive — with logic built
 
 ## Features
 
-This extension provides complete SYNX v3.5 language support for Visual Studio Code:
+This extension provides complete SYNX v3.6 language support for Visual Studio Code:
 
 | Feature | Description |
 |---|---|
@@ -71,12 +87,119 @@ All commands also available via **right-click context menu** on `.synx` and `.js
 
 ---
 
-## Architecture
+## CLI (Rust)
 
-The extension is **zero-dependency** — no external runtime, no native modules. Everything runs as pure TypeScript inside VS Code:
+A single native binary for all platforms, built on `synx-core`:
+
+```bash
+# Install from source
+cargo install --path crates/synx-cli
+
+# Parse → JSON
+synx parse config.synx
+
+# Validate (exit 1 on errors)
+synx validate config.synx --strict
+
+# Convert JSON → SYNX
+synx convert data.json --format synx
+
+# Parse !tool call
+synx tool call.synx
+
+# Compile / decompile binary .synxb
+synx compile config.synx
+synx decompile config.synxb
+
+# Structural diff
+synx diff old.synx new.synx
+
+# Query by dot-path (supports array indices)
+synx query server.host config.synx
+
+# Canonical formatting
+synx format config.synx --write
+```
+
+---
+
+## Language Server (LSP)
+
+`synx-lsp` is a standalone Language Server that speaks [LSP](https://microsoft.github.io/language-server-protocol/) over stdio, built on `tower-lsp-server` + `synx-core`. One binary serves **every editor**:
+
+| Editor | Setup |
+|--------|-------|
+| **Neovim** | `vim.lsp.start({ cmd = { "synx-lsp" }, filetypes = { "synx" } })` |
+| **Helix** | Add to `languages.toml`: `[language-server.synx-lsp] command = "synx-lsp"` |
+| **Zed** | Settings → Language Servers → add `synx-lsp` binary path |
+| **Emacs** | `(lsp-register-client (make-lsp-client :new-connection (lsp-stdio-connection '("synx-lsp"))))` |
+| **JetBrains** | Settings → Languages & Frameworks → LSP → add `synx-lsp` |
+
+Capabilities: **real-time diagnostics** (15 checks), **completion** (markers, constraints, directives), **document symbols** (outline tree).
+
+```bash
+cargo install --path crates/synx-lsp
+```
+
+Full editor matrix: [`crates/synx-lsp/README.md`](crates/synx-lsp/README.md).
+
+---
+
+## Claude & MCP
+
+Use **[`docs/claude.md`](docs/claude.md)** to connect **Claude Desktop** (or any MCP client) to **`integrations/mcp/synx-mcp`** — validate / parse / format `.synx` from the agent without guessing syntax.
+
+---
+
+## GitHub Action
+
+Validate `.synx` files in CI:
+
+```yaml
+- uses: ./.github/actions/synx
+  with:
+    files: 'config/**/*.synx'
+    strict: true
+```
+
+See [`.github/actions/synx/action.yml`](.github/actions/synx/action.yml) for all inputs.
+
+---
+
+## Tree-sitter
+
+Syntax highlighting for Neovim, Helix, Zed, Emacs — and future GitHub code rendering:
+
+```bash
+cd tree-sitter-synx
+npm install && npx tree-sitter generate
+```
+
+See [`tree-sitter-synx/README.md`](tree-sitter-synx/README.md). Queries live in `tree-sitter-synx/queries/` (`highlights.scm`, `folds.scm`).
+
+---
+
+## Fuzzing
+
+Three `cargo-fuzz` targets exercise the parser, binary codec, and formatter:
+
+```bash
+cd crates/synx-core
+cargo +nightly fuzz run fuzz_parse -- -max_total_time=60
+```
+
+In practice we’ve run `fuzz_parse` at scale (≈ **50M executions** across a large corpus); the parser/engine held up after fixing a single root-cause formatting panic.
+
+See [`crates/synx-core/fuzz/README.md`](crates/synx-core/fuzz/README.md) and the checked-in coverage report at `crates/synx-core/fuzz/coverage/fuzz_parse/html/`.
+
+---
+
+## Architecture (VS Code extension)
+
+Source: [`integrations/vscode/synx-vscode/`](integrations/vscode/synx-vscode/). The extension is **zero-dependency** — no external runtime, no native modules. Everything runs as pure TypeScript inside VS Code:
 
 ```
-src/
+integrations/vscode/synx-vscode/src/
 ├── extension.ts      # Entry point — registers all providers
 ├── parser.ts         # AST-like parser with position info (SynxNode, ParsedDoc)
 ├── diagnostics.ts    # 15 diagnostic checks with severity levels
@@ -116,7 +239,7 @@ The extension validates your `.synx` files in real time:
 
 ## Performance
 
-SYNX v3.5 uses a unified Rust core with native bindings. Real benchmark results on a 110-key config (2.5 KB):
+SYNX v3.6 uses a unified Rust core with native bindings. Real benchmark results on a 110-key config (2.5 KB):
 
 ### Rust (criterion, direct)
 
@@ -238,25 +361,59 @@ python llm_benchmark.py
 python format_results.py llm_results.json
 ```
 
-**See [LLM_BENCHMARK_GUIDE.md](benchmarks/LLM_BENCHMARK_GUIDE.md) for advanced options and detailed results interpretation.**
+**See [benchmarks/llm-tests/GUIDE.md](benchmarks/llm-tests/GUIDE.md) for advanced options and detailed results interpretation.**
 
-## Binding API Parity (v3.2.1)
+## Install (v3.6.0)
+
+One-line installs (published names):
+
+```bash
+npm install @aperturesyndicate/synx-format
+pip install synx-format
+cargo add synx-core    # or: cargo add synx-format
+cargo install synx-cli --locked   # CLI binary: synx
+
+# C# / .NET 8 — NuGet (package ID is not Synx.Core; that ID is taken on nuget.org)
+dotnet add package APERTURESyndicate.Synx
+# Browse: https://www.nuget.org/packages/APERTURESyndicate.Synx
+```
+
+Until **`APERTURESyndicate.Synx`** appears on nuget.org, consume the library from this repo: `dotnet add reference parsers/dotnet/src/Synx.Core/Synx.Core.csproj` (or run **`.\publish-csharp.bat`** without `NUGET_API_KEY` and add the `.nupkg` under `artifacts/nuget` as a local feed). Details: [`parsers/dotnet/README.md`](parsers/dotnet/README.md).
+
+### Maintainer: publish C# to NuGet
+
+PowerShell: **`.\publish-csharp.bat`** with **`$env:NUGET_API_KEY`** set to the key string only (**no** `<` `>` around it). Clears stale `*.nupkg` in `artifacts/nuget` before pack; pushes only **`APERTURESyndicate.Synx.*.nupkg`**.
+
+### Ready to `git push` or ship?
+
+- Run quality checks when you change core behavior: [`scripts/verify-release-quality.ps1`](scripts/verify-release-quality.ps1) / [`scripts/verify-release-quality.sh`](scripts/verify-release-quality.sh) as appropriate.
+- Do **not** commit secrets (`NUGET_API_KEY`, PyPI tokens); `artifacts/` is gitignored.
+- For a new **NuGet** version, bump **`Version`** in [`parsers/dotnet/src/Synx.Core/Synx.Core.csproj`](parsers/dotnet/src/Synx.Core/Synx.Core.csproj), then **`.\publish-csharp.bat`**.
+
+## Binding API Parity (v3.6.0)
 
 Unified API surface across runtimes:
 
-| Binding | `parse` | `parse_active` | `stringify` | `format` | `diff` | Notes |
-|---|---|---|---|---|---|---|
-| Rust core (`synx-core`) | ✅ | ✅ | ✅ | ✅ | — | Full options support via `Options` |
-| JavaScript (`packages/synx-js`) | ✅ | ✅ | ✅ | ✅ | ✅ | Pure TypeScript implementation |
-| Python (`synx_native`) | ✅ | ✅ | ✅ | ✅ | — | `parse_active(text, env=None, base_path=None)` |
-| Node native (`bindings/node`) | ✅ | ✅ | ✅ | ✅ | — | `parseActive(text, { env, basePath })` |
-| WebAssembly (`bindings/wasm`) | ✅ | ✅ | ✅ | ✅ | — | Also provides `parse_object` / `parse_active_object` |
-| C FFI (`bindings/c-header`) | ✅ | ✅ | ✅ | ✅ | — | Returned strings must be freed with `synx_free()` |
+| Binding | `parse` | `parse_active` | `parse_tool` | `stringify` | `format` | `compile` | `decompile` | `diff` | Notes |
+|---|---|---|---|---|---|---|---|---|---|
+| Rust core (`synx-core`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | Full options support via `Options` |
+| **CLI (`synx`)** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | `synx parse`, `synx diff`, `synx query`, … |
+| JavaScript (npm `@aperturesyndicate/synx-format`) | ✅ | ✅ | — | ✅ | ✅ | — | — | ✅ | Pure TypeScript implementation |
+| Python (`synx_native`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | `diff(a, b)` / `diff_json(text_a, text_b)` |
+| Node native (`bindings/node`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | `diff(a, b)` / `diffJson(text_a, text_b)` |
+| WebAssembly (`bindings/wasm`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | `diff(text_a, text_b)` → JSON |
+| C FFI (`bindings/c-header`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | `synx_diff(a, b)` → JSON |
+| C++ (`bindings/cpp` + same `synx-c` lib) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | Header `synx/synx.hpp` wraps §C FFI |
+| Go (`bindings/go`, cgo + `synx-c`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | JSON/string API; see `bindings/go/README` (Windows: `CGO_LDFLAGS` + `PATH`) |
+| Mojo (`bindings/mojo` + CPython `synx_native`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | [`Python.import_module`](https://docs.modular.com/mojo/manual/python/python-from-mojo); pip `synx-format`; `.synxb` via hex helpers |
+| Swift (`bindings/swift` + `synx-c`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | SwiftPM `SynxEngine`; link `libsynx_c`; see `bindings/swift/README` |
+| Kotlin/JVM (`bindings/kotlin`, JNA + `synx-c`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | `SynxEngine`; `SYNX_LIB_DIR`; see `bindings/kotlin/README` |
+| C# (NuGet **`APERTURESyndicate.Synx`**, `parsers/dotnet`) | ✅ | ✅ | ✅ | ✅ (`ToJson`) | — | — | — | — | Managed .NET 8 library; `.synxb` / `diff` not in C# yet; not `synx-c` FFI |
 
 Behavior notes:
 
 - Browser WASM runs without host filesystem/env integration by default.
-- C FFI and WASM `stringify` use JSON input for stable cross-language interop.
+- C FFI, C++, Go (cgo), Swift (C interop), Kotlin/JVM (JNA), and WASM `stringify` use JSON strings at the boundary for stable cross-language interop.
 - This table documents API compatibility only; it does not change parser performance characteristics.
 
 ## Quick SYNX Syntax Reference
@@ -339,18 +496,32 @@ version[readonly] 3.0.0
 password[required, min:8, max:64, type:string] MyP@ssw0rd
 ```
 
+### LLM Tool Use (`!tool`) ⚡NEW
+
+```synx
+!tool
+web_search
+  query latest Rust release
+  lang en
+  max_results 5
+```
+
+→ `{ "tool": "web_search", "params": { "query": "latest Rust release", "lang": "en", "max_results": 5 } }`
+
+Combine with `!schema` for tool definitions, or with `!active` for dynamic parameters. See [GUIDE.md](docs/guides/GUIDE.md#-llm-tool-use-tool) for full documentation.
+
 ## 📖 Documentation / Guides
 
 Complete SYNX guides with all 24 markers, benchmarks, code examples, and architecture:
 
 | Language | Guide |
 |---|---|
-| 🇬🇧 **English** | [GUIDE.md](_guides/GUIDE.md) |
-| 🇷🇺 **Russian** | [GUIDE_RU.md](_guides/GUIDE_RU.md) |
-| 🇨🇳 **Chinese** | [GUIDE_ZH.md](_guides/GUIDE_ZH.md) |
-| 🇪🇸 **Español** | [GUIDE_ES.md](_guides/GUIDE_ES.md) |
-| 🇯🇵 **Japanese** | [GUIDE_JA.md](_guides/GUIDE_JA.md) |
-| 🇩🇪 **Deutsch** | [GUIDE_DE.md](_guides/GUIDE_DE.md) |
+| 🇬🇧 **English** | [GUIDE.md](docs/guides/GUIDE.md) |
+| 🇷🇺 **Russian** | [GUIDE_RU.md](docs/guides/GUIDE_RU.md) |
+| 🇨🇳 **Chinese** | [GUIDE_ZH.md](docs/guides/GUIDE_ZH.md) |
+| 🇪🇸 **Español** | [GUIDE_ES.md](docs/guides/GUIDE_ES.md) |
+| 🇯🇵 **Japanese** | [GUIDE_JA.md](docs/guides/GUIDE_JA.md) |
+| 🇩🇪 **Deutsch** | [GUIDE_DE.md](docs/guides/GUIDE_DE.md) |
 
 ## 🔒 Security
 
@@ -388,14 +559,16 @@ Options { max_include_depth: Some(32), ..Default::default() }
 
 ## Full Specification
 
-- **[SPECIFICATION.md (English)](https://github.com/kaiserrberg/synx-format/blob/main/SPECIFICATION_EN.md)**
-- **[SPECIFICATION_RU.md (Russian)](https://github.com/kaiserrberg/synx-format/blob/main/SPECIFICATION_RU.md)**
+- **[SPECIFICATION_EN.md (English)](https://github.com/kaiserrberg/synx-format/blob/main/docs/spec/SPECIFICATION_EN.md)**
+- **[SPECIFICATION_RU.md (Russian)](https://github.com/kaiserrberg/synx-format/blob/main/docs/spec/SPECIFICATION_RU.md)**
+
+How this repo is organized: [docs/repository-layout.md](docs/repository-layout.md).
 
 
 ## Links
 
 - [GitHub Repository](https://github.com/kaiserrberg/synx-format)
-- [npm — @aperturesyndicate/synx](https://www.npmjs.com/package/@aperturesyndicate/synx)
+- [npm — @aperturesyndicate/synx-format](https://www.npmjs.com/package/@aperturesyndicate/synx-format)
 - [PyPI — synx-format](https://pypi.org/project/synx-format/)
 - [crates.io — synx-core](https://crates.io/crates/synx-core)
 - [APERTURESyndicate](https://aperturesyndicate.com)
@@ -408,7 +581,7 @@ Options { max_include_depth: Some(32), ..Default::default() }
 ---
 
 <div align="center">
-  <img src="https://aperturesyndicate.com/branding/logos/asp_128.png" width="128" height="128" />
+  <img src="https://media.aperturesyndicate.com/asother/as/branding/png/asp_128.png" width="128" height="128" />
   <p>Made by <strong>APERTURESyndicate Production</strong></p>
 </div>
 

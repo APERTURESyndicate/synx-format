@@ -1,6 +1,6 @@
 {
-  "name": "@aperturesyndicate/synx",
-  "version": "3.5.2",
+  "name": "@aperturesyndicate/synx-format",
+  "version": "3.6.0",
   "description": "SYNX: The Active Data Format. Faster than JSON, cheaper for AI tokens, built-in logic.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -25,8 +25,7 @@
     "bin",
     "README.md",
     "LICENSE",
-    "SPECIFICATION_RU.md",
-    "SPECIFICATION_EN.md"
+    "SPECIFICATION.md"
   ],
   "scripts": {
     "build": "tsc",
@@ -50,9 +49,9 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/kaiserrberg/synx-format"
+    "url": "https://github.com/APERTURESyndicate/synx-format"
   },
-  "homepage": "https://github.com/kaiserrberg/synx-format",
+  "homepage": "https://github.com/APERTURESyndicate/synx-format",
   "devDependencies": {
     "@types/jest": "^29.5.0",
     "@types/node": "^20.0.0",

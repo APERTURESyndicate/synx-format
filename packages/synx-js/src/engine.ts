@@ -1,5 +1,5 @@
 /**
- * SYNX Engine — @aperturesyndicate/synx
+ * SYNX Engine — @aperturesyndicate/synx-format
  *
  * Resolves active markers (:random, :calc, :env, :alias, :secret, etc.)
  * in a parsed SYNX object tree. Only runs in !active mode.

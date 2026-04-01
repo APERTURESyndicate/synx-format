@@ -2,19 +2,87 @@
 //! with metadata for engine resolution.
 
 use std::collections::HashMap;
-use memchr::memchr_iter;
+use memchr::memchr;
 use crate::value::*;
 use crate::rng;
 
+// ─── Resource limits (fuzz / hostile input) ─────────────────
+// All caps are documented here so callers know parsing is bounded.
+
+/// Maximum UTF-8 bytes accepted per `parse()` (truncate with valid UTF-8 boundary).
+pub(crate) const MAX_SYNX_INPUT_BYTES: usize = 16 * 1024 * 1024;
+
+/// Maximum indexed line starts (1 + number of `\n` before truncate). Bounds `line_starts` RAM (~8× on 64-bit).
+const MAX_LINE_STARTS: usize = 2_000_000;
+
+/// Indentation-tree depth for nested objects (stack size). Iterative parser — prevents giant parent chains.
+const MAX_PARSE_NESTING_DEPTH: usize = 128;
+
+/// Multiline `key |` block body: max accumulated UTF-8 bytes.
+const MAX_MULTILINE_BLOCK_BYTES: usize = 1024 * 1024;
+
+/// `- list item` entries per single list.
+const MAX_LIST_ITEMS: usize = 1_048_576;
+
+/// `!include` lines per file.
+const MAX_INCLUDE_DIRECTIVES: usize = 4096;
+
+/// Max comma-separated parts when parsing `[constraints]` enum values.
+const MAX_CONSTRAINT_ENUM_PARTS: usize = 4096;
+
+/// Max `:a:b:c` marker segments on one key line.
+const MAX_MARKER_CHAIN_SEGMENTS: usize = 512;
+
+/// Truncate `text` to a UTF-8-safe prefix (used by `parse` and canonical `format`).
+pub(crate) fn clamp_synx_text(text: &str) -> &str {
+    if text.len() <= MAX_SYNX_INPUT_BYTES {
+        return text;
+    }
+    let slice = &text.as_bytes()[..MAX_SYNX_INPUT_BYTES];
+    let end = core::str::from_utf8(slice)
+        .map(|s| s.len())
+        .unwrap_or_else(|e| e.valid_up_to());
+    &text[..end]
+}
+
+/// Byte length to parse: full slice, or truncate before the newline that would exceed
+/// `MAX_LINE_STARTS` lines (at most `MAX_LINE_STARTS.saturating_sub(1)` `\n` bytes kept).
+fn find_parse_end_bytes(bytes: &[u8]) -> usize {
+    let max_newlines = MAX_LINE_STARTS.saturating_sub(1);
+    let mut seen_newlines = 0usize;
+    let mut scan = 0usize;
+    while scan < bytes.len() {
+        if let Some(rel) = memchr(b'\n', &bytes[scan..]) {
+            if seen_newlines >= max_newlines {
+                return scan + rel;
+            }
+            seen_newlines += 1;
+            scan += rel + 1;
+        } else {
+            break;
+        }
+    }
+    bytes.len()
+}
+
 /// Parse a SYNX text string into a value tree with metadata.
 pub fn parse(text: &str) -> ParseResult {
+    let text = clamp_synx_text(text);
+    let parse_end = find_parse_end_bytes(text.as_bytes());
+    let text = &text[..parse_end];
     let bytes = text.as_bytes();
 
-    // SIMD-accelerated line splitting via memchr
-    let mut line_starts: Vec<usize> = Vec::with_capacity(64);
+    let mut line_starts: Vec<usize> = Vec::new();
     line_starts.push(0);
-    for pos in memchr_iter(b'\n', bytes) {
-        line_starts.push(pos + 1);
+    let mut scan = 0usize;
+    while scan < bytes.len() {
+        if let Some(rel) = memchr(b'\n', &bytes[scan..]) {
+            let pos = scan + rel;
+            line_starts.push(pos + 1);
+            scan = pos + 1;
+        } else {
+            break;
+        }
     }
     let line_count = line_starts.len();
 
@@ -22,6 +90,9 @@ pub fn parse(text: &str) -> ParseResult {
     let mut stack: Vec<(i32, StackEntry)> = vec![(-1, StackEntry::Root)];
     let mut mode = Mode::Static;
     let mut locked = false;
+    let mut tool = false;
+    let mut schema = false;
+    let mut llm = false;
     let mut metadata: HashMap<String, MetaMap> = HashMap::new();
     let mut includes: Vec<IncludeDirective> = Vec::new();
 
@@ -51,16 +122,33 @@ pub fn parse(text: &str) -> ParseResult {
             i += 1;
             continue;
         }
+        if trimmed == "!tool" {
+            tool = true;
+            i += 1;
+            continue;
+        }
+        if trimmed == "!schema" {
+            schema = true;
+            i += 1;
+            continue;
+        }
+        if trimmed == "!llm" {
+            llm = true;
+            i += 1;
+            continue;
+        }
         if trimmed.starts_with("!include ") {
-            let rest = trimmed[9..].trim();
-            let mut parts = rest.splitn(2, char::is_whitespace);
-            let path = parts.next().unwrap_or("").to_string();
-            let alias = parts.next().map(|s| s.trim().to_string()).unwrap_or_else(|| {
-                // Auto-derive alias from filename
-                let name = path.rsplit(&['/', '\\'][..]).next().unwrap_or(&path);
-                name.strip_suffix(".synx").or_else(|| name.strip_suffix(".SYNX")).unwrap_or(name).to_string()
-            });
-            includes.push(IncludeDirective { path, alias });
+            if includes.len() < MAX_INCLUDE_DIRECTIVES {
+                let rest = trimmed[9..].trim();
+                let mut parts = rest.splitn(2, char::is_whitespace);
+                let path = parts.next().unwrap_or("").to_string();
+                let alias = parts.next().map(|s| s.trim().to_string()).unwrap_or_else(|| {
+                    // Auto-derive alias from filename
+                    let name = path.rsplit(&['/', '\\'][..]).next().unwrap_or(&path);
+                    name.strip_suffix(".synx").or_else(|| name.strip_suffix(".SYNX")).unwrap_or(name).to_string()
+                });
+                includes.push(IncludeDirective { path, alias });
+            }
             i += 1;
             continue;
         }
@@ -93,10 +181,16 @@ pub fn parse(text: &str) -> ParseResult {
         // Continue multiline block
         if let Some(ref mut blk) = block {
             if indent > blk.indent {
-                if !blk.content.is_empty() {
-                    blk.content.push('\n');
+                if blk.content.len() < MAX_MULTILINE_BLOCK_BYTES {
+                    if !blk.content.is_empty() {
+                        blk.content.push('\n');
+                    }
+                    let room = MAX_MULTILINE_BLOCK_BYTES.saturating_sub(blk.content.len());
+                    if room > 0 {
+                        let n = trimmed.len().min(room);
+                        blk.content.push_str(&trimmed[..n]);
+                    }
                 }
-                blk.content.push_str(trimmed);
                 i += 1;
                 continue;
             } else {
@@ -112,8 +206,10 @@ pub fn parse(text: &str) -> ParseResult {
         if trimmed.starts_with("- ") {
             if let Some(ref mut lst) = list {
                 if indent > lst.indent {
-                    let val_str = strip_comment(trimmed[2..].trim());
-                    lst.items.push(cast(&val_str));
+                    if lst.items.len() < MAX_LIST_ITEMS {
+                        let val_str = strip_comment(trimmed[2..].trim());
+                        lst.items.push(cast(&val_str));
+                    }
                     i += 1;
                     continue;
                 }
@@ -226,7 +322,12 @@ pub fn parse(text: &str) -> ParseResult {
                     &parsed.key,
                     Value::Object(HashMap::new()),
                 );
-                stack.push((indent, StackEntry::Key(parsed.key)));
+                // Guard against pathological inputs that create extremely deep nesting,
+                // which can lead to large allocations (metadata path building, parent navigation, etc).
+                // If the cap is hit, we still insert the object but stop increasing nesting.
+                if stack.len() < MAX_PARSE_NESTING_DEPTH {
+                    stack.push((indent, StackEntry::Key(parsed.key)));
+                }
             } else {
                 let value = if let Some(ref hint) = parsed.type_hint {
                     cast_typed(&parsed.value, hint)
@@ -257,12 +358,82 @@ pub fn parse(text: &str) -> ParseResult {
         insert_value(&mut root, &stack, lst.stack_idx, &lst.key, arr);
     }
 
+    let parsed_root = Value::Object(root);
+
+    // !tool reshaping is deferred — done after engine resolution for !active compatibility.
+    // Non-active !tool files are reshaped via Synx::parse_tool() or resolve_tool_output().
+
     ParseResult {
-        root: Value::Object(root),
+        root: parsed_root,
         mode,
         locked,
+        tool,
+        schema,
+        llm,
         metadata,
         includes,
+    }
+}
+
+// ─── !tool output reshaping ──────────────────────────────
+
+/// Reshape parsed tree for `!tool` mode.
+///
+/// **Call mode** (`!tool` without `!schema`):
+///   First top-level key = tool name, its children = params.
+///   Output: `{ tool: "name", params: { ... } }`
+///
+/// **Schema mode** (`!tool` + `!schema`):
+///   Each top-level key = tool name, children = param type definitions.
+///   Output: `{ tools: [ { name: "tool1", params: { key: "type", ... } }, ... ] }`
+pub fn reshape_tool_output(root: &Value, schema: bool) -> Value {
+    let map = match root {
+        Value::Object(m) => m,
+        _ => return root.clone(),
+    };
+
+    if schema {
+        // Schema mode: list of tool definitions
+        let mut tools = Vec::new();
+        // Sort for deterministic output
+        let mut keys: Vec<&String> = map.keys().collect();
+        keys.sort();
+        for key in keys {
+            let val = &map[key];
+            let mut def = HashMap::new();
+            def.insert("name".to_string(), Value::String(key.clone()));
+            def.insert("params".to_string(), val.clone());
+            tools.push(Value::Object(def));
+        }
+        let mut out = HashMap::new();
+        out.insert("tools".to_string(), Value::Array(tools));
+        Value::Object(out)
+    } else {
+        // Call mode: first key = tool name, children = params
+        if map.is_empty() {
+            let mut out = HashMap::new();
+            out.insert("tool".to_string(), Value::Null);
+            out.insert("params".to_string(), Value::Object(HashMap::new()));
+            return Value::Object(out);
+        }
+
+        // Deterministic: pick the first key in source order.
+        // Since HashMap doesn't preserve order, sort and take first.
+        let mut keys: Vec<&String> = map.keys().collect();
+        keys.sort();
+        let tool_key = keys[0];
+        let tool_value = &map[tool_key];
+
+        let params = match tool_value {
+            Value::Object(m) => Value::Object(m.clone()),
+            // If tool has a single value (no nested params), wrap it
+            _ => Value::Object(HashMap::new()),
+        };
+
+        let mut out = HashMap::new();
+        out.insert("tool".to_string(), Value::String(tool_key.clone()));
+        out.insert("params".to_string(), params);
+        Value::Object(out)
     }
 }
 
@@ -334,6 +505,8 @@ fn parse_line(trimmed: &str) -> Option<ParsedLine> {
         if let Some(c) = trimmed[start..].find(')') {
             type_hint = Some(trimmed[start..start + c].to_string());
             pos = start + c + 1;
+        } else {
+            pos += 1;
         }
     }
 
@@ -344,6 +517,8 @@ fn parse_line(trimmed: &str) -> Option<ParsedLine> {
             let constraint_str = &trimmed[pos + 1..pos + close];
             constraints = Some(parse_constraints(constraint_str));
             pos += close + 1;
+        } else {
+            pos += 1;
         }
     }
 
@@ -357,7 +532,11 @@ fn parse_line(trimmed: &str) -> Option<ParsedLine> {
             marker_end += 1;
         }
         let chain = &trimmed[marker_start..marker_end];
-        markers = chain.split(':').map(|s| s.to_string()).collect();
+        markers = chain
+            .split(':')
+            .take(MAX_MARKER_CHAIN_SEGMENTS)
+            .map(|s| s.to_string())
+            .collect();
         pos = marker_end;
     }
 
@@ -414,7 +593,14 @@ fn parse_constraints(raw: &str) -> Constraints {
                 "max" => c.max = val.parse().ok(),
                 "type" => c.type_name = Some(val.to_string()),
                 "pattern" => c.pattern = Some(val.to_string()),
-                "enum" => c.enum_values = Some(val.split('|').map(|s| s.to_string()).collect()),
+                "enum" => {
+                    c.enum_values = Some(
+                        val.split('|')
+                            .take(MAX_CONSTRAINT_ENUM_PARTS)
+                            .map(|s| s.to_string())
+                            .collect(),
+                    );
+                }
                 _ => {}
             }
         }
@@ -677,5 +863,113 @@ mod tests {
         let meta = data.metadata.get("").unwrap();
         assert_eq!(meta["tier"].markers, vec!["random"]);
         assert_eq!(meta["tier"].args, vec!["90", "5", "5"]);
+    }
+
+    #[test]
+    fn test_tool_directive_flags() {
+        let data = parse("!tool\nweb_search\n  query test\n  lang ru\n");
+        assert!(data.tool);
+        assert!(!data.schema);
+        assert_eq!(data.mode, Mode::Static);
+        // Raw parse keeps original tree structure
+        let root = data.root.as_object().unwrap();
+        let ws = root["web_search"].as_object().unwrap();
+        assert_eq!(ws["query"], Value::String("test".into()));
+        assert_eq!(ws["lang"], Value::String("ru".into()));
+    }
+
+    #[test]
+    fn test_tool_schema_flags() {
+        let data = parse("!tool\n!schema\nweb_search\n  query string\n");
+        assert!(data.tool);
+        assert!(data.schema);
+    }
+
+    #[test]
+    fn test_llm_directive() {
+        let data = parse("!llm\ncontext\n  user_profile demo\ntask summarize\n");
+        assert!(data.llm);
+        assert!(!data.tool);
+        let root = data.root.as_object().unwrap();
+        assert_eq!(root["task"], Value::String("summarize".into()));
+        let ctx = root["context"].as_object().unwrap();
+        assert_eq!(ctx["user_profile"], Value::String("demo".into()));
+    }
+
+    #[test]
+    fn test_parse_caps_nesting_depth() {
+        // Pathological input: one key per line, increasing indentation each time,
+        // with empty values so every line would normally create a new nested object.
+        let mut s = String::new();
+        for i in 0..(MAX_PARSE_NESTING_DEPTH as usize + 64) {
+            s.push_str(&" ".repeat(i));
+            s.push_str(&format!("k{i}\n"));
+        }
+
+        let data = parse(&s);
+        let mut cur = data.root.as_object().unwrap();
+        let mut depth = 0usize;
+        // Follow the single-child chain while it stays nested.
+        loop {
+            if cur.len() != 1 {
+                break;
+            }
+            let (_, v) = cur.iter().next().unwrap();
+            match v {
+                Value::Object(next) => {
+                    depth += 1;
+                    cur = next;
+                }
+                _ => break,
+            }
+        }
+
+        assert!(depth <= MAX_PARSE_NESTING_DEPTH);
+    }
+
+    #[test]
+    fn test_tool_call_reshape() {
+        let data = parse("!tool\nweb_search\n  query test\n  lang ru\n");
+        let shaped = reshape_tool_output(&data.root, false);
+        let m = shaped.as_object().unwrap();
+        assert_eq!(m["tool"], Value::String("web_search".into()));
+        let params = m["params"].as_object().unwrap();
+        assert_eq!(params["query"], Value::String("test".into()));
+        assert_eq!(params["lang"], Value::String("ru".into()));
+    }
+
+    #[test]
+    fn test_tool_schema_reshape() {
+        let data = parse("!tool\n!schema\nweb_search\n  query string\n  lang string\nmemory_write\n  path string\n  value string\n");
+        let shaped = reshape_tool_output(&data.root, true);
+        let m = shaped.as_object().unwrap();
+        let tools = m["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 2);
+        // Sorted: memory_write before web_search
+        let t0 = tools[0].as_object().unwrap();
+        assert_eq!(t0["name"], Value::String("memory_write".into()));
+        let p0 = t0["params"].as_object().unwrap();
+        assert_eq!(p0["path"], Value::String("string".into()));
+        let t1 = tools[1].as_object().unwrap();
+        assert_eq!(t1["name"], Value::String("web_search".into()));
+    }
+
+    #[test]
+    fn test_tool_empty() {
+        let data = parse("!tool\n");
+        assert!(data.tool);
+        let shaped = reshape_tool_output(&data.root, false);
+        let m = shaped.as_object().unwrap();
+        assert_eq!(m["tool"], Value::Null);
+    }
+
+    #[test]
+    fn test_tool_with_active() {
+        let data = parse("!tool\n!active\nweb_search\n  port:env:default:8080 PORT\n");
+        assert!(data.tool);
+        assert_eq!(data.mode, Mode::Active);
+        // Metadata should be captured for :env:default
+        let meta = data.metadata.get("web_search").unwrap();
+        assert_eq!(meta["port"].markers, vec!["env", "default", "8080"]);
     }
 }

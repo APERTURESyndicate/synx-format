@@ -1,5 +1,5 @@
 /**
- * SYNX Types — @aperturesyndicate/synx
+ * SYNX Types — @aperturesyndicate/synx-format
  * Core type definitions for the SYNX parser.
  */
 
@@ -84,6 +84,8 @@ export interface SynxParseResult {
   mode: SynxMode;
   root: SynxObject;
   locked?: boolean;
+  /** File declares `!llm` (LLM envelope hint; data tree unchanged). @since 3.6.0 */
+  llm?: boolean;
   includes?: SynxInclude[];
 }
 

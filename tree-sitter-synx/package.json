@@ -1,0 +1,33 @@
+{
+  "name": "tree-sitter-synx",
+  "version": "3.6.0",
+  "description": "Tree-sitter grammar for the SYNX data format",
+  "main": "bindings/node",
+  "author": "APERTURESyndicate <support@aperturesyndicate.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/APERTURESyndicate/synx-format",
+    "directory": "tree-sitter-synx"
+  },
+  "keywords": [
+    "tree-sitter",
+    "synx",
+    "parser",
+    "syntax-highlighting"
+  ],
+  "tree-sitter": [
+    {
+      "scope": "source.synx",
+      "file-types": ["synx"],
+      "highlights": "queries/highlights.scm"
+    }
+  ],
+  "devDependencies": {
+    "tree-sitter-cli": "^0.24"
+  },
+  "scripts": {
+    "generate": "tree-sitter generate",
+    "test": "tree-sitter test"
+  }
+}

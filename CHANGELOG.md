@@ -2,12 +2,28 @@
 
 All notable changes to this repository are documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- **`docs/dev/`** — contributor-facing stubs: [`docs/dev/plugins-roadmap.md`](docs/dev/plugins-roadmap.md) (registry / `!use` / package layout **TBD**; **no** plugin loader in `synx-core` yet).
+- **Publish helper scripts** — `publish-cpp.bat`, `publish-csharp.bat`, `publish-swift.bat`, `publish-kotlin.bat`, `publish-mojo.bat` (see script headers for registry URLs and env vars). **`*.bat`** remains gitignored except **`publish-*.bat`** via `.gitignore` exception.
+- **NuGet package ID (C#):** **`APERTURESyndicate.Synx`** — `Synx.Core` was already taken on nuget.org; project folder and `Synx` namespaces unchanged.
+
+### Documentation
+
+- **Install C# everywhere it matters:** root [`README.md`](README.md) — `dotnet add package APERTURESyndicate.Synx`, link [nuget.org/packages/APERTURESyndicate.Synx](https://www.nuget.org/packages/APERTURESyndicate.Synx), pre-publish path (`dotnet add reference` / local `.nupkg` via `publish-csharp.bat`); maintainer notes for **`.\publish-csharp.bat`** (PowerShell), **`NUGET_API_KEY`** without angle brackets (avoids **403**), stale `artifacts/nuget/*.nupkg` cleanup; short **ready to push** checklist (verification scripts, no secrets, bump `Version` in `Synx.Core.csproj`).
+- **Indexes:** [`docs/README.md`](docs/README.md), [`docs/SYNX_AT_A_GLANCE.md`](docs/SYNX_AT_A_GLANCE.md), [`docs/repository-layout.md`](docs/repository-layout.md), [`EDITING.md`](EDITING.md), [`parsers/README.md`](parsers/README.md), [`parsers/dotnet/README.md`](parsers/dotnet/README.md) — aligned on NuGet ID and publish script.
+- **Guides:** EN/RU C# sections + **DE/ES/JA/ZH** installation blocks — same one-liner and package URL; full detail remains in `parsers/dotnet/README.md`.
+- **Spec §5.9 (EN/RU):** C# section updated for **.NET 8**, **`SynxFormat`** API, **`SynxValue`** records, NuGet URL; removed obsolete **`SynxParser` / `packages/synx-csharp`** text; comparison table uses `SynxFormat.Parse(File.ReadAllText(...))`.
+
 ## Changes by Module
 
 Quick reference of what was modified in recent versions:
 
 | Version | Components Modified |
 |---------|---|
+| **3.6.0** | synx-core (`.synxb`, `!tool`, **`!llm`**, `diff`, JSON Schema helpers, hostile-input caps), synx-cli (**`synx schema`**, **`json-validate`**), synx-lsp, VS Code (`!llm`), bindings (**C++**, **Go cgo**, **SwiftPM+`synx-c`**, **Kotlin/JNA+`synx-c`**, **Mojo↔CPython**), Python extra JSON/hex helpers for thin interop, conformance (**11** cases), tree-sitter, fuzz + **`Synx.FuzzReplay`**, **`SYNX_AT_A_GLANCE`**, SYNX-Adapter, docs: **normative spec + CORE-FREEZE (engine frozen 2026-04-01)** |
 | **3.5.2** | synx-core (`:prompt` marker, `:vision`/`:audio` metadata, calc modulo-by-zero fix), synx-js (same + `Synx.diff()` + prototype pollution fix + ReDoS guard + `deepGet`/parser hardening), synx-vscode (diagnostics/completion for 3 new markers + `:template` sibling-scope fix), all 6 guides |
 | **3.5.1** | synx-core (stack overflow guard, circular alias detection), synx-js (same + SynxError class + browser bundle export), synx-vscode (circular alias diagnostic), security tests |
 | **3.5.0** | synx-core (path jail, depth limit, file size limit, calc length limit), synx-js (same), LICENSE (ethical use clause) |
@@ -20,6 +36,86 @@ Quick reference of what was modified in recent versions:
 | **3.1.3** | VSCode extension, JS/TS API, documentation (6 guides), CLI tool, deployment examples |
 | **3.1.2** | JS parser, Rust parser, VSCode extension, Node.js binding (napi), all guides |
 | **3.1.0** | JS/TS API (runtime manipulation), Rust engine, VSCode extension, all guides |
+
+---
+
+## [3.6.0] — (SYNX Diagen) 2026-03-29
+
+### Added
+
+- **Rust CLI (`synx`):** New `crates/synx-cli` crate providing `synx parse`, `synx validate`, `synx convert`, `synx tool`, `synx compile`, `synx decompile`, `synx diff`, `synx query`, `synx format` commands. Built with clap v4; single static binary. Replaces the legacy Node.js CLI (`packages/synx-js/bin/synx.js` which was stuck at v3.2.0).
+- **`diff` module (`synx-core`):** Structural diff between two parsed SYNX objects — `added`, `removed`, `changed`, `unchanged` keys. Public API: `Synx::diff()`, `diff_to_value()`.
+- **`diff` in all bindings:** Node (`diff`, `diffJson`), Python (`diff`, `diff_json`), WASM (`diff`, `diff_object`), C FFI (`synx_diff`). Full API parity table updated.
+- **`synx query` command:** dot-path query with array index support (e.g. `synx query server.host config.synx`, `synx query items.0 data.synx`).
+- **Conformance test suite:** `tests/conformance/` — 11 canonical test cases (scalar types, nesting, arrays, type casting, comments, multiline, mixed structures, strings with spaces, empty values, tool mode, **`!llm` directive**). Rust runner as integration test: `cargo test -p synx-core --test conformance`.
+- **Language Server (`synx-lsp`):** New `crates/synx-lsp` crate — LSP server over stdio using `tower-lsp-server`. Supports real-time diagnostics (tabs, odd indentation, unknown markers/constraints/types, duplicate keys, `!active` requirement), completion (markers, constraints, directives), and document symbols (full outline tree). Works in any LSP-capable editor: Neovim, Helix, Zed, Emacs, JetBrains (manual LSP config).
+- **GitHub Action:** `.github/actions/synx/action.yml` — composite action to validate `.synx` files in CI using the Rust CLI. Inputs: `files` (glob), `strict` (bool), `version`.
+- **Tree-sitter grammar:** `tree-sitter-synx/` subfolder with `grammar.js`, highlight queries (`queries/highlights.scm`), and `package.json`. Provides syntax highlighting for Neovim, Helix, Zed, Emacs, and future GitHub Linguist support.
+- **Fuzz targets:** `crates/synx-core/fuzz/` with three `cargo-fuzz` targets (`fuzz_parse`, `fuzz_compile`, `fuzz_format`) exercising parser, binary codec, formatter, calc, and engine with arbitrary inputs. See `fuzz/README.md` for usage.
+- **`!tool` directive (synx-core):** LLM tool call format. `!tool` reshapes output to `{ tool: "name", params: { ... } }`. Combined with `!schema`, produces `{ tools: [ { name, params } ] }` for tool definitions. Compatible with `!active` — markers resolve before reshaping. New API: `Synx::parse_tool()`, `reshape_tool_output()`.
+- **Node.js binding:** `parseTool(text, options?)` for tool call parsing.
+- **Python binding:** `parse_tool(text, env=None, base_path=None)` for tool call parsing.
+- **WASM binding:** `parse_tool(text)` / `parse_tool_object(text)` for tool call parsing.
+- **C FFI:** `synx_parse_tool()` for tool call parsing. Updated `synx.h` header.
+- **C++ SDK (`bindings/cpp`):** `include/synx/synx.hpp` (C++17) — optional `std::string` / `std::vector` wrappers over **`synx-c`** / `synx.h` with **full API parity** (`parse`, `parse_active`, `stringify`, `format`, `parse_tool`, `compile`, `decompile`, `is_synxb`, `diff`). CMake example `synx_cpp_minimal` (`SYNX_C_LIBRARY`). Spec §5.7–5.8 and guides (EN/RU/DE/ES/JA/ZH), `README` binding table, and `parsers/README` updated; **still SYNX 3.6.0** (same engine as Rust).
+- **Go binding (`bindings/go`):** cgo module `github.com/APERTURESyndicate/synx-format/bindings/go` — `Parse`, `ParseActive`, `Stringify`, `Format`, `ParseTool`, `Compile`, `Decompile`, `IsSynxb`, `Diff` over **`synx-c`**. Linux/macOS default `-L../../target/release -lsynx_c`; **Windows:** link `synx_c.dll.lib` via `CGO_LDFLAGS` + `CGO_LDFLAGS_ALLOW`, runtime `synx_c.dll` on `PATH`. Tests in `synx_test.go`. Spec §5.10 (EN/RU), guides, `README` parity row, repo layout — **3.6.0**.
+- **Mojo (`bindings/mojo`):** `synx/interop.mojo` calls **`synx_native`** via Modular **Python from Mojo** — same engine as **`synx-core`** (not a pure Mojo grammar port). Demo `examples/demo.mojo`. **`synx-python`:** added `parse_active_to_json`, `parse_tool_to_json`, `stringify_json`, `compile_hex`, `decompile_hex`, `is_synxb_hex` for string-only boundaries; `synx-core` dependency enables **`serde`** for `stringify_json`. Spec §5.11 (EN/RU, renumbered following sections), guides (all locales), `README` table — **3.6.0**.
+- **Swift (`bindings/swift`):** SwiftPM package **`Synx`** — `SynxEngine` wraps **`synx-c`** (`CSynx` + mirrored `synx.h`), `String`/`Data` API (`parse`, `parseActive`, `stringify`, `format`, `parseTool`, `diff`, `compile`, `decompile`, `isSynxb`). Unit tests under `Tests/SynxTests`. Spec §5.13 (EN/RU), comparison table, `README` parity row, repo layout, guides — **3.6.0**.
+- **Kotlin/JVM (`bindings/kotlin`):** **`SynxEngine`** over **`synx-c`** via **JNA** (`com.aperturesyndicate:synx-kotlin`, `publishToMavenLocal`), Gradle **8.11** + Foojay toolchain resolver / **JDK 17**; CI **`kotlin-smoke`** in `bindings-smoke.yml`. Spec §5.12 (EN/RU), parity table, guides, `README` / layout — **3.6.0**.
+- **6 new `!tool` tests** covering directive flags, call reshape, schema reshape, empty tool, and `!active` compatibility.
+- **Binary format `.synxb` (synx-core):** Compact binary representation of SYNX data. Achieves 40%+ size reduction over text via string interning + deflate compression. Public API: `Synx::compile()`, `Synx::decompile()`, `Synx::is_synxb()`.
+- **`binary` module (synx-core):** Wire format: 7-byte header (magic `SYNXB` + version + flags) + 4-byte uncompressed size + deflate-compressed payload. Payload uses string interning table with varint references and zigzag-encoded integers.
+- **`--resolved` flag:** When `resolved=true`, `compile()` resolves all `:env`, `:ref`, `:calc` markers and strips metadata/includes — producing a fully-resolved snapshot.
+- **Node.js binding:** `compile(text, resolved?)` → `Buffer`, `decompile(buf)` → `string`, `isSynxb(buf)` → `boolean`.
+- **Python binding:** `compile(text, resolved=False)` → `bytes`, `decompile(data)` → `str`, `is_synxb(data)` → `bool`.
+- **WASM binding:** `compile(text, resolved)` → `Uint8Array`, `decompile(data)` → `string`, `is_synxb(data)` → `boolean`.
+- **C FFI:** `synx_compile()`, `synx_decompile()`, `synx_is_synxb()`, `synx_free_bytes()`. Updated `synx.h` header.
+- **16 new binary tests** covering round-trip fidelity, all value types, metadata preservation, constraints, size reduction, error paths.
+- **Size benchmark** in `benchmarks/rust/` comparing text vs binary on the 110-key production config.
+- **`.NET` / C# parser (preview):** `parsers/dotnet/` — SDK-style library `Synx.Core` that parses static SYNX (same structural rules as `synx-core::parser::parse`), emits canonical JSON with **sorted object keys** (matching `synx_core::to_json`). `dotnet test` in `parsers/dotnet/` runs the same `tests/conformance/cases/*.synx` + `.expected.json` pairs as the Rust runner, including `!tool` reshape via `Synx.ParseTool` (no `!active` engine yet — tool cases that only need parse + reshape are covered).
+- **Integrations (agents & editors):**
+  - **MCP server** [`integrations/mcp/synx-mcp/`](integrations/mcp/synx-mcp/) — stdio MCP with `validate` / `parse` / `format` tools; companion docs in [`integrations/mcp/README.md`](integrations/mcp/README.md) and [`docs/claude.md`](docs/claude.md).
+  - **AI adapters** [`integrations/ai/synx-adapter/`](integrations/ai/synx-adapter/) — Python and Node helpers (`pack_for_llm` / `packForLlm`, JSON size estimates); index in [`integrations/ai/README.md`](integrations/ai/README.md).
+  - **Sublime Text** — [`integrations/sublime-text/Synx/`](integrations/sublime-text/Synx/).
+  - **Neovim** — [`integrations/neovim/synx.nvim/`](integrations/neovim/synx.nvim/).
+- **LSP crate docs:** [`crates/synx-lsp/README.md`](crates/synx-lsp/README.md) — install and editor hookup for `synx-lsp`.
+- **MCP filesystem tools:** [`integrations/mcp/synx-mcp/`](integrations/mcp/synx-mcp/) — `synx_read_path`, `synx_write_path` (atomic temp + rename), `synx_apply_patch` (ordered unique substring replacements); gated by **`SYNX_MCP_ROOT`** or comma-separated **`SYNX_MCP_ROOTS`** (10 MB cap per file).
+- **Docs for Claude / Anthropic:** [`docs/anthropic-system-prompt.txt`](docs/anthropic-system-prompt.txt), [`docs/anthropic-token-notes.md`](docs/anthropic-token-notes.md) (SYNX vs JSON tokenizer sample comparison), [`docs/claude.md`](docs/claude.md).
+- **Benchmarks:** Node + Python runners now include **XML** (JSON-derived tree) alongside JSON/YAML/SYNX; Node uses `fast-xml-parser`.
+- **`synx-adapter` CLI:** `synx-context` — Python [`synx_adapter.cli_compress`](integrations/ai/synx-adapter/python/synx_adapter/cli_compress.py), Node bin; optional **`--xml` / `--xml-tag`** wraps output in `<synx_data>` (CDATA) so Claude sees XML boundaries while the payload stays SYNX. Adapter [`README.md`](integrations/ai/synx-adapter/README.md) in English.
+- **C# `Synx.Core`:** `!active` resolution engine (markers, `[]` constraints metadata, `!include` list, `:calc` / `:env` / `:ref` / `:alias` / `:random` / `:i18n` / interpolation, etc.) via `SynxFormat.ParseActive` / `ParseFullActive`; `SynxValue.Secret`; extra tests in `EngineActiveTests`.
+- **C# fuzz replay (`Synx.FuzzReplay`):** [`parsers/dotnet/tools/Synx.FuzzReplay/`](parsers/dotnet/tools/Synx.FuzzReplay/) — replay corpus / `minimized-from-*` through `Parse` + `ToJson` (strict UTF-8, aligned with Rust `fuzz_parse`). Documented in [`crates/synx-core/fuzz/README.md`](crates/synx-core/fuzz/README.md).
+- **Python fuzz replay:** [`crates/synx-core/fuzz/scripts/synx_fuzz_replay.py`](crates/synx-core/fuzz/scripts/synx_fuzz_replay.py) — `synx_native` corpus replay (`parse`, `parse_to_json`, `stringify`, `parse_active`, `parse_tool`); same UTF-8 filter as Rust.
+- **Fuzz coverage report (llvm-cov):** `crates/synx-core/fuzz/coverage/fuzz_parse/html/` — pruned to remove 0.00% line-coverage rows/pages (unused files), keeping the report focused on executed code.
+- **Expanded `fuzz_parse` corpus:** Added an additional **7,177** interesting inputs under `crates/synx-core/fuzz/corpus/fuzz_parse/` from a long fuzzing run.
+- **Vendor verification scripts:** [`scripts/verify-release-quality.ps1`](scripts/verify-release-quality.ps1), [`scripts/verify-release-quality.sh`](scripts/verify-release-quality.sh) — `cargo test -p synx-core`, `dotnet test`, FuzzReplay on conformance `.synx`, optional bench build.
+- **`docs/SYNX_AT_A_GLANCE.md`:** single-page map (layout, parsers, benchmarks, AI/Claude, quality gates).
+- **SYNX-Adapter — long context & Anthropic:** `make_anchor_index` / `inject_section_anchors`, `pack_for_llm` / `packForLlm` anchor options; CLI `--anchor-index`, `--section-anchors`, `--anchor-prefix`; **`synx_adapter.anthropic_tools`** and **`@aperturesyndicate/synx-format-adapter/anthropic`**.
+- **`docs/guides/long-context-synx.md`:** SYNX + anchors vs lost-in-the-middle; Anthropic tool-result notes.
+- **Claude Artifacts:** [`integrations/artifacts/synx-visualizer/`](integrations/artifacts/synx-visualizer/) — `SynxVisualizer` React snippet.
+- **`!llm` directive (synx-core):** Optional top-of-file marker for LLM-oriented envelopes; sets `ParseResult.llm`. Parsed **data tree is unchanged** vs omitting the line (conformance: `011-llm-directive`). **`.synxb`:** header flag bit 6; `Synx::decompile` / canonical `format` emit `!llm` when missing from body.
+- **`synx-core` `schema_json`:** `metadata_to_json_schema()`, `value_to_json_value()`, and (with feature `jsonschema`) `validate_with_json_schema` / `validate_serde_json` (draft 2020-12).
+- **`synx` CLI:** `synx schema`, `synx json-validate`, `synx validate --self-schema` / `--json-schema` (bundled JSON Schema validation).
+- **JS:** `Synx.schema()` no longer emits invalid per-property `required`; `parseData()` exposes `llm` when `!llm` is present.
+- **synx-lsp / VS Code:** directive completion + TextMate grammar + editor parser skip for `!llm`.
+
+### Frozen engine (2026-04-01)
+
+The **SYNX 3.6.0** language surface in [`docs/spec/SYNX-3.6-NORMATIVE.md`](docs/spec/SYNX-3.6-NORMATIVE.md) and **`synx-core`** parse → canonical JSON behaviour covered by **`tests/conformance/`** are **frozen**. **PATCH** (`3.6.z`) = spec restoration and compatibility fixes only; non-additive language changes require a new normative version. See [`docs/spec/CORE-FREEZE.md`](docs/spec/CORE-FREEZE.md) and the notice in the root [`README.md`](README.md).
+
+### Changed
+
+- **synx-core (hostile input):** Parser/engine/stringify bounds for long fuzz runs — UTF-8 prefix cap, line-table cap, indentation nesting **128**, multiline block / list / `!include` limits, JSON/stringify/format depth caps, engine scratch string cap; see [`fuzz/README.md`](crates/synx-core/fuzz/README.md). **C#** deep-nesting test aligned with parser limits.
+- **synx-core (format patterns):** Clamp `%Nd/%0Nd` integer width and `%.Nf/%.Ne` float precision to prevent `std::fmt` panics like **“Formatting argument out of range”** under hostile/fuzzed inputs.
+- **Repository layout:** `_guides/` moved to `docs/guides/`; normative specification moved to `docs/spec/`; Criterion crate path is `benchmarks/rust/` (still package name `synx-bench`); LLM benchmark long-form guide is `benchmarks/llm-tests/GUIDE.md`. Added `docs/README.md` and `docs/repository-layout.md`. Removed root `playground-mini-parser.js` (obsolete subset parser). `packages/synx-js` ships a short `SPECIFICATION.md` pointer; full spec files live under `docs/spec/`.
+
+### Dependencies
+
+- Added `miniz_oxide 0.8` (pure-Rust deflate, zero transitive deps) for payload compression.
+- Added `clap 4` for CLI argument parsing (`synx-cli` crate).
+- Added `tower-lsp-server 0.23` + `tokio 1` for LSP server (`synx-lsp` crate).
+- Added `libfuzzer-sys` for fuzz targets (`crates/synx-core/fuzz/`).
+- Added `serde_json` + optional `jsonschema` (with feature `jsonschema`) for schema export/validation in `synx-core` / `synx-cli`.
 
 ---
 
@@ -81,7 +177,7 @@ Quick reference of what was modified in recent versions:
 
 ---
 
-## [3.5.0] - 2026-03-08
+## [3.5.0] - (SYNX Socrate) 2026-03-08
 
 ### Security Hardening
 
@@ -103,7 +199,7 @@ All engines (Rust core + JS/TS) now include built-in security protections. No fu
 
 ---
 
-## [3.4.0] - 2026-03-08
+## [3.4.0] - (SYNX Classic) 2026-03-08
 
 ### Added
 - **`:spam` marker** (Rust engine + JS engine + VSCode preview parser): `key:spam:MAX_CALLS[:WINDOW_SEC] target` limits how often a target can be resolved inside a time window. If `WINDOW_SEC` is omitted, it defaults to `1`.
@@ -208,7 +304,7 @@ All engines (Rust core + JS/TS) now include built-in security protections. No fu
 ### Added
 - **Comment text formatting** (VSCode extension): Markdown-like formatting inside comments — `*italic*` (green), `**bold**` (purple), `***bold+italic***` (gold), `` `code` `` (orange with subtle background). Works in `#`, `//`, and `###` block comments.
 - **Deployment example (Docker + Nginx + Redis)**: Added runnable stack example in `examples/docker-stack` with SYNX-driven config and generated Nginx upstream config.
-- **CLI tool** (`synx`): New CLI with 4 commands — `synx convert` (export to JSON/YAML/TOML/.env), `synx validate` (strict-mode check for CI/CD), `synx watch` (live reload with `--exec` support), `synx schema` (extract constraints as JSON Schema). Installed globally via `npm install -g @aperturesyndicate/synx`.
+- **CLI tool** (`synx`): New CLI with 4 commands — `synx convert` (export to JSON/YAML/TOML/.env), `synx validate` (strict-mode check for CI/CD), `synx watch` (live reload with `--exec` support), `synx schema` (extract constraints as JSON Schema). Installed globally via `npm install -g @aperturesyndicate/synx-format`.
 - **Export formats** (JS/TS API): `Synx.toJSON()`, `Synx.toYAML()`, `Synx.toTOML()`, `Synx.toEnv()` — convert parsed SYNX config to standard formats without external dependencies.
 - **File watcher** (JS/TS API): `Synx.watch(filePath, callback, options)` — monitors `.synx` files for changes and delivers hot-reloaded config via callback.
 - **Schema export** (JS/TS API): `Synx.schema(text)` — extracts constraint annotations (`[required, min:N, max:N, type:T, enum:A|B, pattern:R]`) as a JSON Schema-compatible object.
@@ -320,6 +416,6 @@ All engines (Rust core + JS/TS) now include built-in security protections. No fu
 ---
 
 <div align="center">
-  <img src="https://aperturesyndicate.com/branding/logos/asp_128.png" width="128" height="128" />
+  <img src="https://media.aperturesyndicate.com/asother/as/branding/png/asp_128.png" width="128" height="128" />
   <p>Made by <strong>APERTURESyndicate Production</strong></p>
 </div>
