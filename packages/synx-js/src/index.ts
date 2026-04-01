@@ -1,5 +1,5 @@
 /**
- * SYNX — @aperturesyndicate/synx
+ * SYNX — @aperturesyndicate/synx-format
  *
  * The Active Data Format.
  * Faster than JSON. Cheaper for AI tokens. Built-in logic.
@@ -431,7 +431,6 @@ class Synx {
         if (c.pattern) prop.pattern = c.pattern;
         if (c.enum) prop.enum = c.enum;
         if (c.required) {
-          prop.required = true;
           required.push(key);
         }
         properties[key] = prop;
@@ -454,7 +453,7 @@ class Synx {
    * @param b - Second object (after).
    * @returns A SynxDiff describing the structural differences.
    *
-   * @since 3.5.2
+   * @since 3.6.0
    *
    * @example
    * ```ts
@@ -786,9 +785,10 @@ interface SynxSchemaProperty {
   type?: string;
   minimum?: number;
   maximum?: number;
+  minLength?: number;
+  maxLength?: number;
   pattern?: string;
   enum?: string[];
-  required?: boolean;
 }
 
 interface SynxSchema {

@@ -174,6 +174,12 @@ pub struct ParseResult {
     pub root: Value,
     pub mode: Mode,
     pub locked: bool,
+    /// `!tool` directive — file describes an LLM tool call or schema.
+    pub tool: bool,
+    /// `!schema` directive (combined with `!tool`) — file describes tool definitions.
+    pub schema: bool,
+    /// `!llm` directive — file is an LLM-oriented envelope (semantic hints for tools; data tree unchanged).
+    pub llm: bool,
     /// Metadata for each nesting level, keyed by dot-path prefix.
     /// "" = root level, "server" = server sub-object, etc.
     pub metadata: HashMap<String, MetaMap>,

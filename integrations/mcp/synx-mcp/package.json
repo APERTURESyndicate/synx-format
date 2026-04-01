@@ -1,0 +1,25 @@
+{
+  "name": "@aperturesyndicate/synx-format-mcp",
+  "version": "0.1.0",
+  "description": "MCP server for SYNX — validate, parse, format via synx CLI (Claude Desktop / compatible clients)",
+  "type": "module",
+  "bin": {
+    "synx-mcp": "./src/index.js"
+  },
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "keywords": ["mcp", "synx", "claude", "modelcontextprotocol"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/APERTURESyndicate/synx-format"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^3.24.0"
+  }
+}

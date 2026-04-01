@@ -1,0 +1,5 @@
+!tool
+web_search
+  query latest Rust release
+  lang en
+  max_results 5

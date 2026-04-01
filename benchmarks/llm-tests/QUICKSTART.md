@@ -9,7 +9,7 @@ A complete system to test how well different AI models (Claude, Gemini, GPT) und
 ```
 benchmarks/llm-tests/
 ├── README.md                      # Quick reference
-├── LLM_BENCHMARK_GUIDE.md         # Detailed guide (in parent dir)
+├── GUIDE.md                      # Detailed guide (this folder)
 ├── requirements.txt               # Python dependencies
 ├── benchmark.bat                  # Windows batch runner
 ├── test_cases.py                  # 250 test cases (125 parsing + 125 generation)
@@ -232,7 +232,7 @@ The system is CI/CD friendly:
 - Exit codes indicate success/failure
 - Can be scheduled (monthly/weekly)
 
-See `LLM_BENCHMARK_GUIDE.md` for GitHub Actions example.
+See `GUIDE.md` for GitHub Actions example.
 
 ## Next Steps
 
@@ -247,7 +247,7 @@ See `LLM_BENCHMARK_GUIDE.md` for GitHub Actions example.
 ## Additional Reading
 
 - `README.md` - Quick reference
-- `LLM_BENCHMARK_GUIDE.md` - Complete guide with advanced options
+- `GUIDE.md` - Complete guide with advanced options
 - `test_cases.py` - View/modify test cases
 - `llm_benchmark.py` - View/modify LLM prompts
 - `format_results.py` - View/modify output formatting
@@ -260,4 +260,4 @@ Issues or questions? Check:
 3. API accounts have credits
 4. Network connection is stable
 
-For feature requests, see: `LLM_BENCHMARK_GUIDE.md`
+For feature requests, see: `GUIDE.md`

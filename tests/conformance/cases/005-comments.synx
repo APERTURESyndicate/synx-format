@@ -1,0 +1,4 @@
+# This is a hash comment
+name Alice
+// This is a slash comment
+age 30
