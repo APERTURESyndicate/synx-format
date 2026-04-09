@@ -168,6 +168,15 @@ pub struct IncludeDirective {
     pub alias: String,
 }
 
+/// Use directive: !use @scope/name [as alias]
+#[derive(Debug, Clone)]
+pub struct UseDirective {
+    /// Full package name, e.g. "@aperture/synx-defaults"
+    pub package: String,
+    /// Namespace alias (defaults to last segment: "synx-defaults")
+    pub alias: String,
+}
+
 /// Full parse result with metadata.
 #[derive(Debug)]
 pub struct ParseResult {
@@ -185,6 +194,8 @@ pub struct ParseResult {
     pub metadata: HashMap<String, MetaMap>,
     /// !include directives parsed from the file.
     pub includes: Vec<IncludeDirective>,
+    /// !use directives parsed from the file (package imports).
+    pub uses: Vec<UseDirective>,
 }
 
 /// Options for active mode resolution.
@@ -198,4 +209,9 @@ pub struct Options {
     pub max_include_depth: Option<usize>,
     /// Internal counter — do not set manually.
     pub _include_depth: usize,
+    /// Path to installed packages directory (default: "./synx_packages").
+    pub packages_path: Option<String>,
+    /// Loaded WASM marker runtime (populated by engine from `type markers` packages).
+    #[cfg(feature = "wasm")]
+    pub wasm_runtime: Option<std::sync::Arc<crate::wasm::WasmMarkerRuntime>>,
 }

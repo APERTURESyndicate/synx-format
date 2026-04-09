@@ -35,6 +35,7 @@ namespace SynxLanguageService.Parser
     public static class SynxParser
     {
         private static readonly Regex ModeRe = new(@"^!(active|static)\s*$");
+        private static readonly Regex DirectiveRe = new(@"^!(active|static|lock|tool|schema|llm|include\b.*)$");
         private static readonly Regex ListRe = new(@"^(\s*)-\s+(.*)$");
         private static readonly Regex KeyRe = new(@"^(\s*)([^\s\[:#/!\-(][^\s\[:(]*)(?:\((\w+)\))?(?:\[([^\]]*)\])?((?::[a-zA-Z_]\w*)*)(?:\s+(.*))?$");
 
@@ -61,6 +62,10 @@ namespace SynxLanguageService.Parser
                     doc.ModeLine = i;
                     continue;
                 }
+
+                // Skip other directives
+                if (DirectiveRe.IsMatch(trimmed))
+                    continue;
 
                 int indent = line.Length - line.TrimStart().Length;
 

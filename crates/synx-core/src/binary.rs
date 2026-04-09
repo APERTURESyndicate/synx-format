@@ -583,6 +583,7 @@ pub fn decompile(data: &[u8]) -> Result<ParseResult, String> {
         llm,
         metadata,
         includes,
+        uses: Vec::new(),
     })
 }
 
@@ -632,6 +633,7 @@ mod tests {
             llm: false,
             metadata: HashMap::new(),
             includes: Vec::new(),
+            uses: Vec::new(),
         };
 
         let binary = compile(&result, false);
@@ -678,8 +680,9 @@ mod tests {
             schema: false,
             llm: false,
             metadata,
-            includes,
-        };
+        includes,
+        uses: Vec::new(),
+    };
 
         let binary = compile(&result, false);
         let restored = decompile(&binary).unwrap();
@@ -724,6 +727,7 @@ mod tests {
             llm: false,
             metadata,
             includes: Vec::new(),
+            uses: Vec::new(),
         };
 
         let binary = compile(&result, true);
@@ -776,6 +780,7 @@ mod tests {
             llm: false,
             metadata: HashMap::new(),
             includes: Vec::new(),
+            uses: Vec::new(),
         };
 
         let binary = compile(&result, false);
@@ -854,6 +859,7 @@ mod tests {
             llm: false,
             metadata,
             includes: Vec::new(),
+            uses: Vec::new(),
         };
 
         let binary = compile(&result, false);
@@ -894,6 +900,7 @@ mod tests {
             llm: false,
             metadata: HashMap::new(),
             includes: Vec::new(),
+            uses: Vec::new(),
         };
 
         let binary = compile(&result, false);
@@ -912,6 +919,7 @@ mod tests {
             llm: false,
             metadata: HashMap::new(),
             includes: Vec::new(),
+            uses: Vec::new(),
         };
 
         let binary = compile(&result, false);
@@ -932,6 +940,7 @@ mod tests {
             llm: true,
             metadata: HashMap::new(),
             includes: Vec::new(),
+            uses: Vec::new(),
         };
         let binary = compile(&result, false);
         let restored = decompile(&binary).unwrap();

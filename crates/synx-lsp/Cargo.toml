@@ -1,6 +1,6 @@
 [package]
 name = "synx-lsp"
-version = "3.6.0"
+version = "3.6.1"
 edition = "2021"
 authors = ["APERTURESyndicate <support@aperturesyndicate.com>"]
 description = "SYNX Language Server — LSP diagnostics, completion, and document symbols for .synx files."

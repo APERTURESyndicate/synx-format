@@ -10,5 +10,6 @@ VS Code–only release notes used to be maintained here in full; they duplicated
 
 | Version | Notes |
 |---------|--------|
+| **3.6.1** | Lock-file parser fix, scoped install, constraint diagnostics, 140 tests green. |
 | **3.6.0** | `!tool` / `!schema` / `!llm` grammar + parser skip; completion for `!llm`. |
 | **3.5.2** | `:prompt`, `:vision`, `:audio` in diagnostics and IntelliSense. |

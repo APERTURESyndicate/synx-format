@@ -1,0 +1,30 @@
+!active
+!use @assynx/text-tools
+
+# ─── Text utility markers from @assynx/text-tools ───
+
+app_name SYNX Marker Demo
+
+# :upper — uppercase
+title:upper hello world
+
+# :lower — lowercase  
+slug:lower HELLO-WORLD
+
+# :reverse — reverse string
+palindrome:reverse stressed
+
+# :base64 — encode to base64
+token:base64 secret-api-key-123
+
+# :hash — FNV-1a hash (hex)
+fingerprint:hash user@example.com
+
+# :truncate — truncate with ellipsis (max 10 chars)
+preview:truncate:10 This is a very long description text
+
+# :pad — left-pad to width (8 chars, zero-fill)
+order_id:pad:8:0 42
+
+# :count — character count
+password_length:count my-secure-password

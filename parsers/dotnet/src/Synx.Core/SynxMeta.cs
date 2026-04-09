@@ -21,7 +21,7 @@ public sealed class SynxMeta
     public SynxConstraints? Constraints { get; set; }
 }
 
-/// <summary>Options for <see cref="SynxEngine.Resolve"/> (env, paths, locale).</summary>
+/// <summary>Options for <see cref="SynxEngine.Resolve"/> (env, paths, locale, WASM).</summary>
 public sealed class SynxOptions
 {
     public Dictionary<string, string>? Env { get; set; }
@@ -30,10 +30,21 @@ public sealed class SynxOptions
     public string? BasePath { get; set; }
     public int? MaxIncludeDepth { get; set; }
     public int IncludeDepth { get; set; }
+    /// <summary>Base directory for <c>!use</c> package lookups (default: <c>./synx_packages</c>).</summary>
+    public string? PackagesPath { get; set; }
+    /// <summary>Pre-loaded WASM runtime. If null, the engine creates one automatically for <c>!use</c> marker packages.</summary>
+    public SynxWasmRuntime? WasmRuntime { get; set; }
 }
 
 public sealed class SynxIncludeDirective
 {
     public required string Path { get; init; }
+    public required string Alias { get; init; }
+}
+
+/// <summary>Parsed <c>!use @scope/name [as alias]</c> directive.</summary>
+public sealed class SynxUseDirective
+{
+    public required string Package { get; init; }
     public required string Alias { get; init; }
 }

@@ -10,12 +10,14 @@
     <IncludeDebugSymbolsInLocalVSIXDeployment>false</IncludeDebugSymbolsInLocalVSIXDeployment>
     <CopyBuildOutputToOutputDirectory>true</CopyBuildOutputToOutputDirectory>
     <CopyOutputSymbolsToOutputDirectory>false</CopyOutputSymbolsToOutputDirectory>
-    <Version>3.0.0</Version>
+    <Version>3.6.1</Version>
     <LangVersion>latest</LangVersion>
     <Nullable>disable</Nullable>
     <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
     <UseWPF>true</UseWPF>
     <CreateVsixContainer>true</CreateVsixContainer>
+    <UseCodebase>true</UseCodebase>
+    <DeployExtension>false</DeployExtension>
   </PropertyGroup>
 
   <ItemGroup>
@@ -29,7 +31,9 @@
   </ItemGroup>
 
   <ItemGroup>
-    <None Include="source.extension.vsixmanifest" />
+    <None Include="source.extension.vsixmanifest">
+      <SubType>Designer</SubType>
+    </None>
   </ItemGroup>
 
   <ItemGroup>
@@ -42,5 +46,8 @@
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
   </ItemGroup>
+
+  <!-- Import VSSDK targets for proper VSIX generation, pkgdef creation, etc. -->
+  <Import Project="$(VsSDKInstall)\Microsoft.VsSDK.targets" Condition="'$(VsSDKInstall)' != '' and Exists('$(VsSDKInstall)\Microsoft.VsSDK.targets')" />
 
 </Project>

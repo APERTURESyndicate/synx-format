@@ -2,11 +2,79 @@
 
 All notable changes to this repository are documented in this file.
 
-## [Unreleased]
+## [3.6.1] — 2026-04-09
 
 ### Added
 
-- **C# File I/O helpers** — load/save `.synx` files in one call.
+- **Package registry — soft delete + yank system**
+  - **Soft delete** (`DELETE /api/packages/:scope/:name`) — marks package as deleted (`deleted_at`, `deleted_by`, `deletion_reason` columns) instead of removing from DB/S3. All versions auto-yanked. Tarballs preserved for 30-day grace period.
+  - **Restore endpoint** (`POST /api/packages/:scope/:name/restore`) — un-deletes a soft-deleted package within the 30-day grace period. All versions auto-unyanked.
+  - **Permanent delete** (`DELETE /api/packages/:scope/:name/permanent`) — hard delete for already soft-deleted packages. Removes tarballs from S3 and rows from DB.
+  - **Unyank endpoint** (`POST /api/packages/:scope/:name/:version/unyank`) — restore a single yanked version.
+  - Detail endpoint returns **410 Gone** for soft-deleted packages with `deletedAt` and restoration info.
+  - List endpoint filters out soft-deleted packages (`deleted_at IS NULL`).
+  - DB migration: `deleted_at TIMESTAMPTZ`, `deleted_by TEXT`, `deletion_reason TEXT` on `packages` table.
+
+- **`synx restore` CLI command** — restore a soft-deleted package within the 30-day grace period.
+
+- **`synx create` CLI command** — interactive package scaffolder.
+  - Prompts for scope, name, description, author, license, and package type.
+  - **WASM Marker Package** template — generates `Cargo.toml`, `src/lib.rs` (ABI v1 boilerplate), `synx-pkg.synx`, `build.bat`, `build.sh`, `README.md`.
+  - **SYNX Config Package** template — generates `synx-pkg.synx`, `src/main.synx` (with `:env` and `:default` markers), `README.md`.
+  - Lists generated files on completion with next-steps guidance.
+
+- **Packages page UI improvements**
+  - Author avatar shows real profile image (from `users.avatar_url`) with fallback to initial letter.
+  - Files tab populated from tarball extraction (file list + file contents viewer overlay).
+  - Dependencies and Dependents tabs auto-hidden when empty (`tab-hidden` CSS class).
+  - Cache-bust bumped to `?v=20260408f`.
+
+- **Package registry pipeline — S3 storage + extraction**
+  - Tarball extraction at publish time: README, file list, and file contents stored in `packages` table.
+  - S3 Hetzner Object Storage for tarball persistence.
+  - CLI `DEFAULT_REGISTRY` changed to `https://synx.aperturesyndicate.com/api`.
+  - Forum-API accepts CLI Bearer tokens (via `cli_tokens` table fallback in `getUser()`).
+
+### Changed
+
+- **`synx delete`** — now performs soft delete with 30-day grace period (was permanent hard delete). Confirmation prompt updated to reflect soft delete behavior.
+- **Yank route** — changed from `DELETE /api/packages/:scope/:name/:version` to `POST /api/packages/:scope/:name/:version/yank` to match CLI expectations.
+- **Renamed `@assynx/synx-markers` → `@assynx/text-tools`** — better reflects the package's 8 text utility markers (`:upper`, `:lower`, `:reverse`, `:base64`, `:hash`, `:truncate`, `:pad`, `:count`).
+- **Consolidated `examples/` and `synx_packages/`** — removed duplicate WASM examples that duplicated content already in `synx_packages/`.
+- **Package template moved to `synx_packages/template/`** — starter WASM marker template lives next to official packages.
+
+### Removed
+
+- **Deleted `@assynx/synx-defaults`** — removed from `synx_packages/` and the embedded registry.
+- **Deleted `@aperture/synx-defaults`** — removed the entire `@aperture` scope.
+- **Deleted `examples/wasm-marker-upper/`** and **`examples/wasm-marker-template/`** — consolidated into `synx_packages/`.
+
+### Added
+
+- **SYNX Package System — complete pipeline** (Steps 1–12)
+  - **Package manifests** (`synx-pkg.synx`) — normalized format with name, version, description, author, license, main, synx-version, keywords, files, dependencies, capabilities.
+  - **Package engine** (`crates/synx-cli/src/pkg.rs`) — `Manifest` parser, `LockFile` (synx.lock), `pack()` → `.tar.gz` with SHA-256 integrity, `publish()`, `install()` (registry + local), `uninstall()`, `login()` (token-based auth).
+  - **Credential storage** — `~/.synx/credentials.synx`, token read/write, registry-scoped.
+  - **CLI commands** — `as init`, `as publish`, `as install`, `as uninstall`, `as login`, `as pack`, `as yank`, `as unyank` (wired in `main.rs`).
+  - **`!use` directive support** in LSP (`synx-lsp`) — import packages from `synx_packages/`.
+  - **Semver dependency resolution** — `parse_semver()`, `version_satisfies()` (^, ~, \*, >=, <=, >, <, exact), `check_conflicts()` integrated into `install()`.
+  - **Package yank/unyank** — `yank()` / `unyank()` API calls + CLI commands.
+  - **14 new CLI tests** + **12 semver tests** — all passing.
+
+- **WASM custom markers — sandboxed WebAssembly runtime**
+  - **`WasmMarkerRuntime`** (`crates/synx-core/src/wasm.rs`) — wasmi-based WASM interpreter with ABI v1 (`synx_alloc`, `synx_markers`, `synx_apply`).
+  - **Capability permissions** — `WasmCapabilities { string, fs, net, env }` enforced at module load time.
+  - **Ed25519 package signing** (`crates/synx-core/src/signing.rs`) — `SigningKey`, `VerifyKey`, `PackageSignature`, keygen/sign/verify.
+  - **Engine integration** — WASM dispatch in `engine.rs` after built-in markers, before constraints.
+  - **`@assynx/synx-markers`** — official marker pack with 8 markers: `:upper`, `:lower`, `:reverse`, `:base64`, `:hash`, `:truncate`, `:pad`, `:count`. Built as `.wasm`, installed in `synx_packages/`.
+  - **WASM marker author guide** (`docs/guides/WASM_MARKERS.md`) — ABI spec, project setup, build, sign, publish, capabilities, security model. 
+
+- **JS/TS binary format + tool parsing** (`packages/synx-js/src/index.ts`)
+  - `Synx.compile(text, resolved?)` → `Uint8Array` — pure-JS `.synxb` compiler (string table, varint, zigzag, type tags 0x00–0x08).
+  - `Synx.decompile(data)` → string — decompile `.synxb` back to `.synx` text.
+  - `Synx.isSynxb(data)` → boolean — check for SYNXB magic header.
+  - `Synx.parseTool(text, options?)` → `{ tool, params }` — parse `!tool` mode with reshaping.
+  - JS/TS binding now at **full parity** with Python/C#/Go/Kotlin/Swift.
   - `LoadFileAsync<T>(path)` / `LoadFile<T>(path)` — read + deserialize a `.synx` file.
   - `LoadFileActiveAsync<T>(path, synxOptions?)` — same with `!active` engine resolution.
   - `SaveFileAsync<T>(path, obj)` / `SaveFile<T>(path, obj)` — serialize + write a `.synx` file.
@@ -90,6 +158,7 @@ Quick reference of what was modified in recent versions:
 
 | Version | Components Modified |
 |---------|---|
+| **3.6.1** | forum-api (soft delete, unyank, restore, permanent delete, DB migration), synx-cli (restore command, soft delete messaging), packages page (avatars, files tab, hidden empty tabs), S3 pipeline (tarball extraction, README/files storage) |
 | **3.6.0** | synx-core (`.synxb`, `!tool`, **`!llm`**, `diff`, JSON Schema helpers, hostile-input caps), synx-cli (**`synx schema`**, **`json-validate`**), synx-lsp, VS Code (`!llm`), bindings (**C++**, **Go cgo**, **SwiftPM+`synx-c`**, **Kotlin/JNA+`synx-c`**, **Mojo↔CPython**), Python extra JSON/hex helpers for thin interop, conformance (**11** cases), tree-sitter, fuzz + **`Synx.FuzzReplay`**, **`SYNX_AT_A_GLANCE`**, SYNX-Adapter, docs: **normative spec + CORE-FREEZE (engine frozen 2026-04-01)** |
 | **3.5.2** | synx-core (`:prompt` marker, `:vision`/`:audio` metadata, calc modulo-by-zero fix), synx-js (same + `Synx.diff()` + prototype pollution fix + ReDoS guard + `deepGet`/parser hardening), synx-vscode (diagnostics/completion for 3 new markers + `:template` sibling-scope fix), all 6 guides |
 | **3.5.1** | synx-core (stack overflow guard, circular alias detection), synx-js (same + SynxError class + browser bundle export), synx-vscode (circular alias diagnostic), security tests |

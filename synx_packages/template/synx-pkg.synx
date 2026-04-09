@@ -1,0 +1,59 @@
+name @yourscope/my-markers
+version 1.0.0
+description My custom SYNX markers
+author yourname
+license MIT
+main markers.wasm
+repository https://github.com/yourname/your-repo
+synx-version >=3.6.0
+
+# Category — used for Discover Packages filter on the website.
+# If omitted or misspelled, the package won't appear under any filter
+# and will be harder to find (less visibility = less downloads).
+#
+# Available categories (case-sensitive, pick ONE):
+#   Markers      — custom SYNX markers (WASM plugins)
+#   Config       — configuration presets and schemas
+#   Templates    — project templates for `synx create`
+#   Security     — auth, encryption, secrets management
+#   Front-end    — browser, UI, design system
+#   Back-end     — server, API, database
+#   CLI          — command-line tools and scripts
+#   DevOps       — CI/CD, deployment, infrastructure
+#   Documentation — docs, generators, spec files
+#   CSS          — styles, themes, CSS utilities
+#   Testing      — test runners, mocking, assertions
+#   IoT          — hardware, sensors, embedded
+#   Coverage     — code coverage, analysis
+#   Mobile       — iOS, Android, cross-platform
+#   Frameworks   — full-stack frameworks
+#   Robotics     — robots, automation, ROS
+#   Math         — calculations, statistics, algorithms
+#   AI           — machine learning, LLM, neural networks
+#   Data         — parsing, serialization, databases
+#   Utilities    — general-purpose helpers
+category Markers
+
+keywords
+  - custom
+  - markers
+  - wasm
+
+capabilities
+  - string
+
+# files — list of source files to include in the tarball.
+# IMPORTANT: Always include your source code (e.g. src/lib.rs)
+# so users can inspect it for transparency and trust.
+# If omitted, only .synx files from src/ are packed by default.
+files
+  - src/lib.rs
+
+synxignore
+  - *.bat
+  - *.sh
+  - Cargo.toml
+  - Cargo.lock
+  - target/
+
+dependencies

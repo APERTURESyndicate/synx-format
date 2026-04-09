@@ -19,8 +19,12 @@ pub(crate) mod rng;
 pub mod binary;
 pub mod diff;
 pub mod schema_json;
+#[cfg(feature = "wasm")]
+pub mod wasm;
+#[cfg(feature = "signing")]
+pub mod signing;
 
-pub use value::{Value, Mode, ParseResult, Meta, MetaMap, Options, Constraints, IncludeDirective};
+pub use value::{Value, Mode, ParseResult, Meta, MetaMap, Options, Constraints, IncludeDirective, UseDirective};
 pub use schema_json::{metadata_to_json_schema, value_to_json_value};
 #[cfg(feature = "jsonschema")]
 pub use schema_json::{validate_serde_json, validate_with_json_schema};

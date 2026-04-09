@@ -529,9 +529,274 @@ class Synx {
 
     return { added, removed, changed, unchanged };
   }
+
+  // ─── Binary Format (.synxb) ─────────────────────────────
+
+  /** Magic header for .synxb files */
+  private static readonly SYNXB_MAGIC = new Uint8Array([0x53, 0x59, 0x4e, 0x58, 0x42]); // "SYNXB"
+
+  /**
+   * Check if data is a `.synxb` binary file.
+   *
+   * @param data - Raw bytes to check.
+   * @returns True if the data starts with the SYNXB magic header.
+   *
+   * @example
+   * ```ts
+   * const buf = fs.readFileSync('config.synxb');
+   * if (Synx.isSynxb(buf)) { ... }
+   * ```
+   */
+  static isSynxb(data: Buffer | Uint8Array): boolean {
+    if (data.length < 6) return false;
+    for (let i = 0; i < 5; i++) {
+      if (data[i] !== Synx.SYNXB_MAGIC[i]) return false;
+    }
+    return true;
+  }
+
+  /**
+   * Compile a .synx string into compact binary `.synxb` format.
+   *
+   * The binary format stores the parsed value tree with an interned string table.
+   * It is deterministic and much faster to load than re-parsing text.
+   *
+   * @param text     - The .synx source text.
+   * @param resolved - If true and text is `!active`, resolve markers first.
+   * @returns A Uint8Array containing the `.synxb` binary.
+   *
+   * @example
+   * ```ts
+   * const binary = Synx.compile('name Alice\nage 30');
+   * fs.writeFileSync('config.synxb', binary);
+   * ```
+   */
+  static compile(text: string, resolved: boolean = false): Uint8Array {
+    const parsed = Synx.parse(text, { active: resolved });
+    const strings: string[] = [];
+    const stringIndex = new Map<string, number>();
+
+    function internString(s: string): number {
+      if (stringIndex.has(s)) return stringIndex.get(s)!;
+      const idx = strings.length;
+      strings.push(s);
+      stringIndex.set(s, idx);
+      return idx;
+    }
+
+    // Collect all strings first
+    function collectStrings(val: unknown): void {
+      if (val === null || val === undefined) return;
+      if (typeof val === 'string') { internString(val); return; }
+      if (Array.isArray(val)) { val.forEach(collectStrings); return; }
+      if (typeof val === 'object') {
+        for (const [k, v] of Object.entries(val as Record<string, unknown>)) {
+          internString(k);
+          collectStrings(v);
+        }
+      }
+    }
+    collectStrings(parsed);
+
+    // Encode
+    const buf: number[] = [];
+
+    // Magic + version
+    buf.push(0x53, 0x59, 0x4e, 0x58, 0x42); // SYNXB
+    buf.push(0x01); // version 1
+
+    // Flags: bit0=active, bit3=resolved
+    const isActive = text.trimStart().startsWith('!active');
+    let flags = 0;
+    if (isActive) flags |= 0x01;
+    if (resolved) flags |= 0x08;
+    buf.push(flags);
+
+    // String table
+    writeVarint(buf, strings.length);
+    for (const s of strings) {
+      const encoded = new TextEncoder().encode(s);
+      writeVarint(buf, encoded.length);
+      for (const b of encoded) buf.push(b);
+    }
+
+    // Value tree
+    function writeValue(val: unknown): void {
+      if (val === null || val === undefined) { buf.push(0x00); return; }
+      if (typeof val === 'boolean') { buf.push(val ? 0x02 : 0x01); return; }
+      if (typeof val === 'number') {
+        if (Number.isInteger(val)) {
+          buf.push(0x03);
+          writeZigzag(buf, val);
+        } else {
+          buf.push(0x04);
+          const view = new DataView(new ArrayBuffer(8));
+          view.setFloat64(0, val, true); // little-endian
+          for (let i = 0; i < 8; i++) buf.push(view.getUint8(i));
+        }
+        return;
+      }
+      if (typeof val === 'string') {
+        buf.push(0x05);
+        writeVarint(buf, internString(val));
+        return;
+      }
+      if (Array.isArray(val)) {
+        buf.push(0x06);
+        writeVarint(buf, val.length);
+        val.forEach(writeValue);
+        return;
+      }
+      if (typeof val === 'object') {
+        const entries = Object.entries(val as Record<string, unknown>);
+        buf.push(0x07);
+        writeVarint(buf, entries.length);
+        for (const [k, v] of entries) {
+          writeVarint(buf, internString(k));
+          writeValue(v);
+        }
+      }
+    }
+    writeValue(parsed);
+
+    return new Uint8Array(buf);
+  }
+
+  /**
+   * Decompile a `.synxb` binary back into a .synx text string.
+   *
+   * @param data - Raw `.synxb` bytes.
+   * @returns The reconstructed .synx text.
+   * @throws Error if the data is not valid `.synxb`.
+   *
+   * @example
+   * ```ts
+   * const buf = fs.readFileSync('config.synxb');
+   * const text = Synx.decompile(buf);
+   * console.log(text);
+   * ```
+   */
+  static decompile(data: Buffer | Uint8Array): string {
+    if (!Synx.isSynxb(data)) {
+      throw new SynxError('Not a valid .synxb file');
+    }
+
+    let offset = 5; // skip magic
+    const version = data[offset++];
+    if (version !== 1) throw new SynxError(`Unsupported .synxb version: ${version}`);
+
+    const flags = data[offset++];
+    const isActive = (flags & 0x01) !== 0;
+    const isLocked = (flags & 0x02) !== 0;
+
+    // String table
+    const [strCount, o1] = readVarint(data, offset); offset = o1;
+    const strings: string[] = [];
+    const decoder = new TextDecoder();
+    for (let i = 0; i < strCount; i++) {
+      const [len, o2] = readVarint(data, offset); offset = o2;
+      strings.push(decoder.decode(data.slice(offset, offset + len)));
+      offset += len;
+    }
+
+    // Value tree
+    function readValue(): unknown {
+      const tag = data[offset++];
+      switch (tag) {
+        case 0x00: return null;
+        case 0x01: return false;
+        case 0x02: return true;
+        case 0x03: { const [v, o] = readZigzag(data, offset); offset = o; return v; }
+        case 0x04: {
+          const view = new DataView(data.buffer, data.byteOffset + offset, 8);
+          offset += 8;
+          return view.getFloat64(0, true);
+        }
+        case 0x05: { const [idx, o] = readVarint(data, offset); offset = o; return strings[idx]; }
+        case 0x06: {
+          const [len, o] = readVarint(data, offset); offset = o;
+          const arr: unknown[] = [];
+          for (let i = 0; i < len; i++) arr.push(readValue());
+          return arr;
+        }
+        case 0x07: {
+          const [len, o] = readVarint(data, offset); offset = o;
+          const obj: Record<string, unknown> = {};
+          for (let i = 0; i < len; i++) {
+            const [ki, o2] = readVarint(data, offset); offset = o2;
+            obj[strings[ki]] = readValue();
+          }
+          return obj;
+        }
+        case 0x08: { const [idx, o] = readVarint(data, offset); offset = o; return '[SECRET]'; }
+        default: throw new SynxError(`Unknown value tag: 0x${tag.toString(16)}`);
+      }
+    }
+    const value = readValue() as SynxObject;
+
+    let header = '';
+    if (isActive) header += '!active\n';
+    if (isLocked) header += '!lock\n';
+    if (header) header += '\n';
+    return header + serializeObject(value, 0);
+  }
+
+  /**
+   * Parse a `!tool` mode SYNX text, reshaping into `{ tool, params }` format.
+   *
+   * @param text    - The .synx text (should contain `!tool` directive).
+   * @param options - Optional settings.
+   * @returns `{ tool: string, params: SynxObject }`.
+   *
+   * @example
+   * ```ts
+   * const toolCall = Synx.parseTool('!tool\ntool search\nparams\n  query AI');
+   * // { tool: 'search', params: { query: 'AI' } }
+   * ```
+   */
+  static parseTool(text: string, options: SynxOptions = {}): { tool: string; params: SynxObject } {
+    const parsed = Synx.parse(text, options);
+    const tool = typeof parsed.tool === 'string' ? parsed.tool : '';
+    const params = (typeof parsed.params === 'object' && parsed.params !== null && !Array.isArray(parsed.params))
+      ? parsed.params as SynxObject
+      : {};
+    return { tool, params };
+  }
 }
 
-// ─── Deep equality helper ─────────────────────────────────
+// ─── Binary encoding helpers ──────────────────────────────
+
+function writeVarint(buf: number[], value: number): void {
+  let v = value >>> 0;
+  while (v > 0x7f) {
+    buf.push((v & 0x7f) | 0x80);
+    v >>>= 7;
+  }
+  buf.push(v);
+}
+
+function readVarint(data: Uint8Array | Buffer, offset: number): [number, number] {
+  let result = 0;
+  let shift = 0;
+  while (offset < data.length) {
+    const byte = data[offset++];
+    result |= (byte & 0x7f) << shift;
+    if ((byte & 0x80) === 0) break;
+    shift += 7;
+  }
+  return [result >>> 0, offset];
+}
+
+function writeZigzag(buf: number[], value: number): void {
+  const zigzag = (value << 1) ^ (value >> 31);
+  writeVarint(buf, zigzag >>> 0);
+}
+
+function readZigzag(data: Uint8Array | Buffer, offset: number): [number, number] {
+  const [raw, newOffset] = readVarint(data, offset);
+  const value = (raw >>> 1) ^ -(raw & 1);
+  return [value, newOffset];
+}
 
 function deepEqual(a: unknown, b: unknown): boolean {
   if (a === b) return true;

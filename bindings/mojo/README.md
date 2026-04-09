@@ -1,6 +1,6 @@
 # SYNX for Mojo (`bindings/mojo`)
 
-**Version:** 3.6.0 — **same semantics as `synx-core`**, without maintaining a second grammar implementation in Mojo.
+**Version:** 3.6.1 — **same semantics as `synx-core`**, without maintaining a second grammar implementation in Mojo.
 
 ## What this is (and is not)
 

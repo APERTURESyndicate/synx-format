@@ -1,0 +1,23 @@
+name text-tools
+version 1.0.1
+description Text utility markers — upper, lower, reverse, base64, hash, truncate, pad, count
+author Kaiserbergs
+license MIT
+main markers.wasm
+repository https://github.com/APERTURESyndicate/synx-format
+synx-version >=3.6.0
+category Markers
+
+keywords
+  - text
+  - string
+  - markers
+  - wasm
+
+capabilities
+  - string
+  - encoding
+  - hashing
+
+files
+  - src/lib.rs

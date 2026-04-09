@@ -89,4 +89,4 @@ Install **LSP** (Package Control). Add a client in `LSP.sublime-settings`; see [
 
 ## Version
 
-Matches the workspace / crate version (currently **3.6.0**).
+Matches the workspace / crate version (currently **3.6.1**).

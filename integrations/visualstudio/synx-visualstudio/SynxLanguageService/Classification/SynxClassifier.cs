@@ -123,7 +123,7 @@ namespace SynxLanguageService.Classification
         private readonly ITextBuffer _buffer;
         private readonly IClassificationTypeRegistryService _registry;
 
-        private static readonly Regex ModeRe = new(@"^!(active|static)\s*$");
+        private static readonly Regex ModeRe = new(@"^!(active|static|lock|tool|schema|llm|include\b.*)$");
         private static readonly Regex CommentHashRe = new(@"^(\s*)#(.*)$");
         private static readonly Regex CommentSlashRe = new(@"^(\s*)//(.*)$");
         private static readonly Regex ListRe = new(@"^(\s*)(-)(\s+.*)$");

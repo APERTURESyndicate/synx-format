@@ -1,6 +1,6 @@
 [package]
 name = "synx-format"
-version = "3.6.0"
+version = "3.6.1"
 edition = "2021"
 authors = ["APERTURESyndicate <support@aperturesyndicate.com>"]
 description = "SYNX — The Active Data Format (meta crate). Re-exports synx-core under a format-oriented crate name."
@@ -10,5 +10,5 @@ keywords = ["synx", "parser", "config", "json-alternative", "data-format"]
 categories = ["parser-implementations", "config"]
 
 [dependencies]
-synx-core = { path = "../synx-core", version = "=3.6.0" }
+synx-core = { path = "../synx-core", version = "=3.6.1" }
 

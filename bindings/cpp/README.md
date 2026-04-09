@@ -1,6 +1,6 @@
 # SYNX C++ SDK (`synx-cpp`)
 
-**Version:** 3.6.0 (format + engine parity with `synx-core`)
+**Version:** 3.6.1 (format + engine parity with `synx-core`)
 
 This is a **thin C++17 header wrapper** around the [`synx-c`](../c-header/) C ABI. The native library is the **same Rust implementation** as the rest of the monorepo: identical grammar, `!active` markers, `!tool` / `!schema` reshape, `.synxb` compile/decompile, and canonical JSON rules.
 
