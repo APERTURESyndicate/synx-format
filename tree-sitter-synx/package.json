@@ -1,6 +1,6 @@
 {
   "name": "tree-sitter-synx",
-  "version": "3.6.0",
+  "version": "3.6.1",
   "description": "Tree-sitter grammar for the SYNX data format",
   "main": "bindings/node",
   "author": "APERTURESyndicate <support@aperturesyndicate.com>",

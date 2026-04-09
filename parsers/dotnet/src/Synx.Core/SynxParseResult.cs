@@ -20,4 +20,7 @@ public sealed class SynxParseResult
     public Dictionary<string, Dictionary<string, SynxMeta>> Metadata { get; set; } = new(StringComparer.Ordinal);
 
     public List<SynxIncludeDirective> Includes { get; set; } = [];
+
+    /// <summary><c>!use @scope/name [as alias]</c> directives.</summary>
+    public List<SynxUseDirective> Uses { get; set; } = [];
 }

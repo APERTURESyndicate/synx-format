@@ -13,9 +13,9 @@
   <img src="https://img.shields.io/badge/format-SYNX%20v3.6-blueviolet" />
 </p>
 
-## Frozen reference (3.6.0)
+## Frozen reference (3.6)
 
-As of **April 2026**, **SYNX 3.6.0** is **frozen**: the normative definition is [`docs/spec/SYNX-3.6-NORMATIVE.md`](docs/spec/SYNX-3.6-NORMATIVE.md), and the reference implementation is **`synx-core` 3.6.x** checked by [`tests/conformance/`](tests/conformance/). **PATCH** releases may only restore that contract (bugs, spec alignment); new surface syntax stays **additive** until a new normative version (for example 3.7). Full policy: [`docs/spec/CORE-FREEZE.md`](docs/spec/CORE-FREEZE.md).
+As of **April 2026**, **SYNX 3.6** is **frozen**: the normative definition is [`docs/spec/SYNX-3.6-NORMATIVE.md`](docs/spec/SYNX-3.6-NORMATIVE.md), and the reference implementation is **`synx-core` 3.6.x** checked by [`tests/conformance/`](tests/conformance/). **PATCH** releases may only restore that contract (bugs, spec alignment); new surface syntax stays **additive** until a new normative version (for example 3.7). Full policy: [`docs/spec/CORE-FREEZE.md`](docs/spec/CORE-FREEZE.md).
 
 ---
 
@@ -58,7 +58,7 @@ This extension provides complete SYNX v3.6 language support for Visual Studio Co
 | Feature | Description |
 |---|---|
 | **Syntax Highlighting** | Keys, values, markers, constraints, comments, types, template placeholders, colors |
-| **IntelliSense** | Autocomplete for 12 markers, 7 constraints, type casts, template keys, alias keys |
+| **IntelliSense** | Autocomplete for 28 markers, 7 constraints, type casts, template keys, alias keys |
 | **Hover Info** | Documentation on markers, constraints, `!active`, key types and values |
 | **Diagnostics** | Real-time validation: tabs, indentation, duplicate keys, unknown markers, broken refs |
 | **Go to Definition** | Ctrl+Click on `:alias`, `:template {ref}`, `:calc` variable names, `:include` file paths |
@@ -224,7 +224,7 @@ The extension validates your `.synx` files in real time:
 | Invalid key start | Error | Keys cannot start with `-`, `#`, `/`, `!` |
 | Duplicate keys | Warning | Same key at the same indent level |
 | Unknown type cast | Error | Only `int`, `float`, `bool`, `string` allowed |
-| Unknown marker | Warning | Not one of the 12 known markers |
+| Unknown marker | Warning | Not one of the 28 known markers |
 | Markers without `!active` | Info | Markers only work in active mode |
 | `:alias` broken ref | Error | Referenced key doesn't exist |
 | `:calc` unknown var | Warning | Variable in expression not defined |
@@ -363,7 +363,7 @@ python format_results.py llm_results.json
 
 **See [benchmarks/llm-tests/GUIDE.md](benchmarks/llm-tests/GUIDE.md) for advanced options and detailed results interpretation.**
 
-## Install (v3.6.0)
+## Install (v3.6)
 
 One-line installs (published names):
 
@@ -390,7 +390,7 @@ PowerShell: **`.\publish-csharp.bat`** with **`$env:NUGET_API_KEY`** set to the 
 - Do **not** commit secrets (`NUGET_API_KEY`, PyPI tokens); `artifacts/` is gitignored.
 - For a new **NuGet** version, bump **`Version`** in [`parsers/dotnet/src/Synx.Core/Synx.Core.csproj`](parsers/dotnet/src/Synx.Core/Synx.Core.csproj), then **`.\publish-csharp.bat`**.
 
-## Binding API Parity (v3.6.0)
+## Binding API Parity (v3.6)
 
 Unified API surface across runtimes:
 
@@ -477,10 +477,28 @@ currency:geo
   - US USD
   - EU EUR
 prompt_block:prompt:AppConfig
-  app_name "MyCoolApp"
-  version "2.1.0"
-banner:vision "sunset landscape, 16:9"
-greeting:audio "Welcome to our app"
+  app_name MyCoolApp
+  version 2.1.0
+ref_value:ref:calc:*2 base_rate
+label:i18n
+  en Hello
+  ru Привет
+volume:clamp:0:100 150
+price:round:2 19.999
+price:format:%.2f 19.9
+result:map:status_labels
+  - 200
+  - 404
+instance_id:once:uuid
+app_ok:version:>=:1.0.0 1.2.3
+flags:watch ./flags.synx
+config:fallback:./defaults.synx ./overrides.synx
+api:spam:5:60 https://api.example.com
+banner:vision ./sunset.png
+recording:audio ./welcome.mp3
+db:import ./config/db.synx
+production:inherit base
+  host prod.example.com
 ```
 
 ### Constraints (require `!active`)
@@ -508,20 +526,15 @@ web_search
 
 → `{ "tool": "web_search", "params": { "query": "latest Rust release", "lang": "en", "max_results": 5 } }`
 
-Combine with `!schema` for tool definitions, or with `!active` for dynamic parameters. See [GUIDE.md](docs/guides/GUIDE.md#-llm-tool-use-tool) for full documentation.
+Combine with `!schema` for tool definitions, or with `!active` for dynamic parameters. See [GUIDE.md](docs/guides/GUIDE.md) for full documentation.
 
 ## 📖 Documentation / Guides
 
-Complete SYNX guides with all 24 markers, benchmarks, code examples, and architecture:
+Complete SYNX guides with all 28 markers, benchmarks, code examples, and architecture:
 
 | Language | Guide |
 |---|---|
 | 🇬🇧 **English** | [GUIDE.md](docs/guides/GUIDE.md) |
-| 🇷🇺 **Russian** | [GUIDE_RU.md](docs/guides/GUIDE_RU.md) |
-| 🇨🇳 **Chinese** | [GUIDE_ZH.md](docs/guides/GUIDE_ZH.md) |
-| 🇪🇸 **Español** | [GUIDE_ES.md](docs/guides/GUIDE_ES.md) |
-| 🇯🇵 **Japanese** | [GUIDE_JA.md](docs/guides/GUIDE_JA.md) |
-| 🇩🇪 **Deutsch** | [GUIDE_DE.md](docs/guides/GUIDE_DE.md) |
 
 ## 🔒 Security
 

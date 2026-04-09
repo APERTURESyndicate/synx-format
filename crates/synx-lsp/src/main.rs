@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 use tower_lsp_server::jsonrpc::Result;
@@ -8,6 +9,8 @@ use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 struct Backend {
     client: Client,
     documents: Mutex<HashMap<Uri, String>>,
+    /// Workspace root paths (set on initialize)
+    workspace_roots: Mutex<Vec<PathBuf>>,
 }
 
 // ─── Known sets (mirrors VS Code extension logic) ────────────────────────────
@@ -25,9 +28,119 @@ const KNOWN_CONSTRAINTS: &[&str] = &[
 
 const KNOWN_TYPES: &[&str] = &["int", "float", "bool", "string"];
 
+const PACKAGES_DIR: &str = "synx_packages";
+const MANIFEST_NAME: &str = "synx-pkg.synx";
+
+// ─── Package helpers ─────────────────────────────────────────────────────────
+
+/// Scan synx_packages/ for installed packages, returns list of @scope/name
+fn scan_installed_packages(roots: &[PathBuf]) -> Vec<String> {
+    let mut packages = Vec::new();
+    for root in roots {
+        let pkg_dir = root.join(PACKAGES_DIR);
+        if !pkg_dir.is_dir() {
+            continue;
+        }
+        // Scan @scope directories
+        if let Ok(scopes) = std::fs::read_dir(&pkg_dir) {
+            for scope_entry in scopes.flatten() {
+                let scope_name = scope_entry.file_name().to_string_lossy().to_string();
+                if !scope_name.starts_with('@') || !scope_entry.path().is_dir() {
+                    continue;
+                }
+                if let Ok(pkgs) = std::fs::read_dir(scope_entry.path()) {
+                    for pkg_entry in pkgs.flatten() {
+                        if pkg_entry.path().is_dir() {
+                            let name = format!("{}/{}", scope_name, pkg_entry.file_name().to_string_lossy());
+                            packages.push(name);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    packages.sort();
+    packages.dedup();
+    packages
+}
+
+/// Resolve a package name to its main .synx file path
+fn resolve_package_main(roots: &[PathBuf], package: &str) -> Option<PathBuf> {
+    for root in roots {
+        let pkg_dir = root.join(PACKAGES_DIR).join(package);
+        if !pkg_dir.is_dir() {
+            continue;
+        }
+        // Try reading manifest to find main field
+        let manifest = pkg_dir.join(MANIFEST_NAME);
+        if let Ok(text) = std::fs::read_to_string(&manifest) {
+            for line in text.lines() {
+                let trimmed = line.trim();
+                if let Some(rest) = trimmed.strip_prefix("main ") {
+                    let main = rest.trim();
+                    if !main.is_empty() {
+                        let main_path = pkg_dir.join(main);
+                        if main_path.exists() {
+                            return Some(main_path);
+                        }
+                    }
+                }
+                // Legacy: entry field
+                if let Some(rest) = trimmed.strip_prefix("entry ") {
+                    let entry = rest.trim();
+                    if !entry.is_empty() {
+                        let entry_path = pkg_dir.join(entry);
+                        if entry_path.exists() {
+                            return Some(entry_path);
+                        }
+                    }
+                }
+            }
+        }
+        // Fallback: src/main.synx
+        let fallback = pkg_dir.join("src").join("main.synx");
+        if fallback.exists() {
+            return Some(fallback);
+        }
+    }
+    None
+}
+
+/// Check if a package is installed in any workspace root
+fn is_package_installed(roots: &[PathBuf], package: &str) -> bool {
+    for root in roots {
+        let pkg_dir = root.join(PACKAGES_DIR).join(package);
+        if pkg_dir.is_dir() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Extract !use directives from text: returns Vec<(line_number, package_name, alias)>
+#[allow(dead_code)]
+fn extract_use_directives(text: &str) -> Vec<(usize, String, Option<String>)> {
+    let mut directives = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("!use ") {
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            if let Some(name) = parts.first() {
+                let alias = if parts.len() >= 3 && parts[1] == "as" {
+                    Some(parts[2].to_string())
+                } else {
+                    None
+                };
+                directives.push((i, name.to_string(), alias));
+            }
+        }
+    }
+    directives
+}
+
 // ─── Diagnostics ─────────────────────────────────────────────────────────────
 
-fn diagnose(text: &str) -> Vec<Diagnostic> {
+fn diagnose(text: &str, workspace_roots: &[PathBuf]) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
     let lines: Vec<&str> = text.lines().collect();
 
@@ -53,6 +166,31 @@ fn diagnose(text: &str) -> Vec<Diagnostic> {
         if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("//") {
             continue;
         }
+
+        // Check !use directives for missing packages
+        if let Some(rest) = trimmed.strip_prefix("!use ") {
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            if let Some(&pkg_name) = parts.first() {
+                if pkg_name.starts_with('@') && pkg_name.contains('/') {
+                    if !is_package_installed(workspace_roots, pkg_name) {
+                        let indent = line.len() - line.trim_start().len();
+                        let start = indent + 5; // "!use " = 5 chars
+                        diags.push(Diagnostic {
+                            range: Range::new(
+                                Position::new(lineno, start as u32),
+                                Position::new(lineno, (start + pkg_name.len()) as u32),
+                            ),
+                            severity: Some(DiagnosticSeverity::WARNING),
+                            message: format!("Package '{}' not found in synx_packages/. Run: synx install {}", pkg_name, pkg_name),
+                            source: Some("synx".into()),
+                            ..Default::default()
+                        });
+                    }
+                }
+            }
+            continue;
+        }
+
         if trimmed.starts_with('!') || trimmed.starts_with("- ") {
             continue;
         }
@@ -190,7 +328,7 @@ fn build_constraint_completions() -> Vec<CompletionItem> {
 }
 
 fn build_directive_completions() -> Vec<CompletionItem> {
-    ["!active", "!lock", "!tool", "!schema", "!llm"].iter().map(|&d| {
+    ["!active", "!lock", "!tool", "!schema", "!llm", "!use"].iter().map(|&d| {
         CompletionItem {
             label: d.to_string(),
             kind: Some(CompletionItemKind::KEYWORD),
@@ -199,6 +337,19 @@ fn build_directive_completions() -> Vec<CompletionItem> {
             ..Default::default()
         }
     }).collect()
+}
+
+fn build_package_completions(roots: &[PathBuf]) -> Vec<CompletionItem> {
+    scan_installed_packages(roots)
+        .into_iter()
+        .map(|name| CompletionItem {
+            label: name.clone(),
+            kind: Some(CompletionItemKind::MODULE),
+            detail: Some("Installed package".into()),
+            insert_text: Some(name),
+            ..Default::default()
+        })
+        .collect()
 }
 
 // ─── Document Symbols ────────────────────────────────────────────────────────
@@ -296,17 +447,37 @@ fn find_key_line(lines: &[&str], key: &str, min_indent: usize) -> u32 {
 // ─── LanguageServer impl ────────────────────────────────────────────────────
 
 impl LanguageServer for Backend {
-    async fn initialize(&self, _: InitializeParams) -> Result<InitializeResult> {
+    async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
+        // Capture workspace roots for package resolution
+        let mut roots = Vec::new();
+        if let Some(folders) = &params.workspace_folders {
+            for folder in folders {
+                if let Some(path) = folder.uri.to_file_path() {
+                    roots.push(path.into_owned());
+                }
+            }
+        }
+        if roots.is_empty() {
+            #[allow(deprecated)]
+            if let Some(uri) = &params.root_uri {
+                if let Some(path) = uri.to_file_path() {
+                    roots.push(path.into_owned());
+                }
+            }
+        }
+        *self.workspace_roots.lock().unwrap() = roots;
+
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
                     TextDocumentSyncKind::FULL,
                 )),
                 completion_provider: Some(CompletionOptions {
-                    trigger_characters: Some(vec![":".into(), "[".into(), "!".into()]),
+                    trigger_characters: Some(vec![":".into(), "[".into(), "!".into(), " ".into()]),
                     ..Default::default()
                 }),
                 document_symbol_provider: Some(OneOf::Left(true)),
+                definition_provider: Some(OneOf::Left(true)),
                 ..Default::default()
             },
             server_info: Some(ServerInfo {
@@ -365,6 +536,12 @@ impl LanguageServer for Backend {
         let line = lines.get(pos.line as usize).unwrap_or(&"");
         let before = &line[..std::cmp::min(pos.character as usize, line.len())];
 
+        // After `!use ` — suggest installed packages
+        if before.trim_start().starts_with("!use ") {
+            let roots = self.workspace_roots.lock().unwrap().clone();
+            return Ok(Some(CompletionResponse::Array(build_package_completions(&roots))));
+        }
+
         if before.contains('[') && !before.contains(']') {
             return Ok(Some(CompletionResponse::Array(build_constraint_completions())));
         }
@@ -396,11 +573,50 @@ impl LanguageServer for Backend {
         let symbols = build_symbols(&text);
         Ok(Some(DocumentSymbolResponse::Nested(symbols)))
     }
+
+    async fn goto_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let pos = params.text_document_position_params.position;
+
+        let text: String = {
+            let docs = self.documents.lock().unwrap();
+            match docs.get(&uri) {
+                Some(t) => t.clone(),
+                None => return Ok(None),
+            }
+        };
+
+        let lines: Vec<&str> = text.lines().collect();
+        let line = lines.get(pos.line as usize).unwrap_or(&"");
+        let trimmed = line.trim();
+
+        // Go-to-definition on `!use @scope/name`
+        if let Some(rest) = trimmed.strip_prefix("!use ") {
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            if let Some(&pkg_name) = parts.first() {
+                let roots = self.workspace_roots.lock().unwrap().clone();
+                if let Some(main_path) = resolve_package_main(&roots, pkg_name) {
+                    if let Some(target_uri) = Uri::from_file_path(&main_path) {
+                        return Ok(Some(GotoDefinitionResponse::Scalar(Location {
+                            uri: target_uri,
+                            range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+                        })));
+                    }
+                }
+            }
+        }
+
+        Ok(None)
+    }
 }
 
 impl Backend {
     async fn publish_diagnostics(&self, uri: Uri, text: &str) {
-        let diags = diagnose(text);
+        let roots = self.workspace_roots.lock().unwrap().clone();
+        let diags = diagnose(text, &roots);
         self.client.publish_diagnostics(uri, diags, None).await;
     }
 }
@@ -415,6 +631,7 @@ async fn main() {
     let (service, socket) = LspService::new(|client| Backend {
         client,
         documents: Mutex::new(HashMap::new()),
+        workspace_roots: Mutex::new(Vec::new()),
     });
     Server::new(stdin, stdout, socket).serve(service).await;
 }

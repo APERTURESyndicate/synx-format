@@ -57,8 +57,34 @@ public static partial class SynxEngine
 
         var metadata = result.Metadata;
         var includesDirectives = result.Includes;
+        var useDirectives = result.Uses;
+
+        // ── Load !use packages (before includes, so packages are available) ──
+        var ownedWasm = options.WasmRuntime is null && useDirectives.Count > 0
+            ? new SynxWasmRuntime()
+            : null;
+        var wasm = options.WasmRuntime ?? ownedWasm;
+        var packagesMap = LoadPackages(useDirectives, options, wasm);
+
+        // If we created a WASM runtime and it has markers, update options
+        if (ownedWasm != null && ownedWasm.MarkerNames.Count > 0)
+        {
+            options = CloneOptions(options);
+            options.WasmRuntime = ownedWasm;
+        }
 
         var includesMap = LoadIncludes(includesDirectives, options);
+
+        // ── Merge packages into root before resolution ──
+        if (result.Root is SynxValue.Obj rootObj)
+        {
+            foreach (var (alias, pkgValue) in packagesMap)
+            {
+                if (!rootObj.Map.ContainsKey(alias))
+                    rootObj.Map[alias] = pkgValue;
+            }
+        }
+
         ApplyInheritance(result.Root, metadata);
         StripPrivateKeys(result.Root);
 
@@ -160,7 +186,149 @@ public static partial class SynxEngine
         BasePath = o.BasePath,
         MaxIncludeDepth = o.MaxIncludeDepth,
         IncludeDepth = o.IncludeDepth,
+        PackagesPath = o.PackagesPath,
+        WasmRuntime = o.WasmRuntime,
     };
+
+    /// <summary>
+    /// Load <c>!use</c> packages. WASM marker packages are loaded into the runtime;
+    /// SYNX config packages are returned as values to merge into root.
+    /// </summary>
+    private static Dictionary<string, SynxValue> LoadPackages(
+        List<SynxUseDirective> directives,
+        SynxOptions options,
+        SynxWasmRuntime? wasm)
+    {
+        var map = new Dictionary<string, SynxValue>(StringComparer.Ordinal);
+        var pkgBase = options.PackagesPath ?? "./synx_packages";
+        var baseDir = options.BasePath ?? ".";
+        var pkgRoot = Path.Combine(baseDir, pkgBase);
+
+        foreach (var ud in directives)
+        {
+            var pkgDir = Path.Combine(pkgRoot, ud.Package);
+            if (!Directory.Exists(pkgDir)) continue;
+
+            // Check if this is a WASM marker package
+            if (wasm != null && IsMarkerPackage(pkgDir))
+            {
+                var wasmPath = ReadManifestWasm(pkgDir)
+                    ?? Path.Combine(pkgDir, "src", "main.wasm");
+                var caps = ReadManifestCapabilities(pkgDir);
+
+                if (File.Exists(wasmPath))
+                {
+                    try
+                    {
+                        var wasmBytes = File.ReadAllBytes(wasmPath);
+                        wasm.LoadModule(wasmBytes, caps);
+                    }
+                    catch (Exception e)
+                    {
+                        map[ud.Alias] = new SynxValue.Str($"WASM_ERR: {e.Message}");
+                    }
+                }
+                continue;
+            }
+
+            // Regular SYNX config package
+            var entry = ReadManifestMain(pkgDir)
+                ?? Path.Combine(pkgDir, "src", "main.synx");
+
+            if (!File.Exists(entry)) continue;
+            try
+            {
+                CheckFileSize(entry);
+                var text = File.ReadAllText(entry);
+                var parsed = SynxParserCore.Parse(text);
+                if (parsed.Mode == SynxMode.Active)
+                {
+                    var child = CloneOptions(options);
+                    child.IncludeDepth = options.IncludeDepth + 1;
+                    child.BasePath = Path.GetDirectoryName(entry) ?? pkgDir;
+                    Resolve(parsed, child);
+                }
+                map[ud.Alias] = parsed.Root;
+            }
+            catch { /* skip failed packages */ }
+        }
+        return map;
+    }
+
+    /// <summary>Check if a package directory contains a WASM marker package.</summary>
+    private static bool IsMarkerPackage(string pkgDir)
+    {
+        var manifest = Path.Combine(pkgDir, "synx-pkg.synx");
+        if (!File.Exists(manifest)) return false;
+        foreach (var line in File.ReadLines(manifest))
+        {
+            var trimmed = line.Trim();
+            if (trimmed == "type markers") return true;
+            if (trimmed.StartsWith("main ", StringComparison.Ordinal) &&
+                trimmed["main ".Length..].Trim().EndsWith(".wasm", StringComparison.Ordinal))
+                return true;
+        }
+        return false;
+    }
+
+    /// <summary>Read the <c>main</c> entry point from a package manifest.</summary>
+    private static string? ReadManifestMain(string pkgDir)
+    {
+        var manifest = Path.Combine(pkgDir, "synx-pkg.synx");
+        if (!File.Exists(manifest)) return null;
+        foreach (var line in File.ReadLines(manifest))
+        {
+            var trimmed = line.Trim();
+            if (trimmed.StartsWith("main ", StringComparison.Ordinal))
+            {
+                var entry = trimmed["main ".Length..].Trim();
+                if (entry.Length > 0) return Path.Combine(pkgDir, entry);
+            }
+            if (trimmed.StartsWith("entry ", StringComparison.Ordinal))
+            {
+                var entry = trimmed["entry ".Length..].Trim();
+                if (entry.Length > 0) return Path.Combine(pkgDir, entry);
+            }
+        }
+        return null;
+    }
+
+    /// <summary>Read the WASM entry path from a marker package manifest.</summary>
+    private static string? ReadManifestWasm(string pkgDir)
+    {
+        var manifest = Path.Combine(pkgDir, "synx-pkg.synx");
+        if (!File.Exists(manifest)) return null;
+        foreach (var line in File.ReadLines(manifest))
+        {
+            var trimmed = line.Trim();
+            if (trimmed.StartsWith("wasm ", StringComparison.Ordinal))
+            {
+                var path = trimmed["wasm ".Length..].Trim();
+                if (path.Length > 0) return Path.Combine(pkgDir, path);
+            }
+            if (trimmed.StartsWith("main ", StringComparison.Ordinal))
+            {
+                var path = trimmed["main ".Length..].Trim();
+                if (path.EndsWith(".wasm", StringComparison.Ordinal))
+                    return Path.Combine(pkgDir, path);
+            }
+        }
+        return null;
+    }
+
+    /// <summary>Read capability permissions from a marker package manifest.</summary>
+    private static SynxWasmCapabilities ReadManifestCapabilities(string pkgDir)
+    {
+        var manifest = Path.Combine(pkgDir, "synx-pkg.synx");
+        if (!File.Exists(manifest)) return new SynxWasmCapabilities();
+        foreach (var line in File.ReadLines(manifest))
+        {
+            var trimmed = line.Trim();
+            if (trimmed.StartsWith("permissions ", StringComparison.Ordinal))
+                return SynxWasmCapabilities.FromManifestLine(trimmed["permissions ".Length..]);
+        }
+        return new SynxWasmCapabilities();
+    }
 
     private static void ApplyInheritance(SynxValue root, Dictionary<string, Dictionary<string, SynxMeta>> metadata)
     {

@@ -512,6 +512,30 @@ public static partial class SynxEngine
             }
         }
 
+        // ── WASM custom markers ──
+        if (options.WasmRuntime is { } wasmRt)
+        {
+            foreach (var marker in markers)
+            {
+                if (wasmRt.IsBuiltinMarker(marker)) continue;
+                if (!wasmRt.HasMarker(marker)) continue;
+
+                var markerIdx = markers.IndexOf(marker);
+                var args = markers.Skip(markerIdx + 1).ToList();
+                var currentValue = map.TryGetValue(key, out var cv) ? cv : new SynxValue.Null();
+                try
+                {
+                    var result = wasmRt.ApplyMarker(marker, currentValue, args);
+                    map[key] = result;
+                }
+                catch (Exception e)
+                {
+                    map[key] = new SynxValue.Str($"WASM_ERR: {e.Message}");
+                }
+                break; // Only apply one WASM marker per key
+            }
+        }
+
         if (meta.Constraints is { } constr)
             ValidateConstraintsOnMap(map, key, constr);
     }

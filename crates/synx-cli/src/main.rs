@@ -9,6 +9,8 @@ use synx_core::{
     Mode,
 };
 
+mod pkg;
+
 #[derive(Parser)]
 #[command(
     name = "synx",
@@ -117,6 +119,107 @@ enum Commands {
         #[arg(short, long)]
         write: bool,
     },
+
+    // ─── Package management ───────────────────────────────
+
+    /// Install a package from the registry
+    Install {
+        /// Package name (@scope/name) or @scope/name@version
+        package: Option<String>,
+        /// Specific version to install
+        #[arg(long)]
+        version: Option<String>,
+        /// Install from a local directory instead of registry
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+
+    /// Remove an installed package
+    Uninstall {
+        /// Package name (@scope/name)
+        package: String,
+    },
+
+    /// Update installed packages to latest compatible versions
+    Update {
+        /// Package name (omit to update all)
+        package: Option<String>,
+    },
+
+    /// List installed packages
+    List,
+
+    /// Create a .tar.gz package archive without publishing
+    Pack {
+        /// Package directory (default: current dir)
+        #[arg(default_value = ".")]
+        dir: PathBuf,
+    },
+
+    /// Publish a package to the registry
+    Publish {
+        /// Package directory (default: current dir)
+        #[arg(default_value = ".")]
+        dir: PathBuf,
+    },
+
+    /// Search the package registry
+    Search {
+        /// Search query
+        query: String,
+    },
+
+    /// Show package metadata, or account info if no package given
+    Info {
+        /// Package name (@scope/name) — omit to show account info
+        package: Option<String>,
+    },
+
+    /// Log in to the package registry
+    Login,
+
+    /// Log out from the package registry
+    Logout,
+
+    /// Show the current logged-in user
+    Whoami,
+
+    /// Generate a new Ed25519 signing key pair
+    Keygen,
+
+    /// Show your public signing key
+    PublicKey,
+
+    /// Yank a published version (mark as unavailable without deleting)
+    Yank {
+        /// Package name (@scope/name)
+        package: String,
+        /// Version to yank
+        version: String,
+    },
+
+    /// Undo a yank — make a version available again
+    Unyank {
+        /// Package name (@scope/name)
+        package: String,
+        /// Version to unyank
+        version: String,
+    },
+
+    /// Soft-delete a package from the registry (author only, 30-day grace period)
+    Delete {
+        /// Package name (@scope/name)
+        package: String,
+    },
+
+    /// Restore a soft-deleted package (within 30-day grace period)
+    Restore {
+        /// Package name (@scope/name)
+        package: String,
+    },
+
+    /// Scaffold a new SYNX package interactively
+    Create,
 }
 
 fn read_file(path: &PathBuf) -> String {
@@ -396,6 +499,154 @@ fn main() {
                 });
             } else {
                 print!("{}", formatted);
+            }
+        }
+
+        // ─── Package management ───────────────────────────
+
+        Commands::Install { package, version, path } => {
+            let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let result = if let Some(local_path) = path {
+                pkg::install_local(&project_root, &local_path)
+            } else if let Some(package) = package {
+                pkg::install(&project_root, &package, version.as_deref())
+            } else {
+                eprintln!("error: package name required (e.g. synx install @scope/name)");
+                process::exit(1);
+            };
+            if let Err(e) = result {
+                eprintln!("error: {}", e);
+                process::exit(1);
+            }
+        }
+
+        Commands::Uninstall { package } => {
+            let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            if let Err(e) = pkg::uninstall(&project_root, &package) {
+                eprintln!("error: {}", e);
+                process::exit(1);
+            }
+        }
+
+        Commands::Update { package } => {
+            let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            if let Err(e) = pkg::update(&project_root, package.as_deref()) {
+                eprintln!("error: {}", e);
+                process::exit(1);
+            }
+        }
+
+        Commands::List => {
+            let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            if let Err(e) = pkg::list_installed(&project_root) {
+                eprintln!("error: {}", e);
+                process::exit(1);
+            }
+        }
+
+        Commands::Pack { dir } => {
+            match pkg::pack(&dir) {
+                Ok((path, integrity)) => {
+                    println!("{} ({})", path.display(), integrity);
+                }
+                Err(e) => {
+                    eprintln!("error: {}", e);
+                    process::exit(1);
+                }
+            }
+        }
+
+        Commands::Publish { dir } => {
+            if let Err(e) = pkg::publish(&dir) {
+                eprintln!("error: {}", e);
+                process::exit(1);
+            }
+        }
+
+        Commands::Search { query } => {
+            if let Err(e) = pkg::search(&query) {
+                eprintln!("error: {}", e);
+                process::exit(1);
+            }
+        }
+
+        Commands::Info { package } => {
+            match package {
+                Some(pkg) => {
+                    if let Err(e) = pkg::info(&pkg) {
+                        eprintln!("error: {}", e);
+                        process::exit(1);
+                    }
+                }
+                None => {
+                    if let Err(e) = pkg::account_info() {
+                        eprintln!("error: {}", e);
+                        process::exit(1);
+                    }
+                }
+            }
+        }
+
+        Commands::Login => {
+            if let Err(e) = pkg::login() {
+                eprintln!("error: {}", e);
+                process::exit(1);
+            }
+        }
+
+        Commands::Logout => {
+            if let Err(e) = pkg::logout() {
+                eprintln!("error: {}", e);
+                process::exit(1);
+            }
+        }
+
+        Commands::Whoami => {
+            if let Err(e) = pkg::whoami() {
+                eprintln!("error: {}", e);
+                process::exit(1);
+            }
+        }
+        Commands::Keygen => {
+            if let Err(e) = pkg::keygen() {
+                eprintln!("error: {}", e);
+                process::exit(1);
+            }
+        }
+        Commands::PublicKey => {
+            if let Err(e) = pkg::show_public_key() {
+                eprintln!("error: {}", e);
+                process::exit(1);
+            }
+        }
+        Commands::Yank { package, version } => {
+            if let Err(e) = pkg::yank(&package, &version) {
+                eprintln!("error: {}", e);
+                process::exit(1);
+            }
+        }
+        Commands::Unyank { package, version } => {
+            if let Err(e) = pkg::unyank(&package, &version) {
+                eprintln!("error: {}", e);
+                process::exit(1);
+            }
+        }
+        Commands::Delete { package } => {
+            if let Err(e) = pkg::delete_package(&package) {
+                eprintln!("error: {}", e);
+                process::exit(1);
+            }
+        }
+        Commands::Restore { package } => {
+            if let Err(e) = pkg::restore_package(&package) {
+                eprintln!("error: {}", e);
+                process::exit(1);
+            }
+        }
+        Commands::Create => {
+            if let Err(e) = pkg::create_package() {
+                eprintln!("error: {}", e);
+                process::exit(1);
             }
         }
     }

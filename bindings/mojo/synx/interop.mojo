@@ -1,4 +1,4 @@
-# SYNX 3.6.0 — Mojo ↔ CPython `synx_native` (same Rust engine as `synx-core`).
+# SYNX 3.6.1 — Mojo ↔ CPython `synx_native` (same Rust engine as `synx-core`).
 # Requires: `pip install synx-format` (or maturin develop) so `synx_native` is importable.
 
 from std.python import Python

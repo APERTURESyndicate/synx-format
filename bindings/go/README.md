@@ -1,6 +1,6 @@
 # SYNX Go binding (`synx`) — cgo over `synx-core`
 
-**Version:** 3.6.0 — same engine as Rust via the **`synx-c`** shared library.
+**Version:** 3.6.1 — same engine as Rust via the **`synx-c`** shared library.
 
 This module is **not** a second parser: it calls `synx_parse`, `synx_parse_active`, `synx_stringify`, `synx_format`, `synx_parse_tool`, `synx_compile`, `synx_decompile`, `synx_is_synxb`, and `synx_diff` from [`synx.h`](../c-header/include/synx.h).
 

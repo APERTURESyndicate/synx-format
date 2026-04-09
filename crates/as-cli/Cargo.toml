@@ -1,0 +1,19 @@
+[package]
+name = "as-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "APERTURESyndicate unified CLI — single entry point for all AS tools"
+authors = ["APERTURESyndicate <support@aperturesyndicate.com>"]
+repository = "https://github.com/APERTURESyndicate/synx-format"
+keywords = ["synx", "cli", "aperturesyndicate"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "as"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+dirs = "6"
+toml = "0.8"

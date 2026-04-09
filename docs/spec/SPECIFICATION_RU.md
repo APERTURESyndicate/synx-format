@@ -274,6 +274,7 @@ id(int) 007
 
 **Правила процентов:**
 | Ситуация | Поведение |
+|---|---|
 | Процентов нет | Все элементы равновероятны |
 | Сумма = 100 | Используются как есть |
 | Сумма ≠ 100 | Автоматически нормализуются (пропорции сохраняются) |
@@ -581,6 +582,286 @@ name mydb
 
 ---
 
+
+---
+
+#### `:ref` — разрешение и цепочка
+
+Разрешает ключ по имени и передаёт значение следующим маркерам в цепочке. Похож на `:alias`, но предназначен для цепочек с `:calc` и другими преобразованиями.
+
+```synx
+!active
+
+базовая_ставка 100
+итого:ref:calc:*2 базовая_ставка
+```
+
+Результат: `итого` = 200. Сокращение `:ref:calc:*2 базовая_ставка` разрешает `базовая_ставка` → 100, затем вычисляет `100 * 2`.
+
+---
+
+#### `:i18n` — интернационализация
+
+Выбирает перевод на основе текущей локали. Дочерние ключи — коды языков; движок выбирает тот, что совпадает с `options.lang` (по умолчанию `en`).
+
+```synx
+!active
+
+приветствие:i18n
+  en Hello
+  ru Привет
+  de Hallo
+```
+
+**Плюрализация** — добавьте имя поля-счётчика: `:i18n:count_field`
+
+```synx
+!active
+
+метка_предметов:i18n:количество
+  en
+    one {count} item
+    other {count} items
+  ru
+    one {count} предмет
+    few {count} предмета
+    many {count} предметов
+    other {count} предметов
+```
+
+Категории множественного числа по CLDR (en: one/other, ru: one/few/many/other). `{count}` подставляется значением указанного поля.
+
+---
+
+#### `:clamp` — числовое ограничение диапазона
+
+Ограничивает числовое значение в диапазоне min–max.
+
+```synx
+!active
+
+громкость:clamp:0:100 150
+# → 100
+
+яркость:clamp:0:255 -10
+# → 0
+```
+
+Ошибка, если `MIN > MAX`.
+
+---
+
+#### `:round` — числовое округление
+
+Округляет число до N знаков после запятой.
+
+```synx
+!active
+
+цена:round:2 19.999
+# → 20.00
+
+пи:round:4 3.14159265
+# → 3.1416
+
+целое:round:0 42.7
+# → 43
+```
+
+По умолчанию: 0 знаков (округление до целого).
+
+---
+
+#### `:format` — форматирование в стиле printf
+
+Форматирует значение по шаблону printf.
+
+```synx
+!active
+
+цена:format:%.2f 19.9
+# → "19.90"
+
+код:format:%04d 42
+# → "0042"
+```
+
+Поддерживаемые шаблоны: `%.Nf` (дробное), `%d` (целое), `%0Nd` (с нулями). Макс. ширина/точность: 4096/1024.
+
+---
+
+#### `:map` — таблица подстановок
+
+Подставляет значение из таблицы поиска. Дочерние элементы — пары `значение_поиска результат`.
+
+```synx
+!active
+
+метки_статусов
+  200 OK
+  404 Not Found
+  500 Internal Server Error
+
+результат:map:метки_статусов
+  - 200
+  - 404
+  - 500
+```
+
+Результат: `["OK", "Not Found", "Internal Server Error"]`. Если совпадений нет — возвращает `null`.
+
+---
+
+#### `:once` — сгенерировать один раз, кэшировать
+
+Генерирует значение при первом парсинге и сохраняет его в файле `.synx.lock` для последующих чтений.
+
+```synx
+!active
+
+instance_id:once:uuid
+# → "550e8400-e29b-41d4-a716-446655440000" (стабильно между парсингами)
+
+created_at:once:timestamp
+# → "2026-04-01T12:00:00Z" (замораживается при первом парсинге)
+```
+
+Типы: `uuid`, `timestamp`, `random`.
+
+---
+
+#### `:version` — сравнение версий
+
+Сравнивает значение с ограничением семантической версии. Возвращает булево.
+
+```synx
+!active
+
+app_ok:version:>=:1.0.0 1.2.3
+# → true
+
+engine_ok:version:>=:2.0.0 1.9.5
+# → false
+```
+
+Операторы: `>=`, `<=`, `>`, `<`, `==`, `!=`. Разбирает semver (x.y.z…).
+
+---
+
+#### `:watch` — чтение внешнего файла
+
+Читает внешний JSON или SYNX файл при парсинге и подставляет его содержимое как значение.
+
+```synx
+!active
+
+все_флаги:watch ./flags.synx
+db_host:watch:database.host ./infra.json
+```
+
+Необязательный путь ключа после `:watch:` извлекает конкретное вложенное значение. Макс. глубина: 16, макс. размер: 10 MiB. Защита путей (path-jail).
+
+---
+
+#### `:fallback` — резервный файл
+
+Если основной файл отсутствует, используется резервный путь.
+
+```synx
+!active
+
+config:fallback:./defaults.synx ./overrides.synx
+```
+
+Также применяется, если значение null или пустое.
+
+---
+
+#### `:spam` — ограничение частоты
+
+Ограничивает количество обращений к значению за временное окно.
+
+```synx
+!active
+
+api_endpoint:spam:5:60 https://api.example.com/data
+# Максимум 5 обращений за 60 секунд
+```
+
+Окно по умолчанию: 1 секунда. Счётчик живёт в памяти процесса и сбрасывается при перезапуске.
+
+---
+
+#### `:prompt` — метка для LLM
+
+Форматирует поддерево как именованный block-fence для LLM.
+
+```synx
+!active
+
+config_block:prompt:AppConfig
+  app_name MyCoolApp
+  version 2.1.0
+```
+
+Выход: `AppConfig (SYNX):\n\`\`\`synx\n...\n\`\`\``
+
+---
+
+#### `:vision` — метаданные изображения (сквозной)
+
+Помечает значение как ссылку на изображение для моделей компьютерного зрения. Движок не трансформирует — приложения определяют по метаданным.
+
+```synx
+!active
+диаграмма:vision ./docs/architecture.png
+```
+
+---
+
+#### `:audio` — метаданные аудио (сквозной)
+
+Помечает значение как ссылку на аудио. Движок не трансформирует — приложения определяют по метаданным.
+
+```synx
+!active
+запись:audio ./meetings/standup.mp3
+```
+
+---
+
+#### `:import` — псевдоним для `:include`
+
+Идентичен `:include`. Используйте тот, что читается лучше.
+
+```synx
+!active
+бд:import ./config/db.synx
+```
+
+---
+
+#### `:inherit` — наследование объектов (mixin)
+
+Наследует все поля из одного или нескольких родительских объектов. Дочерние поля имеют приоритет.
+
+```synx
+!active
+
+база
+  host localhost
+  port 8080
+  debug false
+
+продакшн:inherit база
+  host prod.example.com
+  debug false
+```
+
+Результат: `продакшн` = `{ "host": "prod.example.com", "port": 8080, "debug": false }`. Родители объединяются слева направо, затем дочерние поля перезаписывают. Разрешается на предварительном проходе до других маркеров.
+
+---
+
 ### 3.3 Сводная таблица функций
 
 | Функция | Описание | Пример |
@@ -595,10 +876,26 @@ name mydb
 | `:default:X` | Fallback (в комбинации) | `порт:env:default:8080 PORT` |
 | `:unique` | Дедупликация списка | `теги:unique` |
 | `:include` | Подключить внешний файл | `бд:include ./db.synx` |
+| `:import` | Псевдоним для `:include` | `бд:import ./db.synx` |
 | `:geo` | Значение по региону | `валюта:geo` |
 | `:template` | Интерполяция строк | `приветствие:template Привет, {имя}!` |
 | `:split` | Разделение строки на массив | `теги:split space` |
 | `:join` | Объединение массива в строку | `фраза:join space` |
+| `:ref` | Разрешение и цепочка | `итого:ref:calc:*2 базовая_ставка` |
+| `:i18n` | Перевод по локали | `приветствие:i18n` |
+| `:clamp` | Числовое ограничение | `громкость:clamp:0:100 150` |
+| `:round` | Числовое округление | `цена:round:2 19.999` |
+| `:format` | Форматирование printf | `цена:format:%.2f 19.9` |
+| `:map` | Таблица подстановок | `результат:map:метки_статусов` |
+| `:once` | Сгенерировать, кэшировать | `id:once:uuid` |
+| `:version` | Сравнение версий | `ok:version:>=:1.0.0 1.2.3` |
+| `:watch` | Чтение внешнего файла | `флаги:watch ./flags.synx` |
+| `:fallback` | Резервный файл | `cfg:fallback:./default.synx ./custom.synx` |
+| `:spam` | Ограничение частоты | `api:spam:5:60 endpoint` |
+| `:prompt` | Метка для LLM | `ctx:prompt:system Ваш промпт` |
+| `:vision` | Метаданные изображения | `img:vision ./photo.png` |
+| `:audio` | Метаданные аудио | `snd:audio ./clip.mp3` |
+| `:inherit` | Наследование объектов | `прод:inherit база` |
 
 **Комбинирование функций** — через цепочку `:`:
 ```synx
@@ -706,6 +1003,93 @@ api_key[required]:env API_KEY
 ```synx
 !active
 пароль[required, min:8, max:64, type:string] MyP@ssw0rd
+```
+
+---
+
+### 3.6 Директивы
+
+Директивы — строки верхнего уровня, начинающиеся с `!` или `#!`. Они управляют режимом документа и метаданными. Директива должна стоять перед любыми парами ключ-значение.
+
+| Директива | Описание |
+|---|---|
+| `!active` | Включить маркеры, ограничения и валидацию (см. §3.1) |
+| `!lock` | Пометить документ как только для чтения (флаг метаданных) |
+| `!include` | Включить другой SYNX-файл на уровне корня документа |
+| `!tool` | Перестроить вывод как конверт вызова инструмента (имя + параметры) |
+| `!schema` | Экспортировать JSON Schema Draft 2020-12 из структуры документа |
+| `!llm` | Аннотировать документ для LLM (только метаданные) |
+
+#### `!lock` — только для чтения
+
+Устанавливает флаг `locked` в результате парсинга. Дерево данных не меняется — это рекомендация для инструментов.
+
+```synx
+!lock
+
+имя Алиса
+роль администратор
+```
+
+#### `!include` — включение на уровне документа
+
+Включает другой SYNX-файл и объединяет его содержимое на уровне корня. Необязательный псевдоним назначает включённое дерево именованному ключу.
+
+```synx
+!include ./db.synx
+!include ./auth.synx auth_config
+
+имя МоёПриложение
+```
+
+Максимальная глубина: 16. Защита путей запрещает `..` выход.
+
+#### `!tool` — конверт вызова инструмента
+
+Перестраивает вывод: первый ключ становится именем инструмента, его дочерние элементы — параметрами.
+
+```synx
+!tool
+
+web_search
+  query rust async
+  lang en
+  results 10
+```
+
+Выход:
+```json
+{
+  "tool": "web_search",
+  "params": {
+    "query": "rust async",
+    "lang": "en",
+    "results": 10
+  }
+}
+```
+
+#### `!schema` — экспорт JSON Schema
+
+Заставляет парсер генерировать объект JSON Schema Draft 2020-12 на основе ключей и ограничений документа.
+
+```synx
+!schema
+
+имя[required, type:string]
+порт[type:int, min:1, max:65535]
+```
+
+#### `!llm` — метаданные LLM
+
+Директива-метаданные для LLM-инструментов. Не меняет дерево данных.
+
+```synx
+!llm
+
+persona Ассистент
+role Вы — полезный ассистент по программированию
+tone профессиональный и лаконичный
 ```
 
 ---
@@ -1092,7 +1476,7 @@ module.exports = {
 
 ```bash
 # Добавить зависимость
-cargo add synx
+cargo add synx-core
 ```
 
 ```rust
@@ -1143,7 +1527,7 @@ fn main() {
 - `as_object() -> Option<&Map<String, Value>>` — объект (map)
 - `is_null() -> bool` — null-проверка
 
-> 📌 **Важно:** Rust-парсер работает в режиме `static` — все вычисления (`:random`, `:calc`, `:env`) должны быть выполнены до загрузки и включены в значения как заранее вычисленные данные. Функции не вычисляются на лету.
+> 📌 **Важно:** крейт `synx-core` поддерживает все режимы, включая `!active` с маркерами (`:random`, `:calc`, `:env` и др.), а также `!tool`, `.synxb` и `diff`.
 
 ---
 
@@ -1168,7 +1552,7 @@ cargo build -p synx-c --release
 
 **Память:** каждый `char*` нужно один раз освободить через `synx_free()`. Буфер из `synx_compile` — через `synx_free_bytes(ptr, len)`.
 
-**Функции (v3.6.0):** `synx_parse`, `synx_parse_active`, `synx_stringify`, `synx_format`, `synx_parse_tool`, `synx_compile`, `synx_decompile`, `synx_is_synxb`, `synx_diff` — см. `bindings/c-header/include/synx.h`.
+**Функции (v3.6):** `synx_parse`, `synx_parse_active`, `synx_stringify`, `synx_format`, `synx_parse_tool`, `synx_compile`, `synx_decompile`, `synx_is_synxb`, `synx_diff` — см. `bindings/c-header/include/synx.h`.
 
 **Минимальный пример:**
 
@@ -1279,7 +1663,7 @@ func main() {
 }
 ```
 
-**API (v3.6.0):** `Parse`, `ParseActive`, `Stringify`, `Format`, `ParseTool`, `Compile`, `Decompile`, `IsSynxb`, `Diff` — как в `synx.h`.
+**API (v3.6):** `Parse`, `ParseActive`, `Stringify`, `Format`, `ParseTool`, `Compile`, `Decompile`, `IsSynxb`, `Diff` — как в `synx.h`.
 
 > **Паритет:** тот же движок, что у **`synx-core`** (`!active`, `!tool`, `.synxb`, канонический JSON).
 
@@ -1287,7 +1671,7 @@ func main() {
 
 ### 5.11 Mojo — Python interop (`bindings/mojo`)
 
-[Mojo](https://docs.modular.com/mojo/) вызывает **CPython** через [`Python.import_module`](https://docs.modular.com/mojo/manual/python/python-from-mojo). Чтобы получить **паритет SYNX 3.6.0** с **`synx-core`**, используйте модуль **`synx_native`** (тот же **PyO3 / maturin**, что и `pip install synx-format`). Отдельная **чистая** реализация грамматики на Mojo в этом репозитории **не** поставляется — это был бы отдельный крупный порт (как поддерживать `synx-js` рядом с Rust).
+[Mojo](https://docs.modular.com/mojo/) вызывает **CPython** через [`Python.import_module`](https://docs.modular.com/mojo/manual/python/python-from-mojo). Чтобы получить **паритет SYNX 3.6** с **`synx-core`**, используйте модуль **`synx_native`** (тот же **PyO3 / maturin**, что и `pip install synx-format`). Отдельная **чистая** реализация грамматики на Mojo в этом репозитории **не** поставляется — это был бы отдельный крупный порт (как поддерживать `synx-js` рядом с Rust).
 
 **Установка:** Python-пакет с **`synx_native`**. При локальной сборке — `maturin develop`; при необходимости `Python.add_to_path`.
 
@@ -1317,7 +1701,7 @@ val tool = SynxEngine.parseTool("!tool\nweb_search\n  query test\n")
 val active = SynxEngine.parseActive("!active\nport:env:default:8080 PORT\n")
 ```
 
-**API (v3.6.0):** `SynxEngine.parse`, `parseActive`, `stringify`, `format`, `parseTool`, `diff`, `compile`, `decompile`, `isSynxb` — как в [`bindings/c-header/include/synx.h`](../../bindings/c-header/include/synx.h).
+**API (v3.6):** `SynxEngine.parse`, `parseActive`, `stringify`, `format`, `parseTool`, `diff`, `compile`, `decompile`, `isSynxb` — как в [`bindings/c-header/include/synx.h`](../../bindings/c-header/include/synx.h).
 
 > **Паритет:** тот же движок, что **`synx-core`** (включая **`!active`**, **`!tool`**, **`.synxb`**, **`diff`**). Для Gradle нужен **JDK 17+**; артефакт **`com.aperturesyndicate:synx-kotlin`** на Maven Central может появиться позже; пока — **`publishToMavenLocal`**.
 
@@ -1338,7 +1722,7 @@ let json = try SynxEngine.parse("name Wario\nage 30\n")
 print(json)
 ```
 
-**API (v3.6.0):** `SynxEngine.parse`, `parseActive`, `stringify(json:)`, `format`, `parseTool`, `diff`, `compile`, `decompile`, `isSynxb` — как в `synx.h`.
+**API (v3.6):** `SynxEngine.parse`, `parseActive`, `stringify(json:)`, `format`, `parseTool`, `diff`, `compile`, `decompile`, `isSynxb` — как в `synx.h`.
 
 > **Паритет:** тот же движок, что **`synx-core`**. Файл `Sources/CSynx/synx.h` должен совпадать с [`bindings/c-header/include/synx.h`](../../bindings/c-header/include/synx.h).
 
@@ -1576,7 +1960,7 @@ $result.Mode                       # static
 |---|---|---|---|
 | JavaScript | `@aperturesyndicate/synx-format` | `Synx.loadSync()` | Полный движок (active + static) |
 | Python | `synx-format` | `Synx.load()` | Полный движок (active + static) |
-| Rust | `synx` (crates.io) | `Synx::parse()` | Без зависимостей, static-only |
+| Rust | `synx-core` (crates.io) | `Synx::parse()` | Без зависимостей, все режимы включая !active |
 | C | `synx.h` + lib `synx-c` | `synx_parse()` → JSON | FFI к `synx-core` 3.6.x |
 | C++ | `synx/synx.hpp` + та же lib | `synx::parse()` → `optional<string>` | Тонкая обёртка, тот же движок |
 | C# | `APERTURESyndicate.Synx` (NuGet) | `SynxFormat` / API парсера | Библиотека .NET 8; идентификатор `Synx.Core` занят на nuget.org |
@@ -1653,16 +2037,47 @@ const jsonString = JSON.stringify(data, null, 2);
 # комментарий                    → однострочный комментарий
 // комментарий                   → однострочный комментарий
 
-─── Только с !active ───────────────────────────
-ключ:random                      → случайный элемент
-ключ:random 70 20 10             → взвешенный рандом
-ключ:calc A * B                  → арифметика
+─── Директивы ──────────────────────────────────
+!active                          → включить маркеры + ограничения
+!lock                            → документ только для чтения
+!include ./файл.synx             → включить на уровне корня
+!tool                            → конверт вызова инструмента
+!schema                          → экспорт JSON Schema
+!llm                             → флаг метаданных LLM
+
+─── Маркеры (требуют !active) ──────────────────
 ключ:env VAR                     → переменная окружения
 ключ:env:default:X VAR           → env с дефолтом
+ключ:calc A * B                  → арифметика
 ключ:alias другой_ключ           → ссылка на другой ключ
 ключ:secret значение             → скрытое значение
+ключ:default dark                → значение по умолчанию
+ключ:random                      → случайный элемент
+ключ:random 70 20 10             → взвешенный рандом
 ключ:unique                      → дедупликация списка
 ключ:include ./файл.synx         → подключить файл
+ключ:import ./файл.synx          → псевдоним :include
+ключ:template Привет, {имя}!     → интерполяция строк
+ключ:split red, green, blue      → строка в массив
+ключ:join:slash                  → массив в строку
+ключ:geo                         → значение по региону
+ключ:ref:calc:*2 база            → разрешить и цепочка
+ключ:i18n                        → перевод по локали
+ключ:clamp:0:100 150             → числовое ограничение
+ключ:round:2 19.999              → числовое округление
+ключ:format:%.2f 19.9            → форматирование printf
+ключ:map:таблица_поиска          → таблица подстановок
+ключ:once:uuid                   → сгенерировать, кэшировать
+ключ:version:>=:1.0.0 ver        → сравнение версий
+ключ:watch ./flags.synx          → чтение внешнего файла
+ключ:fallback:./default.synx путь → резервный файл
+ключ:spam:5:60 endpoint          → ограничение частоты
+ключ:prompt:label поддерево      → метка для LLM
+ключ:vision ./photo.png          → метаданные изображения
+ключ:audio ./clip.mp3            → метаданные аудио
+ключ:inherit родитель            → наследование объектов
+
+─── Ограничения (требуют !active) ──────────────
 ключ[min:N, max:N]               → ограничения длины/значения
 ключ[type:int]                   → тип данных
 ключ[required]                   → обязательное поле

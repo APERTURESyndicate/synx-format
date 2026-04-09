@@ -4,7 +4,7 @@ setlocal EnableExtensions
 echo.
 echo ============================================================
 echo   SYNX - Publish to crates.io
-echo   Crates: synx-core + synx-format
+echo   Crates: synx-core, synx-format, synx-cli, as-cli
 echo ============================================================
 echo.
 
@@ -65,7 +65,7 @@ if errorlevel 1 (
 
 REM --- 5. Publish synx-format ---
 echo.
-echo [4/4] Publishing synx-format to crates.io...
+echo [4/6] Publishing synx-format to crates.io...
 cargo publish -p synx-format %PUBLISH_FLAGS%
 if errorlevel 1 (
     echo.
@@ -74,16 +74,41 @@ if errorlevel 1 (
     exit /b 1
 )
 
+REM --- 6. Publish synx-cli ---
+echo.
+echo [5/6] Publishing synx-cli to crates.io...
+cargo publish -p synx-cli %PUBLISH_FLAGS%
+if errorlevel 1 (
+    echo.
+    echo [ERROR] Publish failed for synx-cli.
+    echo   synx-cli depends on synx-core. If you just published it, wait 1-2 minutes.
+    exit /b 1
+)
+
+REM --- 7. Publish as-cli ---
+echo.
+echo [6/6] Publishing as-cli to crates.io...
+cargo publish -p as-cli %PUBLISH_FLAGS%
+if errorlevel 1 (
+    echo.
+    echo [ERROR] Publish failed for as-cli.
+    exit /b 1
+)
+
 echo.
 echo ============================================================
 echo   Done. Crates published:
 echo   https://crates.io/crates/synx-core
 echo   https://crates.io/crates/synx-format
+echo   https://crates.io/crates/synx-cli
+echo   https://crates.io/crates/as-cli
 echo ============================================================
 echo.
 echo   Install:
 echo     cargo add synx-core
 echo     cargo add synx-format
+echo     cargo install synx-cli     (installs "synx" binary)
+echo     cargo install as-cli       (installs "as" binary)
 echo.
 
 endlocal

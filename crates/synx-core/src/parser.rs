@@ -95,6 +95,7 @@ pub fn parse(text: &str) -> ParseResult {
     let mut llm = false;
     let mut metadata: HashMap<String, MetaMap> = HashMap::new();
     let mut includes: Vec<IncludeDirective> = Vec::new();
+    let mut uses: Vec<UseDirective> = Vec::new();
 
     let mut block: Option<BlockState> = None;
     let mut list: Option<ListState> = None;
@@ -148,6 +149,23 @@ pub fn parse(text: &str) -> ParseResult {
                     name.strip_suffix(".synx").or_else(|| name.strip_suffix(".SYNX")).unwrap_or(name).to_string()
                 });
                 includes.push(IncludeDirective { path, alias });
+            }
+            i += 1;
+            continue;
+        }
+        if trimmed.starts_with("!use ") {
+            let rest = trimmed[5..].trim();
+            if rest.starts_with('@') {
+                // Parse: !use @scope/name [as alias]
+                let mut parts = rest.splitn(2, " as ");
+                let package = parts.next().unwrap_or("").trim().to_string();
+                let alias = parts.next().map(|s| s.trim().to_string()).unwrap_or_else(|| {
+                    // Auto-derive alias from last segment: @scope/name → name
+                    package.rsplit('/').next().unwrap_or(&package).to_string()
+                });
+                if !package.is_empty() {
+                    uses.push(UseDirective { package, alias });
+                }
             }
             i += 1;
             continue;
@@ -372,6 +390,7 @@ pub fn parse(text: &str) -> ParseResult {
         llm,
         metadata,
         includes,
+        uses,
     }
 }
 

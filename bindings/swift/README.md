@@ -1,6 +1,6 @@
 # SYNX Swift package (`Synx`)
 
-**Version:** 3.6.0 — thin Swift wrapper over the **`synx-c`** C library (Rust **`synx-core`**). Same grammar, `!active`, `!tool`, `.synxb`, and canonical JSON.
+**Version:** 3.6.1 — thin Swift wrapper over the **`synx-c`** C library (Rust **`synx-core`**). Same grammar, `!active`, `!tool`, `.synxb`, and canonical JSON.
 
 ## Build `synx_c` (repo root)
 

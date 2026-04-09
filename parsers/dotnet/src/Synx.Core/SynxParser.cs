@@ -15,6 +15,7 @@ internal static class SynxParserCore
         var stack = new List<(int Indent, StackEntry Entry)> { (-1, new StackEntry.Root()) };
         var metadata = new Dictionary<string, Dictionary<string, SynxMeta>>(StringComparer.Ordinal);
         var includes = new List<SynxIncludeDirective>();
+        var uses = new List<SynxUseDirective>();
         var mode = SynxMode.Static;
         var locked = false;
         var tool = false;
@@ -64,6 +65,22 @@ internal static class SynxParserCore
                     ? sp[1].Trim()
                     : DeriveIncludeAlias(incPath);
                 includes.Add(new SynxIncludeDirective { Path = incPath, Alias = alias });
+                continue;
+            }
+            if (trimmed.StartsWith("!use ", StringComparison.Ordinal))
+            {
+                var rest = trimmed["!use ".Length..].Trim();
+                if (rest.StartsWith('@'))
+                {
+                    // Parse: !use @scope/name [as alias]
+                    var asParts = rest.Split([" as "], 2, StringSplitOptions.None);
+                    var package = asParts[0].Trim();
+                    var alias = asParts.Length > 1
+                        ? asParts[1].Trim()
+                        : package.Split('/').Last();
+                    if (package.Length > 0)
+                        uses.Add(new SynxUseDirective { Package = package, Alias = alias });
+                }
                 continue;
             }
             if (trimmed.StartsWith("#!mode:", StringComparison.Ordinal))
@@ -223,6 +240,7 @@ internal static class SynxParserCore
             Llm = llm,
             Metadata = metadata,
             Includes = includes,
+            Uses = uses,
         };
     }
 

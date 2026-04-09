@@ -74,9 +74,41 @@ pub fn resolve(result: &mut ParseResult, options: &Options) {
     }
     let metadata = std::mem::take(&mut result.metadata);
     let includes_directives = std::mem::take(&mut result.includes);
+    let use_directives = std::mem::take(&mut result.uses);
+
+    // ── Load !use packages (before includes, so packages are available) ──
+    #[cfg(feature = "wasm")]
+    let mut wasm_runtime = crate::wasm::WasmMarkerRuntime::new();
+    let packages_map = load_packages(
+        &use_directives,
+        options,
+        #[cfg(feature = "wasm")]
+        &mut wasm_runtime,
+    );
+
+    // If wasm feature is enabled and markers were loaded, create options with runtime
+    #[cfg(feature = "wasm")]
+    let wasm_options;
+    #[cfg(feature = "wasm")]
+    let options = if !wasm_runtime.marker_names().is_empty() {
+        wasm_options = Options {
+            wasm_runtime: Some(std::sync::Arc::new(wasm_runtime)),
+            ..options.clone()
+        };
+        &wasm_options
+    } else {
+        options
+    };
 
     // ── Load !include files ──
     let includes_map = load_includes(&includes_directives, options);
+
+    // ── Merge packages into root before resolution ──
+    if let Value::Object(ref mut root_map) = result.root {
+        for (alias, pkg_value) in &packages_map {
+            root_map.entry(alias.clone()).or_insert_with(|| pkg_value.clone());
+        }
+    }
 
     // ── :inherit pre-pass ──
     apply_inheritance(&mut result.root, &metadata);
@@ -989,6 +1021,32 @@ fn apply_markers(
     // Metadata-only marker. Recognized by the engine (no error), value passes through.
     // Applications detect this marker via metadata to dispatch audio generation.
 
+    // ── WASM custom markers ──
+    // If a marker is not built-in and a WASM runtime is loaded, dispatch to it.
+    #[cfg(feature = "wasm")]
+    if let Some(ref wasm_rt) = options.wasm_runtime {
+        for marker in markers {
+            if crate::wasm::BUILTIN_MARKERS.contains(&marker.as_str()) {
+                continue;
+            }
+            if wasm_rt.has_marker(marker) {
+                // Collect args: all marker parts after this marker name
+                let marker_idx = markers.iter().position(|m| m == marker).unwrap();
+                let args: Vec<String> = markers[marker_idx + 1..].to_vec();
+                let current_value = map.get(key).cloned().unwrap_or(Value::Null);
+                match wasm_rt.apply_marker(marker, &current_value, &args) {
+                    Ok(result) => {
+                        map.insert(key.to_string(), result);
+                    }
+                    Err(e) => {
+                        map.insert(key.to_string(), Value::String(format!("WASM_ERR: {}", e)));
+                    }
+                }
+                break; // Only apply one WASM marker per key
+            }
+        }
+    }
+
     // ── Constraint validation (always last, after all markers resolved) ──
     if let Some(ref c) = meta.constraints {
         validate_constraints(map, key, c);
@@ -1306,7 +1364,7 @@ fn stringify_value(value: &Value, indent: usize) -> String {
     }
 }
 
-fn cast_primitive(val: &str) -> Value {
+pub(crate) fn cast_primitive(val: &str) -> Value {
     // Quoted strings preserve literal value
     if val.len() >= 2 {
         let bytes = val.as_bytes();
@@ -1657,6 +1715,164 @@ fn load_includes(
     map
 }
 
+/// Load !use packages into a map<alias, Value>.
+///
+/// Looks for `<packages_path>/@scope/name/src/main.synx` on disk.
+/// Falls back to `./synx_packages/` when `options.packages_path` is unset.
+fn load_packages(
+    directives: &[UseDirective],
+    options: &Options,
+    #[cfg(feature = "wasm")] wasm_runtime: &mut crate::wasm::WasmMarkerRuntime,
+) -> HashMap<String, Value> {
+    let mut map = HashMap::new();
+    let pkg_base = options
+        .packages_path
+        .as_deref()
+        .unwrap_or("./synx_packages");
+    let base = options.base_path.as_deref().unwrap_or(".");
+    let pkg_root = std::path::Path::new(base).join(pkg_base);
+
+    for ud in directives {
+        // @scope/name  → package dir is <pkg_root>/@scope/name
+        let pkg_dir = pkg_root.join(&ud.package);
+
+        // Check if this is a WASM marker package (type markers in manifest)
+        #[cfg(feature = "wasm")]
+        {
+            if is_marker_package(&pkg_dir) {
+                // Load the .wasm file from the package
+                let wasm_entry = read_manifest_wasm(&pkg_dir)
+                    .unwrap_or_else(|| pkg_dir.join("src").join("main.wasm"));
+                let caps = read_manifest_capabilities(&pkg_dir);
+                if wasm_entry.is_file() {
+                    if let Ok(wasm_bytes) = std::fs::read(&wasm_entry) {
+                        match wasm_runtime.load_module(&wasm_bytes, caps) {
+                            Ok(_markers) => {}
+                            Err(e) => {
+                                map.insert(
+                                    ud.alias.clone(),
+                                    Value::String(format!("WASM_ERR: {}", e)),
+                                );
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+        }
+
+        // Read entry point from manifest (synx-pkg.synx), fall back to src/main.synx
+        let entry = read_manifest_main(&pkg_dir)
+            .unwrap_or_else(|| pkg_dir.join("src").join("main.synx"));
+
+        if !entry.is_file() {
+            continue;
+        }
+        if check_file_size(&entry).is_err() {
+            continue;
+        }
+        if let Ok(text) = std::fs::read_to_string(&entry) {
+            let mut parsed = parser::parse(&text);
+            if parsed.mode == Mode::Active {
+                let mut child_opts = options.clone();
+                child_opts._include_depth += 1;
+                child_opts.base_path = Some(
+                    entry.parent().unwrap_or(&pkg_dir).to_string_lossy().into_owned()
+                );
+                resolve(&mut parsed, &child_opts);
+            }
+            map.insert(ud.alias.clone(), parsed.root);
+        }
+    }
+    map
+}
+
+/// Read synx-pkg.synx manifest and extract the `main` entry point path.
+/// Returns the absolute path to the entry file, or None if manifest is missing/invalid.
+fn read_manifest_main(pkg_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let manifest = pkg_dir.join("synx-pkg.synx");
+    let text = std::fs::read_to_string(&manifest).ok()?;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("main ") {
+            let entry_path = rest.trim();
+            if !entry_path.is_empty() {
+                return Some(pkg_dir.join(entry_path));
+            }
+        }
+        // Legacy field name support
+        if let Some(rest) = trimmed.strip_prefix("entry ") {
+            let entry_path = rest.trim();
+            if !entry_path.is_empty() {
+                return Some(pkg_dir.join(entry_path));
+            }
+        }
+    }
+    None
+}
+
+/// Check if a package is a WASM marker package.
+/// Matches `type markers` in manifest, or `main` pointing to a `.wasm` file.
+#[cfg(feature = "wasm")]
+fn is_marker_package(pkg_dir: &std::path::Path) -> bool {
+    let manifest = pkg_dir.join("synx-pkg.synx");
+    if let Ok(text) = std::fs::read_to_string(&manifest) {
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed == "type markers" {
+                return true;
+            }
+            if let Some(rest) = trimmed.strip_prefix("main ") {
+                if rest.trim().ends_with(".wasm") {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Read the WASM entry point from a marker package manifest.
+#[cfg(feature = "wasm")]
+fn read_manifest_wasm(pkg_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let manifest = pkg_dir.join("synx-pkg.synx");
+    let text = std::fs::read_to_string(&manifest).ok()?;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("wasm ") {
+            let wasm_path = rest.trim();
+            if !wasm_path.is_empty() {
+                return Some(pkg_dir.join(wasm_path));
+            }
+        }
+        // Also check `main` if it points to a .wasm file
+        if let Some(rest) = trimmed.strip_prefix("main ") {
+            let path = rest.trim();
+            if path.ends_with(".wasm") {
+                return Some(pkg_dir.join(path));
+            }
+        }
+    }
+    None
+}
+
+/// Read capability permissions from a marker package manifest.
+#[cfg(feature = "wasm")]
+fn read_manifest_capabilities(pkg_dir: &std::path::Path) -> crate::wasm::WasmCapabilities {
+    let manifest = pkg_dir.join("synx-pkg.synx");
+    let text = match std::fs::read_to_string(&manifest) {
+        Ok(t) => t,
+        Err(_) => return crate::wasm::WasmCapabilities::default(),
+    };
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("permissions ") {
+            return crate::wasm::WasmCapabilities::from_manifest_line(rest);
+        }
+    }
+    crate::wasm::WasmCapabilities::default()
+}
+
 // ─── Type validation ──────────────────────────────────────
 
 /// Build a global type registry from all metadata.
@@ -1896,7 +2112,7 @@ fn plural_category(lang: &str, n: i64) -> &'static str {
 #[cfg(test)]
 mod tests {
     use crate::{parse, Options, Value};
-    use super::resolve;
+    use super::{resolve, read_manifest_main};
 
     #[test]
     fn test_ref_simple() {
@@ -2315,5 +2531,100 @@ mod tests {
         resolve(&mut r, &Options::default());
         let map = r.root.as_object().unwrap();
         assert_eq!(map["narration"], Value::String("Read this summary aloud".into()));
+    }
+
+    #[test]
+    fn test_use_directive_loads_package() {
+        // Set up a temp package for `!use`
+        let tmp = std::env::temp_dir().join("synx-use-test-load");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let pkg_dir = tmp.join("synx_packages/@test/config");
+        std::fs::create_dir_all(pkg_dir.join("src")).unwrap();
+        std::fs::write(pkg_dir.join("synx-pkg.synx"), "name @test/config\nversion 1.0.0\nmain src/main.synx\n").unwrap();
+        std::fs::write(pkg_dir.join("src/main.synx"), "identity APERTURESyndicate\ndefault_port 8080\n").unwrap();
+
+        let mut r = parse("!active\n!use @test/config\napp MyApp");
+        let opts = Options {
+            base_path: Some(tmp.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        resolve(&mut r, &opts);
+        let map = r.root.as_object().unwrap();
+        assert!(map.contains_key("config"), "package not loaded");
+        let pkg = map["config"].as_object().unwrap();
+        assert_eq!(pkg["identity"], Value::String("APERTURESyndicate".into()));
+        assert_eq!(pkg["default_port"], Value::Int(8080));
+        assert_eq!(map["app"], Value::String("MyApp".into()));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_use_directive_with_alias() {
+        let tmp = std::env::temp_dir().join("synx-use-test-alias");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let pkg_dir = tmp.join("synx_packages/@test/config");
+        std::fs::create_dir_all(pkg_dir.join("src")).unwrap();
+        std::fs::write(pkg_dir.join("synx-pkg.synx"), "name @test/config\nversion 1.0.0\nmain src/main.synx\n").unwrap();
+        std::fs::write(pkg_dir.join("src/main.synx"), "identity APERTURESyndicate\ndefault_port 8080\n").unwrap();
+
+        let mut r = parse("!active\n!use @test/config as defaults\napp MyApp");
+        let opts = Options {
+            base_path: Some(tmp.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        resolve(&mut r, &opts);
+        let map = r.root.as_object().unwrap();
+        assert!(map.contains_key("defaults"), "aliased package not loaded");
+        assert!(!map.contains_key("config"), "should use alias, not auto name");
+        let pkg = map["defaults"].as_object().unwrap();
+        assert_eq!(pkg["identity"], Value::String("APERTURESyndicate".into()));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_use_directive_missing_package_ignored() {
+        let mut r = parse("!active\n!use @nonexistent/pkg\napp MyApp");
+        resolve(&mut r, &Options::default());
+        let map = r.root.as_object().unwrap();
+        // Missing package should be silently skipped
+        assert!(!map.contains_key("pkg"));
+        assert_eq!(map["app"], Value::String("MyApp".into()));
+    }
+
+    #[test]
+    fn test_use_reads_manifest_main_field() {
+        let tmp = std::env::temp_dir().join("synx-use-test-main");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let pkg_dir = tmp.join("synx_packages/@test/myapp");
+        std::fs::create_dir_all(pkg_dir.join("src")).unwrap();
+        std::fs::write(pkg_dir.join("synx-pkg.synx"), "name @test/myapp\nversion 1.0.0\nmain src/main.synx\n").unwrap();
+        std::fs::write(pkg_dir.join("src/main.synx"), "app_name MyApp\nversion 2.0.0\n").unwrap();
+
+        let mut r = parse("!active\n!use @test/myapp as myapp\napp Test");
+        let opts = Options {
+            base_path: Some(tmp.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        resolve(&mut r, &opts);
+        let map = r.root.as_object().unwrap();
+        assert!(map.contains_key("myapp"), "package not loaded via manifest");
+        let pkg = map["myapp"].as_object().unwrap();
+        assert_eq!(pkg["app_name"], Value::String("MyApp".into()));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_read_manifest_main_function() {
+        let tmp = std::env::temp_dir().join("synx-manifest-main-test");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("src")).unwrap();
+        std::fs::write(tmp.join("synx-pkg.synx"), "name @test/pkg\nversion 1.0.0\nmain src/main.synx\n").unwrap();
+        std::fs::write(tmp.join("src/main.synx"), "key value\n").unwrap();
+
+        let result = read_manifest_main(&tmp);
+        assert!(result.is_some(), "should read main from synx-pkg.synx");
+        let path = result.unwrap();
+        assert!(path.ends_with("src/main.synx") || path.ends_with("src\\main.synx"));
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

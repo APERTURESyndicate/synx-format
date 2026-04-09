@@ -595,6 +595,283 @@ Result: `"home/user/documents"`
 
 ---
 
+#### `:ref` — Reference and Chain
+
+Resolves a key by name and passes the value to subsequent markers in the chain. Similar to `:alias`, but designed for chaining with `:calc` and other transformations.
+
+```synx
+!active
+
+base_rate 100
+adjusted:ref:calc:*2 base_rate
+```
+
+Result: `adjusted` = 200. The shorthand `:ref:calc:*2 base_rate` resolves `base_rate` → 100, then computes `100 * 2`.
+
+---
+
+#### `:i18n` — Internationalization
+
+Selects a translated value based on the runtime locale. Child keys are language codes; the engine picks the one matching `options.lang` (defaults to `en`).
+
+```synx
+!active
+
+greeting:i18n
+  en Hello
+  ru Привет
+  de Hallo
+```
+
+**Pluralization** — append the count field name: `:i18n:count_field`
+
+```synx
+!active
+
+items_label:i18n:item_count
+  en
+    one {count} item
+    other {count} items
+  ru
+    one {count} предмет
+    few {count} предмета
+    many {count} предметов
+    other {count} предметов
+```
+
+Plural categories follow CLDR rules (en: one/other, ru: one/few/many/other). `{count}` is substituted with the referenced field's value.
+
+---
+
+#### `:clamp` — Numeric Range Clamping
+
+Clamps a numeric value to a minimum–maximum range.
+
+```synx
+!active
+
+volume:clamp:0:100 150
+# → 100
+
+brightness:clamp:0:255 -10
+# → 0
+```
+
+Error if `MIN > MAX`.
+
+---
+
+#### `:round` — Numeric Rounding
+
+Rounds a numeric value to N decimal places.
+
+```synx
+!active
+
+price:round:2 19.999
+# → 20.00
+
+pi:round:4 3.14159265
+# → 3.1416
+
+whole:round:0 42.7
+# → 43
+```
+
+Default: 0 decimal places (rounds to integer).
+
+---
+
+#### `:format` — Printf-Style Formatting
+
+Formats a value using a printf-style pattern.
+
+```synx
+!active
+
+price:format:%.2f 19.9
+# → "19.90"
+
+code:format:%04d 42
+# → "0042"
+```
+
+Supported patterns: `%.Nf` (float), `%d` (int), `%0Nd` (zero-padded). Max width/precision: 4096/1024.
+
+---
+
+#### `:map` — Lookup Table
+
+Maps a value through a lookup table. Child list items are `lookup_value result_text` pairs.
+
+```synx
+!active
+
+status_labels
+  200 OK
+  404 Not Found
+  500 Internal Server Error
+
+result:map:status_labels
+  - 200
+  - 404
+  - 500
+```
+
+Result: `["OK", "Not Found", "Internal Server Error"]`. If no match found, returns `null`.
+
+---
+
+#### `:once` — Generate Once, Cache
+
+Generates a value once at first parse and caches it in a `.synx.lock` sidecar file for subsequent reads.
+
+```synx
+!active
+
+instance_id:once:uuid
+# → "550e8400-e29b-41d4-a716-446655440000" (stable across parses)
+
+created_at:once:timestamp
+# → "2026-04-01T12:00:00Z" (frozen at first parse)
+```
+
+Types: `uuid`, `timestamp`, `random`.
+
+---
+
+#### `:version` — Version Comparison
+
+Compares a value against a semantic version constraint. Returns a boolean.
+
+```synx
+!active
+
+app_ok:version:>=:1.0.0 1.2.3
+# → true
+
+engine_ok:version:>=:2.0.0 1.9.5
+# → false
+```
+
+Operators: `>=`, `<=`, `>`, `<`, `==`, `!=`. Parses semver (x.y.z…).
+
+---
+
+#### `:watch` — Read External File
+
+Reads an external JSON or SYNX file at parse time and injects its content as the value.
+
+```synx
+!active
+
+all_flags:watch ./flags.synx
+db_host:watch:database.host ./infra.json
+```
+
+Optional key path after `:watch:` extracts a specific nested value. Max depth: 16, max size: 10 MiB. Path-jail enforced.
+
+---
+
+#### `:fallback` — File Fallback
+
+If the primary source file is missing, uses the fallback path instead.
+
+```synx
+!active
+
+config:fallback:./defaults.synx ./overrides.synx
+```
+
+Also applies if the value is null or empty.
+
+---
+
+#### `:spam` — Rate Limiting
+
+Limits how many times a value can be accessed within a time window.
+
+```synx
+!active
+
+api_endpoint:spam:5:60 https://api.example.com/data
+# Max 5 accesses per 60 seconds
+```
+
+Window defaults to 1 second if omitted. The counter lives in process memory and resets on restart.
+
+---
+
+#### `:prompt` — LLM Prompt Label
+
+Formats a subtree as a labeled code fence for LLM consumption.
+
+```synx
+!active
+
+config_block:prompt:AppConfig
+  app_name MyCoolApp
+  version 2.1.0
+```
+
+Output: `AppConfig (SYNX):\n```synx\n...\n````
+
+---
+
+#### `:vision` — Image Metadata (pass-through)
+
+Marks a value as an image reference for vision model input. No engine transformation — applications detect via metadata.
+
+```synx
+!active
+diagram:vision ./docs/architecture.png
+```
+
+---
+
+#### `:audio` — Audio Metadata (pass-through)
+
+Marks a value as an audio reference for audio model input. No engine transformation — applications detect via metadata.
+
+```synx
+!active
+recording:audio ./meetings/standup.mp3
+```
+
+---
+
+#### `:import` — Alias for `:include`
+
+Identical to `:include`. Use whichever reads more naturally.
+
+```synx
+!active
+db:import ./config/db.synx
+```
+
+---
+
+#### `:inherit` — Object Inheritance (Mixin)
+
+Inherits all fields from one or more parent objects. Child fields take priority.
+
+```synx
+!active
+
+base
+  host localhost
+  port 8080
+  debug false
+
+production:inherit base
+  host prod.example.com
+  debug false
+```
+
+Result: `production` = `{ "host": "prod.example.com", "port": 8080, "debug": false }`. Parents are merged left to right, then child overrides. Resolved in a pre-pass before other markers.
+
+---
+
 ### 3.3 Functions Summary Table
 
 | Function | Description | Example |
@@ -609,10 +886,26 @@ Result: `"home/user/documents"`
 | `:default:X` | Fallback (in combination) | `port:env:default:8080 PORT` |
 | `:unique` | List deduplication | `tags:unique` |
 | `:include` | Include external file | `db:include ./db.synx` |
+| `:import` | Alias for `:include` | `db:import ./db.synx` |
 | `:geo` | Value by region | `currency:geo` |
 | `:template` | String interpolation | `greeting:template Hello, {name}!` |
 | `:split` | String → array | `colors:split red, green, blue` |
 | `:join` | Array → string | `tags:join` |
+| `:ref` | Resolve and chain | `adjusted:ref:calc:*2 base_rate` |
+| `:i18n` | Translation by locale | `greeting:i18n` |
+| `:clamp` | Numeric clamping | `volume:clamp:0:100 150` |
+| `:round` | Numeric rounding | `price:round:2 19.999` |
+| `:format` | Printf-style formatting | `price:format:%.2f 19.9` |
+| `:map` | Lookup table | `result:map:status_labels` |
+| `:once` | Generate once, cache | `id:once:uuid` |
+| `:version` | Version comparison | `ok:version:>=:1.0.0 1.2.3` |
+| `:watch` | Read external file | `flags:watch ./flags.synx` |
+| `:fallback` | File fallback | `cfg:fallback:./default.synx ./custom.synx` |
+| `:spam` | Rate limiting | `api:spam:5:60 endpoint` |
+| `:prompt` | LLM prompt label | `ctx:prompt:system Your instructions` |
+| `:vision` | Image metadata | `img:vision ./photo.png` |
+| `:audio` | Audio metadata | `snd:audio ./clip.mp3` |
+| `:inherit` | Object inheritance | `prod:inherit base` |
 
 **Chaining functions** — via `:` chain:
 ```synx
@@ -720,6 +1013,93 @@ Constraints can be combined with commas:
 ```synx
 !active
 password[required, min:8, max:64, type:string] MyP@ssw0rd
+```
+
+---
+
+### 3.6 Directives
+
+Directives are top-level lines that begin with `!` or `#!`. They control the document's mode and metadata. A directive must appear before any key-value lines.
+
+| Directive | Description |
+|---|---|
+| `!active` | Enable markers, constraints, and validation (see §3.1) |
+| `!lock` | Mark document as read-only (metadata flag) |
+| `!include` | Include another SYNX file at the document root level |
+| `!tool` | Reshape output as a tool-call envelope (name + params) |
+| `!schema` | Export a JSON Schema Draft 2020-12 from the document structure |
+| `!llm` | Annotate document for LLM consumption (metadata-only) |
+
+#### `!lock` — Read-Only Hint
+
+Sets the `locked` flag on the parse result. The data tree is unchanged — it is advisory metadata for tooling.
+
+```synx
+!lock
+
+name Alice
+role admin
+```
+
+#### `!include` — Document-Level Include
+
+Includes another SYNX file and merges its contents at the root level. An optional alias assigns the included tree to a named key.
+
+```synx
+!include ./db.synx
+!include ./auth.synx auth_config
+
+name MyApp
+```
+
+Maximum depth: 16. Path-jail security prevents `..` escapes.
+
+#### `!tool` — Tool Call Envelope
+
+Reshapes the output: the first key becomes the tool name, its children become parameters.
+
+```synx
+!tool
+
+web_search
+  query rust async
+  lang en
+  results 10
+```
+
+Output:
+```json
+{
+  "tool": "web_search",
+  "params": {
+    "query": "rust async",
+    "lang": "en",
+    "results": 10
+  }
+}
+```
+
+#### `!schema` — JSON Schema Export
+
+Causes the parser to emit a JSON Schema Draft 2020-12 object derived from the document's keys and constraints.
+
+```synx
+!schema
+
+name[required, type:string]
+port[type:int, min:1, max:65535]
+```
+
+#### `!llm` — LLM Metadata
+
+Metadata-only directive for LLM tooling. Does not change the parsed data tree.
+
+```synx
+!llm
+
+persona Assistant
+role You are a helpful coding assistant
+tone professional and concise
 ```
 
 ---
@@ -1109,7 +1489,7 @@ The SYNX Rust crate (`synx`) provides zero-dependency parsing with a rich type s
 **Installation (Cargo.toml):**
 ```toml
 [dependencies]
-synx = "4.1"
+synx-core = "3.6"
 ```
 
 **Basic Usage:**
@@ -1151,7 +1531,7 @@ fn main() {
 let value = data["server"]["port"];
 ```
 
-**Note:** The Rust parser currently supports **static mode** (no `:random`, `:calc`, `:env` functions). Use it for parsing SYNX data files. For active mode, use the JavaScript or Python libraries.
+**Note:** The Rust `synx-core` crate supports both **static** and **`!active`** modes, including all markers, constraints, `.synxb` compilation, and `!tool` parsing. It is the reference implementation.
 
 ---
 
@@ -1176,7 +1556,7 @@ cargo build -p synx-c --release
 
 **Memory:** every `char*` result is heap-allocated; the caller must `synx_free()` exactly once. Byte buffers from `synx_compile` must be released with `synx_free_bytes(ptr, len)`.
 
-**Functions (v3.6.0):** `synx_parse`, `synx_parse_active`, `synx_stringify`, `synx_format`, `synx_parse_tool`, `synx_compile`, `synx_decompile`, `synx_is_synxb`, `synx_diff` — see `bindings/c-header/include/synx.h`.
+**Functions (v3.6):** `synx_parse`, `synx_parse_active`, `synx_stringify`, `synx_format`, `synx_parse_tool`, `synx_compile`, `synx_decompile`, `synx_is_synxb`, `synx_diff` — see `bindings/c-header/include/synx.h`.
 
 **Minimal example:**
 
@@ -1285,7 +1665,7 @@ func main() {
 }
 ```
 
-**API (v3.6.0):** `Parse`, `ParseActive`, `Stringify`, `Format`, `ParseTool`, `Compile`, `Decompile`, `IsSynxb`, `Diff` — mirror `synx.h`.
+**API (v3.6):** `Parse`, `ParseActive`, `Stringify`, `Format`, `ParseTool`, `Compile`, `Decompile`, `IsSynxb`, `Diff` — mirror `synx.h`.
 
 > **Parity:** Same engine as **`synx-core`** (`!active`, `!tool`, `.synxb`, canonical JSON).
 
@@ -1293,7 +1673,7 @@ func main() {
 
 ### 5.11 Mojo — Python interop (`bindings/mojo`)
 
-[Mojo](https://docs.modular.com/mojo/) can call **CPython** via [`Python.import_module`](https://docs.modular.com/mojo/manual/python/python-from-mojo). The supported way to get **SYNX 3.6.0 parity** with **`synx-core`** is to import **`synx_native`** (the same **PyO3 / maturin** wheel as `pip install synx-format`). This is **not** a standalone Mojo grammar implementation (that would be a separate, large port — analogous to maintaining `synx-js` alongside Rust).
+[Mojo](https://docs.modular.com/mojo/) can call **CPython** via [`Python.import_module`](https://docs.modular.com/mojo/manual/python/python-from-mojo). The supported way to get **SYNX 3.6 parity** with **`synx-core`** is to import **`synx_native`** (the same **PyO3 / maturin** wheel as `pip install synx-format`). This is **not** a standalone Mojo grammar implementation (that would be a separate, large port — analogous to maintaining `synx-js` alongside Rust).
 
 **Setup:** Install Python **`synx_native`** (wheel from this repo or PyPI). Optionally `Python.add_to_path(...)` if you built locally with `maturin develop`.
 
@@ -1334,7 +1714,7 @@ val tool = SynxEngine.parseTool("!tool\nweb_search\n  query test\n")
 val active = SynxEngine.parseActive("!active\nport:env:default:8080 PORT\n")
 ```
 
-**API (v3.6.0):** `SynxEngine.parse`, `parseActive`, `stringify`, `format`, `parseTool`, `diff`, `compile`, `decompile`, `isSynxb` — mirrors [`bindings/c-header/include/synx.h`](../../bindings/c-header/include/synx.h).
+**API (v3.6):** `SynxEngine.parse`, `parseActive`, `stringify`, `format`, `parseTool`, `diff`, `compile`, `decompile`, `isSynxb` — mirrors [`bindings/c-header/include/synx.h`](../../bindings/c-header/include/synx.h).
 
 > **Parity:** Same engine as **`synx-core`** (including **`!active`**, **`!tool`**, **`.synxb`**, **`diff`**). Tooling uses **JDK 17+** for Gradle; published **`com.aperturesyndicate:synx-kotlin`** may follow (use **`publishToMavenLocal`** until then).
 
@@ -1357,7 +1737,7 @@ print(json)
 let tool = try SynxEngine.parseTool("!tool\nweb_search\n  query test\n")
 ```
 
-**API (v3.6.0):** `SynxEngine.parse`, `parseActive`, `stringify(json:)`, `format`, `parseTool`, `diff`, `compile`, `decompile(_:)`, `isSynxb` — mirrors `synx.h`.
+**API (v3.6):** `SynxEngine.parse`, `parseActive`, `stringify(json:)`, `format`, `parseTool`, `diff`, `compile`, `decompile(_:)`, `isSynxb` — mirrors `synx.h`.
 
 > **Parity:** Same engine as **`synx-core`**. `Sources/CSynx/synx.h` must stay in sync with [`bindings/c-header/include/synx.h`](../../bindings/c-header/include/synx.h).
 
@@ -1595,7 +1975,7 @@ Objects are `[ordered]@{}`, arrays are native PowerShell arrays, scalars are typ
 |---|---|---|---|
 | JavaScript | `@aperturesyndicate/synx-format` | `Synx.loadSync()` | Full engine (active + static) |
 | Python | `synx-format` | `Synx.load()` | Full engine (active + static) |
-| Rust | `synx` (crates.io) | `Synx::parse()` | Zero-dependency, static-only |
+| Rust | `synx-core` (crates.io) | `Synx::parse()` | Full engine (reference implementation) |
 | C | `synx.h` + `synx-c` lib | `synx_parse()` → JSON | FFI to `synx-core` 3.6.x |
 | C++ | `synx/synx.hpp` + same lib | `synx::parse()` → `optional<string>` | Thin wrapper; same engine |
 | C# | `APERTURESyndicate.Synx` (NuGet) | `SynxFormat` / parser API | .NET 8 library; `Synx.Core` ID was taken on nuget.org |
@@ -1660,32 +2040,63 @@ const jsonString = JSON.stringify(data, null, 2);
 ## 7. Quick Reference
 
 ```
-KEY VALUE                        → simple pair
-key                              → empty object (group)
-  nested_key value               → nesting (2 spaces)
-key |                            → multiline text
+KEY VALUE                        -> simple pair
+key                              -> empty object (group)
+  nested_key value               -> nesting (2 spaces)
+key |                            -> multiline text
   line 1                           (block)
   line 2
-list                             → list
+list                             -> list
   - item 1
   - item 2
-# comment                       → single-line comment
-// comment                      → single-line comment
+# comment                       -> single-line comment
+// comment                      -> single-line comment
 
-─── Only with !active ──────────────────────────
-key:random                       → random item
-key:random 70 20 10              → weighted random
-key:calc A * B                   → arithmetic
-key:env VAR                      → environment variable
-key:env:default:X VAR            → env with default
-key:alias other_key              → reference to another key
-key:secret value                 → hidden value
-key:unique                       → list deduplication
-key:include ./file.synx          → include file
-key[min:N, max:N]                → length/value constraints
-key[type:int]                    → data type
-key[required]                    → required field
-key[enum:a|b|c]                  → allowed values
-key[pattern:regex]               → regex validation
-key[readonly]                    → read-only
+--- Directives ----------------------------------
+!active                          -> enable markers + constraints
+!lock                            -> mark document read-only
+!include ./file.synx             -> include at root level
+!tool                            -> tool-call envelope
+!schema                          -> JSON Schema export
+!llm                             -> LLM metadata flag
+
+--- Markers (require !active) -------------------
+key:env VAR                      -> environment variable
+key:env:default:X VAR            -> env with fallback
+key:calc A * B                   -> arithmetic
+key:alias other_key              -> reference to another key
+key:secret value                 -> hidden value
+key:default dark                 -> default value
+key:random                       -> random item from list
+key:random 70 20 10              -> weighted random
+key:unique                       -> list deduplication
+key:include ./file.synx          -> include file
+key:import ./file.synx           -> alias for :include
+key:template Hello, {name}!      -> string interpolation
+key:split red, green, blue       -> string to array
+key:join:slash                   -> array to string
+key:geo                          -> value by region
+key:ref:calc:*2 base             -> resolve and chain
+key:i18n                         -> translation by locale
+key:clamp:0:100 150              -> numeric clamping
+key:round:2 19.999               -> numeric rounding
+key:format:%.2f 19.9             -> printf formatting
+key:map:lookup_key               -> lookup table
+key:once:uuid                    -> generate once, cache
+key:version:>=:1.0.0 ver         -> version comparison
+key:watch ./flags.synx           -> read external file
+key:fallback:./default.synx path -> file fallback
+key:spam:5:60 endpoint           -> rate limiting
+key:prompt:label subtree         -> LLM prompt label
+key:vision ./photo.png           -> image metadata
+key:audio ./clip.mp3             -> audio metadata
+key:inherit parent               -> object inheritance
+
+--- Constraints (require !active) ---------------
+key[min:N, max:N]                -> length/value constraints
+key[type:int]                    -> data type
+key[required]                    -> required field
+key[enum:a|b|c]                  -> allowed values
+key[pattern:regex]               -> regex validation
+key[readonly]                    -> read-only
 ```

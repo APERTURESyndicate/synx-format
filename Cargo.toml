@@ -5,15 +5,20 @@ members = [
     "crates/synx-format",
     "crates/synx-cli",
     "crates/synx-lsp",
+    "crates/as-cli",
     "bindings/c-header",
     "bindings/node",
     "bindings/python",
     "bindings/wasm",
     "benchmarks/rust",
 ]
+exclude = [
+    "synx_packages/@assynx/text-tools",
+    "synx_packages/template",
+]
 
 [workspace.package]
-version = "3.6.0"
+version = "3.6.1"
 edition = "2021"
 license = "MIT"
 
