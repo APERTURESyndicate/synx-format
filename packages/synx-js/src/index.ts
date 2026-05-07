@@ -22,7 +22,13 @@ export { SynxError } from './types';
 
 // ─── Native binding auto-detection ───────────────────────
 
-const NATIVE_THRESHOLD = 5120; // 5 KB
+// NOTE (3.6.x stability fix): The previous "auto-engine" that switched between
+// pure-TS and the native Rust binding at 5 KB caused observably *different*
+// trees for the same input depending on file size — a critical surprise.
+// We now always use the pure-TS engine in this package; the native binding
+// remains available via `bindings/node` for callers who explicitly want it.
+// Setting this to Infinity disables the auto-route without removing the code path.
+const NATIVE_THRESHOLD = Number.POSITIVE_INFINITY;
 
 const UNSAFE_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 
@@ -558,21 +564,23 @@ class Synx {
   /**
    * Compile a .synx string into compact binary `.synxb` format.
    *
-   * The binary format stores the parsed value tree with an interned string table.
-   * It is deterministic and much faster to load than re-parsing text.
+   * Wire format (v1) — matches `synx-core::binary` for cross-language interop:
+   *   header   : "SYNXB" (5) + version (1) + flags (1) + uncompressed_size u32 LE (4) = 11 bytes
+   *   payload  : raw-deflate(level=9) of (string_table || value_tree)
    *
    * @param text     - The .synx source text.
    * @param resolved - If true and text is `!active`, resolve markers first.
    * @returns A Uint8Array containing the `.synxb` binary.
-   *
-   * @example
-   * ```ts
-   * const binary = Synx.compile('name Alice\nage 30');
-   * fs.writeFileSync('config.synxb', binary);
-   * ```
    */
   static compile(text: string, resolved: boolean = false): Uint8Array {
-    const parsed = Synx.parse(text, { active: resolved });
+    const input = resolved && !/(?:^|\n)\s*!active\b/.test(text) ? '!active\n' + text : text;
+    const parsed = parseData(input);
+    if (parsed.mode === 'active') {
+      resolve(parsed.root, { _includes: parsed.includes } as any);
+    }
+    stripMetadata(parsed.root);
+    const valueTree = parsed.root;
+
     const strings: string[] = [];
     const stringIndex = new Map<string, number>();
 
@@ -584,82 +592,93 @@ class Synx {
       return idx;
     }
 
-    // Collect all strings first
+    // First pass: collect strings (keys + string values) so the string table
+    // is written before encoded values reference it.
     function collectStrings(val: unknown): void {
       if (val === null || val === undefined) return;
       if (typeof val === 'string') { internString(val); return; }
       if (Array.isArray(val)) { val.forEach(collectStrings); return; }
       if (typeof val === 'object') {
-        for (const [k, v] of Object.entries(val as Record<string, unknown>)) {
+        // Sort keys deterministically; matches Rust `entries.sort_unstable_by_key`.
+        const keys = Object.keys(val as Record<string, unknown>).sort();
+        for (const k of keys) {
           internString(k);
-          collectStrings(v);
+          collectStrings((val as Record<string, unknown>)[k]);
         }
       }
     }
-    collectStrings(parsed);
+    collectStrings(valueTree);
 
-    // Encode
-    const buf: number[] = [];
-
-    // Magic + version
-    buf.push(0x53, 0x59, 0x4e, 0x58, 0x42); // SYNXB
-    buf.push(0x01); // version 1
-
-    // Flags: bit0=active, bit3=resolved
-    const isActive = text.trimStart().startsWith('!active');
-    let flags = 0;
-    if (isActive) flags |= 0x01;
-    if (resolved) flags |= 0x08;
-    buf.push(flags);
-
-    // String table
-    writeVarint(buf, strings.length);
+    // Build the *uncompressed* payload (string table || value tree).
+    const payload: number[] = [];
+    writeVarint(payload, strings.length);
+    const enc = new TextEncoder();
     for (const s of strings) {
-      const encoded = new TextEncoder().encode(s);
-      writeVarint(buf, encoded.length);
-      for (const b of encoded) buf.push(b);
+      const bytes = enc.encode(s);
+      writeVarint(payload, bytes.length);
+      for (const b of bytes) payload.push(b);
     }
 
-    // Value tree
     function writeValue(val: unknown): void {
-      if (val === null || val === undefined) { buf.push(0x00); return; }
-      if (typeof val === 'boolean') { buf.push(val ? 0x02 : 0x01); return; }
+      if (val === null || val === undefined) { payload.push(0x00); return; }
+      if (typeof val === 'boolean') { payload.push(val ? 0x02 : 0x01); return; }
       if (typeof val === 'number') {
         if (Number.isInteger(val)) {
-          buf.push(0x03);
-          writeZigzag(buf, val);
+          payload.push(0x03);
+          writeZigzag(payload, val);
         } else {
-          buf.push(0x04);
+          payload.push(0x04);
           const view = new DataView(new ArrayBuffer(8));
-          view.setFloat64(0, val, true); // little-endian
-          for (let i = 0; i < 8; i++) buf.push(view.getUint8(i));
+          view.setFloat64(0, val, true);
+          for (let i = 0; i < 8; i++) payload.push(view.getUint8(i));
         }
         return;
       }
       if (typeof val === 'string') {
-        buf.push(0x05);
-        writeVarint(buf, internString(val));
+        payload.push(0x05);
+        writeVarint(payload, internString(val));
         return;
       }
       if (Array.isArray(val)) {
-        buf.push(0x06);
-        writeVarint(buf, val.length);
+        payload.push(0x06);
+        writeVarint(payload, val.length);
         val.forEach(writeValue);
         return;
       }
       if (typeof val === 'object') {
-        const entries = Object.entries(val as Record<string, unknown>);
-        buf.push(0x07);
-        writeVarint(buf, entries.length);
-        for (const [k, v] of entries) {
-          writeVarint(buf, internString(k));
-          writeValue(v);
+        payload.push(0x07);
+        const obj = val as Record<string, unknown>;
+        const keys = Object.keys(obj).sort();
+        writeVarint(payload, keys.length);
+        for (const k of keys) {
+          writeVarint(payload, internString(k));
+          writeValue(obj[k]);
         }
       }
     }
-    writeValue(parsed);
+    writeValue(valueTree);
 
-    return new Uint8Array(buf);
+    const payloadBytes = Uint8Array.from(payload);
+    const compressed = compressRawDeflate(payloadBytes);
+
+    // Header
+    const isActive = text.trimStart().startsWith('!active');
+    let flags = 0;
+    if (isActive) flags |= 0x01;
+    if (resolved) flags |= 0x08;
+
+    const out = new Uint8Array(11 + compressed.length);
+    out[0] = 0x53; out[1] = 0x59; out[2] = 0x4e; out[3] = 0x58; out[4] = 0x42; // SYNXB
+    out[5] = 0x01;       // version
+    out[6] = flags;      // flags
+    // uncompressed size, little-endian u32
+    const u = payloadBytes.length >>> 0;
+    out[7]  = u & 0xff;
+    out[8]  = (u >>> 8)  & 0xff;
+    out[9]  = (u >>> 16) & 0xff;
+    out[10] = (u >>> 24) & 0xff;
+    out.set(compressed, 11);
+    return out;
   }
 
   /**
@@ -680,55 +699,69 @@ class Synx {
     if (!Synx.isSynxb(data)) {
       throw new SynxError('Not a valid .synxb file');
     }
+    if (data.length < 11) {
+      throw new SynxError('.synxb file is truncated (header too short)');
+    }
 
-    let offset = 5; // skip magic
-    const version = data[offset++];
+    const version = data[5];
     if (version !== 1) throw new SynxError(`Unsupported .synxb version: ${version}`);
 
-    const flags = data[offset++];
+    const flags = data[6];
     const isActive = (flags & 0x01) !== 0;
     const isLocked = (flags & 0x02) !== 0;
 
+    // Uncompressed size, little-endian u32
+    const uncompSize =
+      (data[7]) | (data[8] << 8) | (data[9] << 16) | (data[10] << 24);
+
+    // Decompress raw-deflate payload
+    const compressed = data.slice(11);
+    const payload = decompressRawDeflate(compressed, uncompSize >>> 0);
+    if (payload.length !== (uncompSize >>> 0)) {
+      throw new SynxError(`.synxb size mismatch: expected ${uncompSize}, got ${payload.length}`);
+    }
+
     // String table
-    const [strCount, o1] = readVarint(data, offset); offset = o1;
+    let offset = 0;
+    const [strCount, o1] = readVarint(payload, offset); offset = o1;
     const strings: string[] = [];
     const decoder = new TextDecoder();
     for (let i = 0; i < strCount; i++) {
-      const [len, o2] = readVarint(data, offset); offset = o2;
-      strings.push(decoder.decode(data.slice(offset, offset + len)));
+      const [len, o2] = readVarint(payload, offset); offset = o2;
+      strings.push(decoder.decode(payload.slice(offset, offset + len)));
       offset += len;
     }
 
     // Value tree
     function readValue(): unknown {
-      const tag = data[offset++];
+      const tag = payload[offset++];
       switch (tag) {
         case 0x00: return null;
         case 0x01: return false;
         case 0x02: return true;
-        case 0x03: { const [v, o] = readZigzag(data, offset); offset = o; return v; }
+        case 0x03: { const [v, o] = readZigzag(payload, offset); offset = o; return v; }
         case 0x04: {
-          const view = new DataView(data.buffer, data.byteOffset + offset, 8);
+          const view = new DataView(payload.buffer, payload.byteOffset + offset, 8);
           offset += 8;
           return view.getFloat64(0, true);
         }
-        case 0x05: { const [idx, o] = readVarint(data, offset); offset = o; return strings[idx]; }
+        case 0x05: { const [idx, o] = readVarint(payload, offset); offset = o; return strings[idx]; }
         case 0x06: {
-          const [len, o] = readVarint(data, offset); offset = o;
+          const [len, o] = readVarint(payload, offset); offset = o;
           const arr: unknown[] = [];
           for (let i = 0; i < len; i++) arr.push(readValue());
           return arr;
         }
         case 0x07: {
-          const [len, o] = readVarint(data, offset); offset = o;
+          const [len, o] = readVarint(payload, offset); offset = o;
           const obj: Record<string, unknown> = {};
           for (let i = 0; i < len; i++) {
-            const [ki, o2] = readVarint(data, offset); offset = o2;
+            const [ki, o2] = readVarint(payload, offset); offset = o2;
             obj[strings[ki]] = readValue();
           }
           return obj;
         }
-        case 0x08: { const [idx, o] = readVarint(data, offset); offset = o; return '[SECRET]'; }
+        case 0x08: { const [idx, o] = readVarint(payload, offset); offset = o; void idx; return '[SECRET]'; }
         default: throw new SynxError(`Unknown value tag: 0x${tag.toString(16)}`);
       }
     }
@@ -742,29 +775,109 @@ class Synx {
   }
 
   /**
-   * Parse a `!tool` mode SYNX text, reshaping into `{ tool, params }` format.
+   * Parse a `!tool` mode SYNX text, reshaping into `{ tool, params }` format
+   * per SYNX 3.6 §9.
    *
-   * @param text    - The .synx text (should contain `!tool` directive).
-   * @param options - Optional settings.
-   * @returns `{ tool: string, params: SynxObject }`.
+   * Call mode (`!tool` without `!schema`):
+   *   First top-level key (lexicographically) is the tool name; its children become params.
+   *   Output: `{ tool: "name", params: { ... } }`. Empty input → `{ tool: null, params: {} }`.
+   *
+   * Schema mode (`!tool` + `!schema`):
+   *   Each top-level key becomes `{ name, params }` in a sorted `tools` array.
+   *   Output: `{ tools: [{ name, params }, ...] }`.
    *
    * @example
    * ```ts
-   * const toolCall = Synx.parseTool('!tool\ntool search\nparams\n  query AI');
-   * // { tool: 'search', params: { query: 'AI' } }
+   * Synx.parseTool('!tool\nweb_search\n  query latest Rust');
+   * // → { tool: 'web_search', params: { query: 'latest Rust' } }
    * ```
    */
-  static parseTool(text: string, options: SynxOptions = {}): { tool: string; params: SynxObject } {
-    const parsed = Synx.parse(text, options);
-    const tool = typeof parsed.tool === 'string' ? parsed.tool : '';
-    const params = (typeof parsed.params === 'object' && parsed.params !== null && !Array.isArray(parsed.params))
-      ? parsed.params as SynxObject
-      : {};
-    return { tool, params };
+  static parseTool(
+    text: string,
+    options: SynxOptions = {}
+  ): { tool: string | null; params: SynxObject } | { tools: Array<{ name: string; params: SynxObject }> } {
+    // Run the parse without auto-engine routing — the reshape semantics are tied
+    // to the directive flags, which the pure-TS parser sets.
+    const parsed = parseData(text);
+    const root = parsed.root;
+    if (parsed.mode === 'active') {
+      resolve(root, { ...options, _includes: parsed.includes } as any);
+    }
+    // Strip the internal __synx metadata from the resulting tree.
+    stripMetadata(root);
+
+    const keys = Object.keys(root).sort();
+
+    if (parsed.schema) {
+      const tools = keys.map(k => {
+        const child = root[k];
+        const params: SynxObject =
+          child && typeof child === 'object' && !Array.isArray(child)
+            ? (child as SynxObject)
+            : {};
+        return { name: k, params };
+      });
+      return { tools };
+    }
+
+    // Call mode
+    if (keys.length === 0) {
+      return { tool: null, params: {} };
+    }
+    const toolName = keys[0];
+    const child = root[toolName];
+    const params: SynxObject =
+      child && typeof child === 'object' && !Array.isArray(child)
+        ? (child as SynxObject)
+        : {};
+    return { tool: toolName, params };
   }
 }
 
+/** Recursively strip the non-enumerable __synx metadata field. */
+function stripMetadata(obj: unknown): void {
+  if (!obj || typeof obj !== 'object') return;
+  if (Array.isArray(obj)) {
+    for (const item of obj) stripMetadata(item);
+    return;
+  }
+  const o = obj as Record<string, unknown>;
+  if (Object.prototype.hasOwnProperty.call(o, '__synx')) {
+    try { delete o.__synx; } catch { /* non-configurable */ }
+  }
+  for (const v of Object.values(o)) stripMetadata(v);
+}
+
 // ─── Binary encoding helpers ──────────────────────────────
+
+/** Lazy load Node's zlib once (browser callers don't compile/decompile binary). */
+let _zlib: typeof import('zlib') | undefined;
+function getZlib(): typeof import('zlib') {
+  if (_zlib) return _zlib;
+  try {
+    _zlib = require('zlib');
+    return _zlib!;
+  } catch {
+    throw new SynxError('.synxb compile/decompile requires Node.js zlib (not available in this environment)');
+  }
+}
+
+/** Raw-deflate compression at level 9 (matches Rust `miniz_oxide::deflate::compress_to_vec`). */
+function compressRawDeflate(payload: Uint8Array): Uint8Array {
+  const z = getZlib();
+  const out = z.deflateRawSync(Buffer.from(payload), { level: 9 });
+  return new Uint8Array(out.buffer, out.byteOffset, out.byteLength);
+}
+
+/** Raw-inflate decompression (matches Rust `miniz_oxide::inflate::decompress_to_vec`). */
+function decompressRawDeflate(compressed: Uint8Array, uncompressedSize: number): Uint8Array {
+  const z = getZlib();
+  const out = z.inflateRawSync(Buffer.from(compressed), {
+    // Hint to the decoder to pre-allocate the right buffer size.
+    chunkSize: Math.max(uncompressedSize | 0, 1024),
+  });
+  return new Uint8Array(out.buffer, out.byteOffset, out.byteLength);
+}
 
 function writeVarint(buf: number[], value: number): void {
   let v = value >>> 0;
@@ -928,7 +1041,21 @@ function fmtEmit(nodes: FmtNode[], indent: number): string {
 // ─── Export Converters ────────────────────────────────────
 
 function toJSONString(obj: SynxObject, pretty = true): string {
-  return pretty ? JSON.stringify(obj, null, 2) : JSON.stringify(obj);
+  // Per SYNX 3.6 §10: canonical JSON has object keys sorted lexicographically.
+  // We use a JSON.stringify replacer that returns a sorted shallow copy of any plain object.
+  const replacer = (_k: string, v: unknown): unknown => {
+    if (v && typeof v === 'object' && !Array.isArray(v)) {
+      const sorted: Record<string, unknown> = {};
+      const keys = Object.keys(v as Record<string, unknown>).sort();
+      for (const k of keys) {
+        if (k.startsWith('__synx')) continue; // hide internal metadata
+        sorted[k] = (v as Record<string, unknown>)[k];
+      }
+      return sorted;
+    }
+    return v;
+  };
+  return pretty ? JSON.stringify(obj, replacer, 2) : JSON.stringify(obj, replacer);
 }
 
 function toYAMLString(value: unknown, indent = 0): string {

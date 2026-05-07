@@ -1,3 +1,5 @@
+> Main SYNX site: https://synx.aperturesyndicate.com/
+
 # SYNX Kotlin/JVM (`synx-kotlin`)
 
 **Version:** 3.6.1 — **`SynxEngine`** wraps **`synx-c`** via [**JNA**](https://github.com/java-native-access/jna) (same Rust **`synx-core`** engine as Swift/Go). Not a pure-Kotlin grammar implementation.

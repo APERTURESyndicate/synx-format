@@ -1,3 +1,5 @@
+> Main SYNX site: https://synx.aperturesyndicate.com/
+
 # SYNX for Mojo (`bindings/mojo`)
 
 **Version:** 3.6.1 — **same semantics as `synx-core`**, without maintaining a second grammar implementation in Mojo.

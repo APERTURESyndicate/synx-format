@@ -1,3 +1,5 @@
+> Main SYNX site: https://synx.aperturesyndicate.com/
+
 # tree-sitter-synx
 
 [Tree-sitter](https://tree-sitter.github.io/) grammar for the **SYNX** data format.

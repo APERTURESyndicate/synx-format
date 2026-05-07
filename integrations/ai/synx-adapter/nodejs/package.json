@@ -19,7 +19,7 @@
     "url": "https://github.com/APERTURESyndicate/synx-format"
   },
   "peerDependencies": {
-    "@aperturesyndicate/synx-format": "^3.6.0"
+    "@aperturesyndicate/synx-format": "^3.6.2"
   },
   "peerDependenciesMeta": {
     "@langchain/core": {

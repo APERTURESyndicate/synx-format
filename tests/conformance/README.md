@@ -1,3 +1,5 @@
+> Main SYNX site: https://synx.aperturesyndicate.com/
+
 # SYNX conformance test suite
 
 A set of `.synx` input files and their expected JSON outputs. Any compliant SYNX parser must produce byte-identical JSON for every case.

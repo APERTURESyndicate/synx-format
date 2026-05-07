@@ -1,3 +1,5 @@
+> Main SYNX site: https://synx.aperturesyndicate.com/
+
 # SYNX C++ SDK (`synx-cpp`)
 
 **Version:** 3.6.1 (format + engine parity with `synx-core`)

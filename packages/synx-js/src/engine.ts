@@ -28,18 +28,28 @@ const DEFAULT_MAX_INCLUDE_DEPTH = 16;
 /** Maximum object nesting depth for active-mode resolution (prevents stack overflow). */
 const MAX_RESOLVE_DEPTH = 512;
 
-/** Ensure a file path stays inside the base directory (path jail). */
+/** Ensure a file path stays inside the base directory (path jail).
+ *  Error messages are kept in lock-step with the Rust engine's `jail_path`. */
 function jailPath(base: string, filePath: string): string {
   if (!pathModule) throw new Error('path module not available');
-  // Block absolute paths
+  // Always check leading "/" or "\" first so the message is portable: POSIX
+  // absolute paths and Windows rooted paths both produce the same string.
+  const first = filePath.charCodeAt(0);
+  if (first === 0x2f /* / */ || first === 0x5c /* \ */) {
+    throw new Error(`SECURITY: rooted paths are not allowed: '${filePath}'`);
+  }
   if (pathModule.isAbsolute(filePath)) {
-    throw new Error(`absolute path not allowed: ${filePath}`);
+    throw new Error(`SECURITY: absolute paths are not allowed: '${filePath}'`);
   }
   const resolved = pathModule.resolve(base, filePath);
   const normalizedBase = pathModule.resolve(base);
-  // Ensure resolved path starts with the base directory
+  if (filePath.includes('..') &&
+      !resolved.startsWith(normalizedBase + pathModule.sep) &&
+      resolved !== normalizedBase) {
+    throw new Error(`SECURITY: path traversal detected: '${filePath}'`);
+  }
   if (!resolved.startsWith(normalizedBase + pathModule.sep) && resolved !== normalizedBase) {
-    throw new Error(`path escapes base directory: ${filePath}`);
+    throw new Error(`SECURITY: path escapes base directory: '${filePath}'`);
   }
   return resolved;
 }
@@ -83,6 +93,19 @@ class SynxSecret {
 
 const SPAM_BUCKETS = new Map<string, number[]>();
 
+/**
+ * Normalise Node.js fs error messages to OS-agnostic strings so that
+ * INCLUDE_ERR / WATCH_ERR text matches the Rust engine. Without this, the
+ * surface depends on the host OS ("ENOENT: no such file or directory" on Linux,
+ * "ENOENT…" + Windows variant) — diff-noisy and not portable.
+ */
+function fmtIoErr(err: any, ctx: string): string {
+  const code = err && err.code;
+  if (code === 'ENOENT') return `file not found: ${ctx}`;
+  if (code === 'EACCES' || code === 'EPERM') return `permission denied: ${ctx}`;
+  return err && err.message ? err.message : String(err);
+}
+
 // ─── Engine ───────────────────────────────────────────────
 
 export function resolve(
@@ -102,8 +125,11 @@ export function resolve(
       if (k.startsWith('_')) delete obj[k];
     }
     // ── Load !include directives ──
-    if (!includesMap && (options as any)._includes) {
-      includesMap = loadIncludes((options as any)._includes as SynxInclude[], options);
+    if (!includesMap) {
+      const inc = (options as any)._includes;
+      includesMap = inc
+        ? loadIncludes(inc as SynxInclude[], options)
+        : new Map<string, SynxObject>();
     }
   }
 
@@ -168,10 +194,10 @@ export function resolve(
       }
     }
 
-    // ── :include ──
-    if (markers.includes('include') && typeof obj[key] === 'string') {
+    // ── :include / :import ──
+    if ((markers.includes('include') || markers.includes('import')) && typeof obj[key] === 'string') {
       if (!fs || !pathModule) {
-        obj[key] = 'INCLUDE_ERR: :include is not supported in browser';
+        obj[key] = 'INCLUDE_ERR: :include/:import is not supported in browser';
         continue;
       }
       const maxDepth = options.maxIncludeDepth ?? DEFAULT_MAX_INCLUDE_DEPTH;
@@ -191,29 +217,36 @@ export function resolve(
           resolve(included, { ...options, basePath: pathModule.dirname(fullPath), _includeDepth: currentDepth + 1 } as any, root);
         }
         obj[key] = included;
+        // Register the loaded subtree under the key as an alias so
+        // `{leaf:<key>}` interpolation finds it (parity with !include directives).
+        if (includesMap) {
+          includesMap.set(key, included as SynxObject);
+        }
       } catch (e: any) {
-        obj[key] = `INCLUDE_ERR: ${e.message}`;
+        obj[key] = `INCLUDE_ERR: ${fmtIoErr(e, includePath)}`;
       }
       continue;
     }
 
     // ── :env ──
-    if (markers.includes('env')) {
-      const varName = String(value);
+    // Only resolve when the value is the string variable name. Mirrors the
+    // Rust engine's `if let Some(Value::String(var_name)) = map.get(key)` guard
+    // so that `key:env:default:foo` with no value (which is parsed as a group)
+    // keeps its `{}` shape instead of accidentally applying the default.
+    if (markers.includes('env') && typeof value === 'string') {
+      const varName = value;
       const envSource = options.env || (typeof process !== 'undefined' ? process.env : {});
       const envVal = envSource[varName];
 
-      // Check for :default in the marker chain
       const defaultIdx = markers.indexOf('default');
-      // Check if key has (string) type hint — if so, skip auto-detection
       const forceString = metaMap[key]?.typeHint === 'string';
       if (envVal !== undefined && envVal !== '') {
-        obj[key] = forceString ? envVal : (isNaN(Number(envVal)) ? envVal : Number(envVal));
+        obj[key] = forceString ? envVal : castPrimitive(envVal);
       } else if (defaultIdx !== -1 && markers.length > defaultIdx + 1) {
         // :env:default:VALUE — join all parts after 'default' back with ':'
         // to preserve IPs (0.0.0.0) and compound values
         const fallback = markers.slice(defaultIdx + 1).join(':');
-        obj[key] = forceString ? fallback : (isNaN(Number(fallback)) ? fallback : Number(fallback));
+        obj[key] = forceString ? fallback : castPrimitive(fallback);
       } else {
         obj[key] = null;
       }
@@ -269,12 +302,33 @@ export function resolve(
 
     // ── :i18n ──
     // Selects a localized value from a nested object based on options.lang.
-    // Syntax: name:i18n\n  en Plains\n  ru Равнины
+    // Plain syntax:        name:i18n\n  en Plains\n  ru Равнины
+    // Plural syntax:       title:i18n:item_count\n  en\n    one {count} item\n    other {count} items\n  ru\n    one ...\n    few ...\n    many ...\n    other ...
     if (markers.includes('i18n') && obj[key] && typeof obj[key] === 'object' && !Array.isArray(obj[key])) {
       const translations = obj[key] as SynxObject;
       const lang = options.lang || 'en';
-      const val = translations[lang] ?? translations['en'] ?? Object.values(translations)[0] ?? null;
-      obj[key] = val;
+      let val: SynxValue = translations[lang] ?? translations['en'] ?? Object.values(translations)[0] ?? null;
+
+      const i18nIdx = markers.indexOf('i18n');
+      const countField = markers[i18nIdx + 1];
+      // Pluralisation: when the picked language entry is itself an object
+      // (one/few/many/other), choose by count.
+      if (countField && val && typeof val === 'object' && !Array.isArray(val)) {
+        const pluralForms = val as SynxObject;
+        const countRaw = (deepGet(root, countField) ?? deepGet(obj, countField)) as SynxValue;
+        const count = typeof countRaw === 'number' ? countRaw
+                    : typeof countRaw === 'string' && !isNaN(Number(countRaw)) ? Number(countRaw)
+                    : 0;
+        const category = pluralCategory(lang, Math.trunc(count));
+        const chosen = pluralForms[category] ?? pluralForms['other'] ?? Object.values(pluralForms)[0] ?? null;
+        if (typeof chosen === 'string') {
+          obj[key] = chosen.split('{count}').join(String(Math.trunc(count)));
+        } else {
+          obj[key] = chosen;
+        }
+      } else {
+        obj[key] = val;
+      }
     }
 
     // ── :calc ──
@@ -297,6 +351,8 @@ export function resolve(
       }
       // Substitute whole-word occurrences without building RegExp objects
       if (vars.size > 0) expr = replaceVars(expr, vars);
+      // Substitute dot-path references (e.g. base.hp, server.port) before evaluating.
+      expr = replaceDotPaths(expr, root);
       try {
         obj[key] = safeCalc(expr);
       } catch (e: any) {
@@ -331,7 +387,11 @@ export function resolve(
           targetParentMeta?.[targetLeafKey]?.markers?.includes('alias') ?? false;
         const isCycle = targetHasAlias && typeof targetVal === 'string' && targetVal === key;
         if (isCycle) {
-          obj[key] = `ALIAS_ERR: circular alias detected: ${key} → ${target}`;
+          // Stable, order-independent message: sort participants lexicographically
+          // so both keys produce the same string regardless of iteration order.
+          const a = currentKeyPath <= target ? currentKeyPath : target;
+          const b = currentKeyPath <= target ? target : currentKeyPath;
+          obj[key] = `ALIAS_ERR: circular alias detected: ${a} → ${b}`;
         } else {
           obj[key] = targetVal ?? null;
         }
@@ -397,7 +457,7 @@ export function resolve(
         if (defaultIdx !== -1 && markers.length > defaultIdx + 1) {
           const fallback = markers.slice(defaultIdx + 1).join(':');
           const forceStr = metaMap[key]?.typeHint === 'string';
-          obj[key] = forceStr ? fallback : (isNaN(Number(fallback)) ? fallback : Number(fallback));
+          obj[key] = forceStr ? fallback : castPrimitive(fallback);
         }
       }
     }
@@ -451,6 +511,52 @@ export function resolve(
       const idx = markers.indexOf('format');
       const pattern = markers[idx + 1] ?? '%s';
       obj[key] = applyFormatPattern(pattern, obj[key]);
+    }
+
+    // ── :replace:FROM:TO ──    @since 3.6.2
+    // Literal substring replacement on a string value. `to` defaults to "" (deletion).
+    // Limitation: `from` and `to` cannot themselves contain `:` since the marker
+    // chain is colon-delimited; for those cases use {interpolation} instead.
+    if (markers.includes('replace') && typeof obj[key] === 'string') {
+      const idx = markers.indexOf('replace');
+      const from = markers[idx + 1];
+      const to = markers[idx + 2] ?? '';
+      if (from !== undefined && from !== '') {
+        obj[key] = (obj[key] as string).split(from).join(to);
+      }
+    }
+
+    // ── :sort  /  :sort:desc ──     @since 3.6.2
+    // Sort an array. Default direction is ascending; `:sort:desc` reverses.
+    // Numbers compare numerically; mixed/string entries fall back to localeCompare.
+    if (markers.includes('sort') && Array.isArray(obj[key])) {
+      const idx = markers.indexOf('sort');
+      const dir = markers[idx + 1];
+      const sorted = (obj[key] as SynxValue[]).slice().sort((a, b) => {
+        if (typeof a === 'number' && typeof b === 'number') return a - b;
+        return String(a).localeCompare(String(b));
+      });
+      if (dir === 'desc') sorted.reverse();
+      obj[key] = sorted;
+    }
+
+    // ── :sum ──     @since 3.6.2
+    // Sum the numeric items of an array. Non-numeric entries are ignored.
+    // Returns an integer when all summands are integers, otherwise a float.
+    if (markers.includes('sum') && Array.isArray(obj[key])) {
+      let total = 0;
+      let allInt = true;
+      for (const v of obj[key] as SynxValue[]) {
+        if (typeof v === 'number') {
+          total += v;
+          if (!Number.isInteger(v)) allInt = false;
+        } else if (typeof v === 'string' && v !== '' && !isNaN(Number(v))) {
+          const n = Number(v);
+          total += n;
+          if (!Number.isInteger(n)) allInt = false;
+        }
+      }
+      obj[key] = allInt ? Math.trunc(total) : total;
     }
 
     // ── :fallback ──
@@ -539,7 +645,7 @@ export function resolve(
               obj[key] = content.trim();
             }
           } catch (e: any) {
-            obj[key] = `WATCH_ERR: ${e.message}`;
+            obj[key] = `WATCH_ERR: ${fmtIoErr(e, filePath)}`;
           }
         }
       }
@@ -589,8 +695,11 @@ function applyInheritance(obj: SynxObject): void {
     const meta = metaMap[key];
     if (!meta || !meta.markers.includes('inherit')) continue;
 
+    // Two supported syntaxes:
+    //   production:inherit:base       → "base" is markers[idx+1]
+    //   production:inherit base       → "base" is meta.args[0] (parser promotes value into args)
     const idx = meta.markers.indexOf('inherit');
-    const parentName = meta.markers[idx + 1];
+    const parentName = meta.markers[idx + 1] || (meta.args && meta.args[0]);
     if (!parentName) continue;
 
     const parentObj = obj[parentName];
@@ -851,7 +960,9 @@ function extractFromFileContent(content: string, keyPath: string, ext: string): 
 
 // ─── Helpers ──────────────────────────────────────────────
 
-/** Serialize a value to SYNX format string (for :prompt marker). */
+/** Serialize a value to SYNX format string (for :prompt marker).
+ *  Keys are emitted in sorted order so that LLM prompts are deterministic
+ *  across runs and across language bindings (matches the Rust engine). */
 function stringifyValue(value: unknown, indent: number): string {
   const sp = ' '.repeat(indent);
   if (value === null || value === undefined) return `${sp}null\n`;
@@ -864,8 +975,10 @@ function stringifyValue(value: unknown, indent: number): string {
   }
   if (typeof value === 'object') {
     let out = '';
-    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-      if (k === '__synx') continue;
+    const obj = value as Record<string, unknown>;
+    const keys = Object.keys(obj).filter(k => k !== '__synx').sort();
+    for (const k of keys) {
+      const v = obj[k];
       if (v && typeof v === 'object' && !Array.isArray(v)) {
         out += `${sp}${k}\n`;
         out += stringifyValue(v, indent + 2);
@@ -888,6 +1001,49 @@ function castPrimitive(val: string): SynxValue {
   if (/^-?\d+$/.test(val)) return parseInt(val, 10);
   if (/^-?\d+\.\d+$/.test(val)) return parseFloat(val);
   return val;
+}
+
+/**
+ * CLDR-inspired plural category selection.
+ * Mirrors the Rust `plural_category` table in `synx-core::engine`.
+ */
+function pluralCategory(lang: string, n: number): string {
+  const absN = Math.abs(n);
+  const n10 = absN % 10;
+  const n100 = absN % 100;
+
+  switch (lang) {
+    case 'ru':
+    case 'uk':
+    case 'be':
+    case 'pl':
+      if (n10 === 1 && n100 !== 11) return 'one';
+      if (n10 >= 2 && n10 <= 4 && !(n100 >= 12 && n100 <= 14)) return 'few';
+      return 'many';
+    case 'cs':
+    case 'sk':
+      if (absN === 1) return 'one';
+      if (absN >= 2 && absN <= 4) return 'few';
+      return 'other';
+    case 'ar':
+      if (absN === 0) return 'zero';
+      if (absN === 1) return 'one';
+      if (absN === 2) return 'two';
+      if (n100 >= 3 && n100 <= 10) return 'few';
+      if (n100 >= 11 && n100 <= 99) return 'many';
+      return 'other';
+    case 'fr':
+    case 'pt':
+      return absN <= 1 ? 'one' : 'other';
+    case 'ja':
+    case 'zh':
+    case 'ko':
+    case 'vi':
+    case 'th':
+      return 'other';
+    default:
+      return absN === 1 ? 'one' : 'other';
+  }
 }
 
 const DELIM_MAP: Record<string, string> = {
@@ -960,6 +1116,48 @@ function replaceVars(expr: string, vars: Map<string, string>): string {
   let result = expr;
   for (const [k, v] of sorted) result = replaceWord(result, k, v);
   return result;
+}
+
+/**
+ * Substitute dot-path references (`a.b.c`) in a calc expression with their
+ * numeric values from the root tree. Tokens without a dot are left unchanged.
+ * Matches the Rust `dot_resolved` pass in `synx-core::engine`.
+ */
+function replaceDotPaths(expr: string, root: SynxObject): string {
+  let out = '';
+  let i = 0;
+  const len = expr.length;
+  while (i < len) {
+    const code = expr.charCodeAt(i);
+    if (isWordChar(code)) {
+      const start = i;
+      let hasDot = false;
+      while (i < len) {
+        const c = expr.charCodeAt(i);
+        if (isWordChar(c)) {
+          i++;
+        } else if (c === 46) { // '.'
+          hasDot = true;
+          i++;
+        } else {
+          break;
+        }
+      }
+      const token = expr.substring(start, i);
+      if (hasDot && token.indexOf('.') !== -1) {
+        const val = deepGet(root, token);
+        if (typeof val === 'number') {
+          out += String(val);
+          continue;
+        }
+      }
+      out += token;
+    } else {
+      out += expr[i];
+      i++;
+    }
+  }
+  return out;
 }
 
 function allowSpamAccess(bucketKey: string, maxCalls: number, windowSec: number): boolean {

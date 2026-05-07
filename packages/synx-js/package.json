@@ -1,63 +1,63 @@
-{
-  "name": "@aperturesyndicate/synx-format",
-  "version": "3.6.1",
-  "description": "SYNX: The Active Data Format. Faster than JSON, cheaper for AI tokens, built-in logic.",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
-  "bin": {
-    "synx": "bin/synx.js"
-  },
-  "browser": "dist/synx.browser.mjs",
-  "exports": {
-    ".": {
-      "types": "./dist/index.d.ts",
-      "require": "./dist/index.js",
-      "import": "./dist/synx.browser.mjs"
-    },
-    "./browser": {
-      "types": "./dist/browser.d.ts",
-      "require": "./dist/synx.browser.js",
-      "import": "./dist/synx.browser.mjs"
-    }
-  },
-  "files": [
-    "dist",
-    "bin",
-    "README.md",
-    "LICENSE",
-    "SPECIFICATION.md"
-  ],
-  "scripts": {
-    "build": "tsc",
-    "build:browser": "node build-browser.js",
-    "build:all": "tsc && node build-browser.js",
-    "test": "npx jest --config jest.config.js",
-    "lint": "eslint src/",
-    "prepublishOnly": "npm run build:all"
-  },
-  "keywords": [
-    "synx",
-    "parser",
-    "config",
-    "json-alternative",
-    "yaml-alternative",
-    "ai-optimized",
-    "data-format",
-    "active-config"
-  ],
-  "author": "APERTURESyndicate <support@aperturesyndicate.com>",
-  "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/APERTURESyndicate/synx-format"
-  },
-  "homepage": "https://github.com/APERTURESyndicate/synx-format",
-  "devDependencies": {
-    "@types/jest": "^29.5.0",
-    "@types/node": "^20.0.0",
-    "esbuild": "^0.27.3",
-    "jest": "^29.7.0",
-    "ts-jest": "^29.1.0",
-    "typescript": "^5.4.0"
-  }
+﻿{
+    "name":  "@aperturesyndicate/synx-format",
+    "version":  "3.6.2",
+    "description":  "SYNX: The Active Data Format. Faster than JSON, cheaper for AI tokens, built-in logic.",
+    "main":  "dist/index.js",
+    "types":  "dist/index.d.ts",
+    "bin":  {
+                "synx":  "bin/synx.js"
+            },
+    "browser":  "dist/synx.browser.mjs",
+    "exports":  {
+                    ".":  {
+                              "types":  "./dist/index.d.ts",
+                              "require":  "./dist/index.js",
+                              "import":  "./dist/index.js"
+                          },
+                    "./browser":  {
+                                      "types":  "./dist/browser.d.ts",
+                                      "require":  "./dist/synx.browser.js",
+                                      "import":  "./dist/synx.browser.mjs"
+                                  }
+                },
+    "files":  [
+                  "dist",
+                  "bin",
+                  "README.md",
+                  "LICENSE",
+                  "SPECIFICATION.md"
+              ],
+    "scripts":  {
+                    "build":  "tsc",
+                    "build:browser":  "node build-browser.js",
+                    "build:all":  "tsc \u0026\u0026 node build-browser.js",
+                    "test":  "npx jest --config jest.config.js",
+                    "lint":  "eslint src/",
+                    "prepublishOnly":  "npm run build:all"
+                },
+    "keywords":  [
+                     "synx",
+                     "parser",
+                     "config",
+                     "json-alternative",
+                     "yaml-alternative",
+                     "ai-optimized",
+                     "data-format",
+                     "active-config"
+                 ],
+    "author":  "APERTURESyndicate \u003csupport@aperturesyndicate.com\u003e",
+    "license":  "MIT",
+    "repository":  {
+                       "type":  "git",
+                       "url":  "https://github.com/APERTURESyndicate/synx-format"
+                   },
+    "homepage":  "https://github.com/APERTURESyndicate/synx-format",
+    "devDependencies":  {
+                            "@types/jest":  "^29.5.0",
+                            "@types/node":  "^20.0.0",
+                            "esbuild":  "^0.27.3",
+                            "jest":  "^29.7.0",
+                            "ts-jest":  "^29.1.0",
+                            "typescript":  "^5.4.0"
+                        }
 }

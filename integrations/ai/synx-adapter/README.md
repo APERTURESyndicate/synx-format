@@ -1,3 +1,5 @@
+> Main SYNX site: https://synx.aperturesyndicate.com/
+
 # SYNX-Adapter
 
 Bridge for AI stacks: turns dicts / object context into **SYNX text** (and optionally a ` ```synx` fenced block, or an **XML wrapper** such as `<synx_data>` for Claude-friendly boundaries).

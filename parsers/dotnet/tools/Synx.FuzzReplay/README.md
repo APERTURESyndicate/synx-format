@@ -1,3 +1,5 @@
+> Main SYNX site: https://synx.aperturesyndicate.com/
+
 # Synx.FuzzReplay
 
 Feeds files through **`SynxFormat.Parse`** and **`SynxFormat.ToJson`** for parity with Rust **`fuzz_parse`** on UTF-8 inputs.

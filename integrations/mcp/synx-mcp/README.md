@@ -1,3 +1,5 @@
+> Main SYNX site: https://synx.aperturesyndicate.com/
+
 # @aperturesyndicate/synx-format-mcp
 
 MCP server (stdio) for SYNX — wraps the **`synx`** CLI.

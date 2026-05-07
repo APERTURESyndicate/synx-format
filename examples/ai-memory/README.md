@@ -1,3 +1,5 @@
+> Main SYNX site: https://synx.aperturesyndicate.com/
+
 # AI Memory Templates (SYNX)
 
 Canonical SYNX templates for building AI agent memory systems.

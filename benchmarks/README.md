@@ -1,3 +1,5 @@
+> Main SYNX site: https://synx.aperturesyndicate.com/
+
 # SYNX Benchmarks
 
 Performance comparison: **JSON · YAML · XML · SYNX** across Rust, Node.js, and Python.

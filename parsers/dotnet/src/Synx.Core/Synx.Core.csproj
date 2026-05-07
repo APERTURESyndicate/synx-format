@@ -10,7 +10,7 @@
   <PropertyGroup>
     <!-- NuGet ID (Synx.Core is taken on nuget.org); code namespace stays Synx -->
     <PackageId>APERTURESyndicate.Synx</PackageId>
-    <Version>3.6.1.0</Version>
+    <Version>3.6.2.0</Version>
     <Authors>APERTURESyndicate</Authors>
     <Company>APERTURESyndicate</Company>
     <Product>SYNX</Product>

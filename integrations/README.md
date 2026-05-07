@@ -1,3 +1,5 @@
+> Main SYNX site: https://synx.aperturesyndicate.com/
+
 # Integrations — editors, IDEs, AI, apps
 
 IDE extensions, language servers, and anything that **uses** SYNX in a host application (not the core parser library).

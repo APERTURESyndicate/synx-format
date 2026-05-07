@@ -60,7 +60,7 @@ function tokenize(expr: string): Token[] {
       continue;
     }
 
-    throw new Error(`SYNX :calc — unexpected character: '${ch}' in expression "${expr}"`);
+    throw new Error(`SYNX :calc — unexpected character: '${ch}' in expression`);
   }
 
   return tokens;

@@ -1,3 +1,5 @@
+> Main SYNX site: https://synx.aperturesyndicate.com/
+
 # SYNX for .NET
 
 C# parser and JSON emitter aligned with [`synx-core`](../../crates/synx-core/): same tree rules as `parser::parse`, deterministic JSON as `to_json` (sorted object keys, matching escapes and float formatting via `Utf8JsonWriter`).

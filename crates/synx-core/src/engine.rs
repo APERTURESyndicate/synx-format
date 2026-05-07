@@ -29,11 +29,20 @@ const MAX_ENGINE_SCRATCH_STRING: usize = 4 * 1024 * 1024;
 /// Validate that `full` path stays within the `base` directory (jail).
 /// Returns `Ok(canonical)` or an `Err` describing the violation.
 fn jail_path(base: &str, file_path: &str) -> Result<std::path::PathBuf, String> {
-    // Block absolute paths in the value itself
+    // Always check leading "/" or "\" first so the message is portable:
+    // POSIX absolute paths and Windows rooted paths both produce the same
+    // "rooted paths are not allowed" string.
+    if let Some(first) = file_path.chars().next() {
+        if first == '/' || first == '\\' {
+            return Err(format!("SECURITY: rooted paths are not allowed: '{}'", file_path));
+        }
+    }
+    // Block any other absolute paths (Windows drive letters, UNC, etc.).
     let fp = std::path::Path::new(file_path);
     if fp.is_absolute() {
         return Err(format!("SECURITY: absolute paths are not allowed: '{}'", file_path));
     }
+
     let base_canonical = match std::fs::canonicalize(base) {
         Ok(p) => p,
         Err(_) => std::path::PathBuf::from(base),
@@ -42,10 +51,15 @@ fn jail_path(base: &str, file_path: &str) -> Result<std::path::PathBuf, String> 
     let full_canonical = match std::fs::canonicalize(&full) {
         Ok(p) => p,
         Err(_) => {
-            // File may not exist yet — at least verify no ".." escapes
+            // File may not exist yet — at least verify no ".." escapes.
             let normalized = full.to_string_lossy();
             if normalized.contains("..") {
                 return Err(format!("SECURITY: path traversal detected: '{}'", file_path));
+            }
+            // Without canonicalisation we cannot prove containment; only
+            // accept if the un-canonicalised join still starts with the base.
+            if !full.starts_with(&base_canonical) {
+                return Err(format!("SECURITY: path escapes base directory: '{}'", file_path));
             }
             return Ok(full);
         }
@@ -63,6 +77,19 @@ fn check_file_size(path: &std::path::Path) -> Result<(), String> {
             Err(format!("SECURITY: file too large ({} bytes, max {})", meta.len(), MAX_FILE_SIZE))
         }
         _ => Ok(()),
+    }
+}
+
+/// Normalise std::io::Error kinds to a portable, OS-agnostic message so that
+/// INCLUDE_ERR / WATCH_ERR strings don't drift between Windows ("The system
+/// cannot find the file specified. (os error 2)") and POSIX ("No such file or
+/// directory"). Other kinds fall through to the platform-specific message.
+fn fmt_io_err(e: &std::io::Error, ctx: &str) -> String {
+    use std::io::ErrorKind;
+    match e.kind() {
+        ErrorKind::NotFound => format!("file not found: {}", ctx),
+        ErrorKind::PermissionDenied => format!("permission denied: {}", ctx),
+        _ => e.to_string(),
     }
 }
 
@@ -101,7 +128,50 @@ pub fn resolve(result: &mut ParseResult, options: &Options) {
     };
 
     // ── Load !include files ──
-    let includes_map = load_includes(&includes_directives, options);
+    let mut includes_map = load_includes(&includes_directives, options);
+
+    // ── Pre-pass: also register `:include`/`:import` marker keys as aliases ──
+    // This makes `{leaf:<key>}` interpolation work for the README pattern:
+    //
+    //   db:include ./common.synx
+    //   greeting Hello, {site_name:db}!
+    //
+    // Without this, only `!include` directives feed the alias map.
+    if let Value::Object(ref root_map) = result.root {
+        for (key, _) in root_map.iter() {
+            let meta = match metadata.get("").and_then(|mm| mm.get(key)) {
+                Some(m) => m,
+                None => continue,
+            };
+            let is_inc = meta.markers.iter().any(|m| m == "include" || m == "import");
+            if !is_inc { continue; }
+            // The current value is the path string from the parser.
+            let path = match root_map.get(key) {
+                Some(Value::String(s)) => s.clone(),
+                _ => continue,
+            };
+            let base = options.base_path.as_deref().unwrap_or(".");
+            let full = match jail_path(base, &path) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            if check_file_size(&full).is_err() { continue; }
+            let text = match std::fs::read_to_string(&full) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            let mut included = parser::parse(&text);
+            if included.mode == Mode::Active {
+                let mut child_opts = options.clone();
+                child_opts._include_depth += 1;
+                if let Some(parent) = full.parent() {
+                    child_opts.base_path = Some(parent.to_string_lossy().into_owned());
+                }
+                resolve(&mut included, &child_opts);
+            }
+            includes_map.entry(key.clone()).or_insert(included.root);
+        }
+    }
 
     // ── Merge packages into root before resolution ──
     if let Value::Object(ref mut root_map) = result.root {
@@ -331,7 +401,7 @@ fn apply_markers(
                 Err(e) => {
                     map.insert(
                         key.to_string(),
-                        Value::String(format!("INCLUDE_ERR: {}", e)),
+                        Value::String(format!("INCLUDE_ERR: {}", fmt_io_err(&e, file_path))),
                     );
                 }
             }
@@ -666,9 +736,17 @@ fn apply_markers(
                     _ => false,
                 };
                 if is_cycle {
+                    // Stable, order-independent message: sort the participants
+                    // lexicographically so both keys produce the same string
+                    // regardless of HashMap iteration order.
+                    let (a, b) = if current_path <= target {
+                        (current_path.as_str(), target.as_str())
+                    } else {
+                        (target.as_str(), current_path.as_str())
+                    };
                     map.insert(
                         key.to_string(),
-                        Value::String(format!("ALIAS_ERR: circular alias detected: {} → {}", current_path, target)),
+                        Value::String(format!("ALIAS_ERR: circular alias detected: {} → {}", a, b)),
                     );
                 } else {
                     let val = target_val.unwrap_or(Value::Null);
@@ -887,6 +965,74 @@ fn apply_markers(
         }
     }
 
+    // ── :replace:FROM:TO ──    (since 3.6.2)
+    // Literal substring replacement on a string value. `TO` defaults to "" (deletion).
+    // `FROM`/`TO` cannot contain ':' because the marker chain is colon-delimited;
+    // for those cases use `{interpolation}` instead.
+    if markers.contains(&"replace".to_string()) {
+        if let Some(Value::String(s)) = map.get(key) {
+            let idx = markers.iter().position(|m| m == "replace").unwrap();
+            let from = markers.get(idx + 1).cloned().unwrap_or_default();
+            let to = markers.get(idx + 2).cloned().unwrap_or_default();
+            if !from.is_empty() {
+                let replaced = s.replace(&from, &to);
+                map.insert(key.to_string(), Value::String(replaced));
+            }
+        }
+    }
+
+    // ── :sort  /  :sort:desc ──    (since 3.6.2)
+    // Sort an array. Numeric items compare numerically; otherwise lexicographic.
+    if markers.contains(&"sort".to_string()) {
+        if let Some(Value::Array(arr)) = map.get(key) {
+            let idx = markers.iter().position(|m| m == "sort").unwrap();
+            let desc = matches!(markers.get(idx + 1).map(|s| s.as_str()), Some("desc"));
+            let mut sorted = arr.clone();
+            sorted.sort_by(|a, b| {
+                match (value_as_number(a), value_as_number(b)) {
+                    (Some(an), Some(bn)) => an
+                        .partial_cmp(&bn)
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                    _ => value_to_string(a).cmp(&value_to_string(b)),
+                }
+            });
+            if desc { sorted.reverse(); }
+            map.insert(key.to_string(), Value::Array(sorted));
+        }
+    }
+
+    // ── :sum ──    (since 3.6.2)
+    // Sum the numeric items of an array. Non-numeric items are ignored.
+    // Returns Int when all summands are integers, Float otherwise.
+    if markers.contains(&"sum".to_string()) {
+        if let Some(Value::Array(arr)) = map.get(key) {
+            let mut total: f64 = 0.0;
+            let mut all_int = true;
+            for v in arr {
+                match v {
+                    Value::Int(n) => total += *n as f64,
+                    Value::Float(f) => {
+                        total += *f;
+                        if f.fract() != 0.0 { all_int = false; }
+                    }
+                    Value::String(s) => {
+                        if let Ok(f) = s.parse::<f64>() {
+                            total += f;
+                            if f.fract() != 0.0 { all_int = false; }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let result = if all_int && total.fract() == 0.0 && total.abs() < i64::MAX as f64 {
+                Value::Int(total as i64)
+            } else {
+                Value::Float(total)
+            };
+            map.insert(key.to_string(), result);
+        }
+    }
+
     // ── :fallback ──
     // Syntax: key:fallback:DEFAULT_PATH value
     // If the value (treated as a file path) doesn't exist on disk, use the fallback.
@@ -993,7 +1139,7 @@ fn apply_markers(
                     map.insert(key.to_string(), value);
                 }
                 Err(e) => {
-                    map.insert(key.to_string(), Value::String(format!("WATCH_ERR: {}", e)));
+                    map.insert(key.to_string(), Value::String(format!("WATCH_ERR: {}", fmt_io_err(&e, file_path))));
                 }
             }
         }
@@ -1139,9 +1285,25 @@ fn validate_constraints(map: &mut HashMap<String, Value>, key: &str, c: &Constra
             }
         }
     }
-    // Note: `pattern` validation is intentionally skipped in the Rust engine
-    // (adding a regex crate would bloat the dependency tree).  Pattern
-    // validation is fully implemented in the JS engine.
+
+    // pattern (regex match — bounded length to avoid pathological compilation costs)
+    if let Some(ref pat) = c.pattern {
+        if pat.len() <= 256 {
+            if let Value::String(ref s) = val {
+                match regex::Regex::new(pat) {
+                    Ok(re) if !re.is_match(s) => {
+                        map.insert(key.to_string(), Value::String(
+                            format!("CONSTRAINT_ERR: '{}' does not match pattern /{}/", key, pat),
+                        ));
+                        return;
+                    }
+                    Ok(_) => {}
+                    // Invalid regex — skip silently, matching the JS engine.
+                    Err(_) => {}
+                }
+            }
+        }
+    }
 }
 
 // ─── New-marker helpers ───────────────────────────────────
@@ -1195,10 +1357,41 @@ fn format_float_pattern(pattern: &str, f: f64) -> String {
     // Same rationale as MAX_FMT_WIDTH: avoid pathological precision values.
     const MAX_FMT_PREC: usize = 1024;
     if let Some(s) = pattern.strip_prefix('%') {
+        // %e — exponential form, matches the JS `Number.toExponential()` shape:
+        //   e.g. 123456.789 → "1.23456789e+5"
+        if s == "e" {
+            if f == 0.0 {
+                return "0e+0".to_string();
+            }
+            // Use Rust's exponential formatter (which uses ryu-like shortest
+            // round-trip digits) and then reshape the exponent token to match
+            // JS `toExponential()` (always signed, no leading zeros).
+            let raw = format!("{:e}", f); // e.g. "1.23456789e5" or "1.23456789e-5"
+            if let Some(epos) = raw.rfind('e') {
+                let mantissa = &raw[..epos];
+                let exp_part = &raw[epos + 1..];
+                let (sign, digits) = match exp_part.chars().next() {
+                    Some('+') => ('+', &exp_part[1..]),
+                    Some('-') => ('-', &exp_part[1..]),
+                    _ => ('+', exp_part),
+                };
+                // Strip the decimal point if the mantissa is an integer (1.0 → 1)
+                let mantissa_clean = if mantissa.ends_with(".0") {
+                    &mantissa[..mantissa.len() - 2]
+                } else {
+                    mantissa
+                };
+                return format!("{}e{}{}", mantissa_clean, sign, digits);
+            }
+            return raw;
+        }
         if let Some(inner) = s.strip_suffix('f').or_else(|| s.strip_suffix('e')) {
             if let Some(prec_s) = inner.strip_prefix('.') {
                 if let Ok(prec) = prec_s.parse::<usize>() {
                     let prec = prec.min(MAX_FMT_PREC);
+                    if s.ends_with('e') {
+                        return format!("{:.prec$e}", f, prec = prec);
+                    }
                     return format!("{:.prec$}", f, prec = prec);
                 }
             }
@@ -1303,30 +1496,54 @@ fn clear_spam_buckets() {
 /// Extract a value from file content by key path (JSON dot-path or SYNX key).
 fn extract_from_file_content(content: &str, key_path: &str, ext: &str) -> Option<Value> {
     if ext == "json" {
-        let search = format!("\"{}\"", key_path);
-        if let Some(pos) = content.find(&search) {
-            let after = content[pos + search.len()..].trim_start();
-            if let Some(rest) = after.strip_prefix(':') {
-                let val_s = rest.trim_start()
-                    .trim_end_matches(',')
-                    .trim_end_matches('}')
-                    .trim()
-                    .trim_matches('"');
-                return Some(cast_primitive(val_s));
+        // Real JSON parse via serde_json — supports dot-path traversal.
+        let parsed: serde_json::Value = serde_json::from_str(content).ok()?;
+        let mut current = &parsed;
+        for part in key_path.split('.') {
+            current = current.get(part)?;
+        }
+        return Some(json_value_to_synx(current));
+    }
+
+    // SYNX file: parse it and follow the dot-path through the resulting tree.
+    let parsed = crate::parser::parse(content);
+    let mut current = &parsed.root;
+    for part in key_path.split('.') {
+        match current {
+            Value::Object(map) => {
+                current = map.get(part)?;
+            }
+            _ => return None,
+        }
+    }
+    Some(current.clone())
+}
+
+/// Convert a `serde_json::Value` to `Value` (best-effort).
+fn json_value_to_synx(v: &serde_json::Value) -> Value {
+    match v {
+        serde_json::Value::Null => Value::Null,
+        serde_json::Value::Bool(b) => Value::Bool(*b),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Value::Int(i)
+            } else if let Some(f) = n.as_f64() {
+                Value::Float(f)
+            } else {
+                Value::Null
             }
         }
-        None
-    } else {
-        for line in content.lines() {
-            let trimmed = line.trim_start();
-            if trimmed.starts_with(key_path) {
-                let rest = &trimmed[key_path.len()..];
-                if rest.starts_with(' ') {
-                    return Some(cast_primitive(rest.trim_start()));
-                }
-            }
+        serde_json::Value::String(s) => Value::String(s.clone()),
+        serde_json::Value::Array(arr) => {
+            Value::Array(arr.iter().map(json_value_to_synx).collect())
         }
-        None
+        serde_json::Value::Object(map) => {
+            let mut out = HashMap::new();
+            for (k, v) in map {
+                out.insert(k.clone(), json_value_to_synx(v));
+            }
+            Value::Object(out)
+        }
     }
 }
 
@@ -1525,12 +1742,19 @@ fn apply_inheritance(root: &mut Value, metadata: &HashMap<String, MetaMap>) {
     };
 
     // Collect inherit targets: child_key → [parent1, parent2, ...]
+    //
+    // Two surface syntaxes feed this list:
+    //   production:inherit:base   → parents come from markers[idx+1..]
+    //   production:inherit base   → parser promotes "base" into meta.args
     let mut inherits: Vec<(String, Vec<String>)> = Vec::new();
     for (key, meta) in &root_meta {
         if meta.markers.contains(&"inherit".to_string()) {
             let idx = meta.markers.iter().position(|m| m == "inherit").unwrap();
-            // All markers after "inherit" are parent names (multi-parent support)
-            let parents: Vec<String> = meta.markers[idx + 1..].to_vec();
+            let mut parents: Vec<String> = meta.markers[idx + 1..].to_vec();
+            // Fall back / extend with marker args promoted from a positional value.
+            if parents.is_empty() && !meta.args.is_empty() {
+                parents = meta.args.clone();
+            }
             if !parents.is_empty() {
                 inherits.push((key.clone(), parents));
             }
@@ -1954,12 +2178,24 @@ fn merge_constraints(base: &mut Constraints, incoming: &Constraints) {
 
 /// Validate [] constraints recursively for all object fields that have
 /// a registered constraint rule.
+///
+/// Skips values that already hold a CONSTRAINT_ERR string from the per-key
+/// validation pass in `apply_markers` — otherwise we'd re-validate the error
+/// message itself and report bogus numbers (the length of the error string)
+/// instead of the original value.
 fn validate_field_constraints(value: &mut Value, registry: &HashMap<String, Constraints>) {
     if let Value::Object(ref mut map) = value {
         let keys: Vec<String> = map.keys().cloned().collect();
         for key in &keys {
             if let Some(constraints) = registry.get(key) {
-                validate_constraints(map, key, constraints);
+                let already_errored = matches!(
+                    map.get(key),
+                    Some(Value::String(s)) if s.starts_with("CONSTRAINT_ERR:")
+                        || s.starts_with("TYPE_ERR:")
+                );
+                if !already_errored {
+                    validate_constraints(map, key, constraints);
+                }
             }
 
             if let Some(child) = map.get_mut(key) {

@@ -20,34 +20,73 @@ import type {
   SynxConstraints,
 } from './types';
 
+// ─── Resource limits (per SYNX 3.6 §3) ────────────────────
+
+/** Maximum UTF-8 bytes accepted per parse() — text is truncated to a valid UTF-16 prefix not exceeding this length. */
+const MAX_SYNX_INPUT_BYTES = 16 * 1024 * 1024; // 16 MiB
+/** Maximum line count considered. */
+const MAX_LINE_STARTS = 2_000_000;
+/** Maximum nesting depth for the parser stack. */
+const MAX_PARSE_NESTING_DEPTH = 128;
+/** Maximum accumulated bytes per multiline `key |` block body. */
+const MAX_MULTILINE_BLOCK_BYTES = 1024 * 1024; // 1 MiB
+/** Maximum items per single list. */
+const MAX_LIST_ITEMS = 1_048_576;
+/** Maximum `!include` directives per file. */
+const MAX_INCLUDE_DIRECTIVES = 4096;
+/** Maximum comma-separated parts inside a single `enum:` constraint. */
+const MAX_CONSTRAINT_ENUM_PARTS = 4096;
+/** Maximum `:a:b:c` marker chain segments on one line. */
+const MAX_MARKER_CHAIN_SEGMENTS = 512;
+
 // ─── Helpers ──────────────────────────────────────────────
 
 /** Cast a raw string value to a JS primitive */
 function castType(val: string): SynxValue {
+  const len = val.length;
+
+  // Quoted strings preserve literal value (bypass auto-casting).
+  // Per SYNX 3.6 §8.3.1: "<inner>" or '<inner>' with length >= 2 → string of inner text.
+  if (len >= 2) {
+    const c0q = val.charCodeAt(0);
+    const cN = val.charCodeAt(len - 1);
+    if ((c0q === 34 && cN === 34) || (c0q === 39 && cN === 39)) {
+      return val.substring(1, len - 1);
+    }
+  }
+
   if (val === 'true') return true;
   if (val === 'false') return false;
   if (val === 'null') return null;
 
-  const len = val.length;
   if (len === 0) return val;
 
   const c0 = val.charCodeAt(0);
 
   // Explicit cast: (int)007, (string)90210, (float)3.0, (bool)true, (random), (random:bool)
+  // Only treat the leading `(...)` as a type hint when it looks like an
+  // identifier-shaped token (`[A-Za-z_][A-Za-z0-9_:]*`). Anything else (e.g.
+  // a value that happens to start with a parenthesised arithmetic expression)
+  // is left untouched as a plain string.
   if (c0 === 40 && len > 2) { // '('
     const closeIdx = val.indexOf(')');
     if (closeIdx > 1) {
       const hint = val.substring(1, closeIdx);
-      const raw = val.substring(closeIdx + 1);
-      switch (hint) {
-        case 'int': { const n = parseInt(raw, 10); return isNaN(n) ? 0 : n; }
-        case 'float': { const n = parseFloat(raw); return isNaN(n) ? 0 : n; }
-        case 'bool': return raw.trim() === 'true';
-        case 'string': return raw;
-        case 'random': return Math.floor(Math.random() * 2147483647);
-        case 'random:int': return Math.floor(Math.random() * 2147483647);
-        case 'random:float': return Math.random();
-        case 'random:bool': return Math.random() < 0.5;
+      if (/^[A-Za-z_][A-Za-z0-9_:]*$/.test(hint)) {
+        const raw = val.substring(closeIdx + 1);
+        switch (hint) {
+          case 'int': { const n = parseInt(raw, 10); return isNaN(n) ? 0 : n; }
+          case 'float': { const n = parseFloat(raw); return isNaN(n) ? 0 : n; }
+          case 'bool': return raw.trim() === 'true';
+          case 'string': return raw;
+          case 'random': return Math.floor(Math.random() * 2147483647);
+          case 'random:int': return Math.floor(Math.random() * 2147483647);
+          case 'random:float': return Math.random();
+          case 'random:bool': return Math.random() < 0.5;
+          // Unknown hint — strip the (hint) wrapper and re-cast the bare value
+          // (matches the Rust `cast_typed` fallback to `cast`).
+          default: return castType(raw);
+        }
       }
     }
   }
@@ -120,7 +159,7 @@ function parseConstraints(raw: string): SynxConstraints {
           case 'max': constraints.max = Number(value); break;
           case 'type': constraints.type = value; break;
           case 'pattern': constraints.pattern = value; break;
-          case 'enum': constraints.enum = value.split('|'); break;
+          case 'enum': constraints.enum = value.split('|').slice(0, MAX_CONSTRAINT_ENUM_PARTS); break;
         }
       }
     }
@@ -161,13 +200,115 @@ function saveMeta(
   metaMap[key] = meta;
 }
 
-// ─── Fallback regex for complex lines (type hints, constraints, markers) ──
-const LINE_REGEX = /^([^\s\[:\-#/(][^\s\[:(]*)(?:\(([\w:]+)\))?(?:\[([^\]]*)\])?(?::([^\s]+))?\s*(.*)$/;
+/**
+ * Parse a key line manually, supporting balanced brackets in [constraints].
+ * Returns null if the line is not a valid key line.
+ */
+function parseKeyLine(trimmed: string): {
+  key: string;
+  typeHint?: string;
+  constraintStr?: string;
+  markerChain?: string;
+  rawValue: string;
+} | null {
+  const len = trimmed.length;
+  if (len === 0) return null;
+
+  const first = trimmed.charCodeAt(0);
+  // First char cannot be [, :, -, #, /, ( per §7
+  if (first === 91 || first === 58 || first === 45 || first === 35 || first === 47 || first === 40) {
+    return null;
+  }
+
+  // Extract key — stop at space, tab, [, :, (
+  let pos = 0;
+  while (pos < len) {
+    const ch = trimmed.charCodeAt(pos);
+    if (ch === 32 || ch === 9 || ch === 91 || ch === 58 || ch === 40) break;
+    pos++;
+  }
+  if (pos === 0) return null;
+  const key = trimmed.substring(0, pos);
+
+  let typeHint: string | undefined;
+  let constraintStr: string | undefined;
+  let markerChain: string | undefined;
+
+  // Optional (type)
+  if (pos < len && trimmed.charCodeAt(pos) === 40) { // '('
+    const closeIdx = trimmed.indexOf(')', pos + 1);
+    if (closeIdx !== -1) {
+      typeHint = trimmed.substring(pos + 1, closeIdx);
+      pos = closeIdx + 1;
+    } else {
+      pos++;
+    }
+  }
+
+  // Optional [constraints] — balanced bracket scan to support patterns like ^[A-Z]{2}$
+  if (pos < len && trimmed.charCodeAt(pos) === 91) { // '['
+    pos++;
+    const cStart = pos;
+    let depth = 1;
+    while (pos < len && depth > 0) {
+      const ch = trimmed.charCodeAt(pos);
+      if (ch === 91) depth++;
+      else if (ch === 93) depth--;
+      if (depth > 0) pos++;
+    }
+    if (depth === 0) {
+      constraintStr = trimmed.substring(cStart, pos);
+      pos++; // skip closing ']'
+    } else {
+      // Unbalanced — fallback to first ']' if any
+      const fb = trimmed.indexOf(']', cStart);
+      if (fb !== -1) {
+        constraintStr = trimmed.substring(cStart, fb);
+        pos = fb + 1;
+      } else {
+        constraintStr = trimmed.substring(cStart);
+        pos = len;
+      }
+    }
+  }
+
+  // Optional :markers
+  if (pos < len && trimmed.charCodeAt(pos) === 58) { // ':'
+    const mStart = pos + 1;
+    let mEnd = mStart;
+    while (mEnd < len) {
+      const ch = trimmed.charCodeAt(mEnd);
+      if (ch === 32 || ch === 9) break;
+      mEnd++;
+    }
+    markerChain = trimmed.substring(mStart, mEnd);
+    pos = mEnd;
+  }
+
+  // Skip whitespace, then take rest as value
+  while (pos < len) {
+    const ch = trimmed.charCodeAt(pos);
+    if (ch !== 32 && ch !== 9) break;
+    pos++;
+  }
+  const rawValue = pos < len ? trimmed.substring(pos) : '';
+
+  return { key, typeHint, constraintStr, markerChain, rawValue };
+}
 
 // ─── Parser ───────────────────────────────────────────────
 
 export function parseData(text: string): SynxParseResult {
-  const lines = text.split('\n');
+  // Truncate input to MAX_SYNX_INPUT_BYTES (UTF-16 code-unit boundary).
+  if (text.length > MAX_SYNX_INPUT_BYTES) {
+    text = text.substring(0, MAX_SYNX_INPUT_BYTES);
+  }
+
+  let lines = text.split('\n');
+  if (lines.length > MAX_LINE_STARTS) {
+    lines = lines.slice(0, MAX_LINE_STARTS);
+  }
+
   const root: SynxObject = {};
   const stack: Array<{ indent: number; obj: SynxObject | SynxArray }> = [
     { indent: -1, obj: root },
@@ -176,6 +317,8 @@ export function parseData(text: string): SynxParseResult {
   let mode: SynxMode = 'static';
   let locked = false;
   let llm = false;
+  let tool = false;
+  let schema = false;
   const includes: SynxInclude[] = [];
   let currentBlock: { indent: number; obj: SynxObject; key: string } | null = null;
   let currentList: { indent: number; arr: SynxArray } | null = null;
@@ -231,25 +374,34 @@ export function parseData(text: string): SynxParseResult {
     const trimmed = rawLine.substring(indent, trimEndPos);
     const trimmedLen = trimmed.length;
 
-    // ── Mode declaration: !active / !lock / !include ──
+    // ── Directives: !active / !lock / !llm / !tool / !schema / !include ──
     if (fc === 33) {
       if (trimmed === '!active') { mode = 'active'; continue; }
       if (trimmed === '!lock') { locked = true; continue; }
       if (trimmed === '!llm') { llm = true; continue; }
+      if (trimmed === '!tool') { tool = true; continue; }
+      if (trimmed === '!schema') { schema = true; continue; }
       if (trimmed.startsWith('!include ')) {
-        const parts = trimmed.substring(9).trim().split(/\s+/);
-        const inclPath = parts[0];
-        const alias = parts[1] || inclPath.replace(/^.*[\/\\]/, '').replace(/\.synx$/i, '');
-        includes.push({ path: inclPath, alias });
+        if (includes.length < MAX_INCLUDE_DIRECTIVES) {
+          const parts = trimmed.substring(9).trim().split(/\s+/);
+          const inclPath = parts[0];
+          const alias = parts[1] || inclPath.replace(/^.*[\/\\]/, '').replace(/\.synx$/i, '');
+          includes.push({ path: inclPath, alias });
+        }
         continue;
       }
     }
 
     // ── Continue multiline block ──
     if (currentBlock && indent > currentBlock.indent) {
-      const line = trimmed;
-      currentBlock.obj[currentBlock.key] +=
-        (currentBlock.obj[currentBlock.key] ? '\n' : '') + line;
+      const existing = currentBlock.obj[currentBlock.key] as string;
+      if (existing.length < MAX_MULTILINE_BLOCK_BYTES) {
+        const line = trimmed;
+        const room = MAX_MULTILINE_BLOCK_BYTES - existing.length;
+        const sep = existing ? '\n' : '';
+        const append = sep + line;
+        currentBlock.obj[currentBlock.key] = existing + append.substring(0, room);
+      }
       continue;
     } else {
       currentBlock = null;
@@ -258,6 +410,7 @@ export function parseData(text: string): SynxParseResult {
     // ── List items: '- ' ──
     if (fc === 45 && trimmedLen > 1 && trimmed.charCodeAt(1) === 32) {
       if (currentList && indent > currentList.indent) {
+        if (currentList.arr.length >= MAX_LIST_ITEMS) { continue; }
         const val = stripInlineComment(trimmed.substring(2).trim());
 
         // Check if this list item has sub-keys (peek next line)
@@ -279,12 +432,11 @@ export function parseData(text: string): SynxParseResult {
               nfc !== 45 && nfc !== 35 &&
               !(nfc === 47 && nextIndent + 1 < nextLine.length && nextLine.charCodeAt(nextIndent + 1) === 47)) {
             const itemObj: SynxObject = {};
-            const itemMatch = val.match(LINE_REGEX);
-            if (itemMatch) {
-              const [, iKey, iTypeHint, , , iVal] = itemMatch;
-              let iValue = iVal || '';
-              if (iTypeHint) iValue = `(${iTypeHint})${iValue}`;
-              itemObj[iKey] = iValue ? castType(stripInlineComment(iValue)) : {};
+            const parsed = parseKeyLine(val);
+            if (parsed) {
+              let iValue = parsed.rawValue;
+              if (parsed.typeHint) iValue = `(${parsed.typeHint})${iValue}`;
+              itemObj[parsed.key] = iValue ? castType(stripInlineComment(iValue)) : {};
             } else {
               itemObj['_value'] = castType(val);
             }
@@ -297,7 +449,7 @@ export function parseData(text: string): SynxParseResult {
         currentList.arr.push(castType(val));
         continue;
       }
-      // Not in list context — skip (LINE_REGEX wouldn't match '- ' anyway)
+      // Not in list context — skip (no key-line starting with '- ' is valid)
       continue;
     }
 
@@ -307,12 +459,11 @@ export function parseData(text: string): SynxParseResult {
     }
 
     // ── Validate first char can start a key ──
-    // LINE_REGEX first char: [^\s\[:\-#/(] — we already filtered #, //, -
+    // First char cannot be [ ( : / (already filtered #, //, -)
     if (fc === 91 || fc === 40 || fc === 58 || fc === 47) continue; // [ ( : /
 
     // ── Parse key line ──
-    // FAST PATH: scan key for special chars ( [ :
-    // If none found, skip LINE_REGEX entirely
+    // Manual scanner with balanced [] support for patterns like ^[A-Z]{2}$.
     let key: string;
     let typeHint: string | undefined;
     let constraintStr: string | undefined;
@@ -349,21 +500,24 @@ export function parseData(text: string): SynxParseResult {
       constraintStr = undefined;
       markerChain = undefined;
     } else {
-      // ── Slow path: regex for lines with ( [ : ──
-      const match = trimmed.match(LINE_REGEX);
-      if (!match) continue;
-      [, key, typeHint, constraintStr, markerChain, rawValue] = match;
-      rawValue = rawValue ? stripInlineComment(rawValue.trim()) : '';
+      // ── Slow path: manual scanner for lines with ( [ : ──
+      const parsed = parseKeyLine(trimmed);
+      if (!parsed) continue;
+      key = parsed.key;
+      typeHint = parsed.typeHint;
+      constraintStr = parsed.constraintStr;
+      markerChain = parsed.markerChain;
+      rawValue = parsed.rawValue ? stripInlineComment(parsed.rawValue) : '';
     }
 
     // Apply explicit type cast
     if (typeHint) rawValue = `(${typeHint})${rawValue}`;
 
-    // Parse markers chain
+    // Parse markers chain (with segment cap)
     let markers: string[] = [];
     let markerArgs: string[] = [];
     if (markerChain) {
-      markers = markerChain.split(':');
+      markers = markerChain.split(':').slice(0, MAX_MARKER_CHAIN_SEGMENTS);
     }
 
     // For :random — the rawValue may contain weight percentages
@@ -373,6 +527,13 @@ export function parseData(text: string): SynxParseResult {
         markerArgs = nums;
         rawValue = '';
       }
+    }
+
+    // For :inherit — a non-empty value is the parent-key name, not a scalar value.
+    // Promote it into markerArgs and clear rawValue so the line opens a group.
+    if (markers.length > 0 && markers.includes('inherit') && rawValue) {
+      markerArgs = [rawValue.trim()];
+      rawValue = '';
     }
 
     const constraints = constraintStr ? parseConstraints(constraintStr) : undefined;
@@ -402,7 +563,10 @@ export function parseData(text: string): SynxParseResult {
     } else if (!rawValue) {
       // No value → nested object (group) OR plain list
       parent[key] = {};
-      stack.push({ indent, obj: parent[key] as SynxObject });
+      // Cap nesting depth: still insert the object but don't push deeper.
+      if (stack.length < MAX_PARSE_NESTING_DEPTH) {
+        stack.push({ indent, obj: parent[key] as SynxObject });
+      }
       // Peek ahead: if next meaningful line starts with -, it's a list
       let peekIdx = i + 1;
       while (peekIdx < lines.length) {
@@ -435,6 +599,8 @@ export function parseData(text: string): SynxParseResult {
     mode,
     locked,
     ...(llm ? { llm: true } : {}),
+    ...(tool ? { tool: true } : {}),
+    ...(schema ? { schema: true } : {}),
     includes: includes.length > 0 ? includes : undefined,
   };
 }

@@ -1,3 +1,5 @@
+> Main SYNX site: https://synx.aperturesyndicate.com/
+
 # SYNX WASM Marker Package — Template
 
 Starter template for creating custom SYNX WASM markers. Copy this folder, add your own markers, build, and publish.

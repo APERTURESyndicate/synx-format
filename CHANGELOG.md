@@ -2,6 +2,123 @@
 
 All notable changes to this repository are documented in this file.
 
+## [3.6.2] — 2026-05-07
+
+A stability and parity release. Closes 27 categories of cross-engine
+divergence between `synx-core` (Rust) and `@aperturesyndicate/synx-format`
+(TypeScript), plus three new utility markers. **No surface syntax change**
+to existing markers — same `.synx` file produces the same JSON in every
+binding now.
+
+### Added — three new markers (active mode)
+
+- **`:replace:FROM:TO`** — literal substring replacement on a string value.
+  `TO` defaults to `""` (deletion). `FROM`/`TO` cannot themselves contain
+  `:` (chain delimiter); use `{interpolation}` for those cases.
+  ```synx
+  !active
+  greeting:replace:l:L Hello there      # → "HeLLo there"
+  ```
+- **`:sort`** / **`:sort:desc`** — sort an array. Numeric items compare
+  numerically, otherwise lexicographic. Default direction is ascending.
+  ```synx
+  !active
+  ranked:sort:desc
+    - 5
+    - 1
+    - 3
+  # → [5, 3, 1]
+  ```
+- **`:sum`** — sum the numeric items of an array (non-numeric items are
+  ignored). Returns an integer when all summands are integers, otherwise
+  a float.
+  ```synx
+  !active
+  total:sum
+    - 19.99
+    - 29.99
+    - 5.50
+  # → 55.48
+  ```
+
+### Fixed — cross-engine parity (CRITICAL)
+
+- **`Synx.parse()` no longer silently switches engines at 5 KB.** The pure-TS
+  parser is now used unconditionally. The native binding remains available
+  via `bindings/node` for callers that explicitly opt in. Previously, the
+  same file produced *different trees* depending on its size.
+- **`Synx.parseTool()` rewritten to spec §9.** Sorts top-level keys
+  lexicographically, takes the first as the tool name, returns
+  `{ tool, params }` (call mode) or `{ tools: [...] }` (schema mode).
+  Previously returned empty `{ tool: "", params: {} }`.
+- **`Value::Secret` is now properly redacted in JSON output.** `synx-core`'s
+  `write_json` emits `"[SECRET]"` for the `Value::Secret` variant; previously
+  the raw secret string was leaked. **Security-relevant**.
+- **`.synxb` binary format is now cross-language compatible.** JS
+  `Synx.compile`/`decompile` now use the same wire format as
+  `synx-core::binary` (header + raw-deflate payload via Node `zlib`).
+- **List items with sub-keys parse identically in both engines.** Rust now
+  supports the README pattern `- name Sword\n  damage 50` as an object,
+  matching the long-standing JS behaviour. Previously Rust silently
+  hoisted `damage` into the parent map.
+- **`!tool` and `!schema` directives now parsed by JS parser.** Previously
+  ignored — flags on `SynxParseResult` were never set.
+
+### Fixed — semantic alignment (MAJOR)
+
+- **`pattern` constraint is now enforced in Rust** (`regex` crate added).
+- **Constraint validation runs once, not twice.** Eliminates Rust error
+  messages like `value 52 exceeds max 10` (where 52 was the byte length
+  of the previous error string).
+- **`[constraints]` parser is now bracket-balanced.** Patterns containing
+  `]` such as `[pattern:^[A-Z]{2}$]` parse correctly in both engines.
+- **`:env` casts booleans/`null` from the environment in JS.** `DEBUG=true`
+  now yields `true` (boolean), not `"true"` (string).
+- **`:calc` supports dot-paths in JS** (`base.hp * 5`). Was Rust-only.
+- **`:i18n:count_field` plural forms work in JS** (CLDR-inspired:
+  `one/few/many/other`/`zero`/`two`).
+- **`:watch:nested.field` resolves dot-paths** in Rust for both JSON and
+  SYNX inputs (real `serde_json` parse, real SYNX parse — not substring
+  search).
+- **`:import` marker** is now handled in JS (was Rust-only).
+- **`:include` / `:import` markers register an alias** in the includes map
+  so `{leaf:db}` interpolation works for the README pattern.
+- **`:inherit base` with children** — both engines now treat the value
+  after `:inherit` as the parent name and open a group for the child
+  block. Previously the README-documented pattern silently broke.
+- **`:format:%e`** is implemented in Rust.
+- **`:prompt` emits keys in sorted order** in both engines (deterministic
+  for LLM caching).
+- **`Synx.toJSON()` sorts keys lexicographically** (canonical JSON per
+  spec §10).
+- **`__proto__` / `constructor` / `prototype` keys are blocked** in both
+  engines for safe consumption from JavaScript downstream code.
+- **`synx parse` auto-enables `--active`** when the file declares
+  `!active` or `#!mode:active`. Removes a long-standing UX papercut.
+
+### Fixed — security (MAJOR)
+
+- **Path-jail blocks Linux-style `/foo` and Windows-rooted `\foo`.**
+  Previously, on Windows, `/etc/passwd` was not classified as absolute
+  by `Path::is_absolute()` and could escape the base directory in some
+  edge cases.
+- **Error messages are OS-portable.** ENOENT / "system cannot find" both
+  emit `file not found: <path>`; absolute/rooted blocks emit identical
+  text on Linux and Windows.
+- **JS parser enforces the §3 limits** (16 MiB input, 128 nesting depth,
+  1 MiB multiline block, 1 M list items, 4 K includes, 4 K enum parts,
+  512 marker chain segments). Previously only the Rust core had them.
+
+### Fixed — cosmetic
+
+- **Cycle-alias error messages are now stable.** Both keys in an
+  `a → b → a` cycle produce the same message regardless of HashMap
+  iteration order.
+- **`(unknown_hint)value`** in JS no longer wraps the value back with
+  the unknown hint; falls through to plain cast (matches Rust
+  `cast_typed` fallback). A leading `(`-prefixed value with non-identifier
+  contents (e.g. `(10 + 20) / 2`) is preserved as a literal string.
+
 ## [3.6.1] — 2026-04-09
 
 ### Added

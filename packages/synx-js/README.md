@@ -1,4 +1,6 @@
-ï»¿# SYNX for JS/TS â€” @aperturesyndicate/synx-format
+> Main SYNX site: https://synx.aperturesyndicate.com/
+
+# SYNX for JS/TS — @aperturesyndicate/synx-format
 
 The official JavaScript & TypeScript parser for the SYNX format.
 
@@ -40,10 +42,10 @@ console.log(data.server.port); // typed as number
 
 | Method | Description |
 |---|---|
-| `Synx.parse<T>(text, options?)` | Parse a .synx string â†’ object |
+| `Synx.parse<T>(text, options?)` | Parse a .synx string ? object |
 | `Synx.loadSync<T>(path, options?)` | Load & parse file (sync) |
 | `Synx.load<T>(path, options?)` | Load & parse file (async, returns Promise) |
-| `Synx.stringify(obj, active?)` | Serialize object â†’ .synx string |
+| `Synx.stringify(obj, active?)` | Serialize object ? .synx string |
 
 ### Options
 
@@ -127,8 +129,8 @@ volume[min:0, max:100, type:int] 75
 
 ## Other Languages
 
-- **Python** â€” [synx-format](https://pypi.org/project/synx-format/) on PyPI
-- **Rust** â€” [synx](https://crates.io/crates/synx) on crates.io
+- **Python** — [synx-format](https://pypi.org/project/synx-format/) on PyPI
+- **Rust** — [synx](https://crates.io/crates/synx) on crates.io
   ```bash
   cargo add synx
   ```
@@ -141,4 +143,4 @@ volume[min:0, max:100, type:int] 75
 
 ## License
 
-MIT â€” Â© APERTURESyndicate
+MIT — © APERTURESyndicate
