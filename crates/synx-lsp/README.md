@@ -1,3 +1,5 @@
+> Main SYNX site: https://synx.aperturesyndicate.com/
+
 # synx-lsp
 
 Language Server Protocol implementation for **SYNX** (`.synx`). One binary gives **diagnostics**, **completion**, and **document symbols** in any LSP-capable editor.

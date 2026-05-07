@@ -47,7 +47,11 @@ export type SynxMarker =
   | 'watch'
   | 'prompt'
   | 'vision'
-  | 'audio';
+  | 'audio'
+  // 3.6.2 additions
+  | 'replace'
+  | 'sort'
+  | 'sum';
 
 /** Constraint types for [] validation */
 export interface SynxConstraints {
@@ -86,6 +90,10 @@ export interface SynxParseResult {
   locked?: boolean;
   /** File declares `!llm` (LLM envelope hint; data tree unchanged). @since 3.6.0 */
   llm?: boolean;
+  /** File declares `!tool` (LLM tool-call envelope). */
+  tool?: boolean;
+  /** File declares `!schema` (used with !tool for schema mode). */
+  schema?: boolean;
   includes?: SynxInclude[];
 }
 

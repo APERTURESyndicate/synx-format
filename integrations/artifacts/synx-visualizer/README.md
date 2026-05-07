@@ -1,3 +1,5 @@
+> Main SYNX site: https://synx.aperturesyndicate.com/
+
 # SYNX-Visualizer (React) — Claude Artifacts
 
 Small **React** component that renders SYNX (or SYNX-like indented text) as a **scrollable, monospace** tree in the **Artifacts** panel. It does not embed the full SYNX parser: it highlights **indentation** and **comments** (`#`, `//`) so long payloads stay readable.

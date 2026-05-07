@@ -1,3 +1,5 @@
+> Main SYNX site: https://synx.aperturesyndicate.com/
+
 # SYNX — Sublime Text
 
 Syntax highlighting + **LSP** (`synx-lsp`) for the SYNX format.

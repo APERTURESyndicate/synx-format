@@ -1,3 +1,5 @@
+> Main SYNX site: https://synx.aperturesyndicate.com/
+
 # SYNX Swift package (`Synx`)
 
 **Version:** 3.6.1 — thin Swift wrapper over the **`synx-c`** C library (Rust **`synx-core`**). Same grammar, `!active`, `!tool`, `.synxb`, and canonical JSON.

@@ -1,3 +1,5 @@
+> Main SYNX site: https://synx.aperturesyndicate.com/
+
 <p align="center">
   <img src="https://media.aperturesyndicate.com/asother/as/branding/png/aperturesyndicate.png" alt="APERTURESyndicate" width="360" />
 </p>
@@ -16,6 +18,8 @@
 ## Frozen reference (3.6)
 
 As of **April 2026**, **SYNX 3.6** is **frozen**: the normative definition is [`docs/spec/SYNX-3.6-NORMATIVE.md`](docs/spec/SYNX-3.6-NORMATIVE.md), and the reference implementation is **`synx-core` 3.6.x** checked by [`tests/conformance/`](tests/conformance/). **PATCH** releases may only restore that contract (bugs, spec alignment); new surface syntax stays **additive** until a new normative version (for example 3.7). Full policy: [`docs/spec/CORE-FREEZE.md`](docs/spec/CORE-FREEZE.md).
+
+> **3.6.2 (2026-05-07)** — stability + parity release: closes 27 categories of cross-engine divergence between `synx-core` and `synx-js`, masks `:secret` in CLI JSON output, makes `.synxb` cross-language compatible, balances `[constraints]` brackets so `[pattern:^[A-Z]{2}$]` parses correctly, fixes `Synx.parseTool` reshape, adds `:replace:from:to`, `:sort` / `:sort:desc`, `:sum` markers. See [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
@@ -499,6 +503,15 @@ recording:audio ./welcome.mp3
 db:import ./config/db.synx
 production:inherit base
   host prod.example.com
+shouted:replace:l:L Hello there
+ranked:sort:desc
+  - 5
+  - 1
+  - 3
+total:sum
+  - 19.99
+  - 29.99
+  - 5.50
 ```
 
 ### Constraints (require `!active`)
@@ -552,11 +565,13 @@ SYNX is designed to be **safe by default** — no code execution, no eval, no ne
 
 | Protection | Description |
 |---|---|
-| **Path jail** | `:include`, `:import`, `:watch`, `:fallback` paths cannot escape the project's base directory. Absolute paths and `../` traversal are blocked. |
+| **Path jail** | `:include`, `:import`, `:watch`, `:fallback` paths cannot escape the project's base directory. Absolute paths, Linux-rooted `/foo`, Windows-rooted `\foo` and `../` traversal are all blocked (3.6.2 closed a Windows-only escape). |
 | **Include depth limit** | Nested includes are limited to 16 levels (configurable). Prevents infinite recursion. |
 | **File size limit** | Included files > 10 MB are rejected. Prevents memory exhaustion. |
 | **Calc expression limit** | Expressions longer than 4096 characters are rejected. |
 | **Env isolation** | When `env` option is provided, only that map is used — no fallthrough to `process.env`. |
+| **Secret redaction** | Values marked `:secret` are emitted as `"[SECRET]"` in JSON output of every binding (`synx parse`, `Synx.toJSON`, FFI, WASM). Real values are accessible only via the typed `Value::Secret` API. **Fixed in 3.6.2** — earlier versions of the Rust CLI leaked the raw value. |
+| **Resource limits everywhere** | The pure-TS engine now enforces the same §3 caps as `synx-core` (16 MiB input, 128 nesting depth, 1 MiB multiline, 1 M list items, …). Browser/Node use is no longer DoS-able by oversized input. |
 
 ### Configuration
 

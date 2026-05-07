@@ -1,3 +1,5 @@
+> Main SYNX site: https://synx.aperturesyndicate.com/
+
 # synx_packages
 
 Local package directory for SYNX `!use` directives and WASM marker packs.

@@ -1,6 +1,6 @@
 [package]
 name = "synx-cli"
-version = "3.6.1"
+version = "3.6.2"
 edition = "2021"
 authors = ["APERTURESyndicate <support@aperturesyndicate.com>"]
 description = "SYNX CLI — parse, validate, convert, diff, query, compile .synx files."

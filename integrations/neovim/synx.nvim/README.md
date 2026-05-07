@@ -1,3 +1,5 @@
+> Main SYNX site: https://synx.aperturesyndicate.com/
+
 # synx.nvim (minimal)
 
 Sets **filetype** `synx` for `*.synx`. Combine with:

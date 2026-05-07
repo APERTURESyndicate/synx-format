@@ -1,3 +1,5 @@
+> Main SYNX site: https://synx.aperturesyndicate.com/
+
 # SYNX Go binding (`synx`) — cgo over `synx-core`
 
 **Version:** 3.6.1 — same engine as Rust via the **`synx-c`** shared library.

@@ -1,3 +1,5 @@
+> Main SYNX site: https://synx.aperturesyndicate.com/
+
 # @assynx/text-tools
 
 8 text utility WASM markers for SYNX.

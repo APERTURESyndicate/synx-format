@@ -1,4 +1,6 @@
-﻿# @aperturesyndicate/synx-format-adapter (Node)
+> Main SYNX site: https://synx.aperturesyndicate.com/
+
+# @aperturesyndicate/synx-format-adapter (Node)
 
 Peer: **`@aperturesyndicate/synx-format`**.
 
@@ -12,4 +14,4 @@ LangChain.js (`@langchain/core` as additional dependency):
 import { synxSystemMessage } from '@aperturesyndicate/synx-format-adapter/langchain.js';
 ```
 
-Локально из монорепы: `npm install ../../packages/synx-js` и `npm install` в этой папке (нужен собранный `dist` у `synx-js`).
+???????? ?? ????????: `npm install ../../packages/synx-js` ? `npm install` ? ???? ????? (????? ????????? `dist` ? `synx-js`).

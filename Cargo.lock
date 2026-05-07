@@ -89,7 +89,7 @@ dependencies = [
 
 [[package]]
 name = "as-cli"
-version = "3.6.1"
+version = "3.6.2"
 dependencies = [
  "clap",
  "dirs",
@@ -2028,7 +2028,7 @@ dependencies = [
 
 [[package]]
 name = "synx-bench"
-version = "3.6.1"
+version = "3.6.2"
 dependencies = [
  "criterion",
  "synx-core",
@@ -2036,7 +2036,7 @@ dependencies = [
 
 [[package]]
 name = "synx-c"
-version = "3.6.1"
+version = "3.6.2"
 dependencies = [
  "serde_json",
  "synx-core",
@@ -2044,7 +2044,7 @@ dependencies = [
 
 [[package]]
 name = "synx-cli"
-version = "3.6.1"
+version = "3.6.2"
 dependencies = [
  "clap",
  "dirs",
@@ -2059,7 +2059,7 @@ dependencies = [
 
 [[package]]
 name = "synx-core"
-version = "3.6.1"
+version = "3.6.2"
 dependencies = [
  "ed25519-dalek",
  "itoa",
@@ -2067,6 +2067,7 @@ dependencies = [
  "memchr",
  "miniz_oxide",
  "rand",
+ "regex",
  "ryu",
  "serde",
  "serde_json",
@@ -2076,14 +2077,14 @@ dependencies = [
 
 [[package]]
 name = "synx-format"
-version = "3.6.1"
+version = "3.6.2"
 dependencies = [
  "synx-core",
 ]
 
 [[package]]
 name = "synx-lsp"
-version = "3.6.1"
+version = "3.6.2"
 dependencies = [
  "serde_json",
  "synx-core",
@@ -2093,7 +2094,7 @@ dependencies = [
 
 [[package]]
 name = "synx-node"
-version = "3.6.1"
+version = "3.6.2"
 dependencies = [
  "napi",
  "napi-build",
@@ -2103,7 +2104,7 @@ dependencies = [
 
 [[package]]
 name = "synx-python"
-version = "3.6.1"
+version = "3.6.2"
 dependencies = [
  "pyo3",
  "serde_json",
@@ -2112,7 +2113,7 @@ dependencies = [
 
 [[package]]
 name = "synx-wasm"
-version = "3.6.1"
+version = "3.6.2"
 dependencies = [
  "serde-wasm-bindgen",
  "serde_json",

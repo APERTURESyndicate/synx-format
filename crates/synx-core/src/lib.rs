@@ -279,7 +279,7 @@ fn write_json_depth(out: &mut String, val: &Value, depth: usize) {
             let mut buf = ryu::Buffer::new();
             out.push_str(buf.format(*f));
         }
-        Value::String(s) | Value::Secret(s) => {
+        Value::String(s) => {
             out.push('"');
             for ch in s.chars() {
                 match ch {
@@ -295,6 +295,13 @@ fn write_json_depth(out: &mut String, val: &Value, depth: usize) {
                 }
             }
             out.push('"');
+        }
+        Value::Secret(_) => {
+            // Secrets MUST never appear in JSON output. Per the README contract
+            // ("`:secret` → не попадёт в логи"), we emit a fixed redaction
+            // marker. Callers that need the underlying value must use the
+            // typed Value API and `Value::as_secret()` directly.
+            out.push_str("\"[SECRET]\"");
         }
         Value::Array(arr) => {
             out.push('[');

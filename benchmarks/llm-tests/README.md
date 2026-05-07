@@ -1,3 +1,5 @@
+> Main SYNX site: https://synx.aperturesyndicate.com/
+
 # LLM SYNX Format Compatibility Tests
 
 Comprehensive testing of how well different LLM models understand and work with the SYNX format.

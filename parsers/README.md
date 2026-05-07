@@ -1,3 +1,5 @@
+> Main SYNX site: https://synx.aperturesyndicate.com/
+
 # Parsers and grammars
 
 Everything that **parses** or **defines syntax** for SYNX lives under this tree (or is linked here until a folder move finishes).

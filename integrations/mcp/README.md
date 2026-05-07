@@ -1,3 +1,5 @@
+> Main SYNX site: https://synx.aperturesyndicate.com/
+
 # MCP — Model Context Protocol (Claude Desktop & compatible clients)
 
 [`synx-mcp/`](synx-mcp/) exposes SYNX to agents:

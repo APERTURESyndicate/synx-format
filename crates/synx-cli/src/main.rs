@@ -288,7 +288,23 @@ fn main() {
         Commands::Parse { file, active } => {
             let text = read_file(&file);
             let base = file.parent().map(|p| p.to_string_lossy().into_owned());
-            let root = parse_file(&text, active, base);
+            // Auto-enable `--active` whenever the file declares `!active` or
+            // `#!mode:active`. Forcing the flag on every invocation is a
+            // long-standing UX papercut (`synx parse config.synx` previously
+            // emitted unresolved marker placeholders for active files).
+            let mut auto_active = false;
+            for line in text.lines() {
+                let t = line.trim();
+                if t == "!active" || t.starts_with("#!mode:active") {
+                    auto_active = true;
+                    break;
+                }
+                // Stop scanning once the directive header ends.
+                if !t.is_empty() && !t.starts_with('!') && !t.starts_with('#') && !t.starts_with("//") {
+                    break;
+                }
+            }
+            let root = parse_file(&text, active || auto_active, base);
             println!("{}", value_to_json(&root));
         }
 

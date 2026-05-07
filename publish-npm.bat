@@ -100,11 +100,16 @@ echo   https://www.npmjs.com/package/@aperturesyndicate/synx-format
 echo ============================================================
 echo.
 
-echo [POST] Deprecating old package @aperturesyndicate/synx ...
-echo        This keeps installs working but points users to the new name.
-call npm deprecate @aperturesyndicate/synx@"*" "DEPRECATED: moved to @aperturesyndicate/synx-format. Install: npm i @aperturesyndicate/synx-format"
-if errorlevel 1 (
-    echo [WARN] Could not deprecate @aperturesyndicate/synx (maybe no perms or already deprecated).
+if /i "%~2"=="--deprecate-old" (
+    echo [POST] Deprecating old package @aperturesyndicate/synx ...
+    echo        This keeps installs working but points users to the new name.
+    call npm deprecate @aperturesyndicate/synx@* "DEPRECATED: moved to @aperturesyndicate/synx-format. Install: npm i @aperturesyndicate/synx-format"
+    if errorlevel 1 (
+        echo [WARN] Could not deprecate @aperturesyndicate/synx (maybe no perms or already deprecated).
+    )
+) else (
+    echo [POST] Skipping old-package deprecate step.
+    echo        To run it manually once: publish-npm.bat %~1 --deprecate-old
 )
 
 endlocal

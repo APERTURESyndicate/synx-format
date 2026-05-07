@@ -1,3 +1,5 @@
+> Main SYNX site: https://synx.aperturesyndicate.com/
+
 # Fuzzing synx-core
 
 Three fuzz targets exercise the parser, binary codec, and formatter with arbitrary inputs.
