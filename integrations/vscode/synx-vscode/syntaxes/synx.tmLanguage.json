@@ -13,6 +13,7 @@
     { "include": "#comment-block" },
     { "include": "#comment-hash" },
     { "include": "#comment-slash" },
+    { "include": "#multiline-block" },
     { "include": "#list-item" },
     { "include": "#level0-keys" },
     { "include": "#level1-keys" },
@@ -290,6 +291,22 @@
     "block-pipe": {
       "match": "\\|\\s*$",
       "name": "keyword.operator.pipe.synx"
+    },
+    "multiline-block": {
+      "comment": "Captures `key |` (with optional (type), [constraints] and :markers) and treats every line indented deeper than the key line as block text — matches the Rust parser's `key |` multiline-string semantics.",
+      "begin": "^(\\s*)([^\\s\\[:#/!\\-(][^\\s\\[:(]*)(\\(\\w+\\))?(\\[[^\\]]*\\])?((?::[a-zA-Z_]\\w*)*)\\s+(\\|)\\s*$",
+      "beginCaptures": {
+        "2": { "name": "keyword.control.property.block.synx" },
+        "3": { "name": "storage.type.cast.synx" },
+        "4": { "name": "support.type.constraint.synx" },
+        "5": { "name": "keyword.control.marker.synx" },
+        "6": { "name": "keyword.operator.pipe.synx" }
+      },
+      "while": "^(?:\\1\\s.*|\\s*)$",
+      "contentName": "string.unquoted.block.synx",
+      "patterns": [
+        { "include": "#template-placeholder" }
+      ]
     },
     "template-placeholder": {
       "match": "\\{([^}]+)\\}",

@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.IO.Compression;
 using System.Text;
 
@@ -58,7 +59,9 @@ internal static class SynxBinary
         if (result.Schema) flags |= FlagSchema;
         if (result.Llm) flags |= FlagLlm;
         outStream.WriteByte(flags);                   // 1 byte
-        outStream.Write(BitConverter.GetBytes((uint)uncompressed.Length)); // 4 bytes LE
+        Span<byte> sizeBuf = stackalloc byte[4];
+        BinaryPrimitives.WriteUInt32LittleEndian(sizeBuf, (uint)uncompressed.Length);
+        outStream.Write(sizeBuf);                     // 4 bytes LE
         outStream.Write(compressed);
 
         return outStream.ToArray();
@@ -74,7 +77,7 @@ internal static class SynxBinary
             throw new InvalidDataException($"Unsupported .synxb version: {data[5]} (expected {FormatVersion}).");
 
         byte flags = data[6];
-        uint uncompSize = BitConverter.ToUInt32(data[7..11]);
+        uint uncompSize = BinaryPrimitives.ReadUInt32LittleEndian(data[7..11]);
 
         var compressed = data[11..].ToArray();
         var payload = Inflate(compressed, (int)uncompSize);
@@ -238,7 +241,9 @@ internal static class SynxBinary
                 break;
             case SynxValue.Float f:
                 s.WriteByte(TagFloat);
-                s.Write(BitConverter.GetBytes(f.Value));
+                Span<byte> floatBuf = stackalloc byte[8];
+                BinaryPrimitives.WriteDoubleLittleEndian(floatBuf, f.Value);
+                s.Write(floatBuf);
                 break;
             case SynxValue.Str str:
                 s.WriteByte(TagString);
@@ -289,7 +294,7 @@ internal static class SynxBinary
 
     private static SynxValue.Float DecodeFloat(byte[] data, ref int pos)
     {
-        double v = BitConverter.ToDouble(data, pos);
+        double v = BinaryPrimitives.ReadDoubleLittleEndian(data.AsSpan(pos, 8));
         pos += 8;
         return new SynxValue.Float(v);
     }

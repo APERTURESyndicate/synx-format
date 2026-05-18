@@ -1,0 +1,24 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "3.6.2",
+	"FriendlyName": "SYNX (Active Data Format)",
+	"Description": "Native C++17 parser for SYNX configs (parity with synx-core 3.6.x).",
+	"Category": "Other",
+	"CreatedBy": "APERTURESyndicate",
+	"CreatedByURL": "https://synx.aperturesyndicate.com",
+	"DocsURL": "https://synx.aperturesyndicate.com",
+	"MarketplaceURL": "",
+	"SupportURL": "https://github.com/aperturesyndicate/synx",
+	"CanContainContent": false,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "Synx",
+			"Type": "Runtime",
+			"LoadingPhase": "PreDefault"
+		}
+	]
+}

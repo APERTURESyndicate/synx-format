@@ -19,7 +19,7 @@
 
 As of **April 2026**, **SYNX 3.6** is **frozen**: the normative definition is [`docs/spec/SYNX-3.6-NORMATIVE.md`](docs/spec/SYNX-3.6-NORMATIVE.md), and the reference implementation is **`synx-core` 3.6.x** checked by [`tests/conformance/`](tests/conformance/). **PATCH** releases may only restore that contract (bugs, spec alignment); new surface syntax stays **additive** until a new normative version (for example 3.7). Full policy: [`docs/spec/CORE-FREEZE.md`](docs/spec/CORE-FREEZE.md).
 
-> **3.6.2 (2026-05-07)** — stability + parity release: closes 27 categories of cross-engine divergence between `synx-core` and `synx-js`, masks `:secret` in CLI JSON output, makes `.synxb` cross-language compatible, balances `[constraints]` brackets so `[pattern:^[A-Z]{2}$]` parses correctly, fixes `Synx.parseTool` reshape, adds `:replace:from:to`, `:sort` / `:sort:desc`, `:sum` markers. See [CHANGELOG.md](CHANGELOG.md).
+> **3.6.3 (2026-05-19)** — cross-implementation parity hot-fix release **plus** a structural shift: C++, Dart, Go, Java, Swift, and a new Godot/GDScript engine now ship as **native parsers under `parsers/`** (and `integrations/godot/synx-gdscript/`); the old `bindings/{cpp,go,swift}` FFI wrappers are retired in favour of these from-scratch implementations. The release also closes 17 cross-parser divergences uncovered by a code-review pass — three of them security-relevant (Go `:include` symlink jail bypass, .NET `Secret` leaking to JSON, .NET missing `__proto__` filter). See [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
@@ -28,9 +28,9 @@ As of **April 2026**, **SYNX 3.6** is **frozen**: the normative definition is [`
 - **[docs/SYNX_AT_A_GLANCE.md](docs/SYNX_AT_A_GLANCE.md)** — single-page overview: paths, parsers, fuzz/C#, AI/Claude, benchmarks, verification scripts  
 - **[docs/README.md](docs/README.md)** — index of guides, specification, and benchmark docs  
 - **[docs/repository-layout.md](docs/repository-layout.md)** — full tree (parsers, integrations, bindings)  
-- **[parsers/README.md](parsers/README.md)** — parser implementations (Rust, TS, C#, C++, Go cgo, Swift, Kotlin/JVM, Mojo↔Python, tree-sitter)  
-- **[integrations/README.md](integrations/README.md)** — VS Code, Visual Studio, Sublime, Neovim, MCP, LSP  
-- **[docs/claude.md](docs/claude.md)** — Claude Desktop (MCP), Anthropic prompt helpers, tokenizer notes  
+- **[parsers/README.md](parsers/README.md)** — native parser implementations (Rust, TypeScript, C++, Dart, C# / .NET, Go, Java, Swift); FFI bindings are listed separately in [bindings/](bindings/)
+- **[integrations/README.md](integrations/README.md)** — VS Code, Visual Studio, Sublime, Neovim, Godot, MCP, LSP  
+- **[docs/anthropic/claude.md](docs/anthropic/claude.md)** — Claude Desktop (MCP), Anthropic prompt helpers, tokenizer notes  
 - **[docs/dev/plugins-roadmap.md](docs/dev/plugins-roadmap.md)** — planned registry / plugins (**stub only**; not shipped in the engine yet)  
 
 ---
@@ -151,7 +151,7 @@ Full editor matrix: [`crates/synx-lsp/README.md`](crates/synx-lsp/README.md).
 
 ## Claude & MCP
 
-Use **[`docs/claude.md`](docs/claude.md)** to connect **Claude Desktop** (or any MCP client) to **`integrations/mcp/synx-mcp`** — validate / parse / format `.synx` from the agent without guessing syntax.
+Use **[`docs/anthropic/claude.md`](docs/anthropic/claude.md)** to connect **Claude Desktop** (or any MCP client) to **`integrations/mcp/synx-mcp`** — validate / parse / format `.synx` from the agent without guessing syntax.
 
 ---
 
@@ -382,42 +382,52 @@ dotnet add package APERTURESyndicate.Synx
 # Browse: https://www.nuget.org/packages/APERTURESyndicate.Synx
 ```
 
-Until **`APERTURESyndicate.Synx`** appears on nuget.org, consume the library from this repo: `dotnet add reference parsers/dotnet/src/Synx.Core/Synx.Core.csproj` (or run **`.\publish-csharp.bat`** without `NUGET_API_KEY` and add the `.nupkg` under `artifacts/nuget` as a local feed). Details: [`parsers/dotnet/README.md`](parsers/dotnet/README.md).
+Until **`APERTURESyndicate.Synx`** appears on nuget.org, consume the library from this repo: `dotnet add reference parsers/dotnet/src/Synx.Core/Synx.Core.csproj`, or `dotnet pack parsers/dotnet/src/Synx.Core/Synx.Core.csproj -c Release -o artifacts/nuget` and add `artifacts/nuget` as a local feed. Details: [`parsers/dotnet/README.md`](parsers/dotnet/README.md).
 
 ### Maintainer: publish C# to NuGet
 
-PowerShell: **`.\publish-csharp.bat`** with **`$env:NUGET_API_KEY`** set to the key string only (**no** `<` `>` around it). Clears stale `*.nupkg` in `artifacts/nuget` before pack; pushes only **`APERTURESyndicate.Synx.*.nupkg`**.
+`dotnet pack parsers/dotnet/src/Synx.Core/Synx.Core.csproj -c Release -o artifacts/nuget` then `dotnet nuget push "artifacts/nuget/APERTURESyndicate.Synx.*.nupkg" -k "$env:NUGET_API_KEY" -s https://api.nuget.org/v3/index.json --skip-duplicate`. Clear stale `*.nupkg` in `artifacts/nuget` before pack; push only `APERTURESyndicate.Synx.*.nupkg`.
 
 ### Ready to `git push` or ship?
 
 - Run quality checks when you change core behavior: [`scripts/verify-release-quality.ps1`](scripts/verify-release-quality.ps1) / [`scripts/verify-release-quality.sh`](scripts/verify-release-quality.sh) as appropriate.
 - Do **not** commit secrets (`NUGET_API_KEY`, PyPI tokens); `artifacts/` is gitignored.
-- For a new **NuGet** version, bump **`Version`** in [`parsers/dotnet/src/Synx.Core/Synx.Core.csproj`](parsers/dotnet/src/Synx.Core/Synx.Core.csproj), then **`.\publish-csharp.bat`**.
+- For a new **NuGet** version, bump **`Version`** in [`parsers/dotnet/src/Synx.Core/Synx.Core.csproj`](parsers/dotnet/src/Synx.Core/Synx.Core.csproj), then run the `dotnet pack` + `dotnet nuget push` pair above.
 
-## Binding API Parity (v3.6)
+## API Parity (v3.6)
 
-Unified API surface across runtimes:
+Unified API surface across runtimes. Since 3.6.3, C++, Dart, Go, Java, and Swift ship as **native from-scratch parsers** under [`parsers/`](parsers/) (no `synx-c` / `libsynx` runtime dependency); `bindings/` is reserved for surfaces that still need to call into the Rust engine via FFI/WASM.
+
+### Native parsers — `parsers/` and `crates/`
+
+| Implementation | `parse` | `parse_active` | `parse_tool` | `stringify` | `format` | `compile` | `decompile` | `diff` | Notes |
+|---|---|---|---|---|---|---|---|---|---|
+| Rust core (`synx-core`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | Canonical reference; full `Options` |
+| CLI (`synx`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | `synx parse`, `synx diff`, `synx query`, … |
+| JavaScript / TypeScript ([`packages/synx-js`](packages/synx-js/)) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | Pure TypeScript — npm `@aperturesyndicate/synx-format` |
+| C++17 ([`parsers/cpp`](parsers/cpp/)) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | CMake project; `synx_tests.exe` 42 / 42 |
+| Dart 3 ([`parsers/dart`](parsers/dart/)) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | Pure Dart; `dart test` 37 / 37 |
+| C# / .NET 8 ([`parsers/dotnet`](parsers/dotnet/)) | ✅ | ✅ | ✅ | ✅ (`ToJson`) | ✅ | ✅ | ✅ | ✅ | NuGet `APERTURESyndicate.Synx` |
+| Go ([`parsers/go`](parsers/go/)) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | Pure Go (no cgo); `go test ./...` clean |
+| Java 17 ([`parsers/java`](parsers/java/)) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | Maven `com.aperturesyndicate:synx` |
+| Swift 5 ([`parsers/swift`](parsers/swift/)) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | SwiftPM `Synx`, no FFI |
+| GDScript / Godot 4 ([`integrations/godot/synx-gdscript`](integrations/godot/synx-gdscript/)) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | Pure GDScript editor plugin; ships as a Godot addon |
+
+### FFI / bridge bindings — `bindings/`
 
 | Binding | `parse` | `parse_active` | `parse_tool` | `stringify` | `format` | `compile` | `decompile` | `diff` | Notes |
 |---|---|---|---|---|---|---|---|---|---|
-| Rust core (`synx-core`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | Full options support via `Options` |
-| **CLI (`synx`)** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | `synx parse`, `synx diff`, `synx query`, … |
-| JavaScript (npm `@aperturesyndicate/synx-format`) | ✅ | ✅ | — | ✅ | ✅ | — | — | ✅ | Pure TypeScript implementation |
-| Python (`synx_native`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | `diff(a, b)` / `diff_json(text_a, text_b)` |
-| Node native (`bindings/node`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | `diff(a, b)` / `diffJson(text_a, text_b)` |
-| WebAssembly (`bindings/wasm`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | `diff(text_a, text_b)` → JSON |
-| C FFI (`bindings/c-header`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | `synx_diff(a, b)` → JSON |
-| C++ (`bindings/cpp` + same `synx-c` lib) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | Header `synx/synx.hpp` wraps §C FFI |
-| Go (`bindings/go`, cgo + `synx-c`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | JSON/string API; see `bindings/go/README` (Windows: `CGO_LDFLAGS` + `PATH`) |
-| Mojo (`bindings/mojo` + CPython `synx_native`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | [`Python.import_module`](https://docs.modular.com/mojo/manual/python/python-from-mojo); pip `synx-format`; `.synxb` via hex helpers |
-| Swift (`bindings/swift` + `synx-c`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | SwiftPM `SynxEngine`; link `libsynx_c`; see `bindings/swift/README` |
-| Kotlin/JVM (`bindings/kotlin`, JNA + `synx-c`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | `SynxEngine`; `SYNX_LIB_DIR`; see `bindings/kotlin/README` |
-| C# (NuGet **`APERTURESyndicate.Synx`**, `parsers/dotnet`) | ✅ | ✅ | ✅ | ✅ (`ToJson`) | — | — | — | — | Managed .NET 8 library; `.synxb` / `diff` not in C# yet; not `synx-c` FFI |
+| Python (`synx_native`, [`bindings/python`](bindings/python/)) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | PyO3 over `synx-core` |
+| Node native ([`bindings/node`](bindings/node/)) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | N-API; pure TS lives in `packages/synx-js` |
+| WebAssembly ([`bindings/wasm`](bindings/wasm/)) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | Browser/edge target of the Rust engine |
+| C FFI ([`bindings/c-header`](bindings/c-header/)) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | Reference C ABI (`synx.h`) |
+| Kotlin/JVM ([`bindings/kotlin`](bindings/kotlin/)) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | JNA over `synx-c`; JVM users on Java can use `parsers/java` directly |
+| Mojo ([`bindings/mojo`](bindings/mojo/)) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | Wraps CPython `synx_native`; experimental |
 
 Behavior notes:
 
 - Browser WASM runs without host filesystem/env integration by default.
-- C FFI, C++, Go (cgo), Swift (C interop), Kotlin/JVM (JNA), and WASM `stringify` use JSON strings at the boundary for stable cross-language interop.
+- C FFI, Kotlin/JVM (JNA), and WASM `stringify` use JSON strings at the boundary for stable cross-language interop.
 - This table documents API compatibility only; it does not change parser performance characteristics.
 
 ## Quick SYNX Syntax Reference

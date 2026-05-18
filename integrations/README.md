@@ -12,10 +12,11 @@ Monorepo map (parsers, fuzz, benchmarks, verification): [`../docs/SYNX_AT_A_GLAN
 | [`visualstudio/synx-visualstudio/`](visualstudio/synx-visualstudio/) | **Visual Studio** extension (C# / VS SDK) |
 | [`sublime-text/Synx/`](sublime-text/Synx/) | **Sublime Text** — `synx.sublime-syntax` + LSP setup for `synx-lsp` |
 | [`neovim/synx.nvim/`](neovim/synx.nvim/) | **Neovim** — `ftdetect` for `*.synx` (+ docs for treesitter + LSP) |
+| [`godot/synx-gdscript/`](godot/synx-gdscript/) | **Godot 4** — pure-GDScript SYNX engine (`addons/synx`): parser, `!active` engine, markers, `.synxb`, formatter, JSON I/O, diff |
 | [`ai/`](ai/) | **SYNX-Adapter** — LangChain / LlamaIndex / JS: контекст в SYNX вместо JSON в промптах ([`synx-adapter`](ai/synx-adapter/)) |
 | [`mcp/`](mcp/) | **MCP** — [`synx-mcp`](mcp/synx-mcp/) for Claude Desktop and compatible agents |
 | [`../crates/synx-lsp`](../crates/synx-lsp/) | **Language Server** (`synx-lsp`) — see [`README.md`](../crates/synx-lsp/README.md) |
-| [`../docs/claude.md`](../docs/claude.md) | **Claude / Anthropic** — MCP config + grounding + prompt helpers |
+| [`../docs/anthropic/claude.md`](../docs/anthropic/claude.md) | **Claude / Anthropic** — MCP config + grounding + prompt helpers |
 
 One **LSP** binary covers diagnostics/completion/symbols in Neovim, Sublime (via LSP package), Helix, Zed, Emacs, JetBrains; **syntax** may use Tree-sitter (`tree-sitter-synx/`) or editor-specific grammars (VS Code, Sublime).
 
@@ -27,5 +28,6 @@ One **LSP** binary covers diagnostics/completion/symbols in Neovim, Sublime (via
 | **Visual Studio** | VSIX via Visual Studio Marketplace; sign with publisher account. |
 | **Sublime Text** | [Package Control channel](https://packagecontrol.io/docs/submitting_a_package) or your own `repositories.json` + tags. |
 | **Neovim** | Public Git repo + **Git tags**; users install with lazy/packer/`packadd`. |
-| **MCP (npm)** | `npm publish` for `@aperturesyndicate/synx-format-mcp`; document `npx -y` in `docs/claude.md`. |
+| **Godot** | Publish as a Godot Asset Library entry, or distribute the `addons/synx/` folder via the repo and **Git tags**. |
+| **MCP (npm)** | `npm publish` for `@aperturesyndicate/synx-format-mcp`; document `npx -y` in `docs/anthropic/claude.md`. |
 | **synx-lsp** | `cargo publish -p synx-lsp` on crates.io; users `cargo install synx-lsp`. |

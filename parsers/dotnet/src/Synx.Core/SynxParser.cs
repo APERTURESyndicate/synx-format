@@ -6,7 +6,9 @@ namespace Synx;
 
 internal static class SynxParserCore
 {
-    internal const int MaxParseNestingDepth = 2048;
+    // Matches Rust `MAX_PARSE_NESTING_DEPTH = 128`. Same input must accept/reject
+    // identically across implementations.
+    internal const int MaxParseNestingDepth = 128;
 
     internal static SynxParseResult Parse(string text)
     {
@@ -142,6 +144,12 @@ internal static class SynxParserCore
 
             var parsed = ParseLine(trimmed);
             if (parsed is null)
+                continue;
+
+            // Reject prototype-polluting keys so JSON consumers (notably JS)
+            // are never exposed to __proto__ / constructor / prototype injection.
+            // Matches `synx_core::parser::parse`.
+            if (parsed.Key is "__proto__" or "constructor" or "prototype")
                 continue;
 
             while (stack.Count > 1 && stack[^1].Indent >= indent)
@@ -559,7 +567,9 @@ internal static class SynxParserCore
             "float" => new SynxValue.Float(double.TryParse(val, CultureInfo.InvariantCulture, out var f) ? f : 0),
             "bool" => new SynxValue.Bool(val.Trim() == "true"),
             "string" => new SynxValue.Str(val),
-            "random" or "random:int" => new SynxValue.Int(s_rng.NextInt64()),
+            // Match Rust `rng::random_i64()` — full signed 64-bit range including
+            // negatives. `Random.NextInt64()` (no args) only covers [0, Int64.MaxValue).
+            "random" or "random:int" => new SynxValue.Int(s_rng.NextInt64(long.MinValue, long.MaxValue)),
             "random:float" => new SynxValue.Float(s_rng.NextDouble()),
             "random:bool" => new SynxValue.Bool(s_rng.Next(2) == 1),
             _ => Cast(val),

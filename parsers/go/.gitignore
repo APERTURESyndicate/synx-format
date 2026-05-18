@@ -1,0 +1,12 @@
+# Go build artefacts
+*.test
+*.exe
+*.out
+coverage.txt
+
+# IDE
+.idea/
+.vscode/
+
+# SYNX runtime
+.synx.lock

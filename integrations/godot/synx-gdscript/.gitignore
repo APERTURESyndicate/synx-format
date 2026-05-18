@@ -1,0 +1,14 @@
+# Godot 4+ ignores
+.godot/
+.import/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# SYNX runtime artefacts created by :once
+.synx.lock
