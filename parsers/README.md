@@ -2,23 +2,35 @@
 
 # Parsers and grammars
 
-Everything that **parses** or **defines syntax** for SYNX lives under this tree (or is linked here until a folder move finishes).
+Native parser implementations of the SYNX format — each is a from-scratch
+port of `synx-core`, NOT an FFI wrapper. One source of truth per language,
+no `.dll` / `.so` dependency to ship.
 
-| Path | Role |
-|------|------|
-| [`crates/synx-core/`](../crates/synx-core/) | Canonical **Rust** parser, engine (`!active`), stringify, `diff`, `.synxb`, fuzz targets |
-| [`crates/synx-cli/`](../crates/synx-cli/) | **Rust** CLI (`synx`) — uses `synx-core` |
-| [`packages/synx-js/`](../packages/synx-js/) | **TypeScript** reference parser + npm package `@aperturesyndicate/synx-format` |
-| [`tree-sitter-synx/`](../tree-sitter-synx/) | **Tree-sitter** grammar + highlight queries (editors / Linguist) |
-| [`dotnet/`](dotnet/) | **C#** (`Synx.Core` project, NuGet **`APERTURESyndicate.Synx`**) — parity with `synx-core` parse/JSON/`!active`; **`Synx.FuzzReplay`** for corpus replay; see [`dotnet/README.md`](dotnet/README.md) |
-| [`../bindings/cpp/`](../bindings/cpp/) | **C++** — `synx/synx.hpp` (C++17) over **`synx-c`** FFI: **same** grammar, markers, `!tool`, `.synxb`, canonical JSON as Rust |
-| [`../bindings/go/`](../bindings/go/) | **Go** — cgo over **`synx-c`**: same engine; `Parse` / `ParseActive` / … return JSON strings or `.synxb` bytes |
-| [`../bindings/mojo/`](../bindings/mojo/) | **Mojo** — `Python.import_module("synx_native")` wrappers: same engine as Rust (not a standalone Mojo lexer/parser port) |
-| [`../bindings/swift/`](../bindings/swift/) | **Swift** — SwiftPM **`SynxEngine`** over **`synx-c`** (`String` / `Data` API) |
-| [`../bindings/kotlin/`](../bindings/kotlin/) | **Kotlin/JVM** — **`SynxEngine`** via **JNA** + **`synx-c`** (`String` / `ByteArray` API) |
+| Path | Language | Role |
+|------|----------|------|
+| [`../crates/synx-core/`](../crates/synx-core/) | **Rust** | Canonical parser, engine (`!active`), stringify, `diff`, `.synxb`, fuzz targets |
+| [`../crates/synx-cli/`](../crates/synx-cli/)   | **Rust** | CLI (`synx`) — uses `synx-core` |
+| [`../packages/synx-js/`](../packages/synx-js/) | **TypeScript** | Reference parser + npm `@aperturesyndicate/synx-format` (no native deps) |
+| [`cpp/`](cpp/)         | **C++17** | Header + sources, CMake project; conformance + unit tests |
+| [`dart/`](dart/)       | **Dart 3** | Pure Dart, pub.dev `synx`; full engine + binary |
+| [`dotnet/`](dotnet/)   | **C# / .NET 8** | NuGet `APERTURESyndicate.Synx` + `Synx.FuzzReplay` for corpus replay |
+| [`go/`](go/)           | **Go**     | Pure Go module (no cgo), `go test ./...` |
+| [`java/`](java/)       | **Java 17** | Maven `com.aperturesyndicate:synx` |
+| [`swift/`](swift/)     | **Swift 5** | SwiftPM `Synx`, no FFI |
+| [`../integrations/godot/synx-gdscript/`](../integrations/godot/synx-gdscript/) | **GDScript / Godot 4** | Pure-GDScript engine packaged as a Godot editor addon (`addons/synx`); lives under `integrations/` because it ships as a Godot plugin, but is a from-scratch parser on par with the entries above |
 
-`crates/synx-lsp` is **not** a parser — it is a language server; see [`integrations/README.md`](../integrations/README.md).
+`../tree-sitter-synx/` holds the editor/Linguist grammar (separate from the
+runtime parsers above). `../crates/synx-lsp` is the language server, not a
+parser — see [`../integrations/README.md`](../integrations/README.md).
 
-## Future layout (optional cleanup)
+The `../bindings/` tree holds the **non-native** language surfaces that
+still need to call into the canonical engine:
 
-When convenient (e.g. after closing IDE / clearing fuzz locks), Rust crates can be moved to `parsers/rust/` and JS to `parsers/javascript/` without losing history — use `git mv`. Until then, paths above stay canonical for tooling and CI.
+| Path | Language | Why FFI |
+|------|----------|---------|
+| `../bindings/c-header/` | **C ABI** (`synx.h`) | Reference C surface for downstream FFI |
+| `../bindings/node/`     | **Node.js** | N-API for raw-speed; pure JS lives in `packages/synx-js` |
+| `../bindings/python/`   | **Python**  | PyO3 binding — no native Python parser yet |
+| `../bindings/kotlin/`   | **Kotlin/JVM** | JNA over `synx-c` — JVM users on Java can use `parsers/java` directly |
+| `../bindings/mojo/`     | **Mojo**    | Wraps the Python build; experimental |
+| `../bindings/wasm/`     | **WebAssembly** | Browser/edge target of the Rust engine |

@@ -276,8 +276,13 @@ fn write_json_depth(out: &mut String, val: &Value, depth: usize) {
             out.push_str(buf.format(*n));
         }
         Value::Float(f) => {
-            let mut buf = ryu::Buffer::new();
-            out.push_str(buf.format(*f));
+            // JSON has no NaN / ±Infinity — emit null so output stays valid.
+            if f.is_nan() || f.is_infinite() {
+                out.push_str("null");
+            } else {
+                let mut buf = ryu::Buffer::new();
+                out.push_str(buf.format(*f));
+            }
         }
         Value::String(s) => {
             out.push('"');

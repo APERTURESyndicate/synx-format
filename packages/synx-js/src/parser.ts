@@ -79,8 +79,12 @@ function castType(val: string): SynxValue {
           case 'float': { const n = parseFloat(raw); return isNaN(n) ? 0 : n; }
           case 'bool': return raw.trim() === 'true';
           case 'string': return raw;
-          case 'random': return Math.floor(Math.random() * 2147483647);
-          case 'random:int': return Math.floor(Math.random() * 2147483647);
+          // Match Rust `rng::random_i64()` as closely as JS can — full safe-integer
+          // range including negatives. JS Number caps at 2^53-1 precisely; values
+          // beyond that lose precision in any roundtrip with .synxb.
+          case 'random':
+          case 'random:int':
+            return Math.floor(Math.random() * Number.MAX_SAFE_INTEGER * 2) - Number.MAX_SAFE_INTEGER;
           case 'random:float': return Math.random();
           case 'random:bool': return Math.random() < 0.5;
           // Unknown hint — strip the (hint) wrapper and re-cast the bare value

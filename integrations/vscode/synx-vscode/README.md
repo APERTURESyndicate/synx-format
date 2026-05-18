@@ -19,6 +19,8 @@
 
 As of **April 2026**, **SYNX 3.6** is **frozen**: the normative definition is [`docs/spec/SYNX-3.6-NORMATIVE.md`](docs/spec/SYNX-3.6-NORMATIVE.md), and the reference implementation is **`synx-core` 3.6.x** checked by [`tests/conformance/`](tests/conformance/). **PATCH** releases may only restore that contract (bugs, spec alignment); new surface syntax stays **additive** until a new normative version (for example 3.7). Full policy: [`docs/spec/CORE-FREEZE.md`](docs/spec/CORE-FREEZE.md).
 
+> **3.6.2 (2026-05-07)** — stability + parity release: closes 27 categories of cross-engine divergence between `synx-core` and `synx-js`, masks `:secret` in CLI JSON output, makes `.synxb` cross-language compatible, balances `[constraints]` brackets so `[pattern:^[A-Z]{2}$]` parses correctly, fixes `Synx.parseTool` reshape, adds `:replace:from:to`, `:sort` / `:sort:desc`, `:sum` markers. See [CHANGELOG.md](CHANGELOG.md).
+
 ---
 
 ## Documentation and repo map
@@ -60,7 +62,7 @@ This extension provides complete SYNX v3.6 language support for Visual Studio Co
 | Feature | Description |
 |---|---|
 | **Syntax Highlighting** | Keys, values, markers, constraints, comments, types, template placeholders, colors |
-| **IntelliSense** | Autocomplete for 12 markers, 7 constraints, type casts, template keys, alias keys |
+| **IntelliSense** | Autocomplete for 28 markers, 7 constraints, type casts, template keys, alias keys |
 | **Hover Info** | Documentation on markers, constraints, `!active`, key types and values |
 | **Diagnostics** | Real-time validation: tabs, indentation, duplicate keys, unknown markers, broken refs |
 | **Go to Definition** | Ctrl+Click on `:alias`, `:template {ref}`, `:calc` variable names, `:include` file paths |
@@ -226,7 +228,7 @@ The extension validates your `.synx` files in real time:
 | Invalid key start | Error | Keys cannot start with `-`, `#`, `/`, `!` |
 | Duplicate keys | Warning | Same key at the same indent level |
 | Unknown type cast | Error | Only `int`, `float`, `bool`, `string` allowed |
-| Unknown marker | Warning | Not one of the 12 known markers |
+| Unknown marker | Warning | Not one of the 28 known markers |
 | Markers without `!active` | Info | Markers only work in active mode |
 | `:alias` broken ref | Error | Referenced key doesn't exist |
 | `:calc` unknown var | Warning | Variable in expression not defined |
@@ -479,10 +481,37 @@ currency:geo
   - US USD
   - EU EUR
 prompt_block:prompt:AppConfig
-  app_name "MyCoolApp"
-  version "2.1.0"
-banner:vision "sunset landscape, 16:9"
-greeting:audio "Welcome to our app"
+  app_name MyCoolApp
+  version 2.1.0
+ref_value:ref:calc:*2 base_rate
+label:i18n
+  en Hello
+  ru Привет
+volume:clamp:0:100 150
+price:round:2 19.999
+price:format:%.2f 19.9
+result:map:status_labels
+  - 200
+  - 404
+instance_id:once:uuid
+app_ok:version:>=:1.0.0 1.2.3
+flags:watch ./flags.synx
+config:fallback:./defaults.synx ./overrides.synx
+api:spam:5:60 https://api.example.com
+banner:vision ./sunset.png
+recording:audio ./welcome.mp3
+db:import ./config/db.synx
+production:inherit base
+  host prod.example.com
+shouted:replace:l:L Hello there
+ranked:sort:desc
+  - 5
+  - 1
+  - 3
+total:sum
+  - 19.99
+  - 29.99
+  - 5.50
 ```
 
 ### Constraints (require `!active`)
@@ -510,20 +539,15 @@ web_search
 
 → `{ "tool": "web_search", "params": { "query": "latest Rust release", "lang": "en", "max_results": 5 } }`
 
-Combine with `!schema` for tool definitions, or with `!active` for dynamic parameters. See [GUIDE.md](docs/guides/GUIDE.md#-llm-tool-use-tool) for full documentation.
+Combine with `!schema` for tool definitions, or with `!active` for dynamic parameters. See [GUIDE.md](docs/guides/GUIDE.md) for full documentation.
 
 ## 📖 Documentation / Guides
 
-Complete SYNX guides with all 24 markers, benchmarks, code examples, and architecture:
+Complete SYNX guides with all 28 markers, benchmarks, code examples, and architecture:
 
 | Language | Guide |
 |---|---|
 | 🇬🇧 **English** | [GUIDE.md](docs/guides/GUIDE.md) |
-| 🇷🇺 **Russian** | [GUIDE_RU.md](docs/guides/GUIDE_RU.md) |
-| 🇨🇳 **Chinese** | [GUIDE_ZH.md](docs/guides/GUIDE_ZH.md) |
-| 🇪🇸 **Español** | [GUIDE_ES.md](docs/guides/GUIDE_ES.md) |
-| 🇯🇵 **Japanese** | [GUIDE_JA.md](docs/guides/GUIDE_JA.md) |
-| 🇩🇪 **Deutsch** | [GUIDE_DE.md](docs/guides/GUIDE_DE.md) |
 
 ## 🔒 Security
 
@@ -541,11 +565,13 @@ SYNX is designed to be **safe by default** — no code execution, no eval, no ne
 
 | Protection | Description |
 |---|---|
-| **Path jail** | `:include`, `:import`, `:watch`, `:fallback` paths cannot escape the project's base directory. Absolute paths and `../` traversal are blocked. |
+| **Path jail** | `:include`, `:import`, `:watch`, `:fallback` paths cannot escape the project's base directory. Absolute paths, Linux-rooted `/foo`, Windows-rooted `\foo` and `../` traversal are all blocked (3.6.2 closed a Windows-only escape). |
 | **Include depth limit** | Nested includes are limited to 16 levels (configurable). Prevents infinite recursion. |
 | **File size limit** | Included files > 10 MB are rejected. Prevents memory exhaustion. |
 | **Calc expression limit** | Expressions longer than 4096 characters are rejected. |
 | **Env isolation** | When `env` option is provided, only that map is used — no fallthrough to `process.env`. |
+| **Secret redaction** | Values marked `:secret` are emitted as `"[SECRET]"` in JSON output of every binding (`synx parse`, `Synx.toJSON`, FFI, WASM). Real values are accessible only via the typed `Value::Secret` API. **Fixed in 3.6.2** — earlier versions of the Rust CLI leaked the raw value. |
+| **Resource limits everywhere** | The pure-TS engine now enforces the same §3 caps as `synx-core` (16 MiB input, 128 nesting depth, 1 MiB multiline, 1 M list items, …). Browser/Node use is no longer DoS-able by oversized input. |
 
 ### Configuration
 

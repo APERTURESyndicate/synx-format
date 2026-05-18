@@ -1,0 +1,362 @@
+name: release
+
+# Single release pipeline driven by a `v*.*.*` git tag.
+# Tier 1 (Rust, npm, NuGet, Dart, GitHub Release) auto-runs on every tag.
+# Tier 2 (Maven, Swift, Go, VS Code) is opt-in via workflow_dispatch — see below.
+#
+# Required repository secrets:
+#   CARGO_REGISTRY_TOKEN     crates.io API token              (Tier 1)
+#   NPM_TOKEN                npmjs.com automation token       (Tier 1)
+#   NUGET_API_KEY            nuget.org API key                (Tier 1)
+#   PYPI_API_TOKEN           pypi.org API token (scope: project synx-format) (Tier 1)
+#   PUB_DEV_PUBLISH_TOKEN    pub.dev OIDC token (optional)    (Tier 1)
+#
+#   MAVEN_USERNAME           Sonatype Central username        (Tier 2)
+#   MAVEN_PASSWORD           Sonatype Central password / token
+#   MAVEN_GPG_PRIVATE_KEY    GPG key for artefact signing
+#   MAVEN_GPG_PASSPHRASE     GPG key passphrase
+#   VSCE_PAT                 VS Code Marketplace PAT          (Tier 2)
+#   OVSX_PAT                 Open VSX Registry PAT            (Tier 2)
+#
+# Tag format must match `vMAJOR.MINOR.PATCH` (e.g. `v3.6.3`).
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+  workflow_dispatch:
+    inputs:
+      tier2:
+        description: 'Also run Tier 2 jobs (Maven, Swift, Go, VS Code)'
+        required: false
+        default: false
+        type: boolean
+      dry_run:
+        description: 'Dry-run mode — build and validate, but do not publish'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write       # for GitHub Release creation
+  id-token: write       # for OIDC publishing (pub.dev, npm provenance)
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IS_DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run == true }}
+
+jobs:
+  # ─── Tier 1 ──────────────────────────────────────────────────────────
+
+  publish-rust:
+    name: Publish crates → crates.io
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo publish synx-core
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        working-directory: crates/synx-core
+        run: |
+          if [ "${{ env.IS_DRY_RUN }}" = "true" ]; then
+            cargo publish --dry-run --allow-dirty
+          else
+            cargo publish
+          fi
+      - name: Wait for crates.io index
+        if: env.IS_DRY_RUN != 'true'
+        run: sleep 45
+      - name: cargo publish synx-format
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        working-directory: crates/synx-format
+        run: |
+          if [ "${{ env.IS_DRY_RUN }}" = "true" ]; then
+            cargo publish --dry-run --allow-dirty
+          else
+            cargo publish
+          fi
+      - name: cargo publish synx-cli
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        working-directory: crates/synx-cli
+        run: |
+          if [ "${{ env.IS_DRY_RUN }}" = "true" ]; then
+            cargo publish --dry-run --allow-dirty
+          else
+            cargo publish
+          fi
+      - name: cargo publish synx-lsp
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        working-directory: crates/synx-lsp
+        run: |
+          if [ "${{ env.IS_DRY_RUN }}" = "true" ]; then
+            cargo publish --dry-run --allow-dirty
+          else
+            cargo publish
+          fi
+
+  publish-npm:
+    name: Publish synx-js → npm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+      - name: Install
+        working-directory: packages/synx-js
+        run: npm ci
+      - name: Build
+        working-directory: packages/synx-js
+        run: npm run build --if-present
+      - name: Publish
+        working-directory: packages/synx-js
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ "${{ env.IS_DRY_RUN }}" = "true" ]; then
+            npm publish --dry-run --access public --provenance
+          else
+            npm publish --access public --provenance
+          fi
+
+  publish-nuget:
+    name: Publish Synx.Core → NuGet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Pack
+        working-directory: parsers/dotnet/src/Synx.Core
+        run: dotnet pack -c Release -o ../../artifacts
+      - name: Push
+        if: env.IS_DRY_RUN != 'true'
+        working-directory: parsers/dotnet/artifacts
+        run: |
+          dotnet nuget push "*.nupkg" \
+            --api-key "${{ secrets.NUGET_API_KEY }}" \
+            --source https://api.nuget.org/v3/index.json \
+            --skip-duplicate
+
+  publish-pypi-wheels:
+    name: Build PyPI wheel (${{ matrix.os }} / ${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64
+          - os: ubuntu-latest
+            target: aarch64
+          - os: windows-latest
+            target: x64
+          - os: macos-latest
+            target: x86_64
+          - os: macos-latest
+            target: aarch64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: bindings/python
+          target: ${{ matrix.target }}
+          args: --release --out dist --interpreter "3.9 3.10 3.11 3.12 3.13"
+          sccache: true
+          manylinux: auto
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pypi-wheels-${{ matrix.os }}-${{ matrix.target }}
+          path: bindings/python/dist
+
+  publish-pypi-sdist:
+    name: Build PyPI sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: bindings/python
+          command: sdist
+          args: --out dist
+      - name: Upload sdist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pypi-sdist
+          path: bindings/python/dist
+
+  publish-pypi:
+    name: Push wheels + sdist → PyPI
+    runs-on: ubuntu-latest
+    needs: [publish-pypi-wheels, publish-pypi-sdist]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: pypi-*
+          merge-multiple: true
+      - name: Publish to PyPI
+        if: env.IS_DRY_RUN != 'true'
+        uses: PyO3/maturin-action@v1
+        with:
+          command: upload
+          args: --skip-existing dist/*
+        env:
+          MATURIN_PYPI_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+
+  publish-pub:
+    name: Publish synx → pub.dev
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dart-lang/setup-dart@v1
+      - name: Resolve dependencies
+        working-directory: parsers/dart
+        run: dart pub get
+      - name: Analyze
+        working-directory: parsers/dart
+        run: dart analyze --fatal-infos
+      - name: Test
+        working-directory: parsers/dart
+        run: dart test
+      - name: Publish
+        if: env.IS_DRY_RUN != 'true'
+        working-directory: parsers/dart
+        env:
+          PUB_DEV_PUBLISH_ACCESS_TOKEN: ${{ secrets.PUB_DEV_PUBLISH_TOKEN }}
+        run: |
+          # pub.dev OIDC publishing is configured per package at
+          # https://pub.dev/packages/<name>/admin → "Automated publishing".
+          # Once enabled there, `dart pub publish --force` succeeds without a
+          # token; the line below stays valid as a fallback for token mode.
+          dart pub publish --force
+
+  github-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [publish-rust, publish-npm, publish-nuget, publish-pypi]
+    if: env.IS_DRY_RUN != 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Extract changelog section for this tag
+        id: changelog
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          # Pull the `## [X.Y.Z] — DATE` block out of CHANGELOG.md.
+          awk "/^## \[$TAG\]/{flag=1;print;next} /^## \[/{flag=0} flag" CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "No changelog entry for $TAG — using auto notes." > release-notes.md
+          fi
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: SYNX ${{ github.ref_name }}
+          body_path: release-notes.md
+          draft: false
+          prerelease: false
+
+  # ─── Tier 2 (opt-in, manual) ─────────────────────────────────────────
+
+  publish-maven:
+    name: Publish Java → Maven Central
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && inputs.tier2 == true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          server-id: central
+          server-username: MAVEN_USERNAME
+          server-password: MAVEN_PASSWORD
+          gpg-private-key: ${{ secrets.MAVEN_GPG_PRIVATE_KEY }}
+          gpg-passphrase: MAVEN_GPG_PASSPHRASE
+      - name: Build + deploy
+        working-directory: parsers/java
+        env:
+          MAVEN_USERNAME: ${{ secrets.MAVEN_USERNAME }}
+          MAVEN_PASSWORD: ${{ secrets.MAVEN_PASSWORD }}
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.MAVEN_GPG_PASSPHRASE }}
+        run: |
+          if [ "${{ env.IS_DRY_RUN }}" = "true" ]; then
+            mvn -B verify
+          else
+            mvn -B deploy -DskipTests=false -Psign
+          fi
+
+  publish-swift:
+    name: Tag Swift Package
+    runs-on: macos-latest
+    if: github.event_name == 'workflow_dispatch' && inputs.tier2 == true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build + test
+        working-directory: parsers/swift
+        run: swift build && swift test
+      # SwiftPM has no central registry — consumers add the GitHub URL.
+      # The `v*.*.*` tag that triggers this workflow is already the release.
+
+  publish-go:
+    name: Validate Go module
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && inputs.tier2 == true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+      - name: Test
+        working-directory: parsers/go
+        run: go test ./...
+      # Go modules are tagged-on-GitHub; the `v*.*.*` tag IS the publish.
+      # This job just verifies the tagged code builds and tests pass.
+
+  publish-vscode:
+    name: Publish VS Code extension
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && inputs.tier2 == true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install vsce + ovsx
+        run: npm install -g @vscode/vsce ovsx
+      - name: Package
+        working-directory: integrations/vscode/synx-vscode
+        run: |
+          npm install
+          vsce package
+      - name: Publish to VS Code Marketplace
+        if: env.IS_DRY_RUN != 'true'
+        working-directory: integrations/vscode/synx-vscode
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+        run: vsce publish
+      - name: Publish to Open VSX
+        if: env.IS_DRY_RUN != 'true'
+        working-directory: integrations/vscode/synx-vscode
+        env:
+          OVSX_PAT: ${{ secrets.OVSX_PAT }}
+        run: ovsx publish *.vsix --pat "$OVSX_PAT"

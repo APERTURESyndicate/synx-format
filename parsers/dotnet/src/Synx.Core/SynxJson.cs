@@ -39,8 +39,11 @@ public static class SynxJson
             case SynxValue.Str s:
                 WriteString(o, s.Value);
                 break;
-            case SynxValue.Secret s:
-                WriteString(o, s.Value);
+            case SynxValue.Secret _:
+                // Secrets MUST never appear in JSON output. Match synx_core::write_json:
+                // emit a fixed redaction marker; the typed Value API must be used to access
+                // the underlying secret directly.
+                o.Append("\"[SECRET]\"");
                 break;
             case SynxValue.Arr a:
                 o.Append('[');
@@ -70,6 +73,13 @@ public static class SynxJson
 
     internal static void WriteDouble(StringBuilder o, double f)
     {
+        // JSON has no NaN / ±Infinity literals — emit null so output stays valid.
+        // Matches the Rust write_json fix in synx_core::write_json_depth.
+        if (double.IsNaN(f) || double.IsInfinity(f))
+        {
+            o.Append("null");
+            return;
+        }
         // Match ECMA/JavaScript shortest representation (same idea as Rust ryu in synx-core).
         var buf = new ArrayBufferWriter<byte>();
         using (var jw = new Utf8JsonWriter(buf))

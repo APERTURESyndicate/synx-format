@@ -75,11 +75,8 @@ Thumbs.db
 # Logs
 *.log
 
-# Claude
-.claudeignore
-
 # Integrations — local npm install (never commit)
 integrations/**/node_modules/
 
-# Accidental duplicate MCP folder at repo root (delete if present)
-/synx-mcp/
+# Dart tooling (`pub get`, `dart test`) — regenerated, never commit
+parsers/**/.dart_tool/

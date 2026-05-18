@@ -2,6 +2,169 @@
 
 All notable changes to this repository are documented in this file.
 
+> **npm registry-only note:** The `@aperturesyndicate/synx-format` npm
+> package leads by one patch. For each release the npm slot is bumped
+> twice (3.6.2 → 3.6.3 → 3.6.4 …) because npm's `3.6.2` slot was once
+> taken and unpublished, and npm policy bans reusing the number.
+> All other registries (crates.io, NuGet, Maven Central, pub.dev, the
+> Visual Studio Marketplace) and the GitHub release tag stay on the
+> "real" version number printed below. Both slots ship identical content.
+
+## [3.6.3] — 2026-05-19
+
+A cross-implementation **parity hot-fix** release. Closes 17 divergences
+uncovered by a code-review pass across all SYNX parsers (Rust canonical
++ C++, Dart, Go, Java, Swift, .NET, JS/TS). Three of the fixes are
+**security-relevant** and required for any production use of the
+non-Rust bindings.
+
+Alongside the parity work, **`parsers/` is now the home for all from-scratch
+language parsers** and `bindings/` is reserved for FFI / WASM bridges back
+into the Rust engine. C++, Go, and Swift no longer ship as thin C-FFI
+wrappers around `synx-core`; each is a native port. Dart and Java join as
+fresh native parsers, and Godot 4 gets a pure-GDScript engine.
+
+No surface-syntax change. All existing `.synx` files parse identically.
+
+### Added — native parsers and Godot integration
+
+- **[`parsers/cpp/`](parsers/cpp/)** — header-only C++17 parser + CMake
+  project (`synx_tests.exe` 42 / 42, conformance + unit). Replaces the
+  `bindings/cpp` C-FFI wrapper; no `libsynx_c` runtime dependency.
+- **[`parsers/dart/`](parsers/dart/)** — pure-Dart 3 implementation (no
+  FFI); `dart test` 37 / 37, `dart analyze` clean. New target — pub.dev
+  package `synx` (planned).
+- **[`parsers/go/`](parsers/go/)** — pure-Go module, **no cgo**. Replaces
+  the `bindings/go` cgo wrapper. `go test ./...` pass, `go vet ./...`
+  clean. Importable directly: `import "github.com/aperturesyndicate/synx-format/parsers/go"`.
+- **[`parsers/java/`](parsers/java/)** — Java 17 implementation (Maven
+  `com.aperturesyndicate:synx`). New target — Maven Central (planned).
+- **[`parsers/swift/`](parsers/swift/)** — SwiftPM-only Swift 5 package
+  with no C interop. Replaces the `bindings/swift` C-FFI wrapper.
+- **[`integrations/godot/synx-gdscript/`](integrations/godot/synx-gdscript/)** —
+  **Godot 4 editor plugin** (`addons/synx`) implementing the SYNX engine in
+  pure GDScript: parser, `!active` engine, markers, binary `.synxb`,
+  formatter, JSON I/O, diff, RNG, calc, options. Drop into any Godot
+  project's `addons/` folder and enable in Project Settings.
+
+### Removed — superseded FFI wrappers
+
+- **`bindings/cpp/`** — replaced by native [`parsers/cpp/`](parsers/cpp/).
+- **`bindings/go/`** — replaced by native [`parsers/go/`](parsers/go/)
+  (cgo dependency gone).
+- **`bindings/swift/`** — replaced by native [`parsers/swift/`](parsers/swift/)
+  (no longer requires linking `libsynx_c`).
+
+Remaining `bindings/` are the surfaces that *legitimately* need FFI or a
+shared engine binary: `c-header` (reference C ABI), `node` (N-API),
+`python` (PyO3), `wasm` (Rust → WebAssembly), `kotlin` (JNA), `mojo`
+(CPython bridge). JVM consumers on plain Java should prefer
+[`parsers/java/`](parsers/java/) over `bindings/kotlin` to avoid the
+JNA / `synx-c` runtime.
+
+### Fixed — JSON output safety
+
+- **Rust core (`synx_core::write_json`)** — `NaN` / `±Infinity` were
+  emitted as the literal `ryu` tokens `NaN` / `inf`, producing **invalid
+  JSON**. Now emits `null`, matching ECMA-404 and the existing
+  Java / Dart / .NET behaviour.
+- **.NET `SynxJson.WriteDouble`** — same fix; `Utf8JsonWriter` throws on
+  non-finite by default, we now short-circuit to `null` before it sees
+  the value.
+- **.NET `SynxJson.WriteJson` for `Secret`** 🔴 **(SECURITY)** — was
+  emitting the **real secret value** as a regular JSON string. Now
+  redacted to `"[SECRET]"` to match `synx_core::write_json` and the
+  README contract (`:secret → не попадёт в логи`).
+
+### Fixed — `:include` / `:watch` path jail
+
+- **Go (`engine.go::jailPath`)** 🔴 **(SECURITY)** — relied on a
+  `filepath.Join` plus a lexical `..` check. A symlink inside `base/`
+  pointing outside the jail (e.g. `base/tmp → /etc`) bypassed the
+  check entirely. Now resolves symlinks via `filepath.EvalSymlinks`
+  and verifies canonical-path containment, matching
+  `synx_core::engine::jail_path`.
+
+### Fixed — `__proto__` / `constructor` / `prototype` filter
+
+- **.NET (`SynxParser.Parse`)** 🔴 **(SECURITY for JS consumers)** —
+  was missing the prototype-pollution reject list. JS / Node consumers
+  of the JSON output were therefore exposed via `__proto__` injection
+  in `.synx` files. Aligned with `synx_core::parser::parse`.
+
+### Fixed — binary `.synxb` endianness
+
+- **.NET (`SynxBinary`)** — `BitConverter.GetBytes(double)` /
+  `BitConverter.ToDouble` and the matching `UInt32` variants used host
+  endianness; output diverged from Rust on big-endian hosts. Now uses
+  `BinaryPrimitives.WriteDoubleLittleEndian` /
+  `ReadDoubleLittleEndian` (and `*UInt32LittleEndian`) to guarantee
+  byte-identical output to `synx_core::binary` on every platform.
+
+### Fixed — `:random:int` range parity
+
+Several non-Rust parsers had constrained the random-integer range,
+breaking parity with `synx_core::rng::random_i64()` which returns the
+full `[i64::MIN, i64::MAX]` band:
+
+- **.NET** — `Random.NextInt64()` (no args) only covers
+  `[0, Int64.MaxValue)`. Now `NextInt64(long.MinValue, long.MaxValue)`.
+- **Java** — `nextLong(Long.MAX_VALUE)` only covers
+  `[0, Long.MAX_VALUE)`. Now plain `nextLong()` (full range).
+- **Swift** — `Int64.random(in: 0..<Int64.max)`. Now
+  `Int64.random(in: Int64.min...Int64.max)`.
+- **Dart** — `Random.nextInt(1 << 32)` capped at unsigned 32-bit. Now
+  combines two 32-bit draws into a full signed 64-bit value.
+- **JS / TS** — `Math.random() * 2147483647` capped at 31-bit
+  non-negative. Now spans `[-Number.MAX_SAFE_INTEGER,
+  Number.MAX_SAFE_INTEGER)` (the precise integer band JS can
+  represent; values beyond 2⁵³−1 still lose precision in any
+  `.synxb` roundtrip — a fundamental `Number` limit, not a code bug).
+
+### Fixed — C++ enum constraint parser
+
+- **`parsers/cpp/src/parser.cpp::parse_constraints`** — the scan
+  condition `p < v.size()` dropped the trailing empty segment, so
+  `enum:` produced `[]` and `enum:a|` produced `["a"]`. Now uses
+  `p <= v.size()`, matching Rust `str::split('|')`: `enum:` →
+  `[""]`, `enum:a|` → `["a", ""]`.
+
+### Fixed — Go enum trim
+
+- **`parsers/go/parser.go::parseConstraints`** — `enum: a | b` was
+  storing the surrounding whitespace as part of each value (`"a "`,
+  `" b "`). Now each segment is `strings.TrimSpace`-ed.
+
+### Fixed — `MAX_PARSE_NESTING_DEPTH` parity
+
+- **.NET (`SynxParserCore`)** — was `2048`, 16× looser than every
+  other parser. Lowered to `128` to match
+  `synx_core::parser::MAX_PARSE_NESTING_DEPTH`. The same input now
+  accepts / rejects identically across all implementations.
+
+### Verification — what passes after this release
+
+| Implementation | Test command | Result |
+| -------------- | ------------ | ------ |
+| Rust core      | `cargo test -p synx-core` | 83 / 83 |
+| Go             | `go test ./...`           | pass |
+| Go             | `go vet ./...`            | clean |
+| C++            | `synx_tests.exe`          | 42 / 42 |
+| Dart           | `dart test`               | 37 / 37 |
+| Dart           | `dart analyze`            | no issues |
+| .NET           | `dotnet build`            | 0 warn / 0 err |
+| TS / JS        | `npx tsc --noEmit`        | clean |
+
+### Compatibility notes
+
+- Pre-3.6.3 `.synx` files containing **literal `__proto__` /
+  `constructor` / `prototype` keys** were silently kept on the .NET
+  side and silently dropped everywhere else. They are now dropped on
+  every side, matching the documented behaviour.
+- `.synxb` binaries produced by .NET **on big-endian hosts** in 3.6.2
+  are not readable by 3.6.3 (and were never readable by Rust);
+  regenerate them.
+
 ## [3.6.2] — 2026-05-07
 
 A stability and parity release. Closes 27 categories of cross-engine
