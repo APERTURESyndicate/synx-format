@@ -1,18 +1,7 @@
 > Main SYNX site: https://synx.aperturesyndicate.com/
 
 <p align="center">
-  <img src="https://media.aperturesyndicate.com/asother/as/branding/png/aperturesyndicate.png" alt="APERTURESyndicate" width="360" />
-</p>
-
-<p align="center">
   <strong>Built for AI and humans by APERTURESyndicate.</strong>
-</p>
-
-<p align="center">
-  <img src="https://img.shields.io/visual-studio-marketplace/v/APERTURESyndicate.synx-vscode?label=version&color=5a6eff" />
-  <img src="https://img.shields.io/visual-studio-marketplace/i/APERTURESyndicate.synx-vscode?color=5a6eff" />
-  <img src="https://img.shields.io/badge/license-MIT-blue" />
-  <img src="https://img.shields.io/badge/format-SYNX%20v3.6-blueviolet" />
 </p>
 
 ## Frozen reference (3.6)
@@ -41,17 +30,9 @@ As of **April 2026**, **SYNX 3.6** is **frozen**: the normative definition is [`
 
 Just **key**, **space**, **value**. No quotes, no commas, no braces:
 
-<p align="center">
-  <img src="https://aperturesyndicate.com/branding/gifs/synx/synx.gif" alt="Writing static SYNX" width="720" />
-</p>
-
 ### `!active` Mode
 
 Add `!active` on the first line and your config comes alive — with logic built right into the format:
-
-<p align="center">
-  <img src="https://aperturesyndicate.com/branding/gifs/synx/synx2.gif" alt="Writing active SYNX with markers" width="720" />
-</p>
 
 ---
 
@@ -619,7 +600,6 @@ How this repo is organized: [docs/repository-layout.md](docs/repository-layout.m
 ---
 
 <div align="center">
-  <img src="https://media.aperturesyndicate.com/asother/as/branding/png/asp_128.png" width="128" height="128" />
   <p>Made by <strong>APERTURESyndicate Production</strong></p>
 </div>
 
