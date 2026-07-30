@@ -24,7 +24,7 @@ Targets:
 
 ```bash
 mvn -f parsers/java/pom.xml test
-mvn -f parsers/java/pom.xml package  # builds target/synx-3.6.2.jar
+mvn -f parsers/java/pom.xml package  # builds target/synx-3.7.0.jar
 ```
 
 Maven coordinate:
@@ -33,7 +33,7 @@ Maven coordinate:
 <dependency>
     <groupId>com.aperturesyndicate</groupId>
     <artifactId>synx</artifactId>
-    <version>3.6.2</version>
+    <version>3.7.0</version>
 </dependency>
 ```
 

@@ -65,8 +65,42 @@ fn find_parse_end_bytes(bytes: &[u8]) -> usize {
     bytes.len()
 }
 
+/// Options for a single [`parse_with`] run.
+///
+/// The default reproduces plain SYNX 3.7 behaviour; the non-default settings
+/// exist for *embedded* parses, where the host format owns the directive
+/// surface and the SYNX document is untrusted payload.
+#[derive(Debug, Clone, Copy)]
+pub struct ParserOptions {
+    /// Recognise `!`-prefixed directive lines (`!active`, `!lock`, `!tool`,
+    /// `!schema`, `!llm`, `!include`, `!use`) and the `#!mode:` pragma.
+    ///
+    /// SYNXL block delegation sets this to `false` (SYNXL §9.4): a record that
+    /// originates from an untrusted dataset must not be able to turn
+    /// `!include` into a file-read primitive against the consuming process,
+    /// nor flip the document into `!active` mode.
+    ///
+    /// Neutralisation happens *inside* this parser, after the multiline-block
+    /// check, so that `|` / `|+` bodies keep their `!` lines verbatim — a
+    /// pre-filter over the raw lines would corrupt those bodies.
+    pub directives: bool,
+}
+
+impl Default for ParserOptions {
+    fn default() -> Self {
+        Self { directives: true }
+    }
+}
+
 /// Parse a SYNX text string into a value tree with metadata.
 pub fn parse(text: &str) -> ParseResult {
+    parse_with(text, ParserOptions::default())
+}
+
+/// Parse a SYNX text string with explicit [`ParserOptions`].
+///
+/// `parse(text)` is `parse_with(text, ParserOptions::default())`.
+pub fn parse_with(text: &str, opts: ParserOptions) -> ParseResult {
     let text = clamp_synx_text(text);
     let parse_end = find_parse_end_bytes(text.as_bytes());
     let text = &text[..parse_end];
@@ -112,69 +146,76 @@ pub fn parse(text: &str) -> ParseResult {
 
         let trimmed = raw.trim();
 
-        // Mode declaration
-        if trimmed == "!active" {
-            mode = Mode::Active;
-            i += 1;
-            continue;
-        }
-        if trimmed == "!lock" {
-            locked = true;
-            i += 1;
-            continue;
-        }
-        if trimmed == "!tool" {
-            tool = true;
-            i += 1;
-            continue;
-        }
-        if trimmed == "!schema" {
-            schema = true;
-            i += 1;
-            continue;
-        }
-        if trimmed == "!llm" {
-            llm = true;
-            i += 1;
-            continue;
-        }
-        if trimmed.starts_with("!include ") {
-            if includes.len() < MAX_INCLUDE_DIRECTIVES {
-                let rest = trimmed[9..].trim();
-                let mut parts = rest.splitn(2, char::is_whitespace);
-                let path = parts.next().unwrap_or("").to_string();
-                let alias = parts.next().map(|s| s.trim().to_string()).unwrap_or_else(|| {
-                    // Auto-derive alias from filename
-                    let name = path.rsplit(&['/', '\\'][..]).next().unwrap_or(&path);
-                    name.strip_suffix(".synx").or_else(|| name.strip_suffix(".SYNX")).unwrap_or(name).to_string()
-                });
-                includes.push(IncludeDirective { path, alias });
+        // Directive lines (§6). Every form below starts with `!` or `#!mode:`,
+        // so gating the whole block on that prefix is behaviour-preserving and
+        // lets an embedded parse switch the class off wholesale (§9.4 of the
+        // SYNXL spec). Unknown `!…` lines still fall through to the generic
+        // line handling, exactly as in 3.6.
+        if opts.directives && (trimmed.starts_with('!') || trimmed.starts_with("#!mode:")) {
+            // Mode declaration
+            if trimmed == "!active" {
+                mode = Mode::Active;
+                i += 1;
+                continue;
             }
-            i += 1;
-            continue;
-        }
-        if trimmed.starts_with("!use ") {
-            let rest = trimmed[5..].trim();
-            if rest.starts_with('@') {
-                // Parse: !use @scope/name [as alias]
-                let mut parts = rest.splitn(2, " as ");
-                let package = parts.next().unwrap_or("").trim().to_string();
-                let alias = parts.next().map(|s| s.trim().to_string()).unwrap_or_else(|| {
-                    // Auto-derive alias from last segment: @scope/name → name
-                    package.rsplit('/').next().unwrap_or(&package).to_string()
-                });
-                if !package.is_empty() {
-                    uses.push(UseDirective { package, alias });
+            if trimmed == "!lock" {
+                locked = true;
+                i += 1;
+                continue;
+            }
+            if trimmed == "!tool" {
+                tool = true;
+                i += 1;
+                continue;
+            }
+            if trimmed == "!schema" {
+                schema = true;
+                i += 1;
+                continue;
+            }
+            if trimmed == "!llm" {
+                llm = true;
+                i += 1;
+                continue;
+            }
+            if trimmed.starts_with("!include ") {
+                if includes.len() < MAX_INCLUDE_DIRECTIVES {
+                    let rest = trimmed[9..].trim();
+                    let mut parts = rest.splitn(2, char::is_whitespace);
+                    let path = parts.next().unwrap_or("").to_string();
+                    let alias = parts.next().map(|s| s.trim().to_string()).unwrap_or_else(|| {
+                        // Auto-derive alias from filename
+                        let name = path.rsplit(&['/', '\\'][..]).next().unwrap_or(&path);
+                        name.strip_suffix(".synx").or_else(|| name.strip_suffix(".SYNX")).unwrap_or(name).to_string()
+                    });
+                    includes.push(IncludeDirective { path, alias });
                 }
+                i += 1;
+                continue;
             }
-            i += 1;
-            continue;
-        }
-        if trimmed.starts_with("#!mode:") {
-            let declared = trimmed.splitn(2, ':').nth(1).unwrap_or("static").trim();
-            mode = if declared == "active" { Mode::Active } else { Mode::Static };
-            i += 1;
-            continue;
+            if trimmed.starts_with("!use ") {
+                let rest = trimmed[5..].trim();
+                if rest.starts_with('@') {
+                    // Parse: !use @scope/name [as alias]
+                    let mut parts = rest.splitn(2, " as ");
+                    let package = parts.next().unwrap_or("").trim().to_string();
+                    let alias = parts.next().map(|s| s.trim().to_string()).unwrap_or_else(|| {
+                        // Auto-derive alias from last segment: @scope/name → name
+                        package.rsplit('/').next().unwrap_or(&package).to_string()
+                    });
+                    if !package.is_empty() {
+                        uses.push(UseDirective { package, alias });
+                    }
+                }
+                i += 1;
+                continue;
+            }
+            if trimmed.starts_with("#!mode:") {
+                let declared = trimmed.splitn(2, ':').nth(1).unwrap_or("static").trim();
+                mode = if declared == "active" { Mode::Active } else { Mode::Static };
+                i += 1;
+                continue;
+            }
         }
 
         // Block comment toggle: ###
@@ -205,8 +246,32 @@ pub fn parse(text: &str) -> ParseResult {
                     }
                     let room = MAX_MULTILINE_BLOCK_BYTES.saturating_sub(blk.content.len());
                     if room > 0 {
-                        let n = trimmed.len().min(room);
-                        blk.content.push_str(&trimmed[..n]);
+                        let slice: &str = if blk.preserve_indent {
+                            // `|+` (SYNX 3.7): lock the strip prefix to the
+                            // indent of the first non-empty continuation line,
+                            // then strip exactly that many leading whitespace
+                            // bytes from each subsequent line. Anything beyond
+                            // the base indent is preserved verbatim.
+                            if blk.base_indent < 0 {
+                                blk.base_indent = indent;
+                            }
+                            // raw is the original line (with leading WS). Strip
+                            // exactly `min(indent, base_indent)` leading ASCII
+                            // spaces/tabs. The byte indent we computed earlier
+                            // is over ASCII whitespace, so byte-slicing matches
+                            // char boundaries.
+                            let strip = blk.base_indent.min(indent) as usize;
+                            let raw_trim_end = raw.trim_end();
+                            if strip < raw_trim_end.len() {
+                                &raw_trim_end[strip..]
+                            } else {
+                                ""
+                            }
+                        } else {
+                            trimmed
+                        };
+                        let n = slice.len().min(room);
+                        blk.content.push_str(&slice[..n]);
                     }
                 }
                 i += 1;
@@ -218,6 +283,15 @@ pub fn parse(text: &str) -> ParseResult {
                 block = None;
                 insert_value(&mut root, &stack, blk_stack_idx, &blk_key, Value::String(content));
             }
+        }
+
+        // SYNXL §9.4 — with directives disabled, a `!…` line that reaches this
+        // point is *not* multiline body (the block branch above already
+        // consumed and preserved those) and MUST be discarded exactly like a
+        // comment line: it must neither set a mode flag nor become a key.
+        if !opts.directives && trimmed.starts_with('!') {
+            i += 1;
+            continue;
         }
 
         // Continue list items
@@ -357,7 +431,13 @@ pub fn parse(text: &str) -> ParseResult {
                 );
             }
 
-            let is_block = parsed.value == "|";
+            // `|` (3.6 frozen) and `|+` (3.7 addition) both open multiline blocks.
+            // `|+` differs only in keeping each continuation line's indent relative
+            // to the first non-empty one — see BlockState docs and §8.4.1 of the
+            // spec. Old documents with literal value `|+` (extremely unlikely) would
+            // change meaning under 3.7; the bump is documented in CHANGELOG.
+            let is_block = parsed.value == "|" || parsed.value == "|+";
+            let preserve_indent = parsed.value == "|+";
             let is_list_marker = parsed.markers.iter().any(|m| {
                 matches!(m.as_str(), "random" | "unique" | "geo" | "join")
             });
@@ -375,6 +455,8 @@ pub fn parse(text: &str) -> ParseResult {
                     key: parsed.key,
                     content: String::new(),
                     stack_idx: parent_idx,
+                    preserve_indent,
+                    base_indent: -1,
                 });
             } else if is_list_marker && parsed.value.is_empty() {
                 // Insert an empty Array now so callers see the key even
@@ -577,6 +659,12 @@ struct BlockState {
     key: String,
     content: String,
     stack_idx: usize,
+    /// SYNX 3.7 `|+`: keep indent relative to the first continuation line.
+    /// `false` is plain `|` (3.6) — every continuation line is fully trimmed.
+    preserve_indent: bool,
+    /// Indent of the first non-empty continuation line, used as the strip
+    /// prefix when `preserve_indent` is true. `-1` means "not yet locked".
+    base_indent: i32,
 }
 
 struct ListState {
@@ -737,7 +825,12 @@ fn parse_line(trimmed: &str) -> Option<ParsedLine> {
 
 // ─── Constraints parser ──────────────────────────────────
 
-fn parse_constraints(raw: &str) -> Constraints {
+/// Parse the body of a `[…]` constraint block.
+///
+/// `pub(crate)` so the SYNXL field-list parser can reuse it verbatim, as
+/// required by SYNXL §5.2 ("MUST be parsed by the implementation's existing
+/// SYNX constraint parser").
+pub(crate) fn parse_constraints(raw: &str) -> Constraints {
     let mut c = Constraints::default();
     for part in raw.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
         if part == "required" {
@@ -769,7 +862,8 @@ fn parse_constraints(raw: &str) -> Constraints {
 
 // ─── Value casting ───────────────────────────────────────
 
-fn cast(val: &str) -> Value {
+/// SYNX §8.3 automatic casting. `pub(crate)` for reuse by SYNXL §8.1.
+pub(crate) fn cast(val: &str) -> Value {
     // Quoted strings preserve literal value (bypass auto-casting)
     // "null" → String("null"), "true" → String("true"), "123" → String("123")
     if val.len() >= 2 {
@@ -833,7 +927,8 @@ fn cast(val: &str) -> Value {
     }
 }
 
-fn cast_typed(val: &str, hint: &str) -> Value {
+/// SYNX §8.3 typed casting. `pub(crate)` for reuse by SYNXL §8.2.
+pub(crate) fn cast_typed(val: &str, hint: &str) -> Value {
     match hint {
         "int" => Value::Int(val.parse().unwrap_or(0)),
         "float" => Value::Float(val.parse().unwrap_or(0.0)),
@@ -979,6 +1074,44 @@ mod tests {
             root["rules"],
             Value::String("Rule one.\nRule two.\nRule three.".into())
         );
+    }
+
+    // SYNX 3.7 — `|+` preserves indentation relative to the first non-empty
+    // continuation line. Required for embedding indent-sensitive content
+    // (code, SYNX examples, ASCII diagrams) inside a multiline value.
+    #[test]
+    fn test_multiline_block_preserve_indent() {
+        let src = "prompt |+\n  Top\n    Indented two\n      Indented four\n    Back to two\n  Top again";
+        let data = parse(src);
+        let root = data.root.as_object().unwrap();
+        assert_eq!(
+            root["prompt"],
+            Value::String(
+                "Top\n  Indented two\n    Indented four\n  Back to two\nTop again".into()
+            )
+        );
+    }
+
+    #[test]
+    fn test_multiline_block_preserve_indent_locks_base() {
+        // Base indent locks to the first content line (4 spaces), so all
+        // subsequent lines have exactly 4 leading spaces stripped.
+        let src = "code |+\n    function foo() {\n      return 1;\n    }";
+        let data = parse(src);
+        let root = data.root.as_object().unwrap();
+        assert_eq!(
+            root["code"],
+            Value::String("function foo() {\n  return 1;\n}".into())
+        );
+    }
+
+    #[test]
+    fn test_multiline_block_preserve_indent_ends_at_opener_indent() {
+        let src = "intro |+\n  hello\n    world\nnext plain";
+        let data = parse(src);
+        let root = data.root.as_object().unwrap();
+        assert_eq!(root["intro"], Value::String("hello\n  world".into()));
+        assert_eq!(root["next"], Value::String("plain".into()));
     }
 
     #[test]
@@ -1131,6 +1264,47 @@ mod tests {
         let shaped = reshape_tool_output(&data.root, false);
         let m = shaped.as_object().unwrap();
         assert_eq!(m["tool"], Value::Null);
+    }
+
+    // SYNXL §9.4 — an embedded parse must not honour directives: a dataset row
+    // must never become a file-read primitive or flip the document's mode.
+    #[test]
+    fn test_directives_disabled_discards_directive_lines() {
+        let src = "!active\n!include /etc/passwd\n!use @scope/pkg\nname Wario\n";
+        let data = parse_with(src, ParserOptions { directives: false });
+        assert_eq!(data.mode, Mode::Static);
+        assert!(data.includes.is_empty());
+        assert!(data.uses.is_empty());
+        let root = data.root.as_object().unwrap();
+        // Discarded like comments — not turned into keys either.
+        assert_eq!(root.len(), 1);
+        assert_eq!(root["name"], Value::String("Wario".into()));
+
+        // Default options keep 3.7 behaviour intact.
+        let data = parse(src);
+        assert_eq!(data.mode, Mode::Active);
+        assert_eq!(data.includes.len(), 1);
+    }
+
+    #[test]
+    fn test_directives_disabled_preserves_bang_lines_in_multiline() {
+        // Enforcement happens *inside* the parse, so a `!` line that is body
+        // content of a `|` / `|+` block survives verbatim.
+        let src = "body |+\n  !include /etc/passwd\n  !active\n  tail\n";
+        let data = parse_with(src, ParserOptions { directives: false });
+        assert_eq!(
+            data.root.as_object().unwrap()["body"],
+            Value::String("!include /etc/passwd\n!active\ntail".into())
+        );
+        assert!(data.includes.is_empty());
+        assert_eq!(data.mode, Mode::Static);
+
+        let src = "body |\n  !include /etc/passwd\n";
+        let data = parse_with(src, ParserOptions { directives: false });
+        assert_eq!(
+            data.root.as_object().unwrap()["body"],
+            Value::String("!include /etc/passwd".into())
+        );
     }
 
     #[test]

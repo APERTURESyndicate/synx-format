@@ -1,0 +1,2 @@
+MarkerInFieldDecl
+The field declaration `id:custom:tag` carries a marker run (a two-segment chain), which is forbidden in a field list — §5.2 forbids any marker run, chain or single (SYNXL-1-NORMATIVE.md §5.2).

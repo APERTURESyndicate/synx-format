@@ -183,10 +183,31 @@ func Parse(text string) ParseResult {
 						block.content.WriteByte('\n')
 					}
 					room := MaxMultilineBytes - block.content.Len()
-					if room < len(t) {
-						block.content.WriteString(t[:room])
+					// `|+` (SYNX 3.7): lock base indent to the first non-empty
+					// continuation line and strip exactly that many leading
+					// whitespace bytes; anything indented further is preserved.
+					var slice string
+					if block.preserveIndent {
+						if block.baseIndent < 0 {
+							block.baseIndent = indent
+						}
+						strip := block.baseIndent
+						if indent < strip {
+							strip = indent
+						}
+						trimEnd := strings.TrimRight(rawStr, " \t\r\n")
+						if strip < len(trimEnd) {
+							slice = trimEnd[strip:]
+						} else {
+							slice = ""
+						}
 					} else {
-						block.content.WriteString(t)
+						slice = t
+					}
+					if room < len(slice) {
+						block.content.WriteString(slice[:room])
+					} else {
+						block.content.WriteString(slice)
 					}
 				}
 				i++
@@ -298,7 +319,10 @@ func Parse(text string) ParseResult {
 			result.Metadata[path][p.key] = meta
 		}
 
-		isBlock := p.value == "|"
+		// `|` (3.6) trims each continuation line; `|+` (3.7) preserves
+		// indent relative to the first non-empty line. See spec §8.4.1.
+		isBlock := p.value == "|" || p.value == "|+"
+		preserveIndent := p.value == "|+"
 		isListMarker := false
 		for _, m := range p.markers {
 			if m == "random" || m == "unique" || m == "geo" || m == "join" {
@@ -310,7 +334,10 @@ func Parse(text string) ParseResult {
 		switch {
 		case isBlock:
 			insertValue(rootObj, stack, parentIdx, p.key, String(""))
-			block = &blockState{indent: indent, key: p.key, stackIdx: parentIdx}
+			block = &blockState{
+				indent: indent, key: p.key, stackIdx: parentIdx,
+				preserveIndent: preserveIndent, baseIndent: -1,
+			}
 		case isListMarker && p.value == "":
 			insertValue(rootObj, stack, parentIdx, p.key, NewArray())
 			list = &listState{indent: indent, key: p.key, stackIdx: parentIdx}
@@ -420,6 +447,11 @@ type blockState struct {
 	key      string
 	content  bytes.Buffer
 	stackIdx int
+	// SYNX 3.7 `|+`: preserveIndent keeps indent relative to the first
+	// non-empty continuation line instead of trimming each line fully.
+	// baseIndent is locked on the first content line; -1 means "unlocked".
+	preserveIndent bool
+	baseIndent     int
 }
 
 type listState struct {

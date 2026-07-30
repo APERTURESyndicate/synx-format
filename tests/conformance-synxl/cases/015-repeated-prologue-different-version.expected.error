@@ -1,0 +1,2 @@
+RepeatedPrologueDifferentVersion
+A `!synxl` prologue appears again later in the document declaring version 2, which differs from the original version 1 (SYNXL-1-NORMATIVE.md §4.1).

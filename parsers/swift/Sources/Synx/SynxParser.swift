@@ -146,11 +146,27 @@ public enum SynxParser {
                         if !blk.content.isEmpty { blk.content.append("\n") }
                         let room = maxMultilineBytes - blk.content.utf8.count
                         if room > 0 {
-                            let n = min(t.utf8.count, room)
-                            if n == t.utf8.count {
-                                blk.content.append(t)
+                            let slice: String
+                            if blk.preserveIndent {
+                                // `|+` (SYNX 3.7): lock base indent on the first
+                                // non-empty continuation line, then strip exactly
+                                // that many leading WS chars per line. Spec §8.4.1.
+                                if blk.baseIndent < 0 { blk.baseIndent = indent }
+                                let strip = min(blk.baseIndent, indent)
+                                let trimmedEnd = raw.trimmingTrailing()
+                                if strip < trimmedEnd.count {
+                                    slice = String(trimmedEnd.dropFirst(strip))
+                                } else {
+                                    slice = ""
+                                }
                             } else {
-                                let prefix = t.utf8.prefix(n)
+                                slice = t
+                            }
+                            let n = min(slice.utf8.count, room)
+                            if n == slice.utf8.count {
+                                blk.content.append(slice)
+                            } else {
+                                let prefix = slice.utf8.prefix(n)
                                 blk.content.append(String(decoding: prefix, as: UTF8.self))
                             }
                         }
@@ -246,13 +262,19 @@ public enum SynxParser {
                 result.metadata[path, default: [:]][parsed.key] = meta
             }
 
-            let isBlock = (parsed.value == "|")
+            // `|` (3.6) trims each continuation line; `|+` (3.7) preserves
+            // indent relative to the first non-empty line. Spec §8.4.1.
+            let isBlock = (parsed.value == "|" || parsed.value == "|+")
+            let preserveIndent = (parsed.value == "|+")
             let isListMarker = parsed.markers.contains { ["random", "unique", "geo", "join"].contains($0) }
 
             if isBlock {
                 insertValue(into: &rootObj, stack: stack, parentIdx: parentIdx,
                             key: parsed.key, value: .string(""))
-                block = BlockState(indent: indent, key: parsed.key, content: "", stackIdx: parentIdx)
+                block = BlockState(
+                    indent: indent, key: parsed.key, content: "", stackIdx: parentIdx,
+                    preserveIndent: preserveIndent, baseIndent: -1
+                )
             } else if isListMarker && parsed.value.isEmpty {
                 insertValue(into: &rootObj, stack: stack, parentIdx: parentIdx,
                             key: parsed.key, value: .array([]))
@@ -356,6 +378,11 @@ private struct BlockState {
     var key: String
     var content: String
     var stackIdx: Int
+    /// SYNX 3.7 `|+`: keep indent relative to the first non-empty
+    /// continuation line. See spec §8.4.1.
+    var preserveIndent: Bool
+    /// Locked on the first non-empty continuation line; -1 means "unlocked".
+    var baseIndent: Int
 }
 
 private struct ListState {

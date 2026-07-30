@@ -521,6 +521,10 @@ struct BlockState {
     std::string key;
     std::string content;
     size_t stack_idx;
+    // SYNX 3.7 `|+`: keep continuation lines' indent relative to the first
+    // non-empty content line. `base_indent < 0` means "not yet locked".
+    bool preserve_indent;
+    int base_indent;
 };
 
 struct ListState {
@@ -690,8 +694,35 @@ ParseResult parse(std::string_view text) {
                         block->content.push_back('\n');
                     }
                     size_t room = kMaxMultilineBlockBytes - block->content.size();
-                    size_t n = std::min(t.size(), room);
-                    block->content.append(t.data(), n);
+                    std::string_view slice;
+                    std::string strip_buf;
+                    if (block->preserve_indent) {
+                        // `|+` (SYNX 3.7): lock the base indent to the first
+                        // non-empty continuation line, then strip exactly that
+                        // many leading whitespace bytes from each subsequent
+                        // line. See spec §8.4.1.
+                        if (block->base_indent < 0) {
+                            block->base_indent = indent;
+                        }
+                        int strip = std::min(block->base_indent, indent);
+                        // `raw` is the original line; trim trailing whitespace
+                        // but keep leading indentation beyond `strip`.
+                        std::string_view raw_trim = raw;
+                        while (!raw_trim.empty()
+                               && (raw_trim.back() == ' '  || raw_trim.back() == '\t'
+                                || raw_trim.back() == '\r' || raw_trim.back() == '\n')) {
+                            raw_trim.remove_suffix(1);
+                        }
+                        if (static_cast<size_t>(strip) < raw_trim.size()) {
+                            slice = raw_trim.substr(strip);
+                        } else {
+                            slice = std::string_view{};
+                        }
+                    } else {
+                        slice = t;
+                    }
+                    size_t n = std::min(slice.size(), room);
+                    block->content.append(slice.data(), n);
                 }
                 ++i; continue;
             }
@@ -808,7 +839,10 @@ ParseResult parse(std::string_view text) {
                 result.metadata[path][p.key] = std::move(m);
             }
 
-            bool is_block = (p.value == "|");
+            // `|` (3.6) trims each continuation line; `|+` (3.7) preserves
+            // indent relative to the first non-empty line. Spec §8.4.1.
+            bool is_block = (p.value == "|" || p.value == "|+");
+            bool preserve_indent = (p.value == "|+");
             bool is_list_marker = false;
             for (const auto& m : p.markers) {
                 if (m == "random" || m == "unique" || m == "geo" || m == "join") {
@@ -819,7 +853,7 @@ ParseResult parse(std::string_view text) {
 
             if (is_block) {
                 insert_value(root, stack, parent_idx, p.key, Value::make_string(""));
-                block = BlockState{indent, p.key, {}, parent_idx};
+                block = BlockState{indent, p.key, {}, parent_idx, preserve_indent, -1};
             } else if (is_list_marker && p.value.empty()) {
                 insert_value(root, stack, parent_idx, p.key, Value::make_array());
                 list = ListState{indent, p.key, parent_idx};

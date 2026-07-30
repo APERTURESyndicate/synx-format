@@ -115,7 +115,22 @@ internal static class SynxParserCore
                 {
                     if (blk.Content.Length > 0)
                         blk.Content.Append('\n');
-                    blk.Content.Append(trimmed);
+                    string slice;
+                    if (blk.PreserveIndent)
+                    {
+                        // `|+` (SYNX 3.7): lock base indent to first non-empty
+                        // continuation line, then strip exactly that many leading
+                        // whitespace chars from each line. See spec §8.4.1.
+                        if (blk.BaseIndent < 0) blk.BaseIndent = indent;
+                        var strip = Math.Min(blk.BaseIndent, indent);
+                        var rawTrim = raw.TrimEnd();
+                        slice = strip < rawTrim.Length ? rawTrim.Substring(strip) : "";
+                    }
+                    else
+                    {
+                        slice = trimmed;
+                    }
+                    blk.Content.Append(slice);
                     continue;
                 }
 
@@ -175,7 +190,10 @@ internal static class SynxParserCore
                 };
             }
 
-            var isBlock = parsed.Value == "|";
+            // `|` (3.6) trims each continuation line; `|+` (3.7) preserves
+            // indent relative to the first non-empty line. Spec §8.4.1.
+            var isBlock = parsed.Value == "|" || parsed.Value == "|+";
+            var preserveIndent = parsed.Value == "|+";
             var isListMarker = parsed.Markers.Any(m =>
                 m is "random" or "unique" or "geo" or "join");
 
@@ -188,6 +206,7 @@ internal static class SynxParserCore
                     Key = parsed.Key,
                     Content = new StringBuilder(),
                     StackIdx = parentIdx,
+                    PreserveIndent = preserveIndent,
                 };
             }
             else if (isListMarker && parsed.Value.Length == 0)
@@ -328,6 +347,13 @@ internal static class SynxParserCore
         public required string Key { get; init; }
         public required StringBuilder Content { get; init; }
         public required int StackIdx { get; init; }
+        /// <summary>
+        /// SYNX 3.7 <c>|+</c>: keep indent relative to the first non-empty
+        /// continuation line instead of fully trimming each line.
+        /// </summary>
+        public bool PreserveIndent { get; init; }
+        /// <summary>Locked on the first non-empty content line; -1 = unlocked.</summary>
+        public int BaseIndent { get; set; } = -1;
     }
 
     private sealed class ListState

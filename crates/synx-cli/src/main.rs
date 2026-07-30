@@ -10,13 +10,14 @@ use synx_core::{
 };
 
 mod pkg;
+mod synxl;
 
 #[derive(Parser)]
 #[command(
     name = "synx",
     version,
     about = "SYNX CLI — The Active Data Format",
-    long_about = "Parse, validate, convert, diff, query, and compile .synx files.\nhttps://github.com/APERTURESyndicate/synx-format"
+    long_about = "Parse, validate, convert, diff, query, and compile .synx files.\nSYNXL datasets (.synxl) are handled by the `synx synxl` subcommands.\nhttps://github.com/APERTURESyndicate/synx-format"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -110,6 +111,16 @@ enum Commands {
         /// Resolve !active markers before querying
         #[arg(long)]
         active: bool,
+    },
+
+    /// SYNXL datasets (.synxl) — parse, validate, convert, split
+    #[command(long_about = "SYNXL datasets (.synxl) — parse, validate, convert, split.\n\
+Datasets are read as a stream: memory stays at one record, whatever the file size.\n\
+\n\
+Exit codes: 0 = ok, 1 = the document violates the SYNXL specification, 2 = I/O failure.")]
+    Synxl {
+        #[command(subcommand)]
+        command: synxl::SynxlCommand,
     },
 
     /// Reformat a .synx file into canonical form
@@ -503,6 +514,10 @@ fn main() {
                     process::exit(1);
                 }
             }
+        }
+
+        Commands::Synxl { command } => {
+            synxl::run(command);
         }
 
         Commands::Format { file, write } => {

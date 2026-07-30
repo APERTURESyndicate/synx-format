@@ -19,6 +19,7 @@ pub(crate) mod rng;
 pub mod binary;
 pub mod diff;
 pub mod schema_json;
+pub mod synxl;
 #[cfg(feature = "wasm")]
 pub mod wasm;
 #[cfg(feature = "signing")]
@@ -28,7 +29,13 @@ pub use value::{Value, Mode, ParseResult, Meta, MetaMap, Options, Constraints, I
 pub use schema_json::{metadata_to_json_schema, value_to_json_value};
 #[cfg(feature = "jsonschema")]
 pub use schema_json::{validate_serde_json, validate_with_json_schema};
-pub use parser::{parse, reshape_tool_output};
+pub use parser::{parse, parse_with, reshape_tool_output, ParserOptions};
+pub use synxl::{
+    parse_lines, parse_lines_with, records_to_json_array, records_to_ndjson, write_document,
+    write_lines, Diagnostic, DiagnosticKind, FieldDecl, FieldList, SynxlDocument, SynxlError,
+    SynxlErrorKind, SynxlOptions, SynxlReader, SynxlReaderOwned, SynxlRecord, SynxlStreamError,
+    SynxlStreamReader,
+};
 pub use engine::resolve;
 pub use calc::safe_calc;
 pub use diff::{diff as diff_objects, DiffResult, DiffChange, diff_to_value};

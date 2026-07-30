@@ -1,0 +1,2 @@
+BlockCombinedWithType
+The field `notes` declares both `(string)` and `[block]`; a block field's shape MUST NOT be constrained by a type (SYNXL-1-NORMATIVE.md §5.3).

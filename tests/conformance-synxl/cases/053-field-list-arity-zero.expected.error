@@ -1,0 +1,2 @@
+FieldListArityZero
+Every field in the list carries `[block]`, leaving an inline arity of 0, which is forbidden (SYNXL-1-NORMATIVE.md §5.3).

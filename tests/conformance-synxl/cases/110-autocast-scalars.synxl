@@ -1,0 +1,4 @@
+!synxl 1
+!fields a ; b ; c ; d ; e ; f
+
+true ; false ; null ; 42 ; 3.14 ; hello

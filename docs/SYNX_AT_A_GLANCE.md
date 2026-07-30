@@ -8,7 +8,11 @@ One-page map of the **synx-format** monorepo: locations, capabilities, quality g
 
 **SYNX** — human-readable structured data (key / value / indent), optional **`!active`** mode with markers (`:calc`, `:env`, `:alias`, …), optional **`!llm`** envelope hint, binary **`.synxb`**, **JSON parity** for interchange. Tagline: fewer tokens than JSON for many LLM payloads.
 
+**SYNXL** (`.synxl`) — a **separate** record-stream format for datasets, the SYNX-native counterpart of JSONL and CSV: one `!fields` declaration, then records; each record projects to a JSON object. Own version axis, own normative spec [`spec/SYNXL-1-NORMATIVE.md`](spec/SYNXL-1-NORMATIVE.md), own conformance suite [`tests/conformance-synxl/`](../tests/conformance-synxl/). Implemented in Rust, TypeScript, Python and the CLI (`synx synxl`) — **not** in the native `parsers/` yet.
+
 **3.6.0 frozen core:** normative [`spec/SYNX-3.6-NORMATIVE.md`](spec/SYNX-3.6-NORMATIVE.md) + [`tests/conformance/`](../tests/conformance/) + `synx-core` 3.6.x — see [`spec/CORE-FREEZE.md`](spec/CORE-FREEZE.md).
+
+**3.7 additions:** [`spec/SYNX-3.7-NORMATIVE.md`](spec/SYNX-3.7-NORMATIVE.md) — the `|+` indent-preserving multiline opener, and nothing else. Everything in 3.6 carries through verbatim.
 
 ---
 
@@ -25,10 +29,12 @@ One-page map of the **synx-format** monorepo: locations, capabilities, quality g
 | **Python fuzz/corpus replay** | [`crates/synx-core/fuzz/scripts/synx_fuzz_replay.py`](../crates/synx-core/fuzz/scripts/synx_fuzz_replay.py) — `synx_native` (`pip install -e bindings/python`) |
 | **TypeScript / npm** | [`packages/synx-js/`](../packages/synx-js/) |
 | **Bindings** | [`bindings/node`](../bindings/node), [`bindings/python`](../bindings/python), [`bindings/wasm`](../bindings/wasm), [`bindings/c-header`](../bindings/c-header), [`bindings/cpp`](../bindings/cpp), [`bindings/go`](../bindings/go), [`bindings/mojo`](../bindings/mojo) (Mojo → `synx_native`) |
-| **Conformance suite** | [`tests/conformance/`](../tests/conformance/) — `.synx` + `.expected.json` |
+| **Conformance suite (SYNX)** | [`tests/conformance/`](../tests/conformance/) — `.synx` + `.expected.json` |
+| **Conformance suite (SYNXL)** | [`tests/conformance-synxl/`](../tests/conformance-synxl/) — `.synxl` + `.expected.json` / `.expected.error` / `.expected.diagnostics` |
+| **SYNXL implementations** | [`crates/synx-core/src/synxl.rs`](../crates/synx-core/src/synxl.rs) · [`crates/synx-cli/src/synxl.rs`](../crates/synx-cli/src/synxl.rs) · [`packages/synx-js/src/synxl.ts`](../packages/synx-js/src/synxl.ts) · [`bindings/python/src/synxl.rs`](../bindings/python/src/synxl.rs) |
 | **Benchmarks** | [`benchmarks/`](../benchmarks/) — Rust Criterion, Node, Python |
 | **Docs index** | [`docs/README.md`](README.md) |
-| **Spec (normative)** | [`docs/spec/SYNX-3.6-NORMATIVE.md`](spec/SYNX-3.6-NORMATIVE.md) · human guides [`SPECIFICATION_EN.md`](spec/SPECIFICATION_EN.md) |
+| **Spec (normative)** | [`docs/spec/SYNX-3.6-NORMATIVE.md`](spec/SYNX-3.6-NORMATIVE.md) (frozen) · [`SYNX-3.7-NORMATIVE.md`](spec/SYNX-3.7-NORMATIVE.md) (`\|+`) · [`SYNXL-1-NORMATIVE.md`](spec/SYNXL-1-NORMATIVE.md) (`.synxl`) · human guides [`SPECIFICATION_EN.md`](spec/SPECIFICATION_EN.md) |
 | **Repo tree** | [`docs/repository-layout.md`](repository-layout.md) |
 | **Integrations index** | [`integrations/README.md`](../integrations/README.md) |
 | **Vendor assurance script** | [`scripts/verify-release-quality.ps1`](../scripts/verify-release-quality.ps1) · [`.sh`](../scripts/verify-release-quality.sh) |
@@ -37,17 +43,20 @@ One-page map of the **synx-format** monorepo: locations, capabilities, quality g
 
 ## What each parser/runtime does
 
-| Implementation | Parse static | `!active` / engine | `.synxb` | Fuzz entry |
-|----------------|-------------|-------------------|---------|------------|
-| **Rust `synx-core`** | yes | yes | yes | `cargo-fuzz` (`fuzz_parse`, `fuzz_compile`, `fuzz_format`) |
-| **C# `Synx.Core`** | yes | yes (`ParseActive`) | no (yet) | **`Synx.FuzzReplay`** (corpus replay; strict UTF-8 like Rust harness) |
-| **JS `@aperturesyndicate/synx-format`** | yes | yes | yes (via core where exposed) | security tests in package |
-| **Python `synx-format`** | yes | yes | yes | — |
-| **C++ `synx/synx.hpp`** (via `synx-c`) | yes | yes | yes | — |
-| **Go** `bindings/go` (cgo, `synx-c`) | yes | yes | yes | — |
-| **Mojo** `bindings/mojo` (CPython `synx_native`) | yes | yes | yes | — |
-| **Swift** `bindings/swift` (`synx-c`) | yes | yes | yes | — |
-| **Kotlin/JVM** `bindings/kotlin` (JNA, `synx-c`) | yes | yes | yes | — |
+| Implementation | Parse static | `!active` / engine | `.synxb` | SYNXL (`.synxl`) | Fuzz entry |
+|----------------|-------------|-------------------|---------|---|------------|
+| **Rust `synx-core`** | yes | yes | yes | yes | `cargo-fuzz` (`fuzz_parse`, `fuzz_compile`, `fuzz_format`) |
+| **Rust CLI `synx`** | yes | yes | yes | yes (`synx synxl`) | — |
+| **C# `Synx.Core`** | yes | yes (`ParseActive`) | no (yet) | no | **`Synx.FuzzReplay`** (corpus replay; strict UTF-8 like Rust harness) |
+| **JS `@aperturesyndicate/synx-format`** | yes | yes | yes (via core where exposed) | yes | security tests in package |
+| **Python `synx-format`** | yes | yes | yes | yes | — |
+| **C++ `synx/synx.hpp`** (via `synx-c`) | yes | yes | yes | no | — |
+| **Go** `bindings/go` (cgo, `synx-c`) | yes | yes | yes | no | — |
+| **Mojo** `bindings/mojo` (CPython `synx_native`) | yes | yes | yes | no | — |
+| **Swift** `bindings/swift` (`synx-c`) | yes | yes | yes | no | — |
+| **Kotlin/JVM** `bindings/kotlin` (JNA, `synx-c`) | yes | yes | yes | no | — |
+
+All rows read SYNX 3.7, `|+` included. SYNXL is a separate format and a separate surface — see [`spec/SYNXL-1-NORMATIVE.md`](spec/SYNXL-1-NORMATIVE.md).
 
 ---
 
@@ -57,6 +66,12 @@ One-page map of the **synx-format** monorepo: locations, capabilities, quality g
 # Rust CLI
 cargo install --path crates/synx-cli
 synx parse file.synx
+
+# SYNXL datasets — streamed, memory stays at one record
+synx synxl parse dataset.synxl --format ndjson
+synx synxl validate dataset.synxl --strict
+synx synxl convert dataset.synxl --to jsonl
+synx synxl split dataset.synxl -n 10000 --output-dir shards/
 
 # .NET — consume (when listed on nuget.org)
 dotnet add package APERTURESyndicate.Synx
@@ -81,7 +96,7 @@ dotnet run -c Release --project parsers/dotnet/tools/Synx.FuzzReplay -- path/to/
 
 ## Quality & safety (why this is “not a bad option”)
 
-1. **Conformance:** shared `tests/conformance/cases/*.synx` — Rust integration test + C# xUnit read the **same files**.
+1. **Conformance:** shared `tests/conformance/cases/*.synx` — Rust integration test + C# xUnit read the **same files**. SYNXL has its own suite, `tests/conformance-synxl/cases/`, read by the Rust, TypeScript and Python implementations.
 2. **Fuzzing:** `cargo-fuzz` on `synx-core` with **bounded allocations** (input cap, line cap, depth 128, block/list/include limits) — see [`fuzz/README.md`](../crates/synx-core/fuzz/README.md).
 3. **Cross-parser replay:** `Synx.FuzzReplay` feeds valid-UTF8 artifacts through **Parse + ToJson** (exercises emit path).
 4. **Security tests:** JS/ReDoS/prototype pollution coverage in `packages/synx-js/tests/`.
@@ -124,7 +139,7 @@ VS Code, Visual Studio, Sublime, Neovim, **tree-sitter** grammar — see [`integ
 
 ## Version
 
-Current format line in root **README**: **SYNX v3.6** (see [`CHANGELOG.md`](../CHANGELOG.md) for module-level history).
+Current language line: **SYNX 3.7** — additive over the frozen 3.6 baseline, adding only `|+`. Current dataset format: **SYNXL 1** (`.synxl`), versioned independently. See [`CHANGELOG.md`](../CHANGELOG.md) for module-level history.
 
 ---
 

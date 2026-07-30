@@ -1,5 +1,5 @@
 name: synx
-version: 3.6.3
+version: 3.7.0
 description: Native Dart parser for SYNX (Active Data Format). Parity with synx-core 3.6.x. No FFI — pure Dart.
 homepage: https://synx.aperturesyndicate.com
 repository: https://github.com/aperturesyndicate/synx

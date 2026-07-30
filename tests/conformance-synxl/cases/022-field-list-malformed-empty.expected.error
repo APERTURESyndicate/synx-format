@@ -1,0 +1,2 @@
+MalformedFieldList
+The `!fields` line declares zero field declarations, which is not a parsable field list (SYNXL-1-NORMATIVE.md §5).

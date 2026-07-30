@@ -52,6 +52,40 @@ rules |
     expect(data.rules).toBe('Rule one.\nRule two.\nRule three.');
   });
 
+  test('parses |+ multiline blocks preserving relative indent (SYNX 3.7)', () => {
+    const data = Synx.parse(`
+prompt |+
+  Top-level line
+    Indented two
+      Indented four
+    Back to two
+  Top again`);
+    expect(data.prompt).toBe(
+      'Top-level line\n  Indented two\n    Indented four\n  Back to two\nTop again'
+    );
+  });
+
+  test('|+ block: base indent locks to first non-empty line', () => {
+    // Even if the opener is at column 0, the base indent is the first
+    // continuation line's indent (4 here), not the opener's indent + 1.
+    const data = Synx.parse(`
+code |+
+    function foo() {
+      return 1;
+    }`);
+    expect(data.code).toBe('function foo() {\n  return 1;\n}');
+  });
+
+  test('|+ block: keys at <= opener indent end the block', () => {
+    const data = Synx.parse(`
+intro |+
+  hello
+    world
+next plain`);
+    expect(data.intro).toBe('hello\n  world');
+    expect(data.next).toBe('plain');
+  });
+
   test('ignores # comments', () => {
     const data = Synx.parse(`
 # This is a comment
@@ -165,6 +199,20 @@ key:secret my_api_key_123
     expect(JSON.stringify(data.key)).toBe('"[SECRET]"');
     // But valueOf reveals it for code usage
     expect((data.key as any).reveal()).toBe('my_api_key_123');
+  });
+
+  test(':secret value is not leaked by Synx.stringify', () => {
+    const data = Synx.parse(`
+!active
+key:secret my_api_key_123
+nested
+  token:secret super_sensitive_456
+    `);
+    const out = Synx.stringify(data, true);
+    expect(out).not.toContain('my_api_key_123');
+    expect(out).not.toContain('super_sensitive_456');
+    expect(out).not.toContain('_value');
+    expect(out).toContain('[SECRET]');
   });
 
   test(':template substitutes {placeholders} (legacy marker)', () => {

@@ -59,6 +59,30 @@ func TestParseMultilineBlock(t *testing.T) {
 	}
 }
 
+// SYNX 3.7 — `|+` keeps each continuation line's indent relative to the
+// first non-empty content line (see spec §8.4.1).
+func TestParseMultilineBlockPreserveIndent(t *testing.T) {
+	src := "prompt |+\n  Top\n    Indented two\n      Indented four\n    Back to two\n  Top again"
+	r := Parse(src)
+	o, _ := AsObject(r.Root)
+	got, _ := AsString(o.GetOr("prompt", Null))
+	want := "Top\n  Indented two\n    Indented four\n  Back to two\nTop again"
+	if got != want {
+		t.Fatalf("|+ mismatch\n got: %q\nwant: %q", got, want)
+	}
+}
+
+func TestParseMultilineBlockPreserveIndentLocksBase(t *testing.T) {
+	src := "code |+\n    function foo() {\n      return 1;\n    }"
+	r := Parse(src)
+	o, _ := AsObject(r.Root)
+	got, _ := AsString(o.GetOr("code", Null))
+	want := "function foo() {\n  return 1;\n}"
+	if got != want {
+		t.Fatalf("|+ base-indent lock failed\n got: %q\nwant: %q", got, want)
+	}
+}
+
 func TestParseActiveMetadata(t *testing.T) {
 	r := Parse("!active\nprice 100\ntax:calc price * 0.2")
 	if r.Mode != ModeActive {

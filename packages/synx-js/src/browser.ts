@@ -8,10 +8,42 @@
 
 import { parseData } from './parser';
 import { resolve } from './engine';
+import {
+  parseSynxl,
+  streamSynxl,
+  streamSynxlAsync,
+  synxlToJSON,
+  synxlToNDJSON,
+  writeSynxl,
+  SYNXL_VERSION,
+} from './synxl';
 import type { SynxObject, SynxOptions } from './types';
+import type { SynxlDocument, SynxlOptions, SynxlRecord, SynxlWriteOptions } from './types';
 
 export type { SynxObject, SynxOptions, SynxValue, SynxArray, SynxPrimitive } from './types';
+export type {
+  SynxlDocument,
+  SynxlRecord,
+  SynxlField,
+  SynxlFieldList,
+  SynxlDiagnostic,
+  SynxlDiagnosticKind,
+  SynxlOptions,
+  SynxlWriteOptions,
+} from './types';
 export { SynxError } from './types';
+export {
+  parseSynxl,
+  streamSynxl,
+  streamSynxlAsync,
+  synxlToJSON,
+  synxlToNDJSON,
+  writeSynxl,
+  splitRecordLine,
+  utf8Length,
+  SynxlError,
+  SYNXL_VERSION,
+} from './synxl';
 
 class Synx {
   static parse<T extends SynxObject = SynxObject>(text: string, options: SynxOptions = {}): T {
@@ -29,6 +61,46 @@ class Synx {
     }
     out += serializeObject(obj, 0);
     return out;
+  }
+
+  // ─── SYNXL — "SYNX Lines" record stream (SYNXL 1) ───────
+  // File I/O is Node-only and therefore absent here; everything else works
+  // unchanged in the browser, including the streaming reader over a `fetch`
+  // body's chunks.
+
+  static readonly SYNXL_VERSION = SYNXL_VERSION;
+
+  static parseSynxl(text: string, options: SynxlOptions = {}): SynxlDocument {
+    return parseSynxl(text, options);
+  }
+
+  static streamSynxl(
+    source: string | Iterable<string>,
+    options: SynxlOptions = {},
+  ): Generator<SynxlRecord, void, undefined> {
+    return streamSynxl(source, options);
+  }
+
+  static streamSynxlAsync(
+    source: AsyncIterable<string | Uint8Array>,
+    options: SynxlOptions = {},
+  ): AsyncGenerator<SynxlRecord, void, undefined> {
+    return streamSynxlAsync(source, options);
+  }
+
+  static synxlToJSON(source: string | SynxlDocument, options: SynxlOptions = {}): string {
+    return synxlToJSON(source, options);
+  }
+
+  static synxlToNDJSON(source: string | SynxlDocument, options: SynxlOptions = {}): string {
+    return synxlToNDJSON(source, options);
+  }
+
+  static writeSynxl(
+    input: SynxlDocument | readonly SynxObject[],
+    options: SynxlWriteOptions = {},
+  ): string {
+    return writeSynxl(input, options);
   }
 }
 

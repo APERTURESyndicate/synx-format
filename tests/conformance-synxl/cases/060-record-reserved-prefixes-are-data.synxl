@@ -1,0 +1,9 @@
+!synxl 1
+!fields val
+
+-5
+[unparsed]
+:foo
+(paren
+/var/log/app
+@kaiserberg

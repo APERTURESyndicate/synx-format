@@ -2,7 +2,9 @@
 
 # SYNX Kotlin/JVM (`synx-kotlin`)
 
-**Version:** 3.6.1 — **`SynxEngine`** wraps **`synx-c`** via [**JNA**](https://github.com/java-native-access/jna) (same Rust **`synx-core`** engine as Swift/Go). Not a pure-Kotlin grammar implementation.
+**Version:** 3.7.0 — **`SynxEngine`** wraps **`synx-c`** via [**JNA**](https://github.com/java-native-access/jna) (same Rust **`synx-core`** engine as Swift/Go). Not a pure-Kotlin grammar implementation.
+
+**SYNXL (`.synxl`) is not available here.** The record-stream format ([`SYNXL-1-NORMATIVE.md`](../../docs/spec/SYNXL-1-NORMATIVE.md), new in 3.7.0) has no C ABI surface in `synx-c`, so `SynxEngine` cannot reach it. SYNX 3.7 itself — including the `|+` multiline opener — works as usual. For SYNXL, use the Rust core, the CLI (`synx synxl`), `@aperturesyndicate/synx-format`, or `synx_native` (Python).
 
 ## Prerequisites
 

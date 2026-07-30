@@ -1,0 +1,6 @@
+!synxl 1
+!fields a ; notes[block] ; c
+
+x ; y
+  notes
+    val hello

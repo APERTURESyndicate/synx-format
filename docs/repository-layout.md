@@ -22,7 +22,11 @@ synx-format/
 
 │   ├── synx-core/             # Parser, engine, stringify, diff, .synxb — canonical Rust
 
+│   │   └── src/synxl.rs       # SYNXL (.synxl) reference implementation: readers, writer, JSON/NDJSON
+
 │   ├── synx-cli/              # CLI binary (`synx`)
+
+│   │   └── src/synxl.rs       # `synx synxl parse|validate|convert|split` (streaming)
 
 │   └── synx-lsp/              # Language Server (`synx-lsp`) — LSP over stdio
 
@@ -42,7 +46,7 @@ synx-format/
 
 │   ├── node/                  # N-API package for Node.js
 
-│   ├── python/                # PyO3 / PyPI build
+│   ├── python/                # PyO3 / PyPI build (`src/synxl.rs` — SYNXL surface of `synx_native`)
 
 │   └── wasm/                  # WebAssembly build
 
@@ -66,6 +70,8 @@ synx-format/
 
 │   └── synx-js/               # Pure TypeScript parser + library (@aperturesyndicate/synx-format)
 
+│       └── src/synxl.ts       # SYNXL (.synxl) reader, streaming reader, writer, JSON/NDJSON
+
 ├── scripts/
 
 │   ├── verify-release-quality.ps1  # Rust + .NET + FuzzReplay checks
@@ -84,11 +90,13 @@ synx-format/
 
 │   ├── dev/                   # Contributor stubs (e.g. plugins roadmap — not normative)
 
-│   └── spec/                  # Normative specification (EN, RU)
+│   └── spec/                  # Normative specs: SYNX-3.6 (frozen), SYNX-3.7 (`|+`), SYNXL-1 (`.synxl`), EN/RU guides
 
 ├── tests/
 
-│   └── conformance/           # Canonical test cases (.synx + .expected.json) + runner
+│   ├── conformance/           # Canonical SYNX test cases (.synx + .expected.json) + runner
+
+│   └── conformance-synxl/     # Canonical SYNXL cases (.synxl + .expected.json / .expected.error / .expected.diagnostics)
 
 ├── examples/                  # Sample .synx files and small demos
 

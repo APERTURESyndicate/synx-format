@@ -1,0 +1,8 @@
+!synxl 1
+!fields id(int) ; body[block]
+
+1
+  body
+    text |+
+        Привет, мир!
+        Как дела?

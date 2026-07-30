@@ -65,7 +65,7 @@ function checkFileSize(filePath: string): void {
 
 // ─── Secret wrapper ───────────────────────────────────────
 
-class SynxSecret {
+export class SynxSecret {
   private _value: string;
 
   constructor(value: string) {
@@ -966,6 +966,8 @@ function extractFromFileContent(content: string, keyPath: string, ext: string): 
 function stringifyValue(value: unknown, indent: number): string {
   const sp = ' '.repeat(indent);
   if (value === null || value === undefined) return `${sp}null\n`;
+  // SynxSecret is an object, but must serialize as its [SECRET] mask — never recurse into _value.
+  if (value instanceof SynxSecret) return `${sp}${String(value)}\n`;
   if (typeof value === 'boolean' || typeof value === 'number') return `${sp}${value}\n`;
   if (typeof value === 'string') return `${sp}${value}\n`;
   if (Array.isArray(value)) {
@@ -979,7 +981,9 @@ function stringifyValue(value: unknown, indent: number): string {
     const keys = Object.keys(obj).filter(k => k !== '__synx').sort();
     for (const k of keys) {
       const v = obj[k];
-      if (v && typeof v === 'object' && !Array.isArray(v)) {
+      if (v instanceof SynxSecret) {
+        out += `${sp}${k} ${String(v)}\n`;
+      } else if (v && typeof v === 'object' && !Array.isArray(v)) {
         out += `${sp}${k}\n`;
         out += stringifyValue(v, indent + 2);
       } else if (Array.isArray(v)) {

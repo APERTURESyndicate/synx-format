@@ -2,7 +2,9 @@
 
 # SYNX for Mojo (`bindings/mojo`)
 
-**Version:** 3.6.1 — **same semantics as `synx-core`**, without maintaining a second grammar implementation in Mojo.
+**Version:** 3.7.0 — **same semantics as `synx-core`**, without maintaining a second grammar implementation in Mojo.
+
+**SYNXL (`.synxl`):** `synx/interop.mojo` wraps the SYNX API only; it has no SYNXL wrappers. The underlying `synx_native` extension *does* expose the record-stream surface (`synxl_parse`, `synxl_stream`, `synxl_stream_file`, `synxl_write`, …), so it is reachable today through the same Python-interop mechanism this folder is built on — just without typed Mojo wrappers. Format definition: [`SYNXL-1-NORMATIVE.md`](../../docs/spec/SYNXL-1-NORMATIVE.md).
 
 ## What this is (and is not)
 

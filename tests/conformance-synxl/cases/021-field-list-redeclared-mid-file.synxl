@@ -1,0 +1,9 @@
+!synxl 1
+!fields a ; b
+
+1 ; 2
+3 ; 4
+
+!fields a ; c
+
+5 ; 6

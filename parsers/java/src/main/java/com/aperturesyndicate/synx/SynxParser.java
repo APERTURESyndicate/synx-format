@@ -142,8 +142,27 @@ public final class SynxParser {
                     if (block.content.length() < MAX_MULTILINE_BYTES) {
                         if (block.content.length() > 0) block.content.append('\n');
                         int room = MAX_MULTILINE_BYTES - block.content.length();
-                        int n = Math.min(t.length(), room);
-                        block.content.append(t, 0, n);
+                        String slice;
+                        if (block.preserveIndent) {
+                            // `|+` (SYNX 3.7): lock base indent to the first
+                            // non-empty continuation line, then strip exactly
+                            // that many leading whitespace chars from each
+                            // subsequent line. See spec §8.4.1.
+                            if (block.baseIndent < 0) block.baseIndent = indent;
+                            int strip = Math.min(block.baseIndent, indent);
+                            // rstrip trailing whitespace from the raw line
+                            int end = rawStr.length();
+                            while (end > 0) {
+                                char c = rawStr.charAt(end - 1);
+                                if (c != ' ' && c != '\t' && c != '\r' && c != '\n') break;
+                                end--;
+                            }
+                            slice = strip < end ? rawStr.substring(strip, end) : "";
+                        } else {
+                            slice = t;
+                        }
+                        int n = Math.min(slice.length(), room);
+                        block.content.append(slice, 0, n);
                     }
                     i++; continue;
                 }
@@ -244,7 +263,10 @@ public final class SynxParser {
                 result.metadata.computeIfAbsent(path, k -> new HashMap<>()).put(parsed.key, meta);
             }
 
-            boolean isBlock = parsed.value.equals("|");
+            // `|` (3.6) trims each continuation line; `|+` (3.7) preserves
+            // indent relative to the first non-empty line. Spec §8.4.1.
+            boolean isBlock = parsed.value.equals("|") || parsed.value.equals("|+");
+            boolean preserveIndent = parsed.value.equals("|+");
             boolean isListMarker = false;
             for (String m : parsed.markers) {
                 if (m.equals("random") || m.equals("unique") || m.equals("geo") || m.equals("join")) {
@@ -254,7 +276,7 @@ public final class SynxParser {
 
             if (isBlock) {
                 insertValue(rootObj, stack, parentIdx, parsed.key, SynxValue.ofString(""));
-                block = new BlockState(indent, parsed.key, new StringBuilder(), parentIdx);
+                block = new BlockState(indent, parsed.key, new StringBuilder(), parentIdx, preserveIndent);
             } else if (isListMarker && parsed.value.isEmpty()) {
                 insertValue(rootObj, stack, parentIdx, parsed.key, SynxValue.ofArray());
                 list = new ListState(indent, parsed.key, parentIdx);
@@ -694,8 +716,14 @@ public final class SynxParser {
         final String key;
         final StringBuilder content;
         final int stackIdx;
-        BlockState(int indent, String key, StringBuilder content, int stackIdx) {
+        /** SYNX 3.7 `|+`: keep indent relative to the first non-empty continuation line. */
+        final boolean preserveIndent;
+        /** Locked on the first non-empty continuation line; -1 means "unlocked". */
+        int baseIndent;
+        BlockState(int indent, String key, StringBuilder content, int stackIdx,
+                   boolean preserveIndent) {
             this.indent = indent; this.key = key; this.content = content; this.stackIdx = stackIdx;
+            this.preserveIndent = preserveIndent; this.baseIndent = -1;
         }
     }
 

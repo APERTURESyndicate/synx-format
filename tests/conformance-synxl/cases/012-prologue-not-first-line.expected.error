@@ -1,0 +1,2 @@
+MissingOrMalformedPrologue
+The `!synxl 1` line is present but is not the first non-empty, non-comment line of the document; a field list precedes it (SYNXL-1-NORMATIVE.md §4.1).

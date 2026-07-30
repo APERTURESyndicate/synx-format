@@ -1,0 +1,10 @@
+# Conformance fixtures are byte-exact contracts: inputs are compared against
+# expectations byte-for-byte, and line endings are part of what is under test
+# (SYNX §2.2 CR handling, §8.4/§8.4.1 multiline bodies). Checking them out with
+# platform-native line endings would make the suites fail on Windows for reasons
+# that have nothing to do with the parsers, so they are never converted.
+tests/conformance/cases/**        -text
+tests/conformance-synxl/cases/**  -text
+
+# Normative specifications are quoted verbatim in issues and tests.
+docs/spec/**                      text eol=lf

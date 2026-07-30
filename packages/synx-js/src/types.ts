@@ -121,6 +121,107 @@ export interface SynxDiff {
   unchanged: string[];
 }
 
+// ─── SYNXL — "SYNX Lines" record stream (SYNXL format version 1) ──────────
+
+/** Recoverable parse observation kinds (SYNXL §11.2). */
+export type SynxlDiagnosticKind =
+  | 'MissingFields'
+  | 'ExtraFields'
+  | 'CastFailed'
+  | 'UnknownBlockKey'
+  | 'BlockFieldNotDeclared'
+  | 'OrphanBlockLine'
+  | 'ConstraintViolation'
+  | 'RecordTruncated';
+
+/** A non-fatal SYNXL parse observation (SYNXL §11.2). */
+export interface SynxlDiagnostic {
+  kind: SynxlDiagnosticKind;
+  /** 0-based record index in document order. */
+  record: number;
+  /** 1-based source line number. */
+  line: number;
+  /** Human-readable description. */
+  message: string;
+  /** Field name the diagnostic refers to, when applicable. */
+  field?: string;
+}
+
+/** One declaration from a `!fields` line (SYNXL §5). */
+export interface SynxlField {
+  /** Field name, compared by exact Unicode scalar sequence. */
+  name: string;
+  /** Declared `[block]` flag (SYNXL §5.3). */
+  block: boolean;
+  /** Declared type from `(type)` or `type:<name>`, if any. */
+  type?: string;
+  /** Declared constraints (SYNXL §5.2). Not enforced unless `validate` is set. */
+  constraints?: SynxConstraints;
+  /** Verbatim declaration text, re-emitted by the writer (SYNXL §14). */
+  decl: string;
+}
+
+/** A `!fields` line in effect for a run of records (SYNXL §5). */
+export interface SynxlFieldList {
+  fields: SynxlField[];
+  /** Number of non-block fields — the expected inline part count (SYNXL §5.3). */
+  arity: number;
+  /** 1-based source line of the `!fields` line. */
+  line: number;
+}
+
+/** One parsed SYNXL record (record line plus its block). */
+export interface SynxlRecord {
+  /** 0-based index in document order. */
+  index: number;
+  /** 1-based source line of the record line. */
+  line: number;
+  /** Field name → value, restricted to the field list in effect. */
+  values: SynxObject;
+  /** The field list this record was parsed under. */
+  fields: SynxlFieldList;
+  /** Diagnostics produced by this record (SYNXL §11.2). */
+  diagnostics: SynxlDiagnostic[];
+}
+
+/** Whole-document SYNXL parse result. */
+export interface SynxlDocument {
+  /** Declared format version from the prologue (SYNXL §4.1). */
+  version: number;
+  records: SynxlRecord[];
+  /** Every field list encountered, in document order. */
+  fieldLists: SynxlFieldList[];
+  /** All diagnostics, in document order (flattened from the records). */
+  diagnostics: SynxlDiagnostic[];
+}
+
+/** Options for the SYNXL reader. */
+export interface SynxlOptions {
+  /**
+   * Enforce declared constraints and report `ConstraintViolation` diagnostics.
+   * Off by default per SYNXL §8.4 (validation is opt-in).
+   */
+  validate?: boolean;
+  /**
+   * Per-record byte budget (line plus block). Defaults to the SYNXL §13 limit
+   * of 16 MiB; overridable mainly for tests and memory-constrained consumers.
+   * Exceeding it truncates the record and records `RecordTruncated`.
+   */
+  maxRecordBytes?: number;
+  /**
+   * Report a `RecordTruncated` diagnostic when the input does not end with a
+   * newline, i.e. when the final record may have been cut mid-write
+   * (SYNXL §15.2). Off by default because a missing final newline is normal.
+   */
+  reportTruncatedTail?: boolean;
+}
+
+/** Options for the SYNXL writer (SYNXL §14). */
+export interface SynxlWriteOptions {
+  /** Indentation width for block fields. Default 2. */
+  indent?: number;
+}
+
 /**
  * Typed error thrown by SYNX in strict mode.
  * The `code` field contains the error prefix (e.g. "CALC_ERR", "ALIAS_ERR").

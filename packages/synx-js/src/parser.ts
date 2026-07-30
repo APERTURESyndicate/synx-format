@@ -41,8 +41,14 @@ const MAX_MARKER_CHAIN_SEGMENTS = 512;
 
 // ─── Helpers ──────────────────────────────────────────────
 
-/** Cast a raw string value to a JS primitive */
-function castType(val: string): SynxValue {
+/**
+ * Cast a raw string value to a JS primitive (SYNX §8.3 automatic casting).
+ *
+ * Exported (additively) so that the SYNXL reader can reuse the exact same
+ * numeric/boolean/quote semantics instead of growing a second caster —
+ * SYNXL §8.1 defines inline casting by reference to this function.
+ */
+export function castType(val: string): SynxValue {
   const len = val.length;
 
   // Quoted strings preserve literal value (bypass auto-casting).
@@ -138,8 +144,13 @@ function stripInlineComment(val: string): string {
   return result.trimEnd();
 }
 
-/** Parse constraint string like "min:3, max:30, required, type:int" */
-function parseConstraints(raw: string): SynxConstraints {
+/**
+ * Parse constraint string like "min:3, max:30, required, type:int".
+ *
+ * Exported (additively) so that the SYNXL field-list parser can reuse the
+ * existing SYNX constraint parser as mandated by SYNXL §5.2.
+ */
+export function parseConstraints(raw: string): SynxConstraints {
   const constraints: SynxConstraints = {};
   let start = 0;
   while (start < raw.length) {
@@ -302,7 +313,23 @@ function parseKeyLine(trimmed: string): {
 
 // ─── Parser ───────────────────────────────────────────────
 
-export function parseData(text: string): SynxParseResult {
+/** Options for {@link parseData}. Additive — omitting them keeps 3.7 behaviour. */
+export interface ParseDataOptions {
+  /**
+   * When `false`, `!`-prefixed lines are NOT interpreted as SYNX directives:
+   * they set no mode flag and record no include. Outside a multiline block such
+   * a line is discarded like a comment; **inside** a `|` / `|+` body it stays
+   * ordinary content, because the multiline context is known at this point.
+   *
+   * Used by the SYNXL reader for block delegation (SYNXL §9.4) — a dataset row
+   * must never become a file-read or mode-change primitive. Defaults to `true`.
+   */
+  directives?: boolean;
+}
+
+export function parseData(text: string, options?: ParseDataOptions): SynxParseResult {
+  const directivesEnabled = options?.directives !== false;
+
   // Truncate input to MAX_SYNX_INPUT_BYTES (UTF-16 code-unit boundary).
   if (text.length > MAX_SYNX_INPUT_BYTES) {
     text = text.substring(0, MAX_SYNX_INPUT_BYTES);
@@ -324,7 +351,13 @@ export function parseData(text: string): SynxParseResult {
   let tool = false;
   let schema = false;
   const includes: SynxInclude[] = [];
-  let currentBlock: { indent: number; obj: SynxObject; key: string } | null = null;
+  // `preserveIndent` toggles SYNX 3.7 `|+` semantics — keep relative indent of
+  // each continuation line instead of full per-line trim. `baseIndent` is the
+  // indent of the first non-empty continuation line (used as the strip prefix).
+  let currentBlock: {
+    indent: number; obj: SynxObject; key: string;
+    preserveIndent: boolean; baseIndent: number;
+  } | null = null;
   let currentList: { indent: number; arr: SynxArray } | null = null;
   let inBlockComment = false;
 
@@ -358,7 +391,7 @@ export function parseData(text: string): SynxParseResult {
     // ── Comments: # or // ──
     if (fc === 35) { // #
       // Legacy: #!mode:active / #!mode:static
-      if (rawLen - indent > 7 && rawLine.charCodeAt(indent + 1) === 33) { // !
+      if (directivesEnabled && rawLen - indent > 7 && rawLine.charCodeAt(indent + 1) === 33) { // !
         if (rawLine.substring(indent, indent + 7) === '#!mode:') {
           const declared = rawLine.substring(indent + 7, rawLen).trim();
           mode = declared === 'active' ? 'active' : 'static';
@@ -380,18 +413,25 @@ export function parseData(text: string): SynxParseResult {
 
     // ── Directives: !active / !lock / !llm / !tool / !schema / !include ──
     if (fc === 33) {
-      if (trimmed === '!active') { mode = 'active'; continue; }
-      if (trimmed === '!lock') { locked = true; continue; }
-      if (trimmed === '!llm') { llm = true; continue; }
-      if (trimmed === '!tool') { tool = true; continue; }
-      if (trimmed === '!schema') { schema = true; continue; }
-      if (trimmed.startsWith('!include ')) {
-        if (includes.length < MAX_INCLUDE_DIRECTIVES) {
-          const parts = trimmed.substring(9).trim().split(/\s+/);
-          const inclPath = parts[0];
-          const alias = parts[1] || inclPath.replace(/^.*[\/\\]/, '').replace(/\.synx$/i, '');
-          includes.push({ path: inclPath, alias });
+      if (directivesEnabled) {
+        if (trimmed === '!active') { mode = 'active'; continue; }
+        if (trimmed === '!lock') { locked = true; continue; }
+        if (trimmed === '!llm') { llm = true; continue; }
+        if (trimmed === '!tool') { tool = true; continue; }
+        if (trimmed === '!schema') { schema = true; continue; }
+        if (trimmed.startsWith('!include ')) {
+          if (includes.length < MAX_INCLUDE_DIRECTIVES) {
+            const parts = trimmed.substring(9).trim().split(/\s+/);
+            const inclPath = parts[0];
+            const alias = parts[1] || inclPath.replace(/^.*[\/\\]/, '').replace(/\.synx$/i, '');
+            includes.push({ path: inclPath, alias });
+          }
+          continue;
         }
+      } else if (!(currentBlock && indent > currentBlock.indent)) {
+        // Directives disabled (SYNXL §9.4): outside a multiline body a `!` line
+        // is discarded exactly like a comment. Inside one it falls through to
+        // the block-continuation branch below and is preserved verbatim.
         continue;
       }
     }
@@ -400,7 +440,19 @@ export function parseData(text: string): SynxParseResult {
     if (currentBlock && indent > currentBlock.indent) {
       const existing = currentBlock.obj[currentBlock.key] as string;
       if (existing.length < MAX_MULTILINE_BLOCK_BYTES) {
-        const line = trimmed;
+        let line: string;
+        if (currentBlock.preserveIndent) {
+          // SYNX 3.7 `|+`: lock the base indent to the FIRST non-empty
+          // continuation line, then strip exactly that prefix from every line.
+          // Anything indented further than the base is preserved verbatim,
+          // making the block safe for embedding indent-sensitive content
+          // (code, SYNX examples, ASCII art, etc.).
+          if (currentBlock.baseIndent < 0) currentBlock.baseIndent = indent;
+          const strip = Math.min(indent, currentBlock.baseIndent);
+          line = rawLine.substring(strip, trimEndPos);
+        } else {
+          line = trimmed;
+        }
         const room = MAX_MULTILINE_BLOCK_BYTES - existing.length;
         const sep = existing ? '\n' : '';
         const append = sep + line;
@@ -552,10 +604,15 @@ export function parseData(text: string): SynxParseResult {
     if (key === '__proto__' || key === 'constructor' || key === 'prototype') continue;
 
     // ── Determine what this line creates ──
-    if (rawValue === '|') {
-      // Multiline block
+    if (rawValue === '|' || rawValue === '|+') {
+      // Multiline block. `|` (3.6) trims each continuation line; `|+` (3.7)
+      // preserves indent relative to the first non-empty continuation line.
       parent[key] = '';
-      currentBlock = { indent, obj: parent, key };
+      currentBlock = {
+        indent, obj: parent, key,
+        preserveIndent: rawValue === '|+',
+        baseIndent: -1,
+      };
       saveMeta(parent, key, markers, markerArgs, constraints, mode, typeHint);
     } else if (!rawValue && markers.length > 0 &&
                (markers.includes('random') || markers.includes('unique') ||

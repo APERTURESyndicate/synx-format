@@ -1,0 +1,1 @@
+[{"id":1,"messages":[{"content":"You are a helpful assistant.","role":"system"},{"content":"def f(x):\n    return x + 1","role":"user"}],"score":0.91},{"id":2,"messages":[{"content":"Привет","role":"user"}],"score":0.74},{"id":3,"lang":"ru","messages":[{"content":"Как дела?","role":"user"}],"score":0.55}]

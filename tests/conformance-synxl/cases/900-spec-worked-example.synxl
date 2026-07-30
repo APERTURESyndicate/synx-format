@@ -1,0 +1,24 @@
+!synxl 1
+!fields id[type:int, required] ; score[type:float] ; messages[block]
+
+1 ; 0.91
+  messages
+    - role system
+      content You are a helpful assistant.
+    - role user
+      content |+
+          def f(x):
+              return x + 1
+
+2 ; 0.74
+  messages
+    - role user
+      content Привет
+
+# schema evolution: a new column appears mid-file
+!fields id[type:int, required] ; score[type:float] ; lang ; messages[block]
+
+3 ; 0.55 ; ru
+  messages
+    - role user
+      content Как дела?

@@ -1,0 +1,2 @@
+NonDeterministicTypeHint
+The field `n` declares the `random` type hint, which MUST NOT appear in a SYNXL field list (SYNXL-1-NORMATIVE.md §8.3).

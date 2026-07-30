@@ -1,0 +1,7 @@
+!synxl 1
+!fields name
+
+# this is a hash comment at indent 0
+Alice
+// this is a slash comment at indent 0
+Bob

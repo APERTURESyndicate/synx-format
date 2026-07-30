@@ -1,0 +1,2 @@
+MarkerInFieldDecl
+The field declaration `id:custom` carries a single marker (not a chain); §5.2 forbids any marker run in a field declaration, chain or single alike (SYNXL-1-NORMATIVE.md §5.2).

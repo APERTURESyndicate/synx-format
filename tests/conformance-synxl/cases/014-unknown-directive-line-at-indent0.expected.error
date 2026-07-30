@@ -1,0 +1,2 @@
+UnknownDirectiveLine
+A line at indent 0 begins with `!` but is neither `!synxl` nor `!fields` (SYNXL-1-NORMATIVE.md §4.1).

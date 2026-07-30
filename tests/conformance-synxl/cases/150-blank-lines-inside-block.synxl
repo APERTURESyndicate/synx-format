@@ -1,0 +1,8 @@
+!synxl 1
+!fields id(int) ; notes[block]
+
+1
+  notes
+    a one
+
+    b two

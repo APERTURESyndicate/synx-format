@@ -1,6 +1,8 @@
-# SYNX 3.6 — Complete Guide
+# SYNX 3.7 — Complete Guide
 
-> **Version 3.6** — Frozen specification (April 2026).  
+> **Version 3.7** — additive revision of the frozen 3.6 specification (July 2026).  
+> 3.6 stays the interoperability baseline; 3.7 adds one construct, `|+`, and changes nothing else.  
+> 3.7.0 also ships **SYNXL** (`.synxl`) — a separate record-stream format for datasets, on its own version axis.  
 > Reference implementation: [`synx-core`](https://crates.io/crates/synx-core)
 
 ---
@@ -15,6 +17,7 @@
    - [Nesting](#nesting)
    - [Arrays](#arrays)
    - [Multiline Values](#multiline-values)
+   - [Indent-Preserving Multiline (`|+`)](#indent-preserving-multiline-)
    - [Comments](#comments)
 5. [Directives](#directives)
    - [!active](#active)
@@ -59,14 +62,15 @@
    - [enum](#enum)
    - [readonly](#readonly)
 8. [Marker Chaining](#marker-chaining)
-9. [Language Bindings](#language-bindings)
-10. [Binary Format & Diff](#binary-format--diff)
-11. [JSON Schema](#json-schema)
-12. [Tools & Editors](#tools--editors)
-13. [Packages](#packages)
-14. [Security](#security)
-15. [Performance](#performance)
-16. [FAQ](#faq)
+9. [SYNXL — Record Streams (`.synxl`)](#synxl--record-streams-synxl)
+10. [Language Bindings](#language-bindings)
+11. [Binary Format & Diff](#binary-format--diff)
+12. [JSON Schema](#json-schema)
+13. [Tools & Editors](#tools--editors)
+14. [Packages](#packages)
+15. [Security](#security)
+16. [Performance](#performance)
+17. [FAQ](#faq)
 
 ---
 
@@ -246,7 +250,7 @@ dotnet add package APERTURESyndicate.Synx
 
 ```toml
 [dependencies]
-synx-core = "3.6"
+synx-core = "3.7"
 ```
 
 ### C++
@@ -262,13 +266,13 @@ go get github.com/APERTURESyndicate/synx-format/go
 ### Swift
 
 ```swift
-.package(url: "https://github.com/APERTURESyndicate/synx-format", from: "3.6.0")
+.package(url: "https://github.com/APERTURESyndicate/synx-format", from: "3.7.0")
 ```
 
 ### Kotlin / JVM
 
 ```kotlin
-implementation("com.aperturesyndicate:synx-engine:3.6.0")
+implementation("com.aperturesyndicate:synx-engine:3.7.0")
 ```
 
 ### VS Code Extension
@@ -384,6 +388,52 @@ description |
 Result: `"This is a long text\nthat spans multiple lines.\nEach line is joined with a newline character."`
 
 Maximum block size: 1 MiB.
+
+`|` trims every continuation line, so any indentation *inside* the text is lost. When the indentation is part of the content, use `|+`.
+
+### Indent-Preserving Multiline (`|+`)
+
+**New in 3.7.** `|+` opens a multiline block that keeps each line's indentation **relative to the first continuation line**:
+
+```synx
+prompt |+
+  Outline:
+    - step one
+    - step two
+      sub-step
+  End.
+```
+
+Result:
+
+```
+Outline:
+  - step one
+  - step two
+    sub-step
+End.
+```
+
+The indent of the first non-empty continuation line becomes the **base indent** and is locked there. Everything at that depth starts at column 0 in the body; everything deeper keeps the extra spaces. The common leading whitespace that exists only for visual nesting under the parent key is removed, and nothing else is.
+
+Use `|+` whenever the content is indent-sensitive — source code, SYNX examples inside a SYNX file, YAML/Python snippets, AI prompt scaffolds:
+
+```synx
+!active
+
+snippet |+
+  def factorial(n):
+      if n <= 1:
+          return 1
+      return n * factorial(n - 1)
+```
+
+Notes:
+
+- Everything else on the key line — type hints, constraints, marker chains — works exactly as with `|`.
+- The 1 MiB block limit applies identically.
+- Interior blank lines are **not** preserved in this version (same behaviour as `|`).
+- Compatibility: a 3.6 parser reads `key |+` as the two-character string `"|+"`. That is the only input on which 3.6 and 3.7 parsers disagree. If you need a document to stay 3.6-portable, avoid `|+`; if you need the literal string, quote it (`key "|+"`).
 
 ### Comments
 
@@ -1283,6 +1333,196 @@ The general order is: `key(type)[constraints]:marker1:marker2:... value`
 
 ---
 
+## SYNXL — Record Streams (`.synxl`)
+
+**New in 3.7.0.** SYNXL ("SYNX Lines") is a **record-stream format for datasets** — the SYNX-native counterpart of JSONL and CSV. It is a separate format with its own version axis and its own normative specification: [`docs/spec/SYNXL-1-NORMATIVE.md`](../spec/SYNXL-1-NORMATIVE.md) (format version **1**). It embeds SYNX 3.7 for the nested part of a record.
+
+A SYNXL document is **not** a SYNX document: its root is a sequence of records, not an object. `Synx.parse` will not read one — use the SYNXL entry points below.
+
+### The shape of a document
+
+A document declares a **field list** once, then carries records:
+
+```synxl
+!synxl 1
+!fields id[type:int, required] ; score[type:float] ; messages[block]
+
+1 ; 0.91
+  messages
+    - role system
+      content You are a helpful assistant.
+    - role user
+      content |+
+          def f(x):
+              return x + 1
+
+2 ; 0.74
+  messages
+    - role user
+      content Привет
+```
+
+Record 1 projects to:
+
+```json
+{"id":1,"messages":[{"content":"You are a helpful assistant.","role":"system"},{"content":"def f(x):\n    return x + 1","role":"user"}],"score":0.91}
+```
+
+The rules that matter in practice:
+
+| Element | Meaning |
+|---|---|
+| `!synxl 1` | Mandatory prologue. Without it a `;`-delimited text file is indistinguishable from a dataset. |
+| `!fields …` | Ordered field declarations, `;`-separated. Same `(type)` and `[constraints]` surface as a SYNX key line. |
+| Record line | Any line at indent 0 that is not a prologue, a field list, or a comment. Split on `;`, positionally matched. |
+| `[block]` field | Value comes from the record's **indented block**, parsed by the ordinary SYNX 3.7 parser — nesting, lists and `|+` all work there. |
+| Empty inline part | JSON `null`. An empty string is written `""` — "absent" and "empty text" are distinct, unlike CSV. |
+| `;` alone on a line | The all-null record. |
+| Indent 0 | Structural. That single-byte rule is what makes streaming, appending and sharding possible. |
+
+Other things worth knowing:
+
+- **Schema evolution.** A new `!fields` line anywhere in the file replaces the schema for records after it. Existing records are untouched, so a producer that gains a column just appends.
+- **No inline comment stripping.** In a dataset `#` and `//` are content — hashtags, URLs, code — so SYNXL does not truncate values at them the way SYNX does. Comments exist only as whole lines at indent 0.
+- **Diagnostics, not silence.** A record with too few or too many parts, a failed cast, an unknown block key — each is reported as a diagnostic on the result and the record keeps parsing. Nothing is dropped silently.
+- **Validation is opt-in.** Declared `[constraints]` are recorded as metadata and only enforced when you ask, because `pattern:` means a regex per cell.
+- **Untrusted input is safe.** Directives are disabled inside a record's block, so a dataset row can never become an `!include` file-read primitive.
+- **Size.** There is no whole-file limit — datasets are routinely gigabytes. The cap is 16 MiB *per record*, and an oversized record is truncated with a diagnostic rather than failing the file.
+
+### Reading it from code
+
+```rust
+// Rust — synx-core
+use std::fs::File;
+use std::io::BufReader;
+use synx_core::synxl::{self, SynxlStreamReader};
+
+// Whole document in memory
+let doc = synxl::parse_lines(&std::fs::read_to_string("chat.synxl")?)?;
+println!("version {}, {} records", doc.version, doc.len());
+
+let first = doc.records[0].as_object().unwrap();   // records are Value::Object
+println!("{:?}", first.get("id"));                 // Some(Int(1))
+println!("{}", doc.to_json());                     // canonical JSON array
+println!("{}", doc.to_ndjson());                   // one object per line
+for d in &doc.diagnostics { eprintln!("{d}"); }
+
+// Streaming off disk — live memory is one record, whatever the file size
+for record in SynxlStreamReader::new(BufReader::new(File::open("chat.synxl")?))? {
+    let record = record?;                          // an Err ends the document
+    let obj = record.value.as_object().unwrap();   // + record.index / .line / .diagnostics
+    println!("{:?}", obj.get("id"));
+}
+
+// Writing — quoting and promotion of multi-line values to blocks are automatic
+let text = synxl::write_lines(
+    &[synxl::FieldDecl::new("id"), synxl::FieldDecl::new_block("messages")],
+    &doc.records,
+)?;
+
+// Opt-in constraint checking
+let checked = synxl::parse_lines_with(&src, &synxl::SynxlOptions { validate: true })?;
+```
+
+`SynxlReader` (borrowed text) and `SynxlReaderOwned` (owns its `String`, so it can be stored or returned) are the in-memory streaming variants; `SynxlStreamReader` streams the document itself from any `io::BufRead`.
+
+```typescript
+// TypeScript / JavaScript — @aperturesyndicate/synx-format
+import { Synx } from '@aperturesyndicate/synx-format';
+
+const doc = Synx.parseSynxl(text);
+doc.version;                     // 1
+doc.records[0].values.id;        // 1
+doc.records[0].values.messages;  // [{ role: 'system', content: '…' }, …]
+doc.records[0].line;             // 1-based source line
+doc.diagnostics;                 // SynxlDiagnostic[]
+
+Synx.synxlToJSON(text);          // canonical JSON array
+Synx.synxlToNDJSON(text);        // one object per line
+
+// Streaming — sync over text, async over a file or a chunk stream
+for (const record of Synx.streamSynxl(text)) console.log(record.values.id);
+for await (const record of Synx.streamSynxlFile('chat.synxl')) console.log(record.values.id);
+
+// From disk
+const fromDisk = Synx.loadSynxlSync('chat.synxl');   // or: await Synx.loadSynxl('chat.synxl')
+
+// Writing, and saving to disk
+const out = Synx.writeSynxl([{ id: 1, messages: [{ role: 'user', content: 'Hi' }] }]);
+Synx.saveSynxlSync('out.synxl', records);
+
+// Opt-in constraint checking
+Synx.parseSynxl(text, { validate: true }).diagnostics;
+```
+
+Hard errors throw `SynxlError` (a subclass of `SynxError`) carrying a machine-readable `condition` and the 1-based `line`.
+
+```python
+# Python — synx_native
+import synx_native as synx
+
+doc = synx.synxl_parse(text)
+doc.version                      # 1
+len(doc)                         # 2
+doc.records[0]["id"]             # 1 — records are plain dicts
+doc.records[0]["messages"]       # [{'role': 'system', 'content': '…'}, …]
+doc.diagnostics                  # list of dicts
+doc.to_json(); doc.to_ndjson()
+
+doc = synx.synxl_load("chat.synxl")
+
+# Streaming — one record in memory at a time
+for record in synx.synxl_stream(text): ...
+for record in synx.synxl_stream_file("chat.synxl"): ...
+
+# The *_records variants yield SynxlRecord objects instead of bare dicts
+for record in synx.synxl_stream_records(text):
+    print(record.index, record.line, record["id"], record.diagnostics)
+
+# Writing: `fields` declares the columns; omit it to synthesize from the keys
+synx.synxl_write(records, fields=["id", {"name": "messages", "block": True}])
+
+# Opt-in constraint checking; hard errors raise synx.SynxlError
+synx.synxl_parse(text, validate=True).diagnostics
+synx.synxl_to_json(text); synx.synxl_to_ndjson(text)
+```
+
+### CLI
+
+Every `.synxl` input is streamed, so memory stays at one record no matter how large the file is.
+
+```bash
+# Canonical JSON array, or one object per line
+synx synxl parse chat.synxl
+synx synxl parse chat.synxl --format ndjson --output chat.ndjson
+
+# Exit 0 = ok, 1 = the document violates the spec, 2 = I/O failure
+synx synxl validate chat.synxl
+synx synxl validate chat.synxl --constraints --strict   # also enforce [constraints]; diagnostics fail too
+
+# Conversion, both directions
+synx synxl convert chat.synxl --to jsonl
+synx synxl convert chat.synxl --to csv --block-json     # block fields have no CSV form without this
+synx synxl convert data.jsonl --to synxl
+synx synxl convert data.csv   --to synxl --delimiter ';'
+
+# Shard into standalone documents — each shard repeats the prologue and the
+# field list in effect at the split point
+synx synxl split chat.synxl -n 10000 --output-dir shards/ --prefix part
+```
+
+### Why not JSONL or CSV
+
+Against **JSONL**: field names and structural punctuation are not repeated per record, which is the dominant token cost of JSONL for LLM consumption; multi-line text stays readable instead of `\n`-escaped; types are declared once rather than inferred per record. The trade is that SYNXL records are homogeneous by construction — heterogeneous shapes need a new field list or a separate file.
+
+Against **CSV**: types and constraints are declared; `null` and the empty string are distinguishable; nesting and multi-line text need no escaping; comments exist; the schema may evolve mid-file. There are no quote-doubling rules and no dialects — the delimiter is always `;`.
+
+### Support
+
+SYNXL is implemented in **Rust** (`synx-core`), **TypeScript** (`@aperturesyndicate/synx-format`), **Python** (`synx_native`), and the **CLI** (`synx synxl`). The native parsers for C++, Dart, .NET, Go, Java, Swift and Godot/GDScript implement SYNX 3.7 — including `|+` — but do **not** read `.synxl` yet.
+
+---
+
 ## Language Bindings
 
 SYNX has 12 official language bindings that all pass the same conformance test suite:
@@ -1301,6 +1541,8 @@ SYNX has 12 official language bindings that all pass the same conformance test s
 | **Kotlin/JVM** | `synx-engine` (JNA) | `SynxEngine.parse()`, `stringify()`, `diff()` |
 | **WebAssembly** | `bindings/wasm` | `parse()`, `stringify()`, `format()`, `diff()`, `compile()` |
 | **Mojo** | `bindings/mojo` (CPython interop) | `parse_json()`, `stringify_json()`, `diff_json()` |
+
+All of them read SYNX 3.7, `|+` included. The table covers the **SYNX** API only — the separate **SYNXL** surface (`parse_lines` / `parseSynxl` / `synxl_parse` / `synx synxl`) exists in Rust, TypeScript, Python and the CLI, and nowhere else yet.
 
 ---
 
@@ -1506,10 +1748,13 @@ Never. The value is everything after the first space. If you need an empty strin
 No. SYNX is a different format that represents the same data model. Use `synx parse` / `synx convert` to convert between them.
 
 **What is the frozen spec?**  
-SYNX v3.6.0 is frozen as of April 2026. No breaking changes to the format grammar. Tooling and bindings continue to receive updates.
+SYNX v3.6.0 is frozen as of April 2026 and remains the canonical interoperability baseline. New surface syntax is **additive** and arrives in new normative version files: 3.7 adds `|+` and nothing else, so every 3.6 document parses identically under a 3.7 parser.
+
+**What is SYNXL, and do I need it?**  
+SYNXL (`.synxl`) is a separate record-stream format for datasets — see [SYNXL — Record Streams](#synxl--record-streams-synxl). Use `.synx` for configuration and single documents; use `.synxl` when you have many homogeneous records (training samples, eval sets, table exports) and would otherwise reach for JSONL or CSV. The two formats have independent version numbers.
 
 ---
 
 <p align="center">
-  <strong>SYNX v3.6</strong> — Built for AI and humans by <a href="https://aperturesyndicate.com">APERTURESyndicate</a>
+  <strong>SYNX v3.7</strong> — Built for AI and humans by <a href="https://aperturesyndicate.com">APERTURESyndicate</a>
 </p>

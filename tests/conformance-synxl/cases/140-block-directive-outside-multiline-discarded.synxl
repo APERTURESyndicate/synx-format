@@ -1,0 +1,7 @@
+!synxl 1
+!fields id(int) ; meta[block]
+
+1
+  meta
+    !oops should not run
+    note fine

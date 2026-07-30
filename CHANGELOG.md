@@ -2,13 +2,150 @@
 
 All notable changes to this repository are documented in this file.
 
-> **npm registry-only note:** The `@aperturesyndicate/synx-format` npm
-> package leads by one patch. For each release the npm slot is bumped
-> twice (3.6.2 → 3.6.3 → 3.6.4 …) because npm's `3.6.2` slot was once
-> taken and unpublished, and npm policy bans reusing the number.
-> All other registries (crates.io, NuGet, Maven Central, pub.dev, the
-> Visual Studio Marketplace) and the GitHub release tag stay on the
-> "real" version number printed below. Both slots ship identical content.
+> **Historical npm numbering note (3.6.x only):** For the 3.6.x release
+> line, the `@aperturesyndicate/synx-format` npm package led by one
+> patch — e.g. the "real" 3.6.2 release shipped to npm as `3.6.3` —
+> because npm's `3.6.2` slot had once been taken and unpublished, and
+> npm policy bans reusing a version number. All other registries
+> (crates.io, NuGet, Maven Central, pub.dev, the Visual Studio
+> Marketplace) and the GitHub release tag stayed on the "real" version
+> number for those releases; both slots shipped identical content.
+> **Starting with 3.7.0, this divergence is resolved:** the npm slot
+> for `3.7.0` was free, so npm and every other registry — plus the
+> git tag — now publish on the same version number.
+
+## [3.7.0] — 2026-07-30
+
+### Added — `|+` indent-preserving multiline blocks
+
+- New multiline opener **`|+`** alongside the existing `|`. While `|` trims each
+  continuation line fully (per Frozen 3.6 §8.4), `|+` keeps each line's indent
+  *relative to the first non-empty continuation line*. The base prefix is
+  locked on that first line and stripped from every subsequent line; anything
+  beyond it is preserved verbatim. This makes it safe to embed indentation-
+  sensitive content (code, SYNX examples, ASCII diagrams, AI-prompt scaffolds)
+  directly inside a SYNX value.
+
+  Example:
+  ```synx
+  prompt |+
+    Outline:
+      - step one
+      - step two
+        sub-step
+  ```
+  parses as `"Outline:\n  - step one\n  - step two\n    sub-step"`.
+
+- **Frozen reference (3.6) is unaffected.** A 3.6 parser sees `key |+` as a
+  plain string value `"|+"`. Documents that worked under 3.6 keep parsing
+  identically. The only behavioural change between 3.6 and 3.7 is that the
+  literal token `|+` now opens a multiline block; previously it was a
+  (probably nonsensical) two-character string value.
+
+- Specification update: see [`docs/spec/SYNX-3.7-NORMATIVE.md`](docs/spec/SYNX-3.7-NORMATIVE.md)
+  §8.4.1.
+
+### Updated parsers
+
+`|+` is implemented in every parser shipped from this repo:
+
+- **[`crates/synx-core/`](crates/synx-core/)** — Rust reference engine. Also
+  reaches every FFI binding: `bindings/c-header`, `bindings/node`,
+  `bindings/python`, `bindings/wasm`, `bindings/kotlin`, `bindings/mojo`.
+- **[`packages/synx-js/`](packages/synx-js/)** — TypeScript / browser bundle
+  (`@aperturesyndicate/synx-format`).
+- **[`parsers/cpp/`](parsers/cpp/)** — C++17 header-only.
+- **[`parsers/dart/`](parsers/dart/)** — pure Dart 3.
+- **[`parsers/dotnet/`](parsers/dotnet/)** — .NET 9.
+- **[`parsers/go/`](parsers/go/)** — pure Go.
+- **[`parsers/java/`](parsers/java/)** — Java 17.
+- **[`parsers/swift/`](parsers/swift/)** — Swift 5.
+
+Tests added in JS, Rust core, and Go covering: indent preservation, base
+indent locking, block termination at opener indent.
+
+### Added — SYNXL (`.synxl`), the SYNX Lines record format
+
+A **record-stream format** for homogeneous datasets: the SYNX-native
+counterpart of JSONL and CSV. Aimed at AI/LLM datasets and tabular data.
+
+```synxl
+!synxl 1
+!fields id[type:int, required] ; score[type:float] ; messages[block]
+
+1 ; 0.91
+  messages
+    - role system
+      content You are a helpful assistant.
+    - role user
+      content |+
+          def f(x):
+              return x + 1
+
+2 ; 0.74
+  messages
+    - role user
+      content Привет
+```
+
+- **Field list declared once** (`!fields`), carrying SYNX types and
+  constraints. Against JSONL this removes the dominant token cost — keys and
+  structural punctuation repeated on every record. Against CSV it adds types,
+  and it makes an empty field unambiguously `null` (an empty *string* is
+  `""`).
+- **One record starts at indent 0**; anything indented below it belongs to
+  that record. No record separator is needed, appending is safe, and a record
+  boundary is decidable from a single byte — which is what makes streaming and
+  parallel parsing possible.
+- **Fields marked `[block]` expand under the record** in full SYNX: nested
+  objects, lists, and `|` / `|+` multiline text. Multi-line values stay
+  readable text instead of `\n`-escaped noise, so chat-style datasets
+  (`messages` as a list of role/content objects) are expressible directly.
+  Block content is defined by delegation to the SYNX 3.7 parser, so it is the
+  same language, not a lookalike.
+- **Schema evolution mid-file:** a later `!fields` line replaces the one in
+  effect and applies to following records only, so a producer that gains a
+  column keeps appending without rewriting history.
+- **Diagnostics instead of silent drops.** SYNX §8.10 skips malformed
+  structure silently; SYNXL reports it (`MissingFields`, `ExtraFields`,
+  `CastFailed`, `UnknownBlockKey`, …) with record index and line, because a
+  dataset that silently loses a column is worse than one that fails loudly.
+- **Per-record size limit, not per-file.** SYNX caps input at 16 MiB; that cap
+  is deliberately not applied to a SYNXL document, since records are
+  independent and datasets are routinely gigabytes.
+- **Security:** SYNX directives inside a record block are never honored — a
+  row from an untrusted corpus must not become a file-read primitive via
+  `!include`. A line beginning with `!` inside a `|+` body remains ordinary
+  content.
+
+Specification: [`docs/spec/SYNXL-1-NORMATIVE.md`](docs/spec/SYNXL-1-NORMATIVE.md).
+SYNXL is versioned on **its own axis** (format version `1`), independent of
+the SYNX language version and of the `.synxb` container version — a SYNXL
+document is not a SYNX document, since its top level is a record sequence
+rather than an object (SYNX §8.1).
+
+#### Available in this release
+
+- **[`crates/synx-core/`](crates/synx-core/)** — reference implementation.
+  Whole-document parse, an owned reader, and a true streaming reader over
+  `io::BufRead` whose live memory is one record; canonical JSON and NDJSON
+  projections; a writer with round-trip guarantees.
+- **[`packages/synx-js/`](packages/synx-js/)** — TypeScript, including the
+  browser bundle; sync generator and async iterator streaming.
+- **[`bindings/python/`](bindings/python/)** — parse, off-disk streaming,
+  both projections, writer.
+- **[`crates/synx-cli/`](crates/synx-cli/)** — `synx synxl parse | validate |
+  convert | split`. Converters both ways for JSONL and CSV; `split` writes
+  shards that each carry the prologue and the field list in effect at the cut,
+  so every shard is a valid document on its own.
+
+Conformance suite: [`tests/conformance-synxl/`](tests/conformance-synxl/) —
+67 cases derived from the specification text independently of any
+implementation. The Rust runner additionally re-reads every accepted case
+through all three readers and fails on disagreement.
+
+The remaining parsers (C++, Dart, .NET, Go, Java, Swift) do not implement
+SYNXL yet; they are unaffected and remain fully SYNX 3.7 conforming.
 
 ## [3.6.3] — 2026-05-19
 

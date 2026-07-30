@@ -8,9 +8,9 @@ no `.dll` / `.so` dependency to ship.
 
 | Path | Language | Role |
 |------|----------|------|
-| [`../crates/synx-core/`](../crates/synx-core/) | **Rust** | Canonical parser, engine (`!active`), stringify, `diff`, `.synxb`, fuzz targets |
-| [`../crates/synx-cli/`](../crates/synx-cli/)   | **Rust** | CLI (`synx`) — uses `synx-core` |
-| [`../packages/synx-js/`](../packages/synx-js/) | **TypeScript** | Reference parser + npm `@aperturesyndicate/synx-format` (no native deps) |
+| [`../crates/synx-core/`](../crates/synx-core/) | **Rust** | Canonical parser, engine (`!active`), stringify, `diff`, `.synxb`, **SYNXL** (`src/synxl.rs`), fuzz targets |
+| [`../crates/synx-cli/`](../crates/synx-cli/)   | **Rust** | CLI (`synx`) — uses `synx-core`; **SYNXL** via `synx synxl parse\|validate\|convert\|split` |
+| [`../packages/synx-js/`](../packages/synx-js/) | **TypeScript** | Reference parser + npm `@aperturesyndicate/synx-format` (no native deps); **SYNXL** (`src/synxl.ts`) |
 | [`cpp/`](cpp/)         | **C++17** | Header + sources, CMake project; conformance + unit tests |
 | [`dart/`](dart/)       | **Dart 3** | Pure Dart, pub.dev `synx`; full engine + binary |
 | [`dotnet/`](dotnet/)   | **C# / .NET 8** | NuGet `APERTURESyndicate.Synx` + `Synx.FuzzReplay` for corpus replay |
@@ -22,6 +22,29 @@ no `.dll` / `.so` dependency to ship.
 `../tree-sitter-synx/` holds the editor/Linguist grammar (separate from the
 runtime parsers above). `../crates/synx-lsp` is the language server, not a
 parser — see [`../integrations/README.md`](../integrations/README.md).
+
+## SYNXL (`.synxl`) support
+
+Every parser listed above reads **SYNX 3.7**, including the `|+`
+indent-preserving multiline opener.
+
+**SYNXL** — the record-stream format specified in
+[`../docs/spec/SYNXL-1-NORMATIVE.md`](../docs/spec/SYNXL-1-NORMATIVE.md) — is a
+*separate* format on its own version axis, and is **not** implemented by the
+native parsers yet. As of 3.7.0 it exists in:
+
+| Implementation | SYNXL entry point |
+|---|---|
+| Rust `synx-core` | `synx_core::synxl::{parse_lines, SynxlReader, SynxlReaderOwned, SynxlStreamReader, write_lines}` |
+| Rust CLI `synx` | `synx synxl parse` · `validate` · `convert` · `split` |
+| TypeScript `packages/synx-js` | `Synx.parseSynxl` · `streamSynxl` · `streamSynxlFile` · `writeSynxl` · `synxlToJSON` / `synxlToNDJSON` |
+| Python `bindings/python` | `synx_native.synxl_parse` · `synxl_load` · `synxl_stream` · `synxl_stream_file` · `synxl_write` |
+
+`cpp/`, `dart/`, `dotnet/`, `go/`, `java/`, `swift/` and the Godot/GDScript
+engine do **not** read `.synxl`. Adding it means implementing the whole of
+SYNXL-1 and passing [`../tests/conformance-synxl/cases/`](../tests/conformance-synxl/cases/),
+which is the practical conformance contract; block-field parsing delegates to
+the parser's existing SYNX 3.7 implementation rather than a second tree builder.
 
 The `../bindings/` tree holds the **non-native** language surfaces that
 still need to call into the canonical engine:

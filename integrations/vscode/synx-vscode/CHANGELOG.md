@@ -2,6 +2,15 @@
 
 All notable changes to this repository are documented in this file.
 
+## [3.7.0] — 2026-07-30
+
+### Added — `|+` indent-preserving multiline blocks
+
+Support for the new multiline opener `|+`, which keeps each line's
+original indentation instead of dedenting to the block's minimum
+(as `|` does). Syntax highlighting and parsing updated to recognize
+`|+` alongside the existing `|` opener.
+
 ## [3.6.3] — 2026-05-19
 
 ### Fixed — multiline `key |` block highlighting

@@ -1,0 +1,8 @@
+!synxl 1
+!fields id(int) ; code[block]
+
+1
+  code
+    snippet |+
+        def f(x):
+            return x + 1

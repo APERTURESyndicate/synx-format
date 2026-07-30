@@ -167,8 +167,25 @@ SynxParseResult parse(String rawText) {
         if (block.content.length < maxMultilineBytes) {
           if (block.content.isNotEmpty) block.content.write('\n');
           final room = maxMultilineBytes - block.content.length;
-          final n = t.length < room ? t.length : room;
-          block.content.write(t.substring(0, n));
+          String slice;
+          if (block.preserveIndent) {
+            // `|+` (SYNX 3.7): lock base indent to the first non-empty
+            // content line, then strip exactly that many leading WS chars
+            // per subsequent line. See spec §8.4.1.
+            if (block.baseIndent < 0) block.baseIndent = indent;
+            final strip = block.baseIndent < indent ? block.baseIndent : indent;
+            var end = raw.length;
+            while (end > 0) {
+              final c = raw.codeUnitAt(end - 1);
+              if (c != 0x20 && c != 0x09 && c != 0x0D && c != 0x0A) break;
+              end--;
+            }
+            slice = strip < end ? raw.substring(strip, end) : '';
+          } else {
+            slice = t;
+          }
+          final n = slice.length < room ? slice.length : room;
+          block.content.write(slice.substring(0, n));
         }
         i++;
         continue;
@@ -274,13 +291,16 @@ SynxParseResult parse(String rawText) {
       result.metadata.putIfAbsent(path, () => {})[parsed.key] = meta;
     }
 
-    final isBlock = parsed.value == '|';
+    // `|` (3.6) trims each continuation line; `|+` (3.7) preserves indent
+    // relative to the first non-empty line. Spec §8.4.1.
+    final isBlock = parsed.value == '|' || parsed.value == '|+';
+    final preserveIndent = parsed.value == '|+';
     final isListMarker = parsed.markers
         .any((m) => m == 'random' || m == 'unique' || m == 'geo' || m == 'join');
 
     if (isBlock) {
       _insertValue(rootObj, stack, parentIdx, parsed.key, synxString(''));
-      block = _BlockState(indent, parsed.key, parentIdx);
+      block = _BlockState(indent, parsed.key, parentIdx, preserveIndent);
     } else if (isListMarker && parsed.value.isEmpty) {
       _insertValue(rootObj, stack, parentIdx, parsed.key, synxArray());
       list = _ListState(indent, parsed.key, parentIdx);
@@ -371,7 +391,13 @@ class _BlockState {
   final String key;
   final int stackIdx;
   final StringBuffer content = StringBuffer();
-  _BlockState(this.indent, this.key, this.stackIdx);
+  /// SYNX 3.7 `|+`: keep indent relative to the first non-empty
+  /// continuation line instead of fully trimming each line.
+  final bool preserveIndent;
+  /// Locked on the first non-empty continuation line; -1 means "unlocked".
+  int baseIndent;
+  _BlockState(this.indent, this.key, this.stackIdx, this.preserveIndent)
+      : baseIndent = -1;
 }
 
 class _ListState {

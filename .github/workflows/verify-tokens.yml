@@ -1,0 +1,168 @@
+name: verify-tokens
+
+# Checks that every publishing secret actually authenticates, WITHOUT publishing
+# anything. `cargo publish --dry-run` and `npm publish --dry-run` do not contact
+# the registry's auth at all, so a dry-run release tells you nothing about
+# whether the tokens are right — and a real release cannot be undone, because a
+# version number can never be reused. This workflow closes that gap.
+#
+# Nothing here uploads, and no secret value is ever echoed: only the identity
+# each registry reports back, plus HTTP status codes.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  crates-io:
+    name: crates.io
+    runs-on: ubuntu-latest
+    steps:
+      - name: Who am I on crates.io
+        env:
+          TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then echo "::error::CARGO_REGISTRY_TOKEN is empty"; exit 1; fi
+          # crates.io returns 403 to any request without a meaningful
+          # User-Agent — their API access policy, independent of the token. A
+          # missing UA is indistinguishable from a bad token, so send one.
+          UA="synx-format-release-check (https://github.com/APERTURESyndicate/synx-format)"
+          code=$(curl -sS -o body.json -w '%{http_code}' \
+            -A "$UA" -H "Authorization: $TOKEN" https://crates.io/api/v1/me)
+          echo "HTTP $code"
+          if [ "$code" = "200" ]; then
+            echo "authenticated as: $(jq -r '.user.login // "?"' body.json)"
+          else
+            echo "::error::crates.io rejected the token (HTTP $code)"
+            jq -r '.errors[]?.detail // empty' body.json
+            exit 1
+          fi
+      - name: Can this token publish synx-core
+        env:
+          TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          # Owner list is public, but the check that matters is that the
+          # authenticated user is among them — otherwise publish returns 403.
+          UA="synx-format-release-check (https://github.com/APERTURESyndicate/synx-format)"
+          me=$(curl -sS -A "$UA" -H "Authorization: $TOKEN" https://crates.io/api/v1/me | jq -r '.user.login')
+          owners=$(curl -sS -A "$UA" https://crates.io/api/v1/crates/synx-core/owners | jq -r '.users[].login' | tr '\n' ' ')
+          echo "owners of synx-core: $owners"
+          case " $owners " in
+            *" $me "*) echo "OK — $me can publish synx-core" ;;
+            *) echo "::warning::$me is not listed as an owner of synx-core; publish would fail with 403" ;;
+          esac
+
+  npm:
+    name: npm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+      - name: Who am I on npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then echo "::error::NPM_TOKEN is empty"; exit 1; fi
+          who=$(npm whoami 2>&1) || { echo "::error::npm rejected the token: $who"; exit 1; }
+          echo "authenticated as: $who"
+          echo "--- can this account publish @aperturesyndicate/synx-format? ---"
+          # The package is scoped, so the meaningful question is whether this
+          # identity is an owner of it — not whether it appears in a personal
+          # package list, which does not cover scope/org membership.
+          if owners=$(npm owner ls @aperturesyndicate/synx-format 2>&1); then
+            echo "$owners"
+            if echo "$owners" | grep -qi "^$who "; then
+              echo "OK — $who is an owner and can publish"
+            else
+              echo "::error::$who is NOT an owner of @aperturesyndicate/synx-format — publish would be rejected"
+              exit 1
+            fi
+          else
+            echo "::warning::could not read owners: $owners"
+          fi
+
+  pypi:
+    name: PyPI
+    runs-on: ubuntu-latest
+    steps:
+      - name: Does PyPI accept the token
+        env:
+          TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then echo "::error::PYPI_API_TOKEN is empty"; exit 1; fi
+          case "$TOKEN" in
+            pypi-*) echo "token has the expected 'pypi-' prefix" ;;
+            *) echo "::warning::token does not start with 'pypi-' — PyPI API tokens normally do" ;;
+          esac
+          # The legacy endpoint only accepts multipart form posts — a bare POST
+          # returns 405 and tells us nothing. Sending the form fields without a
+          # file makes PyPI authenticate first and *then* reject the payload:
+          # 400 means the credentials were accepted, 403 means they were not.
+          code=$(curl -sS -o body.txt -w '%{http_code}' \
+            -u "__token__:$TOKEN" \
+            -F ":action=file_upload" \
+            -F "protocol_version=1" \
+            https://upload.pypi.org/legacy/ || true)
+          echo "HTTP $code"
+          case "$code" in
+            400) echo "OK — token authenticated (400 = credentials fine, payload deliberately incomplete)"
+                 echo "reply: $(head -c 200 body.txt)" ;;
+            403) echo "::error::PyPI rejected the token (403)"; head -c 400 body.txt; exit 1 ;;
+            401) echo "::error::PyPI says unauthorized (401)"; head -c 400 body.txt; exit 1 ;;
+            *)   echo "::warning::inconclusive status $code — token neither confirmed nor rejected"
+                 head -c 400 body.txt ;;
+          esac
+
+  nuget:
+    name: NuGet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - uses: actions/checkout@v4
+      - name: Does nuget.org accept the key
+        env:
+          KEY: ${{ secrets.NUGET_API_KEY }}
+        run: |
+          if [ -z "$KEY" ]; then echo "::error::NUGET_API_KEY is empty"; exit 1; fi
+          # The verifykey endpoint answers 400 regardless, so it cannot settle
+          # this. Instead push a package whose version is ALREADY on nuget.org
+          # (3.6.2) with --skip-duplicate: the key has to authenticate before the
+          # server can report the duplicate, and a published version can never be
+          # overwritten. So this proves the key without releasing anything.
+          dotnet pack parsers/dotnet/src/Synx.Core -c Release -o probe \
+            -p:Version=3.6.2 -p:PackageVersion=3.6.2 >/dev/null
+          ls -1 probe
+          set +e
+          out=$(dotnet nuget push "probe/*.nupkg" \
+                  --api-key "$KEY" \
+                  --source https://api.nuget.org/v3/index.json \
+                  --skip-duplicate 2>&1)
+          rc=$?
+          set -e
+          # Never print the raw output: it can echo back the request.
+          if echo "$out" | grep -qiE '401|403|forbidden|unauthorized|api key'; then
+            echo "::error::nuget.org rejected the API key"
+            echo "$out" | grep -iE '401|403|forbidden|unauthorized|api key' | head -3
+            exit 1
+          elif [ $rc -eq 0 ]; then
+            echo "OK — key authenticated; the existing 3.6.2 was skipped as a duplicate"
+            echo "$out" | grep -iE 'already exists|skipping|pushed' | head -3
+          else
+            echo "::warning::push failed for another reason (rc=$rc)"
+            echo "$out" | tail -5
+          fi
+
+  summary:
+    name: Summary
+    runs-on: ubuntu-latest
+    needs: [crates-io, npm, pypi, nuget]
+    if: always()
+    steps:
+      - run: |
+          echo "crates.io : ${{ needs.crates-io.result }}"
+          echo "npm       : ${{ needs.npm.result }}"
+          echo "PyPI      : ${{ needs.pypi.result }}"
+          echo "NuGet     : ${{ needs.nuget.result }}"

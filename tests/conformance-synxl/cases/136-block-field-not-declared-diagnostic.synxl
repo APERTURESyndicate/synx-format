@@ -1,0 +1,6 @@
+!synxl 1
+!fields id(int) ; label
+
+1 ; hello
+  label
+    x extra

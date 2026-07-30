@@ -1,0 +1,2 @@
+MissingOrMalformedPrologue
+The first non-empty, non-comment line is not a valid `!synxl <version>` prologue (SYNXL-1-NORMATIVE.md §4.1).

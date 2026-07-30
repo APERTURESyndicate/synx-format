@@ -4,10 +4,19 @@
   <strong>Built for AI and humans by APERTURESyndicate.</strong>
 </p>
 
-## Frozen reference (3.6)
+## Frozen reference (3.6) + additions (3.7)
 
-As of **April 2026**, **SYNX 3.6** is **frozen**: the normative definition is [`docs/spec/SYNX-3.6-NORMATIVE.md`](docs/spec/SYNX-3.6-NORMATIVE.md), and the reference implementation is **`synx-core` 3.6.x** checked by [`tests/conformance/`](tests/conformance/). **PATCH** releases may only restore that contract (bugs, spec alignment); new surface syntax stays **additive** until a new normative version (for example 3.7). Full policy: [`docs/spec/CORE-FREEZE.md`](docs/spec/CORE-FREEZE.md).
+As of **April 2026**, **SYNX 3.6** is **frozen** as the canonical interoperability baseline: the normative definition is [`docs/spec/SYNX-3.6-NORMATIVE.md`](docs/spec/SYNX-3.6-NORMATIVE.md), and the reference implementation is **`synx-core` 3.6.x** checked by [`tests/conformance/`](tests/conformance/). **PATCH** releases may only restore that contract (bugs, spec alignment); new surface syntax stays **additive** and arrives in new normative version files. Full policy: [`docs/spec/CORE-FREEZE.md`](docs/spec/CORE-FREEZE.md).
 
+**SYNX 3.7** ([`docs/spec/SYNX-3.7-NORMATIVE.md`](docs/spec/SYNX-3.7-NORMATIVE.md)) is the first additive revision. It introduces a single new construct — `|+`, an indent-preserving multiline opener — and inherits every other rule from 3.6 verbatim. A 3.6 parser remains conformant for any document that does not use a 3.7-only construct.
+
+> **3.7.0 (2026-07-30)** — two additions.
+>
+> 1. **`|+`**, an indent-preserving multiline opener. Required when embedding indent-sensitive content (code, SYNX examples, AI-prompt scaffolds) inside a SYNX value; plain `|` still trims each continuation line. Implemented in every parser shipped from this repo (Rust core, JS/TS, C++, Dart, .NET, Go, Java, Swift, plus all FFI bindings into the Rust core).
+> 2. **SYNXL** (`.synxl`), a new record-stream format for datasets — the SYNX-native counterpart of JSONL and CSV. Own version axis, own normative spec: [`docs/spec/SYNXL-1-NORMATIVE.md`](docs/spec/SYNXL-1-NORMATIVE.md). See [SYNXL — record streams](#synxl--record-streams-synxl) below.
+>
+> See [CHANGELOG.md](CHANGELOG.md).
+>
 > **3.6.3 (2026-05-19)** — cross-implementation parity hot-fix release **plus** a structural shift: C++, Dart, Go, Java, Swift, and a new Godot/GDScript engine now ship as **native parsers under `parsers/`** (and `integrations/godot/synx-gdscript/`); the old `bindings/{cpp,go,swift}` FFI wrappers are retired in favour of these from-scratch implementations. The release also closes 17 cross-parser divergences uncovered by a code-review pass — three of them security-relevant (Go `:include` symlink jail bypass, .NET `Secret` leaking to JSON, .NET missing `__proto__` filter). See [CHANGELOG.md](CHANGELOG.md).
 
 ---
@@ -21,6 +30,151 @@ As of **April 2026**, **SYNX 3.6** is **frozen**: the normative definition is [`
 - **[integrations/README.md](integrations/README.md)** — VS Code, Visual Studio, Sublime, Neovim, Godot, MCP, LSP  
 - **[docs/anthropic/claude.md](docs/anthropic/claude.md)** — Claude Desktop (MCP), Anthropic prompt helpers, tokenizer notes  
 - **[docs/dev/plugins-roadmap.md](docs/dev/plugins-roadmap.md)** — planned registry / plugins (**stub only**; not shipped in the engine yet)  
+- **[docs/spec/SYNXL-1-NORMATIVE.md](docs/spec/SYNXL-1-NORMATIVE.md)** — normative spec for **SYNXL** (`.synxl`), the record-stream format; conformance cases in [`tests/conformance-synxl/cases/`](tests/conformance-synxl/cases/)
+
+---
+
+## SYNXL — record streams (`.synxl`)
+
+**New in 3.7.0.** SYNXL ("SYNX Lines") is a **separate format on its own version axis** — the SYNX-native counterpart of JSONL and CSV. A document declares its fields once, then carries records; each record projects to a JSON object and the whole document to a JSON array. Normative definition: [`docs/spec/SYNXL-1-NORMATIVE.md`](docs/spec/SYNXL-1-NORMATIVE.md) (format version **1**, embedding SYNX 3.7 for block fields).
+
+A SYNXL document is **not** a SYNX document — its root is a sequence of records rather than an object — so `Synx.parse` will not read one. Use the SYNXL entry points below.
+
+```synxl
+!synxl 1
+!fields id[type:int, required] ; score[type:float] ; messages[block]
+
+1 ; 0.91
+  messages
+    - role system
+      content You are a helpful assistant.
+    - role user
+      content |+
+          def f(x):
+              return x + 1
+
+2 ; 0.74
+  messages
+    - role user
+      content Привет
+```
+
+→ `[{"id":1,"messages":[{"content":"You are a helpful assistant.","role":"system"},{"content":"def f(x):\n    return x + 1","role":"user"}],"score":0.91}, …]`
+
+- Inline fields are `;`-delimited and **positional**; an empty part is `null`, `""` is the empty string — the ambiguity CSV never resolved.
+- A `[block]` field takes its value from the record's indented block, parsed by the ordinary SYNX 3.7 parser — so nesting, lists and `|+` all work there, and long text stays readable instead of `\n`-escaped.
+- Directives are disabled **inside** a block, so an untrusted dataset row can never become an `!include` file-read primitive.
+- A new `!fields` line mid-file replaces the schema for records after it: datasets stay append-safe across schema evolution.
+- Malformed structure is reported as a **diagnostic**, never dropped silently — a dataset that quietly loses a column is worse than one that fails loudly.
+
+### Reading it from code
+
+```rust
+// Rust — synx-core
+use std::fs::File;
+use std::io::BufReader;
+use synx_core::synxl::{self, SynxlStreamReader};
+
+// Whole document in memory
+let doc = synxl::parse_lines(&std::fs::read_to_string("chat.synxl")?)?;
+println!("version {}, {} records", doc.version, doc.len());
+
+let first = doc.records[0].as_object().unwrap();   // records are Value::Object
+println!("{:?}", first.get("id"));                 // Some(Int(1))
+println!("{}", doc.to_json());                     // canonical JSON array (§12.1)
+println!("{}", doc.to_ndjson());                   // one object per line (§12.2)
+for d in &doc.diagnostics { eprintln!("{d}"); }    // §11.2 — never dropped silently
+
+// Streaming off disk — live memory is one record, whatever the file size
+for record in SynxlStreamReader::new(BufReader::new(File::open("chat.synxl")?))? {
+    let record = record?;                          // Err ends the document (§11.1)
+    let obj = record.value.as_object().unwrap();   // + record.index / .line / .diagnostics
+    println!("{:?}", obj.get("id"));
+}
+
+// Writing (§14) — quoting and block promotion are automatic
+let text = synxl::write_lines(
+    &[synxl::FieldDecl::new("id"), synxl::FieldDecl::new_block("messages")],
+    &doc.records,
+)?;
+
+// Opt-in constraint checking (§8.4, off by default)
+let checked = synxl::parse_lines_with(&src, &synxl::SynxlOptions { validate: true })?;
+```
+
+```typescript
+// TypeScript / JavaScript — @aperturesyndicate/synx-format
+import { Synx } from '@aperturesyndicate/synx-format';
+
+const doc = Synx.parseSynxl(text);
+doc.version;                     // 1
+doc.records[0].values.id;        // 1
+doc.records[0].values.messages;  // [{ role: 'system', content: '…' }, …]
+doc.diagnostics;                 // SynxlDiagnostic[] — §11.2
+
+Synx.synxlToJSON(text);          // canonical JSON array (§12.1)
+Synx.synxlToNDJSON(text);        // one object per line (§12.2)
+
+// Streaming — sync over text, async over a file or a chunk stream
+for (const record of Synx.streamSynxl(text)) console.log(record.values.id);
+for await (const record of Synx.streamSynxlFile('chat.synxl')) console.log(record.values.id);
+
+// From disk
+const fromDisk = Synx.loadSynxlSync('chat.synxl');   // or: await Synx.loadSynxl('chat.synxl')
+
+// Writing (§14) and opt-in validation (§8.4)
+Synx.writeSynxl([{ id: 1, messages: [{ role: 'user', content: 'Hi' }] }]);
+Synx.parseSynxl(text, { validate: true }).diagnostics;
+```
+
+```python
+# Python — synx_native
+import synx_native as synx
+
+doc = synx.synxl_parse(text)
+doc.version                      # 1
+len(doc)                         # 2
+doc.records[0]["id"]             # 1 — records are plain dicts
+doc.records[0]["messages"]       # [{'role': 'system', 'content': '…'}, …]
+doc.diagnostics                  # list of dicts — §11.2
+doc.to_json(); doc.to_ndjson()   # §12.1 / §12.2
+
+doc = synx.synxl_load("chat.synxl")
+
+# Streaming — one record in memory at a time
+for record in synx.synxl_stream(text): ...
+for record in synx.synxl_stream_file("chat.synxl"): ...
+
+# The *_records variants yield SynxlRecord objects instead of bare dicts
+for record in synx.synxl_stream_records(text):
+    print(record.index, record.line, record["id"], record.diagnostics)
+
+# Writing (§14) and opt-in validation (§8.4); hard errors raise synx.SynxlError
+synx.synxl_write(records, fields=["id", {"name": "messages", "block": True}])
+synx.synxl_parse(text, validate=True).diagnostics
+```
+
+```bash
+# CLI — every input is streamed, so memory stays at one record
+synx synxl parse chat.synxl                    # canonical JSON array (§12.1)
+synx synxl parse chat.synxl --format ndjson    # one object per line (§12.2)
+synx synxl validate chat.synxl --strict        # exit 0 ok · 1 spec violation · 2 I/O failure
+synx synxl convert chat.synxl --to jsonl       # also: --to csv --block-json
+synx synxl convert data.jsonl --to synxl       # jsonl→synxl and csv→synxl too
+synx synxl split chat.synxl -n 10000 --output-dir shards/
+```
+
+### Implementation status
+
+| Surface | SYNX 3.7 (incl. `\|+`) | SYNXL 1 |
+|---|---|---|
+| Rust core (`synx-core`), CLI (`synx synxl`) | ✅ | ✅ |
+| TypeScript (`@aperturesyndicate/synx-format`) | ✅ | ✅ |
+| Python (`synx_native`) | ✅ | ✅ |
+| C++, Dart, .NET, Go, Java, Swift ([`parsers/`](parsers/)), Godot/GDScript | ✅ | ❌ not yet |
+| Node native, WASM, C FFI, Kotlin, Mojo ([`bindings/`](bindings/)) | ✅ | ❌ not yet |
+
+SYNXL is currently implemented in **Rust, TypeScript, Python, and the CLI**. The native parsers under `parsers/` read SYNX 3.7 — including `|+` — but do **not** read `.synxl`.
 
 ---
 
@@ -104,6 +258,12 @@ synx query server.host config.synx
 
 # Canonical formatting
 synx format config.synx --write
+
+# SYNXL datasets (.synxl) — streamed, memory stays at one record
+synx synxl parse chat.synxl --format ndjson
+synx synxl validate chat.synxl --strict
+synx synxl convert chat.synxl --to jsonl
+synx synxl split chat.synxl -n 10000 --output-dir shards/
 ```
 
 ---
@@ -348,7 +508,7 @@ python format_results.py llm_results.json
 
 **See [benchmarks/llm-tests/GUIDE.md](benchmarks/llm-tests/GUIDE.md) for advanced options and detailed results interpretation.**
 
-## Install (v3.6)
+## Install (v3.7)
 
 One-line installs (published names):
 
@@ -375,7 +535,7 @@ Until **`APERTURESyndicate.Synx`** appears on nuget.org, consume the library fro
 - Do **not** commit secrets (`NUGET_API_KEY`, PyPI tokens); `artifacts/` is gitignored.
 - For a new **NuGet** version, bump **`Version`** in [`parsers/dotnet/src/Synx.Core/Synx.Core.csproj`](parsers/dotnet/src/Synx.Core/Synx.Core.csproj), then run the `dotnet pack` + `dotnet nuget push` pair above.
 
-## API Parity (v3.6)
+## API Parity (v3.7)
 
 Unified API surface across runtimes. Since 3.6.3, C++, Dart, Go, Java, and Swift ship as **native from-scratch parsers** under [`parsers/`](parsers/) (no `synx-c` / `libsynx` runtime dependency); `bindings/` is reserved for surfaces that still need to call into the Rust engine via FFI/WASM.
 
@@ -407,6 +567,7 @@ Unified API surface across runtimes. Since 3.6.3, C++, Dart, Go, Java, and Swift
 
 Behavior notes:
 
+- The tables above cover the **SYNX** API. **SYNXL** (`.synxl`) is a separate surface, currently implemented only in `synx-core`, the CLI, `packages/synx-js`, and `bindings/python` — see [Implementation status](#implementation-status).
 - Browser WASM runs without host filesystem/env integration by default.
 - C FFI, Kotlin/JVM (JNA), and WASM `stringify` use JSON strings at the boundary for stable cross-language interop.
 - This table documents API compatibility only; it does not change parser performance characteristics.
@@ -431,8 +592,17 @@ inventory
 
 # Type casting
 zip_code(string) 90210
-# Multiline text
+# Multiline text — `|` joins lines, trimming each one
+description |
+  This is a long text
   that spans multiple lines.
+
+# Multiline text — `|+` keeps indentation relative to the first line (3.7)
+prompt |+
+  Outline:
+    - step one
+    - step two
+  End.
 
 # Comments
 # hash comment

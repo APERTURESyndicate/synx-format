@@ -13,12 +13,61 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { parseData } from './parser';
-import { resolve } from './engine';
+import { resolve, SynxSecret } from './engine';
+import { toCanonicalJSONString } from './json';
+import {
+  parseSynxl,
+  streamSynxl,
+  streamSynxlAsync,
+  synxlToJSON,
+  synxlToNDJSON,
+  writeSynxl,
+  splitRecordLine as synxlSplitRecordLine,
+  utf8Length as synxlUtf8Length,
+  SYNXL_VERSION,
+  MAX_SYNXL_RECORD_BYTES,
+  MAX_SYNXL_FIELDS,
+  MAX_SYNXL_FIELD_NAME_BYTES,
+  MAX_SYNXL_FIELD_LISTS,
+  MAX_SYNXL_RECORDS,
+} from './synxl';
 import type { SynxObject, SynxOptions, SynxValue, SynxMetaMap, SynxDiff } from './types';
+import type {
+  SynxlDocument,
+  SynxlOptions,
+  SynxlRecord,
+  SynxlWriteOptions,
+} from './types';
 import { SynxError } from './types';
 
 export type { SynxObject, SynxOptions, SynxValue, SynxArray, SynxPrimitive, SynxDiff } from './types';
+export type {
+  SynxlDocument,
+  SynxlRecord,
+  SynxlField,
+  SynxlFieldList,
+  SynxlDiagnostic,
+  SynxlDiagnosticKind,
+  SynxlOptions,
+  SynxlWriteOptions,
+} from './types';
 export { SynxError } from './types';
+export {
+  parseSynxl,
+  streamSynxl,
+  streamSynxlAsync,
+  synxlToJSON,
+  synxlToNDJSON,
+  writeSynxl,
+  splitRecordLine,
+  utf8Length,
+  SYNXL_VERSION,
+  MAX_SYNXL_RECORD_BYTES,
+  MAX_SYNXL_FIELDS,
+  MAX_SYNXL_FIELD_NAME_BYTES,
+  MAX_SYNXL_FIELD_LISTS,
+  MAX_SYNXL_RECORDS,
+} from './synxl';
 
 // ─── Native binding auto-detection ───────────────────────
 
@@ -832,6 +881,99 @@ class Synx {
         : {};
     return { tool: toolName, params };
   }
+
+  // ─── SYNXL — "SYNX Lines" record stream (SYNXL 1) ───────
+
+  /** SYNXL format version implemented by this package. */
+  static readonly SYNXL_VERSION = SYNXL_VERSION;
+
+  /**
+   * Parse a `.synxl` record-stream document (SYNXL §4–§11).
+   *
+   * @throws SynxError on a hard error (§11.1) — no partial result is returned.
+   *
+   * @example
+   * ```ts
+   * const doc = Synx.parseSynxl('!synxl 1\n!fields id[type:int] ; name\n1 ; Alice\n');
+   * doc.records[0].values; // { id: 1, name: 'Alice' }
+   * ```
+   */
+  static parseSynxl(text: string, options: SynxlOptions = {}): SynxlDocument {
+    return parseSynxl(text, options);
+  }
+
+  /** Load and parse a `.synxl` file synchronously. */
+  static loadSynxlSync(filePath: string, options: SynxlOptions = {}): SynxlDocument {
+    const text = fs.readFileSync(path.resolve(filePath), 'utf-8');
+    return parseSynxl(text, options);
+  }
+
+  /** Load and parse a `.synxl` file asynchronously. */
+  static async loadSynxl(filePath: string, options: SynxlOptions = {}): Promise<SynxlDocument> {
+    const text = await fs.promises.readFile(path.resolve(filePath), 'utf-8');
+    return parseSynxl(text, options);
+  }
+
+  /** Streaming SYNXL reader over text or an iterable of lines (§15.1). */
+  static streamSynxl(
+    source: string | Iterable<string>,
+    options: SynxlOptions = {},
+  ): Generator<SynxlRecord, void, undefined> {
+    return streamSynxl(source, options);
+  }
+
+  /** Async streaming SYNXL reader over chunks (§15.1). */
+  static streamSynxlAsync(
+    source: AsyncIterable<string | Uint8Array>,
+    options: SynxlOptions = {},
+  ): AsyncGenerator<SynxlRecord, void, undefined> {
+    return streamSynxlAsync(source, options);
+  }
+
+  /** Stream records from a `.synxl` file without materialising it (§15.1). */
+  static streamSynxlFile(
+    filePath: string,
+    options: SynxlOptions = {},
+  ): AsyncGenerator<SynxlRecord, void, undefined> {
+    const stream = fs.createReadStream(path.resolve(filePath), { encoding: 'utf-8' });
+    return streamSynxlAsync(stream as AsyncIterable<string>, options);
+  }
+
+  /** Canonical JSON array projection of a SYNXL document (§12.1). */
+  static synxlToJSON(source: string | SynxlDocument, options: SynxlOptions = {}): string {
+    return synxlToJSON(source, options);
+  }
+
+  /** Canonical NDJSON projection of a SYNXL document (§12.2). */
+  static synxlToNDJSON(source: string | SynxlDocument, options: SynxlOptions = {}): string {
+    return synxlToNDJSON(source, options);
+  }
+
+  /** Serialize records back to SYNXL text, with automatic quoting (§14). */
+  static writeSynxl(
+    input: SynxlDocument | readonly SynxObject[],
+    options: SynxlWriteOptions = {},
+  ): string {
+    return writeSynxl(input, options);
+  }
+
+  /** Save records to a `.synxl` file synchronously. */
+  static saveSynxlSync(
+    filePath: string,
+    input: SynxlDocument | readonly SynxObject[],
+    options: SynxlWriteOptions = {},
+  ): void {
+    fs.writeFileSync(path.resolve(filePath), writeSynxl(input, options), 'utf-8');
+  }
+
+  /** Save records to a `.synxl` file asynchronously. */
+  static async saveSynxl(
+    filePath: string,
+    input: SynxlDocument | readonly SynxObject[],
+    options: SynxlWriteOptions = {},
+  ): Promise<void> {
+    await fs.promises.writeFile(path.resolve(filePath), writeSynxl(input, options), 'utf-8');
+  }
 }
 
 /** Recursively strip the non-enumerable __synx metadata field. */
@@ -943,7 +1085,9 @@ function serializeObject(obj: SynxObject, indent: number): string {
     if (Array.isArray(val)) {
       out += `${spaces}${key}\n`;
       for (const item of val) {
-        if (item && typeof item === 'object' && !Array.isArray(item)) {
+        if (item instanceof SynxSecret) {
+          out += `${spaces}  - ${String(item)}\n`;
+        } else if (item && typeof item === 'object' && !Array.isArray(item)) {
           const entries = Object.entries(item as SynxObject);
           if (entries.length > 0) {
             const [firstKey, firstVal] = entries[0];
@@ -956,6 +1100,8 @@ function serializeObject(obj: SynxObject, indent: number): string {
           out += `${spaces}  - ${item}\n`;
         }
       }
+    } else if (val instanceof SynxSecret) {
+      out += `${spaces}${key} ${String(val)}\n`;
     } else if (val && typeof val === 'object') {
       out += `${spaces}${key}\n`;
       out += serializeObject(val as SynxObject, indent + 2);
@@ -1042,20 +1188,9 @@ function fmtEmit(nodes: FmtNode[], indent: number): string {
 
 function toJSONString(obj: SynxObject, pretty = true): string {
   // Per SYNX 3.6 §10: canonical JSON has object keys sorted lexicographically.
-  // We use a JSON.stringify replacer that returns a sorted shallow copy of any plain object.
-  const replacer = (_k: string, v: unknown): unknown => {
-    if (v && typeof v === 'object' && !Array.isArray(v)) {
-      const sorted: Record<string, unknown> = {};
-      const keys = Object.keys(v as Record<string, unknown>).sort();
-      for (const k of keys) {
-        if (k.startsWith('__synx')) continue; // hide internal metadata
-        sorted[k] = (v as Record<string, unknown>)[k];
-      }
-      return sorted;
-    }
-    return v;
-  };
-  return pretty ? JSON.stringify(obj, replacer, 2) : JSON.stringify(obj, replacer);
+  // The implementation lives in ./json so that the SYNXL projection (§12) uses
+  // the very same writer.
+  return toCanonicalJSONString(obj, pretty);
 }
 
 function toYAMLString(value: unknown, indent = 0): string {
@@ -1234,3 +1369,13 @@ module.exports = Synx;
 module.exports.default = Synx;
 module.exports.Synx = Synx;
 module.exports.SynxError = SynxError;
+// SYNXL: `module.exports` is the Synx class, so every SYNXL static above is
+// already reachable as a named CommonJS export. Only the helpers and limits
+// that have no static counterpart need re-attaching here.
+module.exports.splitRecordLine = synxlSplitRecordLine;
+module.exports.utf8Length = synxlUtf8Length;
+module.exports.MAX_SYNXL_RECORD_BYTES = MAX_SYNXL_RECORD_BYTES;
+module.exports.MAX_SYNXL_FIELDS = MAX_SYNXL_FIELDS;
+module.exports.MAX_SYNXL_FIELD_NAME_BYTES = MAX_SYNXL_FIELD_NAME_BYTES;
+module.exports.MAX_SYNXL_FIELD_LISTS = MAX_SYNXL_FIELD_LISTS;
+module.exports.MAX_SYNXL_RECORDS = MAX_SYNXL_RECORDS;

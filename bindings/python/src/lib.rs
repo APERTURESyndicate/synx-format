@@ -1,8 +1,11 @@
 //! SYNX Python binding — exposes parse/parse_active/stringify/format to Python via PyO3.
+//! SYNXL ("SYNX Lines") lives in [`synxl`].
 
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use synx_core::{self, Value, Mode, Options};
+
+mod synxl;
 
 fn decode_hex(s: &str) -> PyResult<Vec<u8>> {
     let s = s.trim();
@@ -367,6 +370,7 @@ fn synx_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(load_active, m)?)?;
     m.add_function(wrap_pyfunction!(save, m)?)?;
     m.add_function(wrap_pyfunction!(from_json, m)?)?;
+    synxl::register(m)?;
     Ok(())
 }
 
