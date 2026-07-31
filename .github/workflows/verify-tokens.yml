@@ -81,6 +81,27 @@ jobs:
           else
             echo "::warning::could not read owners: $owners"
           fi
+          echo "--- does a write survive 2FA? ---"
+          # whoami is a read and passes even with a token that cannot publish:
+          # the 3.7.0 run authenticated fine and then died on EOTP, because only
+          # an Automation token bypasses two-factor. So exercise a real write —
+          # add a throwaway dist-tag to an already published version and remove
+          # it again. Nothing is published and no version is consumed.
+          set +e
+          out=$(npm dist-tag add @aperturesyndicate/synx-format@3.6.3 ci-auth-probe 2>&1)
+          rc=$?
+          set -e
+          if echo "$out" | grep -q 'EOTP'; then
+            echo "::error::npm still demands a one-time password — this is not an Automation token"
+            exit 1
+          elif [ $rc -ne 0 ]; then
+            echo "::warning::dist-tag write failed for another reason:"
+            echo "$out" | tail -3
+          else
+            echo "OK — write accepted without a one-time password; publish will work"
+            npm dist-tag rm @aperturesyndicate/synx-format ci-auth-probe >/dev/null 2>&1 \
+              && echo "probe tag removed" || echo "::warning::could not remove the probe tag ci-auth-probe"
+          fi
 
   pypi:
     name: PyPI

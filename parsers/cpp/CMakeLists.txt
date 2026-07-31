@@ -16,7 +16,7 @@
 
 cmake_minimum_required(VERSION 3.16)
 project(synx-cpp
-    VERSION 3.7.0
+    VERSION 3.7.1
     DESCRIPTION "SYNX (Active Data Format) — native C++17 parser"
     LANGUAGES CXX)
 

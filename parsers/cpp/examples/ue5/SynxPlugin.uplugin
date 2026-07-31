@@ -1,7 +1,7 @@
 {
 	"FileVersion": 3,
 	"Version": 1,
-	"VersionName": "3.7.0",
+	"VersionName": "3.7.1",
 	"FriendlyName": "SYNX (Active Data Format)",
 	"Description": "Native C++17 parser for SYNX configs (parity with synx-core 3.6.x).",
 	"Category": "Other",

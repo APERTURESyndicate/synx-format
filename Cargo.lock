@@ -89,7 +89,7 @@ dependencies = [
 
 [[package]]
 name = "as-cli"
-version = "3.7.0"
+version = "3.7.1"
 dependencies = [
  "clap",
  "dirs",
@@ -1489,6 +1489,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "99636d423fa2ca130fa5acde3059308006d46f98caac629418e53f7ebb1e9999"
 dependencies = [
  "once_cell",
+ "python3-dll-a",
  "target-lexicon",
 ]
 
@@ -1525,6 +1526,15 @@ dependencies = [
  "pyo3-build-config",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "python3-dll-a"
+version = "0.2.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d381ef313ae70b4da5f95f8a4de773c6aa5cd28f73adec4b4a31df70b66780d8"
+dependencies = [
+ "cc",
 ]
 
 [[package]]
@@ -2028,7 +2038,7 @@ dependencies = [
 
 [[package]]
 name = "synx-bench"
-version = "3.7.0"
+version = "3.7.1"
 dependencies = [
  "criterion",
  "synx-core",
@@ -2036,7 +2046,7 @@ dependencies = [
 
 [[package]]
 name = "synx-c"
-version = "3.7.0"
+version = "3.7.1"
 dependencies = [
  "serde_json",
  "synx-core",
@@ -2044,7 +2054,7 @@ dependencies = [
 
 [[package]]
 name = "synx-cli"
-version = "3.7.0"
+version = "3.7.1"
 dependencies = [
  "clap",
  "dirs",
@@ -2059,7 +2069,7 @@ dependencies = [
 
 [[package]]
 name = "synx-core"
-version = "3.7.0"
+version = "3.7.1"
 dependencies = [
  "ed25519-dalek",
  "itoa",
@@ -2077,14 +2087,14 @@ dependencies = [
 
 [[package]]
 name = "synx-format"
-version = "3.7.0"
+version = "3.7.1"
 dependencies = [
  "synx-core",
 ]
 
 [[package]]
 name = "synx-lsp"
-version = "3.7.0"
+version = "3.7.1"
 dependencies = [
  "serde_json",
  "synx-core",
@@ -2094,7 +2104,7 @@ dependencies = [
 
 [[package]]
 name = "synx-node"
-version = "3.7.0"
+version = "3.7.1"
 dependencies = [
  "napi",
  "napi-build",
@@ -2104,7 +2114,7 @@ dependencies = [
 
 [[package]]
 name = "synx-python"
-version = "3.7.0"
+version = "3.7.1"
 dependencies = [
  "pyo3",
  "serde_json",
@@ -2113,7 +2123,7 @@ dependencies = [
 
 [[package]]
 name = "synx-wasm"
-version = "3.7.0"
+version = "3.7.1"
 dependencies = [
  "serde-wasm-bindgen",
  "serde_json",

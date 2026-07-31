@@ -174,13 +174,20 @@ SynxParseResult parse(String rawText) {
             // per subsequent line. See spec §8.4.1.
             if (block.baseIndent < 0) block.baseIndent = indent;
             final strip = block.baseIndent < indent ? block.baseIndent : indent;
+            // `raw` is the line's bytes, not a String — and §8.4.1 defines the
+            // slice in byte offsets (indent is counted in UTF-8 code units), so
+            // trim and cut on the byte list and decode once at the end. `strip`
+            // only ever covers leading spaces/tabs, so it cannot split a
+            // multi-byte character.
             var end = raw.length;
             while (end > 0) {
-              final c = raw.codeUnitAt(end - 1);
+              final c = raw[end - 1];
               if (c != 0x20 && c != 0x09 && c != 0x0D && c != 0x0A) break;
               end--;
             }
-            slice = strip < end ? raw.substring(strip, end) : '';
+            slice = strip < end
+                ? utf8.decode(raw.sublist(strip, end), allowMalformed: true)
+                : '';
           } else {
             slice = t;
           }

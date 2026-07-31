@@ -1,6 +1,6 @@
 [package]
 name = "synx-python"
-version = "3.7.0"
+version = "3.7.1"
 edition = "2021"
 authors = ["APERTURESyndicate <support@aperturesyndicate.com>"]
 description = "SYNX Python native module via PyO3"
@@ -16,5 +16,11 @@ extension-module = ["pyo3/extension-module"]
 
 [dependencies]
 synx-core = { path = "../../crates/synx-core", features = ["serde", "wasm"] }
-pyo3 = { version = "0.24" }
+# `generate-import-lib` lets Windows wheels be built for interpreter versions
+# that are not installed on the runner. The release matrix builds 3.9–3.13 from
+# a runner that only has one of them; on Linux and macOS that is fine, but the
+# Windows linker needs a python3x.lib, and without this feature maturin stops
+# with "compiling for Windows without an interpreter requires PyO3's
+# generate-import-lib feature" — which is what failed the 3.7.0 run.
+pyo3 = { version = "0.24", features = ["generate-import-lib"] }
 serde_json = "1"

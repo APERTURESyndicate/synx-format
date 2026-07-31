@@ -14,6 +14,40 @@ All notable changes to this repository are documented in this file.
 > for `3.7.0` was free, so npm and every other registry — plus the
 > git tag — now publish on the same version number.
 
+## [3.7.1] — 2026-07-31
+
+A release-integrity fix. 3.7.0 reached crates.io and NuGet but not npm, PyPI or
+pub.dev, and the reason on pub.dev was a genuine defect rather than a
+credential problem. This release carries the same feature set as 3.7.0 with
+that defect fixed, so every registry lands on one number again.
+
+### Fixed
+
+- **Dart parser did not compile under `|+`.** The §8.4.1 branch called
+  `codeUnitAt` and `substring` on `raw`, which is the line's byte list rather
+  than a `String`. Trimming and slicing now happen on the bytes with a single
+  decode at the end — which is also what the specification describes, since the
+  offsets there are byte offsets. `dart analyze` rejected the package, so the
+  broken parser was never published.
+
+- **Windows wheels failed to build.** maturin stopped with *"compiling for
+  Windows without an interpreter requires PyO3's `generate-import-lib`
+  feature"*: the release matrix builds for CPython 3.9–3.13 from a runner that
+  has only one of them installed. The feature is now enabled. Because the PyPI
+  upload waits on every wheel, this single failure had skipped PyPI entirely.
+
+### Added — `|+` test coverage for Dart and .NET
+
+The Dart defect survived to a release because `|+` was only covered in Rust,
+JS and Go. Both parsers now carry the operator's own suite: the worked example
+from the specification, base-indent locking, per-line trailing-whitespace
+stripping, block termination at the opener indent, plain `|` for contrast, and
+a non-ASCII body — the case that fails whenever a byte offset is applied to the
+wrong unit, which is exactly how the Dart parser broke. **.NET passed without
+any change to the parser**, confirming the package already on NuGet is sound.
+
+C++, Java and Swift still have no `|+` coverage; that gap is open.
+
 ## [3.7.0] — 2026-07-30
 
 ### Added — `|+` indent-preserving multiline blocks

@@ -7,7 +7,7 @@
 
     <groupId>com.aperturesyndicate</groupId>
     <artifactId>synx</artifactId>
-    <version>3.7.0</version>
+    <version>3.7.1</version>
     <packaging>jar</packaging>
 
     <name>SYNX</name>
