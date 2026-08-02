@@ -61,12 +61,7 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         working-directory: crates/synx-core
-        run: |
-          if [ "${{ env.IS_DRY_RUN }}" = "true" ]; then
-            cargo publish --dry-run --allow-dirty
-          else
-            cargo publish
-          fi
+        run: bash "$GITHUB_WORKSPACE/scripts/ci/publish-crate.sh" synx-core
       - name: Wait for crates.io index
         if: env.IS_DRY_RUN != 'true'
         run: sleep 45
@@ -74,32 +69,17 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         working-directory: crates/synx-format
-        run: |
-          if [ "${{ env.IS_DRY_RUN }}" = "true" ]; then
-            cargo publish --dry-run --allow-dirty
-          else
-            cargo publish
-          fi
+        run: bash "$GITHUB_WORKSPACE/scripts/ci/publish-crate.sh" synx-format
       - name: cargo publish synx-cli
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         working-directory: crates/synx-cli
-        run: |
-          if [ "${{ env.IS_DRY_RUN }}" = "true" ]; then
-            cargo publish --dry-run --allow-dirty
-          else
-            cargo publish
-          fi
+        run: bash "$GITHUB_WORKSPACE/scripts/ci/publish-crate.sh" synx-cli
       - name: cargo publish synx-lsp
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         working-directory: crates/synx-lsp
-        run: |
-          if [ "${{ env.IS_DRY_RUN }}" = "true" ]; then
-            cargo publish --dry-run --allow-dirty
-          else
-            cargo publish
-          fi
+        run: bash "$GITHUB_WORKSPACE/scripts/ci/publish-crate.sh" synx-lsp
 
   publish-npm:
     name: Publish synx-js → npm
@@ -121,11 +101,20 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
+          set -euo pipefail
           if [ "${{ env.IS_DRY_RUN }}" = "true" ]; then
             npm publish --dry-run --access public --provenance
-          else
-            npm publish --access public --provenance
+            exit 0
           fi
+          pkg="$(node -p "require('./package.json').name")"
+          ver="$(node -p "require('./package.json').version")"
+          # A re-pushed tag must not fail an already-finished release: npm
+          # rejects republishing a version, and that is the expected state.
+          if npm view "${pkg}@${ver}" version >/dev/null 2>&1; then
+            echo "::notice title=Already published::${pkg} ${ver} is already on npm — nothing to do"
+            exit 0
+          fi
+          npm publish --access public --provenance
 
   publish-nuget:
     name: Publish Synx.Core → NuGet
@@ -246,8 +235,21 @@ jobs:
             echo "skip=true" >> "$GITHUB_OUTPUT"
             echo "::notice::PUB_DEV_PUBLISH_TOKEN is not set — skipping the pub.dev publish."
           fi
+      - name: Skip if this version is already on pub.dev
+        if: steps.pubcred.outputs.skip != 'true'
+        id: pubver
+        working-directory: parsers/dart
+        run: |
+          set -euo pipefail
+          ver="$(awk '/^version:/{print $2; exit}' pubspec.yaml)"
+          code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 \
+            "https://pub.dev/api/packages/synx/versions/${ver}" || echo 000)"
+          if [ "$code" = "200" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Already published::synx ${ver} is already on pub.dev — nothing to do"
+          fi
       - name: Publish
-        if: env.IS_DRY_RUN != 'true' && steps.pubcred.outputs.skip != 'true'
+        if: env.IS_DRY_RUN != 'true' && steps.pubcred.outputs.skip != 'true' && steps.pubver.outputs.skip != 'true'
         working-directory: parsers/dart
         env:
           PUB_DEV_PUBLISH_ACCESS_TOKEN: ${{ secrets.PUB_DEV_PUBLISH_TOKEN }}

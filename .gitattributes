@@ -8,3 +8,6 @@ tests/conformance-synxl/cases/**  -text
 
 # Normative specifications are quoted verbatim in issues and tests.
 docs/spec/**                      text eol=lf
+
+# CI shell scripts run on Linux runners; a CRLF shebang is a "bad interpreter".
+*.sh                              text eol=lf

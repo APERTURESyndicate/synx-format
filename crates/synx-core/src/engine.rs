@@ -2349,6 +2349,12 @@ fn plural_category(lang: &str, n: i64) -> &'static str {
 mod tests {
     use crate::{parse, Options, Value};
     use super::{resolve, read_manifest_main};
+    use std::sync::Mutex;
+
+    // The :spam buckets are process-global, and clear_spam_buckets() wipes all of
+    // them — so two spam tests running on different threads can clear each other's
+    // bucket mid-test. Every spam test takes this lock for its whole body.
+    static SPAM_TESTS: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_ref_simple() {
@@ -2621,6 +2627,7 @@ mod tests {
 
     #[test]
     fn test_spam_rate_limit_exceeded() {
+        let _serialized = SPAM_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         super::clear_spam_buckets();
 
         let mut r1 = parse("!active\nsecret_token abc\naccess:spam:1:5 secret_token");
@@ -2639,6 +2646,7 @@ mod tests {
 
     #[test]
     fn test_spam_default_window_sec_is_one() {
+        let _serialized = SPAM_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         super::clear_spam_buckets();
 
         let mut r = parse("!active\na 1\nx:spam:2 a");
