@@ -2,6 +2,7 @@
 //! SYNXL ("SYNX Lines") lives in [`synxl`].
 
 use pyo3::prelude::*;
+use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::types::{PyDict, PyList};
 use synx_core::{self, Value, Mode, Options};
 
@@ -33,7 +34,7 @@ fn encode_hex(bytes: &[u8]) -> String {
 }
 
 /// Convert synx_core::Value to a Python object.
-fn value_to_py(py: Python<'_>, val: &Value) -> PyObject {
+fn value_to_py(py: Python<'_>, val: &Value) -> Py<PyAny> {
     match val {
         Value::Null => py.None(),
         Value::Bool(b) => b.into_pyobject(py).unwrap().to_owned().into_any().unbind(),
@@ -42,7 +43,7 @@ fn value_to_py(py: Python<'_>, val: &Value) -> PyObject {
         Value::String(s) => s.into_pyobject(py).unwrap().into_any().unbind(),
         Value::Secret(_) => "[SECRET]".into_pyobject(py).unwrap().into_any().unbind(),
         Value::Array(arr) => {
-            let items: Vec<PyObject> = arr.iter().map(|v| value_to_py(py, v)).collect();
+            let items: Vec<Py<PyAny>> = arr.iter().map(|v| value_to_py(py, v)).collect();
             let list = PyList::new(py, &items).unwrap();
             list.into_pyobject(py).unwrap().into_any().unbind()
         }
@@ -56,39 +57,83 @@ fn value_to_py(py: Python<'_>, val: &Value) -> PyObject {
     }
 }
 
+/// Nesting depth accepted when converting a Python value.
+///
+/// Matched to the SYNX parser's own cap, so anything this crate can *parse*
+/// can also be converted back. Past it the conversion errors out instead of
+/// recursing: `py_to_value` walks the object graph, and Python containers can
+/// be arbitrarily deep or outright cyclic (`x["self"] = x`), neither of which
+/// the caller can catch once the native stack is gone.
+const MAX_PY_VALUE_DEPTH: usize = 128;
+
 /// Convert a Python object back to synx_core::Value.
 fn py_to_value(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<Value> {
+    py_to_value_at(py, obj, 0)
+}
+
+fn py_to_value_at(py: Python<'_>, obj: &Bound<'_, PyAny>, depth: usize) -> PyResult<Value> {
+    if depth > MAX_PY_VALUE_DEPTH {
+        // A cycle reaches this too: it has no bottom, so it hits the cap. The
+        // alternative is a stack overflow, which on Windows kills the process
+        // outright — no traceback, nothing for `except` to catch.
+        return Err(PyValueError::new_err(format!(
+            "value nests deeper than {} levels, or contains a reference cycle",
+            MAX_PY_VALUE_DEPTH
+        )));
+    }
     if obj.is_none() {
         Ok(Value::Null)
     } else if let Ok(b) = obj.extract::<bool>() {
         Ok(Value::Bool(b))
     } else if let Ok(n) = obj.extract::<i64>() {
         Ok(Value::Int(n))
+    } else if obj.is_instance_of::<pyo3::types::PyInt>() {
+        // A Python int that did not fit i64. Falling through to `f64` would
+        // round it — a 20-digit id becomes a different id — and then to the
+        // catch-all, which would turn it into a string. Neither is a number
+        // the caller wrote, so this is refused instead.
+        Err(PyValueError::new_err(
+            "integer is outside the i64 range SYNX can represent",
+        ))
     } else if let Ok(f) = obj.extract::<f64>() {
         Ok(Value::Float(f))
     } else if let Ok(s) = obj.extract::<String>() {
         Ok(Value::String(s))
-    } else if let Ok(list) = obj.downcast::<PyList>() {
+    } else if let Ok(list) = obj.cast::<PyList>() {
         let mut arr = Vec::new();
         for item in list.iter() {
-            arr.push(py_to_value(py, &item)?);
+            arr.push(py_to_value_at(py, &item, depth + 1)?);
         }
         Ok(Value::Array(arr))
-    } else if let Ok(dict) = obj.downcast::<PyDict>() {
+    } else if let Ok(tuple) = obj.cast::<pyo3::types::PyTuple>() {
+        // A tuple is a sequence, so it maps to an array. The catch-all below
+        // would have stringified it to `(1, 2, 3)`.
+        let mut arr = Vec::new();
+        for item in tuple.iter() {
+            arr.push(py_to_value_at(py, &item, depth + 1)?);
+        }
+        Ok(Value::Array(arr))
+    } else if let Ok(dict) = obj.cast::<PyDict>() {
         let mut map = std::collections::HashMap::new();
         for (k, v) in dict.iter() {
             let key: String = k.extract()?;
-            map.insert(key, py_to_value(py, &v)?);
+            map.insert(key, py_to_value_at(py, &v, depth + 1)?);
         }
         Ok(Value::Object(map))
     } else {
-        Ok(Value::String(format!("{}", obj)))
+        // Anything else has no SYNX representation. `str(obj)` used to stand in
+        // for one, which silently turned a `set`, a `bytes` or a custom class
+        // into its repr and wrote that to disk as if it were data.
+        Err(PyTypeError::new_err(format!(
+            "cannot convert {} to a SYNX value; pass a str, int, float, bool, None, list, tuple or dict",
+            obj.get_type().name()?
+        )))
     }
 }
 
 /// Parse a SYNX string and return a Python dict.
 #[pyfunction]
-fn parse(py: Python<'_>, text: &str) -> PyResult<PyObject> {
+fn parse(py: Python<'_>, text: &str) -> PyResult<Py<PyAny>> {
     let result = synx_core::parse(text);
     Ok(value_to_py(py, &result.root))
 }
@@ -193,7 +238,7 @@ fn parse_active(
     text: &str,
     env: Option<std::collections::HashMap<String, String>>,
     base_path: Option<String>,
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     let mut result = synx_core::parse(text);
     if result.mode == Mode::Active {
         let mut opts = Options::default();
@@ -218,7 +263,7 @@ fn parse_tool(
     text: &str,
     env: Option<std::collections::HashMap<String, String>>,
     base_path: Option<String>,
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     let mut result = synx_core::parse(text);
     if result.mode == Mode::Active {
         let mut opts = Options::default();
@@ -285,7 +330,7 @@ fn to_prompt_block(text: &str, label: &str) -> PyResult<String> {
 /// Structural diff between two parsed SYNX dicts.
 /// Returns `{ "added": {...}, "removed": {...}, "changed": {...}, "unchanged": [...] }`.
 #[pyfunction]
-fn diff(py: Python<'_>, a: &Bound<'_, PyAny>, b: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+fn diff(py: Python<'_>, a: &Bound<'_, PyAny>, b: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
     let val_a = py_to_value(py, a)?;
     let val_b = py_to_value(py, b)?;
     let map_a = match val_a { Value::Object(m) => m, _ => std::collections::HashMap::new() };
@@ -307,7 +352,7 @@ fn diff_json(text_a: &str, text_b: &str) -> PyResult<String> {
 
 /// Load and parse a .synx file. Returns a Python dict.
 #[pyfunction]
-fn load(py: Python<'_>, file_path: &str) -> PyResult<PyObject> {
+fn load(py: Python<'_>, file_path: &str) -> PyResult<Py<PyAny>> {
     let text = std::fs::read_to_string(file_path)
         .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
     let map = synx_core::Synx::parse(&text);
@@ -317,7 +362,7 @@ fn load(py: Python<'_>, file_path: &str) -> PyResult<PyObject> {
 /// Load, parse and resolve a .synx file with !active engine. Returns a Python dict.
 #[pyfunction]
 #[pyo3(signature = (file_path, base_path=None))]
-fn load_active(py: Python<'_>, file_path: &str, base_path: Option<&str>) -> PyResult<PyObject> {
+fn load_active(py: Python<'_>, file_path: &str, base_path: Option<&str>) -> PyResult<Py<PyAny>> {
     let text = std::fs::read_to_string(file_path)
         .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
     let mut opts = synx_core::Options::default();

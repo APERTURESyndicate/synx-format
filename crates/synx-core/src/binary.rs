@@ -584,6 +584,9 @@ pub fn decompile(data: &[u8]) -> Result<ParseResult, String> {
         metadata,
         includes,
         uses: Vec::new(),
+        // A `.synxb` container carries an already-parsed tree; nothing is
+        // dropped on the way back out.
+        truncated: false,
     })
 }
 
@@ -634,6 +637,7 @@ mod tests {
             metadata: HashMap::new(),
             includes: Vec::new(),
             uses: Vec::new(),
+            truncated: false,
         };
 
         let binary = compile(&result, false);
@@ -682,6 +686,7 @@ mod tests {
             metadata,
         includes,
         uses: Vec::new(),
+        truncated: false,
     };
 
         let binary = compile(&result, false);
@@ -728,6 +733,7 @@ mod tests {
             metadata,
             includes: Vec::new(),
             uses: Vec::new(),
+            truncated: false,
         };
 
         let binary = compile(&result, true);
@@ -781,6 +787,7 @@ mod tests {
             metadata: HashMap::new(),
             includes: Vec::new(),
             uses: Vec::new(),
+            truncated: false,
         };
 
         let binary = compile(&result, false);
@@ -860,6 +867,7 @@ mod tests {
             metadata,
             includes: Vec::new(),
             uses: Vec::new(),
+            truncated: false,
         };
 
         let binary = compile(&result, false);
@@ -901,6 +909,7 @@ mod tests {
             metadata: HashMap::new(),
             includes: Vec::new(),
             uses: Vec::new(),
+            truncated: false,
         };
 
         let binary = compile(&result, false);
@@ -920,6 +929,7 @@ mod tests {
             metadata: HashMap::new(),
             includes: Vec::new(),
             uses: Vec::new(),
+            truncated: false,
         };
 
         let binary = compile(&result, false);
@@ -941,6 +951,7 @@ mod tests {
             metadata: HashMap::new(),
             includes: Vec::new(),
             uses: Vec::new(),
+            truncated: false,
         };
         let binary = compile(&result, false);
         let restored = decompile(&binary).unwrap();

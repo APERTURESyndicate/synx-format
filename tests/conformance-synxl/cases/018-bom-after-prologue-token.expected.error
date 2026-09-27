@@ -1,0 +1,2 @@
+MissingOrMalformedPrologue
+U+FEFF is not whitespace (3.1 ignores a BOM only at the start of input), so the first line is not a valid prologue.

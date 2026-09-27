@@ -21,7 +21,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 
-import { parseSynxl, synxlToJSON, SynxlError } from '../src/synxl';
+import { parseSynxl, synxlToJSON, writeSynxl, SynxlError } from '../src/synxl';
 import type { SynxlErrorCondition } from '../src/synxl';
 
 const CASES_DIR = path.resolve(__dirname, '..', '..', '..', 'tests', 'conformance-synxl', 'cases');
@@ -135,7 +135,39 @@ function runCase(file: string): CaseResult {
     }
   }
 
+  const roundTrip = checkRoundTrip(doc, gotJson);
+  if (roundTrip) return { name, failure: roundTrip };
+
   return { name, failure: null };
+}
+
+/**
+ * §14.1 — `parse(write(parse(D)))` must project identically to `parse(D)`.
+ *
+ * Self-checking, so it covers every accepted case without a fixture of its own:
+ * §14.1's scope is documents obtained by parsing, which is what these are. The
+ * writer is otherwise untested by the suite, and its failure mode is the quiet
+ * kind — a value returning as a different type, or a record vanishing because
+ * its line picked up an indent.
+ */
+function checkRoundTrip(doc: ReturnType<typeof parseSynxl>, expectedJson: string): string | null {
+  let written: string;
+  try {
+    written = writeSynxl(doc);
+  } catch (e) {
+    return `§14 writer refused a document it had just parsed — ${(e as Error).message}`;
+  }
+  let reparsed;
+  try {
+    reparsed = parseSynxl(written);
+  } catch (e) {
+    return `§14.1 round-trip produced a document the parser rejects — ${(e as Error).message}\n    written: ${JSON.stringify(written)}`;
+  }
+  const got = synxlToJSON(reparsed);
+  if (got !== expectedJson) {
+    return `§14.1 round-trip changed the projection\n    written:  ${JSON.stringify(written)}\n    expected: ${expectedJson}\n    actual:   ${got}`;
+  }
+  return null;
 }
 
 describe('SYNXL conformance suite (tests/conformance-synxl)', () => {

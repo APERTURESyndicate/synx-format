@@ -1,0 +1,3 @@
+!synxl 1
+!fields id(int) ; __proto__ ; constructor
+1 ; boo ; ctor

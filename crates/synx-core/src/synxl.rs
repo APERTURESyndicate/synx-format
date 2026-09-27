@@ -18,7 +18,7 @@
 //! assert_eq!(doc.to_json(), r#"[{"id":1,"name":"Wario"}]"#);
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use memchr::memchr;
@@ -51,7 +51,12 @@ pub const MAX_SYNXL_RECORDS: usize = 16_777_216;
 
 /// Nesting depth guard for the block writer (§14) — mirrors the crate's other
 /// serializers, which all cap recursion rather than trusting the value tree.
-const MAX_WRITE_DEPTH: usize = 64;
+///
+/// Matched to the SYNX parser's own nesting cap: a shallower writer would
+/// silently drop levels that a parse can produce, breaking §14.1 round-trip on
+/// documents this crate accepts. Anything deeper than a parse can yield is
+/// rejected up front (§14.3) instead of being trimmed away.
+const MAX_WRITE_DEPTH: usize = parser::MAX_PARSE_NESTING_DEPTH;
 
 /// Decimal places used when a float has to be expanded out of exponent form so
 /// that it survives a SYNX cast round-trip (see `write_float`). Large enough to
@@ -720,6 +725,16 @@ impl ReaderCore {
             if trimmed.is_empty() {
                 continue;
             }
+            // §4.3 — a `###` block comment ignores every line until the closing
+            // marker, whatever its indent. Checked before the orphan rule
+            // below: a line that the format says to ignore must not also be
+            // reported as an orphan.
+            if self.in_block_comment {
+                if trimmed == "###" {
+                    self.in_block_comment = false;
+                }
+                continue;
+            }
             // §3.4 — indent > 0 belongs to the current record's block. Reaching
             // this loop means no record is open, so the line is orphaned: it is
             // discarded and reported against the *following* record (§11.2).
@@ -834,7 +849,25 @@ impl ReaderCore {
         } else {
             // §9.4 — directives are disabled inside the embedded parse, and
             // §9.5 — no `!active` mode means no metadata capture.
-            match parser::parse_with(block_text, ParserOptions { directives: false }).root {
+            let parsed = parser::parse_with(
+                block_text,
+                ParserOptions { directives: false, nondeterministic_hints: false },
+            );
+            // SYNX's own caps (multiline body bytes, indexed lines) apply
+            // within a block, scoped to that block (§13). When one of them
+            // drops content, saying nothing would make an accepted record
+            // indistinguishable from a complete one — the exact failure §16.4
+            // tells consumers to guard against.
+            if parsed.truncated {
+                diagnostics.push(Diagnostic {
+                    record_index: index,
+                    line: line_no,
+                    kind: DiagnosticKind::RecordTruncated,
+                    message: "block content exceeded a SYNX parser limit (§13) and was truncated"
+                        .to_string(),
+                });
+            }
+            match parsed.root {
                 Value::Object(map) => Some(map),
                 _ => None,
             }
@@ -843,7 +876,11 @@ impl ReaderCore {
         let fl = &self.field_lists[fl_idx];
         let mut obj: HashMap<String, Value> = HashMap::with_capacity(fl.fields.len());
 
-        if record_line.trim() == ";" {
+        // `trim_wsp`, not `trim`: §3.3 draws the line between structure and
+        // content, and trimming *within* a record line takes only spaces and
+        // horizontal tabs. A trailing U+00A0 is field content (§7.1 step 4),
+        // so `;\u{a0}` is a two-part record, not the all-null form.
+        if trim_wsp(record_line) == ";" {
             // §7.2 — the all-null record. Matched *before* the §7.1 split,
             // whose result would otherwise depend on the arity: two null parts
             // at arity 2, but a spurious `MissingFields` at arity 3. At arity 1
@@ -1400,6 +1437,14 @@ impl<R: std::io::BufRead> SynxlStreamReader<R> {
             if trimmed.is_empty() {
                 continue;
             }
+            // §4.3 — a `###` block comment ignores every line until the closing
+            // marker, indent included; an ignored line is not an orphan.
+            if self.core.in_block_comment {
+                if trimmed == "###" {
+                    self.core.in_block_comment = false;
+                }
+                continue;
+            }
             // §3.4 — indent > 0 with no record open is an orphan (§11.2).
             if self.cur.len() - self.cur.trim_start().len() > 0 {
                 let no = self.cur_no;
@@ -1615,22 +1660,25 @@ pub fn parse_lines_with(text: &str, opts: &SynxlOptions) -> Result<SynxlDocument
 /// shallowest indent (SYNX §8.6 stack repair), so re-scanning that one level is
 /// enough — and it only runs when a diagnostic is actually being emitted.
 fn block_key_lines(block: &str, first_line_no: usize) -> HashMap<&str, usize> {
-    let mut min_indent = usize::MAX;
-    for line in block.split('\n') {
-        let line = line.strip_suffix('\r').unwrap_or(line);
-        if line.trim().is_empty() {
-            continue;
-        }
-        min_indent = min_indent.min(line.len() - line.trim_start().len());
-    }
-
+    // A key lands at the root of the embedded document when its indent is at
+    // or below every indent seen before it: the first line opens the root
+    // level, and SYNX §8.6 stack repair pulls any later dedent back up to it.
+    // Comparing against the block's *overall* minimum instead would skip the
+    // deeper-but-still-root keys, and their diagnostics would then fall back
+    // to the record line — the divergence §11.2 forbids.
+    let mut running_min = usize::MAX;
     let mut map: HashMap<&str, usize> = HashMap::new();
     for (i, line) in block.split('\n').enumerate() {
         let line = line.strip_suffix('\r').unwrap_or(line);
         let trimmed = line.trim();
-        if trimmed.is_empty() || line.len() - line.trim_start().len() != min_indent {
+        if trimmed.is_empty() {
             continue;
         }
+        let indent = line.len() - line.trim_start().len();
+        if indent > running_min {
+            continue;
+        }
+        running_min = indent;
         // Lines SYNX never turns into a key (SYNX §7) plus `!` lines, which
         // SYNXL discards inside a block (§9.4).
         if trimmed.starts_with("- ") || trimmed.starts_with('!') {
@@ -2169,12 +2217,81 @@ pub fn write_lines(fields: &[FieldDecl], records: &[Value]) -> Result<String, Sy
     Ok(out)
 }
 
-/// Emit one `!fields` line and the records that use it.
+/// §5.1 / §5.3.4 — reject a field list that would not survive a read back.
+///
+/// Field names reach this crate straight from caller data (a dict key, a CSV
+/// header, a JSON property), so none of §5.1's constraints can be assumed.
+/// Writing them out unchecked produces documents that either fail to parse or,
+/// worse, parse into a *different* schema: a `;` in a name silently splits one
+/// column into two, and a newline splits one record into two.
+fn validate_writable_fields(fields: &[FieldDecl]) -> Result<(), SynxlError> {
+    if fields.is_empty() {
+        return Err(SynxlError::new(
+            SynxlErrorKind::Unwritable,
+            0,
+            "a field list must declare at least one field (§5.3.4); an empty one reads back as a malformed field list",
+        ));
+    }
+    if fields.len() > MAX_SYNXL_FIELDS {
+        return Err(SynxlError::new(
+            SynxlErrorKind::Unwritable,
+            0,
+            format!("field list declares {} fields, over the {} limit (§13)", fields.len(), MAX_SYNXL_FIELDS),
+        ));
+    }
+    let mut seen: HashSet<&str> = HashSet::with_capacity(fields.len());
+    for field in fields {
+        let name = field.name.as_str();
+        if name.is_empty() {
+            return Err(SynxlError::new(
+                SynxlErrorKind::Unwritable,
+                0,
+                "field name is empty (§5.1.1)",
+            ));
+        }
+        if name.len() > MAX_SYNXL_FIELD_NAME_BYTES {
+            return Err(SynxlError::new(
+                SynxlErrorKind::Unwritable,
+                0,
+                format!(
+                    "field name `{}` is {} bytes, over the {} byte limit (§13)",
+                    elide(name),
+                    name.len(),
+                    MAX_SYNXL_FIELD_NAME_BYTES
+                ),
+            ));
+        }
+        if let Some(bad) = name
+            .chars()
+            .find(|c| matches!(c, ';' | '[' | '(' | ':') || c.is_whitespace())
+        {
+            return Err(SynxlError::new(
+                SynxlErrorKind::Unwritable,
+                0,
+                format!(
+                    "field name `{}` contains `{}`, which §5.1.1 excludes; it would read back as a different schema",
+                    elide(name),
+                    bad.escape_debug()
+                ),
+            ));
+        }
+        if !seen.insert(name) {
+            return Err(SynxlError::new(
+                SynxlErrorKind::Unwritable,
+                0,
+                format!("field name `{}` is declared twice (§5.1.4)", elide(name)),
+            ));
+        }
+    }
+    Ok(())
+}
 fn write_group(
     out: &mut String,
     fields: &[FieldDecl],
     records: &[Value],
 ) -> Result<(), SynxlError> {
+    validate_writable_fields(fields)?;
+
     // §14.3 — a value that cannot live inline is promoted, which is a property
     // of the whole column: block-ness is declared once, in the field list.
     let mut block: Vec<bool> = fields
@@ -2184,7 +2301,7 @@ fn write_group(
                 || records.iter().any(|r| {
                     r.as_object()
                         .and_then(|m| m.get(&f.name))
-                        .map(needs_block)
+                        .map(|v| needs_block(v, f.type_name()))
                         .unwrap_or(false)
                 })
         })
@@ -2241,7 +2358,7 @@ fn write_group(
             block[i]
                 || map
                     .and_then(|m| m.get(&f.name))
-                    .map(Value::is_null)
+                    .map(writes_as_empty)
                     .unwrap_or(true)
         });
         if all_null {
@@ -2257,7 +2374,7 @@ fn write_group(
                 }
                 first = false;
                 let value = map.and_then(|m| m.get(&field.name)).unwrap_or(&Value::Null);
-                write_inline(out, value);
+                write_inline(out, value, field.type_name());
             }
         }
         out.push('\n');
@@ -2324,8 +2441,23 @@ fn write_field_decl(out: &mut String, field: &FieldDecl, block: bool) {
     }
 }
 
+/// Does this value render as an empty inline part?
+///
+/// `null` does by §14.2, and so does a non-finite float: it has no SYNX
+/// representation, so §14.3 writes it as an empty part that reads back as
+/// `null`. Both therefore count towards the §7.2 all-null form — without the
+/// second case, a single-column record holding `inf` writes an empty line,
+/// which §3.5 makes invisible and the record disappears on the way back in.
+fn writes_as_empty(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::Float(f) => !f.is_finite(),
+        _ => false,
+    }
+}
+
 /// §14.3 — values that cannot be written as an inline part.
-fn needs_block(value: &Value) -> bool {
+fn needs_block(value: &Value, hint: Option<&str>) -> bool {
     match value {
         // Structure has no inline form at all.
         Value::Object(_) | Value::Array(_) => true,
@@ -2335,16 +2467,23 @@ fn needs_block(value: &Value) -> bool {
                 // Quoting has no escapes (§7.4/§16.5), so a value that needs
                 // quoting and contains both quote characters — the `;` + quote
                 // case of §14.3 among others — has to be promoted.
-                || (inline_needs_quote(s) && pick_quote(s).is_none())
+                || (inline_needs_quote(s, hint) && pick_quote(s).is_none())
         }
         _ => false,
     }
 }
 
 /// Would this string be misread if written as a bare inline part? (§14.3)
-fn inline_needs_quote(s: &str) -> bool {
+///
+/// `hint` is the effective type of the column it is going into ([`FieldDecl::type_name`]),
+/// which decides whether the reader will apply §8.2 typed casting to it.
+fn inline_needs_quote(s: &str, hint: Option<&str>) -> bool {
     s.is_empty()
-        || s != trim_wsp(s)
+        // Any Unicode whitespace at either edge, not just space and tab: a
+        // leading U+00A0 gives the written line a non-zero indent (§3.3), so
+        // the reader takes it for block content and the whole record vanishes.
+        || s.starts_with(char::is_whitespace)
+        || s.ends_with(char::is_whitespace)
         || s.contains(';')
         || s.starts_with('#')
         || s.starts_with("//")
@@ -2352,7 +2491,14 @@ fn inline_needs_quote(s: &str) -> bool {
         // A leading quote would make §7.1 step 2 read the part as quoted.
         || s.starts_with('"')
         || s.starts_with('\'')
-        || cast_inline(s) != Value::String(s.to_string())
+        || match hint {
+            // A typed column casts what it reads (§8.2), so an unquoted `N/A`
+            // in an `int` column comes back as null with a `CastFailed`. §7.4
+            // exempts quoted parts from casting, so quoting is what preserves
+            // the string.
+            Some(h) => cast_typed_checked(s, h) != Some(Value::String(s.to_string())),
+            None => cast_inline(s) != Value::String(s.to_string()),
+        }
 }
 
 /// A quote character that does not occur in `s`, or `None` if both do.
@@ -2367,7 +2513,7 @@ fn pick_quote(s: &str) -> Option<char> {
 }
 
 /// §14.2 / §14.3 — one inline part.
-fn write_inline(out: &mut String, value: &Value) {
+fn write_inline(out: &mut String, value: &Value, hint: Option<&str>) {
     match value {
         // §14.2 — an unset field is an empty part.
         Value::Null => {}
@@ -2378,7 +2524,7 @@ fn write_inline(out: &mut String, value: &Value) {
         }
         Value::Float(f) => write_float(out, *f),
         Value::String(s) | Value::Secret(s) => {
-            if inline_needs_quote(s) {
+            if inline_needs_quote(s, hint) {
                 match pick_quote(s) {
                     Some(q) => {
                         out.push(q);
@@ -2498,7 +2644,14 @@ fn write_synx_item(out: &mut String, item: &Value, indent: usize, depth: usize) 
                 .iter()
                 .position(|k| dash_line_safe(&map[*k]))
                 .unwrap_or(0);
-            let head_key = keys[head];
+            // An empty object in a list has no key to hang on the `- ` line.
+            // SYNX writes it as a bare dash, which is how it parsed in the
+            // first place; indexing `keys` here would panic instead.
+            let Some(head_key) = keys.get(head).copied() else {
+                push_indent(out, indent);
+                out.push_str("-\n");
+                return;
+            };
             push_indent(out, indent);
             out.push_str("- ");
             out.push_str(head_key);

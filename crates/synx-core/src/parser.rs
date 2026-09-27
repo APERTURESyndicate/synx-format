@@ -16,7 +16,7 @@ pub(crate) const MAX_SYNX_INPUT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_LINE_STARTS: usize = 2_000_000;
 
 /// Indentation-tree depth for nested objects (stack size). Iterative parser — prevents giant parent chains.
-const MAX_PARSE_NESTING_DEPTH: usize = 128;
+pub(crate) const MAX_PARSE_NESTING_DEPTH: usize = 128;
 
 /// Multiline `key |` block body: max accumulated UTF-8 bytes.
 const MAX_MULTILINE_BLOCK_BYTES: usize = 1024 * 1024;
@@ -43,6 +43,41 @@ pub(crate) fn clamp_synx_text(text: &str) -> &str {
         .map(|s| s.len())
         .unwrap_or_else(|e| e.valid_up_to());
     &text[..end]
+}
+
+/// Byte offset of the first character at or past `strip` bytes of leading whitespace.
+///
+/// Indentation is measured over *Unicode* whitespace (SYNX §4), so a line may
+/// carry a multi-byte indent character such as U+00A0. Slicing at the raw byte
+/// count would then land inside that character and panic; this walks whole
+/// characters instead and never returns a non-boundary offset. For an
+/// ASCII-only indent — the overwhelmingly common case — the result is `strip`.
+fn strip_boundary(s: &str, strip: usize) -> usize {
+    let mut off = 0usize;
+    for ch in s.chars() {
+        if off >= strip || !ch.is_whitespace() {
+            break;
+        }
+        off += ch.len_utf8();
+    }
+    off
+}
+
+/// Keys that would reach a JS consumer's prototype chain instead of its data.
+fn is_reserved_js_key(key: &str) -> bool {
+    key == "__proto__" || key == "constructor" || key == "prototype"
+}
+
+/// Longest prefix of `s` that fits in `limit` bytes without splitting a character.
+fn utf8_prefix_len(s: &str, limit: usize) -> usize {
+    if s.len() <= limit {
+        return s.len();
+    }
+    let mut end = limit;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
 }
 
 /// Byte length to parse: full slice, or truncate before the newline that would exceed
@@ -84,11 +119,21 @@ pub struct ParserOptions {
     /// check, so that `|` / `|+` bodies keep their `!` lines verbatim — a
     /// pre-filter over the raw lines would corrupt those bodies.
     pub directives: bool,
+
+    /// Honour the `random`, `random:int`, `random:float` and `random:bool`
+    /// type hints.
+    ///
+    /// SYNXL block delegation sets this to `false` (SYNXL §8.3): a hint
+    /// carried by dataset data would make the §12 projection differ between
+    /// two reads of the same bytes, which defeats hashing, deduplication and
+    /// the byte-identical projection §1.4 is measured on. Disabled, the hints
+    /// fall back to automatic casting like any other unrecognised hint.
+    pub nondeterministic_hints: bool,
 }
 
 impl Default for ParserOptions {
     fn default() -> Self {
-        Self { directives: true }
+        Self { directives: true, nondeterministic_hints: true }
     }
 }
 
@@ -101,10 +146,13 @@ pub fn parse(text: &str) -> ParseResult {
 ///
 /// `parse(text)` is `parse_with(text, ParserOptions::default())`.
 pub fn parse_with(text: &str, opts: ParserOptions) -> ParseResult {
+    let original_len = text.len();
     let text = clamp_synx_text(text);
     let parse_end = find_parse_end_bytes(text.as_bytes());
     let text = &text[..parse_end];
     let bytes = text.as_bytes();
+    // Either cap having bitten means input was dropped before parsing began.
+    let mut truncated_multiline = text.len() < original_len;
 
     let mut line_starts: Vec<usize> = Vec::new();
     line_starts.push(0);
@@ -145,6 +193,82 @@ pub fn parse_with(text: &str, opts: ParserOptions) -> ParseResult {
         let raw = &text[start..end];
 
         let trimmed = raw.trim();
+
+        // A blank line is never structural and never body: SYNX §8.4.1 does not
+        // preserve blank lines inside a multiline body.
+        if trimmed.is_empty() {
+            i += 1;
+            continue;
+        }
+
+        let indent = (raw.len() - raw.trim_start().len()) as i32;
+
+        // Continue multiline block.
+        //
+        // This branch runs *before* every line-class rule below, and that order
+        // is load-bearing: a `|` / `|+` body is a raw byte slice (SYNX §8.4.1),
+        // so `#`, `//`, `###`, `!include` and `#!mode:` are ordinary content
+        // there. Classifying first would delete comment lines out of code
+        // samples, let a stray `###` swallow the rest of the record, and turn a
+        // dataset row into a directive — which SYNXL §9.4 calls out explicitly.
+        if let Some(ref mut blk) = block {
+            if indent > blk.indent {
+                if blk.content.len() < MAX_MULTILINE_BLOCK_BYTES {
+                    if !blk.content.is_empty() {
+                        blk.content.push('\n');
+                    }
+                    let room = MAX_MULTILINE_BLOCK_BYTES.saturating_sub(blk.content.len());
+                    if room > 0 {
+                        let slice: &str = if blk.preserve_indent {
+                            // `|+` (SYNX 3.7): lock the strip prefix to the
+                            // indent of the first non-empty continuation line,
+                            // then strip exactly that many leading whitespace
+                            // bytes from each subsequent line. Anything beyond
+                            // the base indent is preserved verbatim.
+                            if blk.base_indent < 0 {
+                                blk.base_indent = indent;
+                            }
+                            let strip = blk.base_indent.min(indent) as usize;
+                            let raw_trim_end = raw.trim_end();
+                            let cut = strip_boundary(raw_trim_end, strip);
+                            if cut < raw_trim_end.len() {
+                                &raw_trim_end[cut..]
+                            } else {
+                                ""
+                            }
+                        } else {
+                            trimmed
+                        };
+                        let n = utf8_prefix_len(slice, room);
+                        blk.content.push_str(&slice[..n]);
+                        if n < slice.len() {
+                            truncated_multiline = true;
+                        }
+                    }
+                } else {
+                    truncated_multiline = true;
+                }
+                i += 1;
+                continue;
+            } else {
+                let content = std::mem::take(&mut blk.content);
+                let blk_key = blk.key.clone();
+                let blk_stack_idx = blk.stack_idx;
+                block = None;
+                insert_value(&mut root, &stack, blk_stack_idx, &blk_key, Value::String(content));
+            }
+        }
+
+        // Block comment toggle: ###
+        if trimmed == "###" {
+            in_block_comment = !in_block_comment;
+            i += 1;
+            continue;
+        }
+        if in_block_comment {
+            i += 1;
+            continue;
+        }
 
         // Directive lines (§6). Every form below starts with `!` or `#!mode:`,
         // so gating the whole block on that prefix is behaviour-preserving and
@@ -218,78 +342,18 @@ pub fn parse_with(text: &str, opts: ParserOptions) -> ParseResult {
             }
         }
 
-        // Block comment toggle: ###
-        if trimmed == "###" {
-            in_block_comment = !in_block_comment;
-            i += 1;
-            continue;
-        }
-        if in_block_comment {
-            i += 1;
-            continue;
-        }
-
-        // Skip empty / comments
-        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("//") {
-            i += 1;
-            continue;
-        }
-
-        let indent = (raw.len() - raw.trim_start().len()) as i32;
-
-        // Continue multiline block
-        if let Some(ref mut blk) = block {
-            if indent > blk.indent {
-                if blk.content.len() < MAX_MULTILINE_BLOCK_BYTES {
-                    if !blk.content.is_empty() {
-                        blk.content.push('\n');
-                    }
-                    let room = MAX_MULTILINE_BLOCK_BYTES.saturating_sub(blk.content.len());
-                    if room > 0 {
-                        let slice: &str = if blk.preserve_indent {
-                            // `|+` (SYNX 3.7): lock the strip prefix to the
-                            // indent of the first non-empty continuation line,
-                            // then strip exactly that many leading whitespace
-                            // bytes from each subsequent line. Anything beyond
-                            // the base indent is preserved verbatim.
-                            if blk.base_indent < 0 {
-                                blk.base_indent = indent;
-                            }
-                            // raw is the original line (with leading WS). Strip
-                            // exactly `min(indent, base_indent)` leading ASCII
-                            // spaces/tabs. The byte indent we computed earlier
-                            // is over ASCII whitespace, so byte-slicing matches
-                            // char boundaries.
-                            let strip = blk.base_indent.min(indent) as usize;
-                            let raw_trim_end = raw.trim_end();
-                            if strip < raw_trim_end.len() {
-                                &raw_trim_end[strip..]
-                            } else {
-                                ""
-                            }
-                        } else {
-                            trimmed
-                        };
-                        let n = slice.len().min(room);
-                        blk.content.push_str(&slice[..n]);
-                    }
-                }
-                i += 1;
-                continue;
-            } else {
-                let content = std::mem::take(&mut blk.content);
-                let blk_key = blk.key.clone();
-                let blk_stack_idx = blk.stack_idx;
-                block = None;
-                insert_value(&mut root, &stack, blk_stack_idx, &blk_key, Value::String(content));
-            }
-        }
-
         // SYNXL §9.4 — with directives disabled, a `!…` line that reaches this
         // point is *not* multiline body (the block branch above already
         // consumed and preserved those) and MUST be discarded exactly like a
         // comment line: it must neither set a mode flag nor become a key.
         if !opts.directives && trimmed.starts_with('!') {
+            i += 1;
+            continue;
+        }
+
+        // Skip comments. Checked after the directive block above so that the
+        // `#!mode:` pragma is still recognised.
+        if trimmed.starts_with('#') || trimmed.starts_with("//") {
             i += 1;
             continue;
         }
@@ -352,13 +416,18 @@ pub fn parse_with(text: &str, opts: ParserOptions) -> ParseResult {
                                 let mut item_obj: HashMap<String, Value> = HashMap::new();
                                 if let Some(parsed) = parse_line(&val_str) {
                                     let val = if let Some(ref hint) = parsed.type_hint {
-                                        cast_typed(&parsed.value, hint)
+                                        cast_typed_with(&parsed.value, hint, opts.nondeterministic_hints)
                                     } else if !parsed.value.is_empty() {
                                         cast(&parsed.value)
                                     } else {
                                         Value::Object(HashMap::new())
                                     };
-                                    item_obj.insert(parsed.key, val);
+                                    // Same prototype-pollution guard as the key-line
+                                    // branch below: a list item is just as capable of
+                                    // carrying `__proto__` into the JSON projection.
+                                    if !is_reserved_js_key(&parsed.key) {
+                                        item_obj.insert(parsed.key, val);
+                                    }
                                 } else {
                                     item_obj.insert("_value".to_string(), cast(&val_str));
                                 }
@@ -397,10 +466,7 @@ pub fn parse_with(text: &str, opts: ParserOptions) -> ParseResult {
             // Reject prototype-polluting keys so downstream consumers (esp. JS
             // applications consuming the JSON output) are not exposed to
             // `__proto__` / `constructor` / `prototype` injection.
-            if parsed.key == "__proto__"
-                || parsed.key == "constructor"
-                || parsed.key == "prototype"
-            {
+            if is_reserved_js_key(&parsed.key) {
                 i += 1;
                 continue;
             }
@@ -471,7 +537,6 @@ pub fn parse_with(text: &str, opts: ParserOptions) -> ParseResult {
                 list = Some(ListState {
                     indent,
                     key: parsed.key,
-                    items: Vec::new(),
                     stack_idx: parent_idx,
                 });
             } else if parsed.value.is_empty() {
@@ -512,7 +577,6 @@ pub fn parse_with(text: &str, opts: ParserOptions) -> ParseResult {
                         list = Some(ListState {
                             indent,
                             key: parsed.key,
-                            items: Vec::new(),
                             stack_idx: parent_idx,
                         });
                         i += 1;
@@ -535,7 +599,7 @@ pub fn parse_with(text: &str, opts: ParserOptions) -> ParseResult {
                 }
             } else {
                 let value = if let Some(ref hint) = parsed.type_hint {
-                    cast_typed(&parsed.value, hint)
+                    cast_typed_with(&parsed.value, hint, opts.nondeterministic_hints)
                 } else {
                     cast(&parsed.value)
                 };
@@ -576,6 +640,7 @@ pub fn parse_with(text: &str, opts: ParserOptions) -> ParseResult {
         metadata,
         includes,
         uses,
+        truncated: truncated_multiline,
     }
 }
 
@@ -670,7 +735,6 @@ struct BlockState {
 struct ListState {
     indent: i32,
     key: String,
-    items: Vec<Value>,
     stack_idx: usize,
 }
 
@@ -928,15 +992,18 @@ pub(crate) fn cast(val: &str) -> Value {
 }
 
 /// SYNX §8.3 typed casting. `pub(crate)` for reuse by SYNXL §8.2.
-pub(crate) fn cast_typed(val: &str, hint: &str) -> Value {
+///
+/// `nondeterministic` switches the `random:*` family off for embedded parses
+/// (see [`ParserOptions::nondeterministic_hints`]).
+pub(crate) fn cast_typed_with(val: &str, hint: &str, nondeterministic: bool) -> Value {
     match hint {
         "int" => Value::Int(val.parse().unwrap_or(0)),
         "float" => Value::Float(val.parse().unwrap_or(0.0)),
         "bool" => Value::Bool(val.trim() == "true"),
         "string" => Value::String(val.to_string()),
-        "random" | "random:int" => Value::Int(rng::random_i64()),
-        "random:float" => Value::Float(rng::random_f64_01()),
-        "random:bool" => Value::Bool(rng::random_bool()),
+        "random" | "random:int" if nondeterministic => Value::Int(rng::random_i64()),
+        "random:float" if nondeterministic => Value::Float(rng::random_f64_01()),
+        "random:bool" if nondeterministic => Value::Bool(rng::random_bool()),
         _ => cast(val),
     }
 }
@@ -1271,7 +1338,7 @@ mod tests {
     #[test]
     fn test_directives_disabled_discards_directive_lines() {
         let src = "!active\n!include /etc/passwd\n!use @scope/pkg\nname Wario\n";
-        let data = parse_with(src, ParserOptions { directives: false });
+        let data = parse_with(src, ParserOptions { directives: false, nondeterministic_hints: false });
         assert_eq!(data.mode, Mode::Static);
         assert!(data.includes.is_empty());
         assert!(data.uses.is_empty());
@@ -1291,7 +1358,7 @@ mod tests {
         // Enforcement happens *inside* the parse, so a `!` line that is body
         // content of a `|` / `|+` block survives verbatim.
         let src = "body |+\n  !include /etc/passwd\n  !active\n  tail\n";
-        let data = parse_with(src, ParserOptions { directives: false });
+        let data = parse_with(src, ParserOptions { directives: false, nondeterministic_hints: false });
         assert_eq!(
             data.root.as_object().unwrap()["body"],
             Value::String("!include /etc/passwd\n!active\ntail".into())
@@ -1300,7 +1367,7 @@ mod tests {
         assert_eq!(data.mode, Mode::Static);
 
         let src = "body |\n  !include /etc/passwd\n";
-        let data = parse_with(src, ParserOptions { directives: false });
+        let data = parse_with(src, ParserOptions { directives: false, nondeterministic_hints: false });
         assert_eq!(
             data.root.as_object().unwrap()["body"],
             Value::String("!include /etc/passwd".into())

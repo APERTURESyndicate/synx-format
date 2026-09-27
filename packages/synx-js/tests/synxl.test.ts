@@ -493,7 +493,9 @@ describe('SYNXL — JSON projections', () => {
   });
 
   test('NDJSON projection is one canonical object per line', () => {
-    expect(synxlToNDJSON(SRC)).toBe('{"a":"x","b":1}\n{"a":"y","b":2}');
+    // Terminated, not separated: each record ends in `LF`, so appending one is
+    // plain concatenation and the bytes match the reference implementation.
+    expect(synxlToNDJSON(SRC)).toBe('{"a":"x","b":1}\n{"a":"y","b":2}\n');
   });
 
   test('unset fields project as JSON null', () => {
@@ -824,7 +826,7 @@ describe('SYNXL — public API surface', () => {
     expect(Synx.SYNXL_VERSION).toBe(1);
     expect(Synx.parseSynxl(src).records[0].values).toEqual({ id: 1, name: 'Alice' });
     expect(Synx.synxlToJSON(src)).toBe('[{"id":1,"name":"Alice"}]');
-    expect(Synx.synxlToNDJSON(src)).toBe('{"id":1,"name":"Alice"}');
+    expect(Synx.synxlToNDJSON(src)).toBe('{"id":1,"name":"Alice"}\n');
     expect([...Synx.streamSynxl(src)]).toHaveLength(1);
     expect(Synx.writeSynxl(Synx.parseSynxl(src))).toContain('!synxl 1');
   });

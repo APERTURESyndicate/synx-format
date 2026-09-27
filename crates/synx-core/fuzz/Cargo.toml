@@ -26,4 +26,9 @@ name = "fuzz_format"
 path = "fuzz_targets/fuzz_format.rs"
 doc = false
 
+[[bin]]
+name = "fuzz_synxl"
+path = "fuzz_targets/fuzz_synxl.rs"
+doc = false
+
 [workspace]

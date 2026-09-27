@@ -178,9 +178,9 @@ describe('Security — :calc Safety', () => {
 // ─── Type Casting Edge Cases ──────────────────────────────
 
 describe('Security — Type Casting', () => {
-  test('(int) truncates float', () => {
+  test('(int) on a non-integer yields 0, as the reference engine does', () => {
     const data = Synx.parse('value (int)42.99') as any;
-    expect(data.value).toBe(42);
+    expect(data.value).toBe(0);
   });
 
   test('(bool) on "false" string returns false', () => {
@@ -188,25 +188,25 @@ describe('Security — Type Casting', () => {
     expect(data.flag).toBe(false);
   });
 
-  test('"null" quoted stays as string (with surrounding quotes)', () => {
-    // Actual behavior: the parser preserves the surrounding double-quotes in the value.
-    // The quoted string syntax does not strip quotes — it keeps them as-is.
+  // SYNX §8.3 automatic casting strips the surrounding quotes and stops: the
+  // literal keeps its text and never reaches the `null` / `true` / number
+  // rules. Quoting is how a document says "this is a string", so dropping the
+  // quotes from the *value* is the point of it.
+  test('"null" quoted stays a string', () => {
     const data = Synx.parse('value "null"') as any;
-    expect(data.value).toBe('"null"');
+    expect(data.value).toBe('null');
     expect(typeof data.value).toBe('string');
   });
 
-  test('"true" quoted stays as string (with surrounding quotes)', () => {
-    // Actual behavior: quotes are preserved in the stored value.
+  test('"true" quoted stays a string', () => {
     const data = Synx.parse('value "true"') as any;
-    expect(data.value).toBe('"true"');
+    expect(data.value).toBe('true');
     expect(typeof data.value).toBe('string');
   });
 
-  test('"42" quoted stays as string (with surrounding quotes)', () => {
-    // Actual behavior: quotes are preserved; the value is the string `"42"`, not `42`.
+  test('"42" quoted stays a string', () => {
     const data = Synx.parse('value "42"') as any;
-    expect(data.value).toBe('"42"');
+    expect(data.value).toBe('42');
     expect(typeof data.value).toBe('string');
   });
 });
@@ -261,5 +261,26 @@ describe('Error Ergonomics — SynxError', () => {
     expect(caught.name).toBe('SynxError');
     expect(caught.code).toMatch(/^CALC_ERR/);
     expect(caught).toBeInstanceOf(Error);
+  });
+});
+
+describe('Parity with synx-core — active mode', () => {
+  test('SynxSecret never prints through util.inspect, spread or entries', () => {
+    process.env.SYNX_TEST_SECRET = 'TOPSECRET12345';
+    const data = Synx.parse('!active\nsecret[required]:secret:env SYNX_TEST_SECRET\n') as any;
+    const { inspect } = require('util');
+    const seen = [inspect(data), JSON.stringify(data), String(data.secret), JSON.stringify({ ...data.secret }), Object.entries(data.secret).join()].join('|');
+    expect(seen).not.toContain('TOPSECRET');
+    expect(data.secret.reveal()).toBe('TOPSECRET12345');
+    delete process.env.SYNX_TEST_SECRET;
+  });
+
+  test('enum rejects null', () => {
+    expect((Synx.parse('!active\nk[enum:a|b] null\n') as any).k).toMatch(/^CONSTRAINT_ERR/);
+  });
+
+  test('a (type) hint mismatch left after constraints becomes TYPE_ERR', () => {
+    expect((Synx.parse('!active\nk(float)[enum:a|b] app\n') as any).k).toBe("TYPE_ERR: 'k' expected float but got string");
+    expect((Synx.parse('!active\nport(int) 3000\n') as any).port).toBe(3000);
   });
 });

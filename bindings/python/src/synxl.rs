@@ -17,7 +17,7 @@ use std::fs::File;
 use std::io::BufReader;
 
 use pyo3::create_exception;
-use pyo3::exceptions::{PyIOError, PyIndexError, PyTypeError};
+use pyo3::exceptions::{PyIOError, PyIndexError, PyKeyError, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
@@ -61,7 +61,7 @@ fn stream_err(py: Python<'_>, err: &SynxlStreamError) -> PyErr {
 }
 
 /// §11.2 — one diagnostic as a plain dict.
-fn diagnostic_to_py(py: Python<'_>, d: &Diagnostic) -> PyResult<PyObject> {
+fn diagnostic_to_py(py: Python<'_>, d: &Diagnostic) -> PyResult<Py<PyAny>> {
     let dict = PyDict::new(py);
     dict.set_item("record_index", d.record_index)?;
     dict.set_item("line", d.line)?;
@@ -70,8 +70,8 @@ fn diagnostic_to_py(py: Python<'_>, d: &Diagnostic) -> PyResult<PyObject> {
     Ok(dict.into_any().unbind())
 }
 
-fn diagnostics_to_py(py: Python<'_>, items: &[Diagnostic]) -> PyResult<PyObject> {
-    let list: Vec<PyObject> = items
+fn diagnostics_to_py(py: Python<'_>, items: &[Diagnostic]) -> PyResult<Py<PyAny>> {
+    let list: Vec<Py<PyAny>> = items
         .iter()
         .map(|d| diagnostic_to_py(py, d))
         .collect::<PyResult<_>>()?;
@@ -79,7 +79,7 @@ fn diagnostics_to_py(py: Python<'_>, items: &[Diagnostic]) -> PyResult<PyObject>
 }
 
 /// §5 — one field declaration as a plain dict.
-fn field_to_py(py: Python<'_>, f: &FieldDecl) -> PyResult<PyObject> {
+fn field_to_py(py: Python<'_>, f: &FieldDecl) -> PyResult<Py<PyAny>> {
     let dict = PyDict::new(py);
     dict.set_item("name", f.name.as_str())?;
     dict.set_item("type", f.type_name())?;
@@ -95,11 +95,11 @@ fn field_to_py(py: Python<'_>, f: &FieldDecl) -> PyResult<PyObject> {
 }
 
 /// §5 / §4.2 — a whole field list: its source line, arity and declarations.
-fn field_list_to_py(py: Python<'_>, fl: &FieldList) -> PyResult<PyObject> {
+fn field_list_to_py(py: Python<'_>, fl: &FieldList) -> PyResult<Py<PyAny>> {
     let dict = PyDict::new(py);
     dict.set_item("line", fl.line)?;
     dict.set_item("arity", fl.arity())?;
-    let fields: Vec<PyObject> = fl
+    let fields: Vec<Py<PyAny>> = fl
         .fields()
         .iter()
         .map(|f| field_to_py(py, f))
@@ -108,8 +108,8 @@ fn field_list_to_py(py: Python<'_>, fl: &FieldList) -> PyResult<PyObject> {
     Ok(dict.into_any().unbind())
 }
 
-fn field_lists_to_py(py: Python<'_>, lists: &[FieldList]) -> PyResult<PyObject> {
-    let items: Vec<PyObject> = lists
+fn field_lists_to_py(py: Python<'_>, lists: &[FieldList]) -> PyResult<Py<PyAny>> {
+    let items: Vec<Py<PyAny>> = lists
         .iter()
         .map(|fl| field_list_to_py(py, fl))
         .collect::<PyResult<_>>()?;
@@ -129,23 +129,24 @@ fn options(validate: bool) -> SynxlOptions {
 #[pyclass(name = "SynxlDocument", module = "synx_native", frozen)]
 pub struct PySynxlDocument {
     doc: CoreDocument,
-    records_cache: std::sync::OnceLock<Py<PyList>>,
 }
 
 impl PySynxlDocument {
     fn new(doc: CoreDocument) -> Self {
-        Self { doc, records_cache: std::sync::OnceLock::new() }
+        Self { doc }
     }
 
-    /// Records as Python dicts, converted once and cached.
-    fn record_list(&self, py: Python<'_>) -> PyResult<&Py<PyList>> {
-        if let Some(list) = self.records_cache.get() {
-            return Ok(list);
-        }
-        let items: Vec<PyObject> = self.doc.records.iter().map(|v| value_to_py(py, v)).collect();
-        let list = PyList::new(py, items)?.unbind();
-        let _ = self.records_cache.set(list);
-        Ok(self.records_cache.get().expect("record list just set"))
+    /// Records as Python dicts, built fresh on each call.
+    ///
+    /// Deliberately not cached. A cached list is handed out by reference, so
+    /// `doc.records.sort()` or a de-duplicating `pop()` mutates the object
+    /// every later read shares — while `len(doc)`, `doc[i]` and `to_json()`
+    /// keep answering from the Rust vector. The document then contradicts
+    /// itself with nothing to signal it. Rebuilding costs a conversion per
+    /// call and keeps every view consistent.
+    fn record_list(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
+        let items: Vec<Py<PyAny>> = self.doc.records.iter().map(|v| value_to_py(py, v)).collect();
+        Ok(PyList::new(py, items)?.unbind())
     }
 }
 
@@ -160,18 +161,18 @@ impl PySynxlDocument {
     /// Records in document order, each a dict (§12.1).
     #[getter]
     fn records(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
-        Ok(self.record_list(py)?.clone_ref(py))
+        self.record_list(py)
     }
 
     /// Every §11.2 diagnostic, in record order.
     #[getter]
-    fn diagnostics(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn diagnostics(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         diagnostics_to_py(py, &self.doc.diagnostics)
     }
 
     /// Field lists in declaration order (§4.2).
     #[getter]
-    fn field_lists(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn field_lists(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         field_lists_to_py(py, &self.doc.field_lists)
     }
 
@@ -188,7 +189,7 @@ impl PySynxlDocument {
     }
 
     /// The field list in effect for record `index`, or `None`.
-    fn field_list_for(&self, py: Python<'_>, index: usize) -> PyResult<Option<PyObject>> {
+    fn field_list_for(&self, py: Python<'_>, index: usize) -> PyResult<Option<Py<PyAny>>> {
         match self.doc.field_list_for(index) {
             Some(fl) => Ok(Some(field_list_to_py(py, fl)?)),
             None => Ok(None),
@@ -217,7 +218,7 @@ impl PySynxlDocument {
         self.doc.records.len()
     }
 
-    fn __getitem__(&self, py: Python<'_>, index: isize) -> PyResult<PyObject> {
+    fn __getitem__(&self, py: Python<'_>, index: isize) -> PyResult<Py<PyAny>> {
         let len = self.doc.records.len() as isize;
         let idx = if index < 0 { index + len } else { index };
         if idx < 0 || idx >= len {
@@ -226,7 +227,7 @@ impl PySynxlDocument {
         Ok(value_to_py(py, &self.doc.records[idx as usize]))
     }
 
-    fn __iter__(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn __iter__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         Ok(self.record_list(py)?.bind(py).try_iter()?.into_any().unbind())
     }
 
@@ -257,7 +258,7 @@ pub struct PySynxlRecord {
     #[pyo3(get)]
     field_list: usize,
     values: Py<PyDict>,
-    diagnostics: PyObject,
+    diagnostics: Py<PyAny>,
 }
 
 #[pymethods]
@@ -270,7 +271,7 @@ impl PySynxlRecord {
 
     /// Diagnostics produced by this record alone (§11.2).
     #[getter]
-    fn diagnostics(&self, py: Python<'_>) -> PyObject {
+    fn diagnostics(&self, py: Python<'_>) -> Py<PyAny> {
         self.diagnostics.clone_ref(py)
     }
 
@@ -279,15 +280,49 @@ impl PySynxlRecord {
         self.values.clone_ref(py)
     }
 
-    fn keys(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn keys(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         Ok(self.values.bind(py).keys().into_any().unbind())
     }
 
-    fn __getitem__(&self, py: Python<'_>, key: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+    fn __getitem__(&self, py: Python<'_>, key: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
         match self.values.bind(py).get_item(key)? {
             Some(v) => Ok(v.unbind()),
-            None => Err(PyIndexError::new_err(format!("no field {}", key))),
+            // `KeyError`, not `IndexError`: this is a mapping, and every
+            // `except KeyError` around a field lookup depends on it.
+            None => Err(PyKeyError::new_err(format!("no field {}", key))),
         }
+    }
+
+    /// Iterate field names, like a dict.
+    ///
+    /// Without `__iter__`, CPython falls back to the legacy sequence protocol,
+    /// calls `record[0]`, gets the `KeyError`/`IndexError` above and quietly
+    /// ends the loop — so `for name in record:` used to be a silent no-op.
+    fn __iter__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        Ok(self.values.bind(py).keys().try_iter()?.into_any().unbind())
+    }
+
+    /// `dict`-style lookup with a default.
+    #[pyo3(signature = (key, default = None))]
+    fn get(
+        &self,
+        py: Python<'_>,
+        key: &Bound<'_, PyAny>,
+        default: Option<Py<PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
+        match self.values.bind(py).get_item(key)? {
+            Some(v) => Ok(v.unbind()),
+            None => Ok(default.unwrap_or_else(|| py.None())),
+        }
+    }
+
+    /// `(name, value)` pairs, like a dict.
+    ///
+    /// There is no matching `values()` method: `record.values` is already the
+    /// record's dict (a getter), and shadowing it with a dict-style method
+    /// would break every caller that reads the attribute.
+    fn items(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        Ok(self.values.bind(py).items().into_any().unbind())
     }
 
     fn __contains__(&self, py: Python<'_>, key: &Bound<'_, PyAny>) -> PyResult<bool> {
@@ -312,7 +347,7 @@ fn record_to_py(py: Python<'_>, rec: &CoreRecord) -> PyResult<PySynxlRecord> {
     let values = value_to_py(py, &rec.value);
     let dict = values
         .bind(py)
-        .downcast::<PyDict>()
+        .cast::<PyDict>()
         .map_err(|_| PyTypeError::new_err("SYNXL record is not an object"))?
         .clone()
         .unbind();
@@ -328,7 +363,7 @@ fn record_to_py(py: Python<'_>, rec: &CoreRecord) -> PyResult<PySynxlRecord> {
 // ─── Streaming reader (§15.1) ────────────────────────────────
 
 /// Turn one streamed record into what the iterator yields.
-fn yield_record(py: Python<'_>, rec: &CoreRecord, with_meta: bool) -> PyResult<PyObject> {
+fn yield_record(py: Python<'_>, rec: &CoreRecord, with_meta: bool) -> PyResult<Py<PyAny>> {
     if with_meta {
         Ok(Py::new(py, record_to_py(py, rec)?)?.into_any())
     } else {
@@ -365,14 +400,14 @@ impl PySynxlStream {
 
     /// Field lists seen so far, in declaration order (§4.2).
     #[getter]
-    fn field_lists(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn field_lists(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         field_lists_to_py(py, self.reader.field_lists())
     }
 
     /// Diagnostics found after the last record — `OrphanBlockLine` at end of
     /// input (§11.2). Empty until iteration finishes.
     #[getter]
-    fn trailing_diagnostics(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn trailing_diagnostics(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         diagnostics_to_py(py, self.reader.trailing_diagnostics())
     }
 
@@ -380,7 +415,7 @@ impl PySynxlStream {
         slf
     }
 
-    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<PyObject>> {
+    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
         match self.reader.next() {
             None => Ok(None),
             Some(Err(err)) => Err(synxl_err(py, &err)),
@@ -403,7 +438,7 @@ pub struct PySynxlFileStream {
 impl PySynxlFileStream {
     fn build(
         py: Python<'_>,
-        file_path: &str,
+        file_path: std::path::PathBuf,
         opts: SynxlOptions,
         with_meta: bool,
     ) -> PyResult<Self> {
@@ -424,13 +459,13 @@ impl PySynxlFileStream {
 
     /// Field lists seen so far, in declaration order (§4.2).
     #[getter]
-    fn field_lists(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn field_lists(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         field_lists_to_py(py, self.reader.field_lists())
     }
 
     /// Diagnostics recorded after the last record (§11.2).
     #[getter]
-    fn trailing_diagnostics(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn trailing_diagnostics(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         diagnostics_to_py(py, self.reader.trailing_diagnostics())
     }
 
@@ -438,7 +473,7 @@ impl PySynxlFileStream {
         slf
     }
 
-    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<PyObject>> {
+    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
         match self.reader.next() {
             None => Ok(None),
             Some(Err(err)) => Err(stream_err(py, &err)),
@@ -457,7 +492,12 @@ impl PySynxlFileStream {
 #[pyfunction]
 #[pyo3(signature = (text, *, validate=false))]
 fn synxl_parse(py: Python<'_>, text: &str, validate: bool) -> PyResult<PySynxlDocument> {
-    match synxl::parse_lines_with(text, &options(validate)) {
+    // The parse runs without the GIL. It is pure Rust over a borrowed `&str`
+    // and touches no Python object, while a multi-million-record document
+    // takes it long enough that holding the GIL freezes every other thread in
+    // the process — health checks, timeouts, request handling and all.
+    let parsed = py.detach(|| synxl::parse_lines_with(text, &options(validate)));
+    match parsed {
         Ok(doc) => Ok(PySynxlDocument::new(doc)),
         Err(err) => Err(synxl_err(py, &err)),
     }
@@ -466,8 +506,11 @@ fn synxl_parse(py: Python<'_>, text: &str, validate: bool) -> PyResult<PySynxlDo
 /// Read a `.synxl` file and parse it (§4–§10).
 #[pyfunction]
 #[pyo3(signature = (file_path, *, validate=false))]
-fn synxl_load(py: Python<'_>, file_path: &str, validate: bool) -> PyResult<PySynxlDocument> {
-    let text = std::fs::read_to_string(file_path)
+fn synxl_load(py: Python<'_>, file_path: std::path::PathBuf, validate: bool) -> PyResult<PySynxlDocument> {
+    // Blocking disk I/O with the GIL held stalls the whole interpreter for as
+    // long as the read takes; nothing here touches a Python object.
+    let text = py
+        .detach(|| std::fs::read_to_string(file_path))
         .map_err(|e| PyIOError::new_err(e.to_string()))?;
     synxl_parse(py, &text, validate)
 }
@@ -498,7 +541,7 @@ fn synxl_stream_records(py: Python<'_>, text: String, validate: bool) -> PyResul
 #[pyo3(signature = (file_path, *, validate=false))]
 fn synxl_stream_file(
     py: Python<'_>,
-    file_path: &str,
+    file_path: std::path::PathBuf,
     validate: bool,
 ) -> PyResult<PySynxlFileStream> {
     PySynxlFileStream::build(py, file_path, options(validate), false)
@@ -510,7 +553,7 @@ fn synxl_stream_file(
 #[pyo3(signature = (file_path, *, validate=false))]
 fn synxl_stream_file_records(
     py: Python<'_>,
-    file_path: &str,
+    file_path: std::path::PathBuf,
     validate: bool,
 ) -> PyResult<PySynxlFileStream> {
     PySynxlFileStream::build(py, file_path, options(validate), true)
@@ -520,8 +563,10 @@ fn synxl_stream_file_records(
 #[pyfunction]
 #[pyo3(signature = (text, *, validate=false))]
 fn synxl_to_json(py: Python<'_>, text: &str, validate: bool) -> PyResult<String> {
-    match synxl::parse_lines_with(text, &options(validate)) {
-        Ok(doc) => Ok(doc.to_json()),
+    let parsed =
+        py.detach(|| synxl::parse_lines_with(text, &options(validate)).map(|d| d.to_json()));
+    match parsed {
+        Ok(json) => Ok(json),
         Err(err) => Err(synxl_err(py, &err)),
     }
 }
@@ -530,14 +575,23 @@ fn synxl_to_json(py: Python<'_>, text: &str, validate: bool) -> PyResult<String>
 #[pyfunction]
 #[pyo3(signature = (text, *, validate=false))]
 fn synxl_to_ndjson(py: Python<'_>, text: &str, validate: bool) -> PyResult<String> {
-    match synxl::parse_lines_with(text, &options(validate)) {
-        Ok(doc) => Ok(doc.to_ndjson()),
+    let parsed = py
+        .detach(|| synxl::parse_lines_with(text, &options(validate)).map(|d| d.to_ndjson()));
+    match parsed {
+        Ok(nd) => Ok(nd),
         Err(err) => Err(synxl_err(py, &err)),
     }
 }
 
 /// Field specs for `synxl_write`: `"name"` or `{"name": ..., "type": ..., "block": ...}`.
 fn parse_field_specs(py: Python<'_>, spec: &Bound<'_, PyAny>) -> PyResult<Vec<FieldDecl>> {
+    // A `str` is iterable in Python, so `fields="ab"` would quietly declare two
+    // one-character columns instead of raising. Nobody means that.
+    if spec.extract::<String>().is_ok() {
+        return Err(PyTypeError::new_err(
+            "fields must be a sequence of field specs, not a single string; pass e.g. [\"id\", \"name\"]",
+        ));
+    }
     let mut out: Vec<FieldDecl> = Vec::new();
     for item in spec.try_iter()? {
         let item = item?;
@@ -545,7 +599,7 @@ fn parse_field_specs(py: Python<'_>, spec: &Bound<'_, PyAny>) -> PyResult<Vec<Fi
             out.push(FieldDecl::new(name));
             continue;
         }
-        let dict = item.downcast::<PyDict>().map_err(|_| {
+        let dict = item.cast::<PyDict>().map_err(|_| {
             PyTypeError::new_err("field spec must be a str or a dict with a `name` key")
         })?;
         let name: String = dict
@@ -608,7 +662,7 @@ fn synxl_write(
         if fields.is_none() {
             // Python dicts keep insertion order, which is the author's intent;
             // any other mapping falls back to a stable lexicographic order.
-            let mut keys: Vec<String> = match item.downcast::<PyDict>() {
+            let mut keys: Vec<String> = match item.cast::<PyDict>() {
                 Ok(dict) => dict
                     .keys()
                     .iter()

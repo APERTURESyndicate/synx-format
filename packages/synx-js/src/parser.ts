@@ -20,6 +20,31 @@ import type {
   SynxConstraints,
 } from './types';
 
+const I64_MIN = -(2n ** 63n);
+const I64_MAX = 2n ** 63n - 1n;
+
+/**
+ * An integer literal as the reference implementation represents it, or `null`
+ * when it does not fit i64.
+ *
+ * Rust parses into `i64` and, on overflow, falls through §8.3 to the string
+ * rule — SYNX floats need a dot, so there is nothing in between. Matching that
+ * matters twice over: the JSON type of the value differs (`"92233…"` versus a
+ * number), and `parseInt` on a 19-digit id returns a *different* id with no
+ * diagnostic to say so.
+ */
+export function parseI64(text: string): number | bigint | null {
+  let big: bigint;
+  try {
+    big = BigInt(text);
+  } catch {
+    return null;
+  }
+  if (big < I64_MIN || big > I64_MAX) return null;
+  const asNumber = Number(big);
+  return Number.isSafeInteger(asNumber) ? asNumber : big;
+}
+
 // ─── Resource limits (per SYNX 3.6 §3) ────────────────────
 
 /** Maximum UTF-8 bytes accepted per parse() — text is truncated to a valid UTF-16 prefix not exceeding this length. */
@@ -42,13 +67,61 @@ const MAX_MARKER_CHAIN_SEGMENTS = 512;
 // ─── Helpers ──────────────────────────────────────────────
 
 /**
+ * Unicode `White_Space` — the set SYNX §4's `ltrim` removes when measuring
+ * indentation. Restricting this to space and tab makes a line opening with
+ * U+00A0 look like a key at indent 0, which loses the block field it belonged
+ * to and invents a diagnostic in its place.
+ */
+export function isUnicodeSpaceCode(c: number): boolean {
+  return (c >= 0x09 && c <= 0x0d) || c === 0x20 || c === 0x85 || c === 0xa0 ||
+    c === 0x1680 || (c >= 0x2000 && c <= 0x200a) ||
+    c === 0x2028 || c === 0x2029 || c === 0x202f || c === 0x205f || c === 0x3000;
+}
+
+/** UTF-8 byte length of a UTF-16 string — the unit every §3/§13 cap is in. */
+export function utf8Length(s: string): number {
+  let bytes = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c < 0x80) bytes += 1;
+    else if (c < 0x800) bytes += 2;
+    else if (c >= 0xd800 && c <= 0xdbff && i + 1 < s.length) {
+      const lo = s.charCodeAt(i + 1);
+      if (lo >= 0xdc00 && lo <= 0xdfff) { bytes += 4; i++; } else { bytes += 3; }
+    } else bytes += 3;
+  }
+  return bytes;
+}
+
+/** Longest prefix of `s` fitting `maxBytes` of UTF-8, never splitting a pair. */
+export function truncateUtf8Prefix(s: string, maxBytes: number): string {
+  if (maxBytes <= 0) return '';
+  let bytes = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    let size = 3;
+    let step = 1;
+    if (c < 0x80) size = 1;
+    else if (c < 0x800) size = 2;
+    else if (c >= 0xd800 && c <= 0xdbff && i + 1 < s.length) {
+      const lo = s.charCodeAt(i + 1);
+      if (lo >= 0xdc00 && lo <= 0xdfff) { size = 4; step = 2; }
+    }
+    if (bytes + size > maxBytes) return s.substring(0, i);
+    bytes += size;
+    i += step - 1;
+  }
+  return s;
+}
+
+/**
  * Cast a raw string value to a JS primitive (SYNX §8.3 automatic casting).
  *
  * Exported (additively) so that the SYNXL reader can reuse the exact same
  * numeric/boolean/quote semantics instead of growing a second caster —
  * SYNXL §8.1 defines inline casting by reference to this function.
  */
-export function castType(val: string): SynxValue {
+export function castType(val: string, nondeterministic = true): SynxValue {
   const len = val.length;
 
   // Quoted strings preserve literal value (bypass auto-casting).
@@ -81,7 +154,13 @@ export function castType(val: string): SynxValue {
       if (/^[A-Za-z_][A-Za-z0-9_:]*$/.test(hint)) {
         const raw = val.substring(closeIdx + 1);
         switch (hint) {
-          case 'int': { const n = parseInt(raw, 10); return isNaN(n) ? 0 : n; }
+          case 'int': {
+            const exact = parseI64(raw);
+            if (exact !== null) return exact;
+            // spec: the reference `parse::<i64>().unwrap_or(0)` yields 0 for
+            // anything that is not an in-range integer literal — `42.99` too.
+            return 0;
+          }
           case 'float': { const n = parseFloat(raw); return isNaN(n) ? 0 : n; }
           case 'bool': return raw.trim() === 'true';
           case 'string': return raw;
@@ -90,12 +169,17 @@ export function castType(val: string): SynxValue {
           // beyond that lose precision in any roundtrip with .synxb.
           case 'random':
           case 'random:int':
+            if (!nondeterministic) return castType(raw, false);
             return Math.floor(Math.random() * Number.MAX_SAFE_INTEGER * 2) - Number.MAX_SAFE_INTEGER;
-          case 'random:float': return Math.random();
-          case 'random:bool': return Math.random() < 0.5;
+          case 'random:float':
+            if (!nondeterministic) return castType(raw, false);
+            return Math.random();
+          case 'random:bool':
+            if (!nondeterministic) return castType(raw, false);
+            return Math.random() < 0.5;
           // Unknown hint — strip the (hint) wrapper and re-cast the bare value
           // (matches the Rust `cast_typed` fallback to `cast`).
-          default: return castType(raw);
+          default: return castType(raw, nondeterministic);
         }
       }
     }
@@ -123,7 +207,12 @@ export function castType(val: string): SynxValue {
       }
     }
     if (allNumeric) {
-      if (dotPos === -1) return parseInt(val, 10);
+      // SYNX §8.3: integer, then decimal float, then string. The reference
+      // implementation parses into `i64`, so an integer that overflows it is a
+      // string here too, and one that merely leaves JavaScript's safe range is
+      // kept exact as a `bigint` — `parseInt` would round a 19-digit id to a
+      // different id with nothing to signal it.
+      if (dotPos === -1) return parseI64(val) ?? val;
       if (dotPos > firstDigit && dotPos < len - 1) return parseFloat(val);
     }
   }
@@ -325,10 +414,22 @@ export interface ParseDataOptions {
    * must never become a file-read or mode-change primitive. Defaults to `true`.
    */
   directives?: boolean;
+
+  /**
+   * Honour the `random`, `random:int`, `random:float` and `random:bool` type
+   * hints. Default `true`.
+   *
+   * SYNXL block delegation sets this to `false` (SYNXL §8.3): a hint carried by
+   * dataset data would make the §12 projection differ between two reads of the
+   * same bytes, which defeats hashing, de-duplication and the byte-identical
+   * projection §1.4 is measured on.
+   */
+  nondeterministicHints?: boolean;
 }
 
 export function parseData(text: string, options?: ParseDataOptions): SynxParseResult {
   const directivesEnabled = options?.directives !== false;
+  const nondeterministic = options?.nondeterministicHints !== false;
 
   // Truncate input to MAX_SYNX_INPUT_BYTES (UTF-16 code-unit boundary).
   if (text.length > MAX_SYNX_INPUT_BYTES) {
@@ -366,10 +467,14 @@ export function parseData(text: string, options?: ParseDataOptions): SynxParseRe
     const rawLen = rawLine.length;
 
     // ── Manual indent computation (no regex) ──
+    //
+    // Unicode-aware, matching SYNX §4's `length(raw) - length(ltrim(raw))`: a
+    // line opening with U+00A0 or U+3000 is indented, so it stays block content
+    // instead of turning into a spurious key. The scan and every slice below
+    // work in the same UTF-16 frame, so no offset lands mid-character.
     let indent = 0;
     while (indent < rawLen) {
-      const ch = rawLine.charCodeAt(indent);
-      if (ch !== 32 && ch !== 9 && ch !== 13) break; // space, tab, \r
+      if (!isUnicodeSpaceCode(rawLine.charCodeAt(indent))) break;
       indent++;
     }
 
@@ -377,29 +482,6 @@ export function parseData(text: string, options?: ParseDataOptions): SynxParseRe
     if (indent === rawLen) continue;
 
     const fc = rawLine.charCodeAt(indent); // first non-whitespace char
-
-    // ── Block comment toggle: ### ──
-    if (fc === 35) {
-      const rest = rawLine.substring(indent).trimEnd();
-      if (rest === '###') {
-        inBlockComment = !inBlockComment;
-        continue;
-      }
-    }
-    if (inBlockComment) continue;
-
-    // ── Comments: # or // ──
-    if (fc === 35) { // #
-      // Legacy: #!mode:active / #!mode:static
-      if (directivesEnabled && rawLen - indent > 7 && rawLine.charCodeAt(indent + 1) === 33) { // !
-        if (rawLine.substring(indent, indent + 7) === '#!mode:') {
-          const declared = rawLine.substring(indent + 7, rawLen).trim();
-          mode = declared === 'active' ? 'active' : 'static';
-        }
-      }
-      continue;
-    }
-    if (fc === 47 && indent + 1 < rawLen && rawLine.charCodeAt(indent + 1) === 47) continue; // //
 
     // ── Compute trimmed string (manual trim, no regex) ──
     let trimEndPos = rawLen;
@@ -410,6 +492,52 @@ export function parseData(text: string, options?: ParseDataOptions): SynxParseRe
     }
     const trimmed = rawLine.substring(indent, trimEndPos);
     const trimmedLen = trimmed.length;
+
+    // ── Continue multiline block ──
+    //
+    // Ahead of every line-class rule below, and deliberately so: a `|` / `|+`
+    // body is raw text (SYNX §8.4.1), so `#`, `//`, `###` and `!` lines inside
+    // one are content. Classifying first deletes comments out of code samples,
+    // lets a stray `###` swallow the rest of the document, and — for `!` —
+    // turns a data row into a directive, which SYNXL §9.4 forbids outright.
+    if (currentBlock && indent > currentBlock.indent) {
+      const existing = currentBlock.obj[currentBlock.key] as string;
+      if (utf8Length(existing) < MAX_MULTILINE_BLOCK_BYTES) {
+        let line: string;
+        if (currentBlock.preserveIndent) {
+          // SYNX 3.7 `|+`: lock the base indent to the FIRST non-empty
+          // continuation line, then strip exactly that prefix from every line.
+          // Anything indented further than the base is preserved verbatim,
+          // making the block safe for embedding indent-sensitive content
+          // (code, SYNX examples, ASCII art, etc.).
+          if (currentBlock.baseIndent < 0) currentBlock.baseIndent = indent;
+          const strip = Math.min(indent, currentBlock.baseIndent);
+          line = rawLine.substring(strip, trimEndPos);
+        } else {
+          line = trimmed;
+        }
+        const room = MAX_MULTILINE_BLOCK_BYTES - utf8Length(existing);
+        const sep = existing ? '\n' : '';
+        const append = sep + line;
+        // Byte budget, UTF-8 boundary: `substring(0, room)` counts UTF-16
+        // units, so it both overshoots the cap and can split a surrogate pair,
+        // leaving a lone surrogate no strict JSON consumer will accept.
+        currentBlock.obj[currentBlock.key] = existing + truncateUtf8Prefix(append, room);
+      }
+      continue;
+    } else {
+      currentBlock = null;
+    }
+
+    // ── Block comment toggle: ### ──
+    if (fc === 35) {
+      const rest = rawLine.substring(indent).trimEnd();
+      if (rest === '###') {
+        inBlockComment = !inBlockComment;
+        continue;
+      }
+    }
+    if (inBlockComment) continue;
 
     // ── Directives: !active / !lock / !llm / !tool / !schema / !include ──
     if (fc === 33) {
@@ -428,40 +556,28 @@ export function parseData(text: string, options?: ParseDataOptions): SynxParseRe
           }
           continue;
         }
-      } else if (!(currentBlock && indent > currentBlock.indent)) {
-        // Directives disabled (SYNXL §9.4): outside a multiline body a `!` line
-        // is discarded exactly like a comment. Inside one it falls through to
-        // the block-continuation branch below and is preserved verbatim.
+      } else {
+        // Directives disabled (SYNXL §9.4): a `!` line reaching here is not
+        // multiline body — the branch above already consumed and preserved
+        // those — so it is discarded exactly like a comment.
         continue;
       }
     }
 
-    // ── Continue multiline block ──
-    if (currentBlock && indent > currentBlock.indent) {
-      const existing = currentBlock.obj[currentBlock.key] as string;
-      if (existing.length < MAX_MULTILINE_BLOCK_BYTES) {
-        let line: string;
-        if (currentBlock.preserveIndent) {
-          // SYNX 3.7 `|+`: lock the base indent to the FIRST non-empty
-          // continuation line, then strip exactly that prefix from every line.
-          // Anything indented further than the base is preserved verbatim,
-          // making the block safe for embedding indent-sensitive content
-          // (code, SYNX examples, ASCII art, etc.).
-          if (currentBlock.baseIndent < 0) currentBlock.baseIndent = indent;
-          const strip = Math.min(indent, currentBlock.baseIndent);
-          line = rawLine.substring(strip, trimEndPos);
-        } else {
-          line = trimmed;
+
+    // ── Comments: # or // ──
+    // After the directive block, so the `#!mode:` pragma still resolves.
+    if (fc === 35) { // #
+      // Legacy: #!mode:active / #!mode:static
+      if (directivesEnabled && rawLen - indent > 7 && rawLine.charCodeAt(indent + 1) === 33) { // !
+        if (rawLine.substring(indent, indent + 7) === '#!mode:') {
+          const declared = rawLine.substring(indent + 7, rawLen).trim();
+          mode = declared === 'active' ? 'active' : 'static';
         }
-        const room = MAX_MULTILINE_BLOCK_BYTES - existing.length;
-        const sep = existing ? '\n' : '';
-        const append = sep + line;
-        currentBlock.obj[currentBlock.key] = existing + append.substring(0, room);
       }
       continue;
-    } else {
-      currentBlock = null;
     }
+    if (fc === 47 && indent + 1 < rawLen && rawLine.charCodeAt(indent + 1) === 47) continue; // //
 
     // ── List items: '- ' ──
     if (fc === 45 && trimmedLen > 1 && trimmed.charCodeAt(1) === 32) {
@@ -492,9 +608,9 @@ export function parseData(text: string, options?: ParseDataOptions): SynxParseRe
             if (parsed) {
               let iValue = parsed.rawValue;
               if (parsed.typeHint) iValue = `(${parsed.typeHint})${iValue}`;
-              itemObj[parsed.key] = iValue ? castType(stripInlineComment(iValue)) : {};
+              itemObj[parsed.key] = iValue ? castType(stripInlineComment(iValue), nondeterministic) : {};
             } else {
-              itemObj['_value'] = castType(val);
+              itemObj['_value'] = castType(val, nondeterministic);
             }
             currentList.arr.push(itemObj);
             stack.push({ indent, obj: itemObj });
@@ -502,7 +618,7 @@ export function parseData(text: string, options?: ParseDataOptions): SynxParseRe
           }
         }
 
-        currentList.arr.push(castType(val));
+        currentList.arr.push(castType(val, nondeterministic));
         continue;
       }
       // Not in list context — skip (no key-line starting with '- ' is valid)
@@ -519,6 +635,15 @@ export function parseData(text: string, options?: ParseDataOptions): SynxParseRe
     if (fc === 91 || fc === 40 || fc === 58 || fc === 47) continue; // [ ( : /
 
     // ── Parse key line ──
+    // SYNX §7: a key cannot open with `[`, `:`, `-`, `#`, `/` or `(`, and such
+    // a line is discarded rather than turned into a key. `parseKeyLine` applies
+    // this, but the fast path below bypasses it, which let a bare `-` become
+    // the key `-` — a name no writer can produce and the reference
+    // implementation never yields.
+    if (fc === 91 || fc === 58 || fc === 45 || fc === 35 || fc === 47 || fc === 40) {
+      continue;
+    }
+
     // Manual scanner with balanced [] support for patterns like ^[A-Z]{2}$.
     let key: string;
     let typeHint: string | undefined;
@@ -594,14 +719,20 @@ export function parseData(text: string, options?: ParseDataOptions): SynxParseRe
 
     const constraints = constraintStr ? parseConstraints(constraintStr) : undefined;
 
+    // ── Reject prototype-polluting keys ──
+    //
+    // Checked *before* the stack is repaired, matching the reference
+    // implementation. Popping first would let `__proto__` at the depth of a
+    // real key close that key's subtree, so the lines underneath re-open it
+    // and overwrite the sibling the document actually declared — a rejected
+    // key must not be able to reshape the record around it.
+    if (key === '__proto__' || key === 'constructor' || key === 'prototype') continue;
+
     // ── Pop stack to correct parent ──
     while (stack.length > 1 && stack[stack.length - 1].indent >= indent) {
       stack.pop();
     }
     const parent = stack[stack.length - 1].obj as SynxObject;
-
-    // ── Reject prototype-polluting keys ──
-    if (key === '__proto__' || key === 'constructor' || key === 'prototype') continue;
 
     // ── Determine what this line creates ──
     if (rawValue === '|' || rawValue === '|+') {
@@ -650,7 +781,7 @@ export function parseData(text: string, options?: ParseDataOptions): SynxParseRe
       saveMeta(parent, key, markers, markerArgs, constraints, mode, typeHint);
     } else {
       // Simple key-value
-      parent[key] = castType(rawValue);
+      parent[key] = castType(rawValue, nondeterministic);
       saveMeta(parent, key, markers, markerArgs, constraints, mode, typeHint);
     }
   }

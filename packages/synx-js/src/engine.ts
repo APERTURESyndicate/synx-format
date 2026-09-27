@@ -66,10 +66,12 @@ function checkFileSize(filePath: string): void {
 // ─── Secret wrapper ───────────────────────────────────────
 
 export class SynxSecret {
-  private _value: string;
+  // Runtime-private: a TS `private` field is an ordinary own property, so
+  // util.inspect / console.log / Object.entries / spread would print it.
+  #value: string;
 
   constructor(value: string) {
-    this._value = value;
+    this.#value = value;
   }
 
   toString(): string {
@@ -82,7 +84,11 @@ export class SynxSecret {
 
   /** Call this explicitly to get the real value */
   reveal(): string {
-    return this._value;
+    return this.#value;
+  }
+
+  [Symbol.for('nodejs.util.inspect.custom')](): string {
+    return '[SECRET]';
   }
 
   [Symbol.toPrimitive](hint: string): string | number {
@@ -116,8 +122,11 @@ export function resolve(
   _resolveDepth = 0,
   _currentPath = '',
 ): SynxObject {
+  const isTop = !root;
+  let typeRegistry: Map<string, string> | undefined;
   if (!root) {
     root = obj;
+    typeRegistry = buildTypeRegistry(obj);
     // ── :inherit pre-pass (only at root level) ──
     applyInheritance(obj);
     // Remove private blocks (keys starting with _)
@@ -681,6 +690,10 @@ export function resolve(
     }
   }
 
+  // spec: reference engine runs a final global pass by field name after
+  // constraints — `(type)` hints are checked against the resolved value.
+  if (isTop && typeRegistry && typeRegistry.size > 0) validateFieldTypes(obj, typeRegistry);
+
   return obj;
 }
 
@@ -795,6 +808,67 @@ function loadIncludes(
   return map;
 }
 
+// ─── Global type validation (mirrors synx-core build_type_registry / validate_field_types) ───
+
+function buildTypeRegistry(obj: SynxObject, registry = new Map<string, string>(), depth = 0): Map<string, string> {
+  if (depth > MAX_RESOLVE_DEPTH) return registry;
+  const metaMap: SynxMetaMap | undefined = (obj as any).__synx;
+  if (metaMap) {
+    for (const key of Object.keys(metaMap)) {
+      const hint = metaMap[key]?.typeHint;
+      if (hint && !registry.has(key)) registry.set(key, hint);
+    }
+  }
+  for (const key of Object.keys(obj)) {
+    const v = obj[key];
+    if (Array.isArray(v)) {
+      for (const item of v) if (isPlainObject(item)) buildTypeRegistry(item as SynxObject, registry, depth + 1);
+    } else if (isPlainObject(v)) buildTypeRegistry(v as SynxObject, registry, depth + 1);
+  }
+  return registry;
+}
+
+function isPlainObject(v: unknown): boolean {
+  return typeof v === 'object' && v !== null && !Array.isArray(v) && !(v instanceof SynxSecret);
+}
+
+function valueMatchesType(v: unknown, t: string): boolean {
+  switch (t) {
+    case 'int':    return typeof v === 'number' && Number.isInteger(v);
+    case 'float':  return typeof v === 'number';
+    case 'bool':   return typeof v === 'boolean';
+    case 'string': return typeof v === 'string' || v instanceof SynxSecret;
+    case 'array':  return Array.isArray(v);
+    case 'object': return isPlainObject(v);
+    default:       return true;
+  }
+}
+
+function valueTypeName(v: unknown): string {
+  if (v === null || v === undefined) return 'null';
+  if (v instanceof SynxSecret) return 'secret';
+  if (Array.isArray(v)) return 'array';
+  if (typeof v === 'number') return Number.isInteger(v) ? 'int' : 'float';
+  if (typeof v === 'boolean') return 'bool';
+  if (typeof v === 'string') return 'string';
+  return 'object';
+}
+
+function validateFieldTypes(obj: SynxObject, registry: Map<string, string>, depth = 0): void {
+  if (depth > MAX_RESOLVE_DEPTH) return;
+  for (const key of Object.keys(obj)) {
+    if (key === '__synx') continue;
+    const expected = registry.get(key);
+    if (expected !== undefined && !valueMatchesType(obj[key], expected)) {
+      obj[key] = `TYPE_ERR: '${key}' expected ${expected} but got ${valueTypeName(obj[key])}`;
+    }
+    const child = obj[key];
+    if (Array.isArray(child)) {
+      for (const item of child) if (isPlainObject(item)) validateFieldTypes(item as SynxObject, registry, depth + 1);
+    } else if (isPlainObject(child)) validateFieldTypes(child as SynxObject, registry, depth + 1);
+  }
+}
+
 // ─── Constraint enforcement ───────────────────────────────────────────────
 
 function validateConstraints(obj: SynxObject, key: string, c: import('./types').SynxConstraints): void {
@@ -805,7 +879,14 @@ function validateConstraints(obj: SynxObject, key: string, c: import('./types').
     obj[key] = `CONSTRAINT_ERR: '${key}' is required`;
     return;
   }
-  if (val === null || val === undefined) return;
+  // spec: the reference engine still checks enum for null, reading it as an
+  // empty string; type, range and pattern checks skip an absent value.
+  if (val === null || val === undefined) {
+    if (c.enum && !c.enum.includes('')) {
+      obj[key] = `CONSTRAINT_ERR: '${key}' must be one of [${c.enum.join('|')}]`;
+    }
+    return;
+  }
 
   // type check
   if (c.type) {

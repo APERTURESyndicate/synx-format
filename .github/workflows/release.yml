@@ -278,6 +278,7 @@ jobs:
         id: changelog
         run: |
           TAG="${GITHUB_REF_NAME#v}"
+          echo "version=$TAG" >> "$GITHUB_OUTPUT"
           # Pull the `## [X.Y.Z] — DATE` block out of CHANGELOG.md.
           awk "/^## \[$TAG\]/{flag=1;print;next} /^## \[/{flag=0} flag" CHANGELOG.md > release-notes.md
           if [ ! -s release-notes.md ]; then
@@ -286,7 +287,7 @@ jobs:
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          name: SYNX ${{ github.ref_name }}
+          name: ${{ steps.changelog.outputs.version }}
           body_path: release-notes.md
           draft: false
           prerelease: false

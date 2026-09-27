@@ -536,7 +536,11 @@ describe('Security — Deep Nesting', () => {
     }).not.toThrow();
   });
 
-  test('values beyond depth 512 contain NESTING_ERR', () => {
+  // The parser stops building at `MAX_PARSE_NESTING_DEPTH` (128), so the
+  // engine's 512-deep resolve guard is never the thing that fires on a hostile
+  // document — the tree simply stops. Anything past the parser cap is absent,
+  // not marked.
+  test('nesting past the parser cap is dropped, not resolved', () => {
     let lines = ['!active'];
     let indent = '';
     for (let i = 0; i < 600; i++) {
@@ -546,16 +550,16 @@ describe('Security — Deep Nesting', () => {
     lines.push(`${indent}value deep`);
     const result = Synx.parse(lines.join('\n')) as any;
 
-    // Walk down to depth 510 — should be a normal object
+    // Walk down to just inside the parser cap — still a normal object.
     let cur = result;
-    for (let i = 0; i < 510; i++) {
+    for (let i = 0; i < 126; i++) {
       expect(typeof cur).toBe('object');
       expect(cur).not.toBeNull();
       cur = cur[`level_${i}`];
     }
     expect(typeof cur).toBe('object');
 
-    // Walk down to depth 512 — children should contain NESTING_ERR
+    // Past the cap the tree ends rather than carrying resolved values.
     let cur2 = result;
     for (let i = 0; i < 512; i++) {
       if (typeof cur2 !== 'object' || cur2 === null) break;

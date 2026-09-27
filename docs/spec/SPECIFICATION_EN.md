@@ -412,6 +412,8 @@ print(key)                          # [SECRET]
 print(key.reveal())                 # sk-1234567890abcdef  ← real value
 ```
 
+> Since 3.7.2 the mask also holds for `util.inspect` / `console.log` of a whole object, object spread and `Object.entries` (TypeScript), for `{:?}` (Rust), and for the payload handed to WASM marker plugins.
+
 > ⚠️ **Important:** Never log the result of `.reveal()`. This method is intended only for passing the value to APIs, database connections, etc.
 
 ---

@@ -19,6 +19,7 @@ use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::Mutex;
 
 use clap::Subcommand;
 use synx_core::synxl::{
@@ -44,6 +45,9 @@ pub enum SynxlCommand {
         /// Also enforce declared [constraints] (§8.4, off by default)
         #[arg(long)]
         validate: bool,
+        /// Also write diagnostics (§11.2) here, one JSON object per line
+        #[arg(long)]
+        diagnostics_out: Option<PathBuf>,
     },
 
     /// Validate a .synxl dataset (exit 0 = ok, 1 = spec violation, 2 = I/O error)
@@ -56,6 +60,9 @@ pub enum SynxlCommand {
         /// Treat diagnostics (§11.2) as errors too
         #[arg(long)]
         strict: bool,
+        /// Also write diagnostics (§11.2) here, one JSON object per line
+        #[arg(long)]
+        diagnostics_out: Option<PathBuf>,
     },
 
     /// Convert between .synxl and jsonl/csv
@@ -82,6 +89,9 @@ pub enum SynxlCommand {
         /// synxl→csv: serialize every [block] cell as JSON instead of failing
         #[arg(long)]
         block_json: bool,
+        /// Also write diagnostics (§11.2) here, one JSON object per line
+        #[arg(long)]
+        diagnostics_out: Option<PathBuf>,
     },
 
     /// Split a .synxl dataset into shards of N records
@@ -102,24 +112,63 @@ pub enum SynxlCommand {
         /// Shard file name prefix (default: the input's file stem)
         #[arg(long)]
         prefix: Option<String>,
+        /// Also write diagnostics (§11.2) here, one JSON object per line
+        #[arg(long)]
+        diagnostics_out: Option<PathBuf>,
     },
 }
 
 pub fn run(command: SynxlCommand) {
-    match command {
-        SynxlCommand::Parse { file, format, output, validate } => {
-            cmd_parse(file, &format, output, validate)
-        }
-        SynxlCommand::Validate { file, constraints, strict } => {
-            cmd_validate(file, constraints, strict)
-        }
-        SynxlCommand::Convert { file, from, to, output, delimiter, block_json } => {
-            cmd_convert(file, from, to, output, &delimiter, block_json)
-        }
-        SynxlCommand::Split { file, records, output_dir, prefix } => {
-            cmd_split(file, records, output_dir, prefix)
+    let diagnostics_out = match &command {
+        SynxlCommand::Parse { diagnostics_out, .. }
+        | SynxlCommand::Validate { diagnostics_out, .. }
+        | SynxlCommand::Convert { diagnostics_out, .. }
+        | SynxlCommand::Split { diagnostics_out, .. } => diagnostics_out.clone(),
+    };
+    if let Some(path) = diagnostics_out {
+        if let Err(e) = open_diagnostics(&path) {
+            eprintln!("error: {}", e.message());
+            process::exit(e.code());
         }
     }
+
+    // `-` reads stdin; spooled here so every subcommand below sees a plain,
+    // re-readable path. The guard lives to the end of `run`.
+    let spool = {
+        let source = match &command {
+            SynxlCommand::Parse { file, .. }
+            | SynxlCommand::Validate { file, .. }
+            | SynxlCommand::Convert { file, .. }
+            | SynxlCommand::Split { file, .. } => file.clone(),
+        };
+        match StdinSpool::take(&source) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("error: {}", e.message());
+                process::exit(e.code());
+            }
+        }
+    };
+    let resolve = |file: PathBuf| match &spool {
+        Some(s) => s.path.clone(),
+        None => file,
+    };
+
+    match command {
+        SynxlCommand::Parse { file, format, output, validate, .. } => {
+            cmd_parse(resolve(file), &format, output, validate)
+        }
+        SynxlCommand::Validate { file, constraints, strict, .. } => {
+            cmd_validate(resolve(file), constraints, strict)
+        }
+        SynxlCommand::Convert { file, from, to, output, delimiter, block_json, .. } => {
+            cmd_convert(resolve(file), from, to, output, &delimiter, block_json)
+        }
+        SynxlCommand::Split { file, records, output_dir, prefix, .. } => {
+            cmd_split(resolve(file), records, output_dir, prefix)
+        }
+    }
+    flush_diagnostics();
 }
 
 // ─── Errors and exit codes ───────────────────────────────────
@@ -152,6 +201,12 @@ impl From<SynxlStreamError> for CmdError {
     fn from(e: SynxlStreamError) -> Self {
         match e {
             SynxlStreamError::Format(f) => CmdError::Format(f.to_string()),
+            // Invalid UTF-8 is a fact about the document (§3.1), not about the
+            // machine: reporting it as an I/O failure tells a caller that
+            // retries on exit 2 to keep retrying a file that will never parse.
+            SynxlStreamError::Io(err) if err.kind() == io::ErrorKind::InvalidData => {
+                CmdError::Format(err.to_string())
+            }
             SynxlStreamError::Io(err) => {
                 CmdError::Io(format!("I/O error while reading SYNXL: {}", err))
             }
@@ -173,6 +228,7 @@ fn fail(label: &str, err: CmdError, cleanup: &[&PathBuf]) -> ! {
     for path in cleanup {
         let _ = fs::remove_file(path);
     }
+    flush_diagnostics();
     eprintln!("error: {}: {}", label, err.message());
     process::exit(err.code());
 }
@@ -189,18 +245,26 @@ fn cmd_parse(file: PathBuf, format: &str, output: Option<PathBuf>, validate: boo
         }
     };
     let label = file.display().to_string();
+    let path = file.clone();
+    let mut reopen = move || open_reader(&path).map(|r| Box::new(r) as Box<dyn BufRead>);
 
     let result = (|| {
+        // §11.1 — stdout cannot be rolled back, so the document is checked in
+        // full before anything is emitted. Without this a mid-file hard error
+        // leaves a *valid-looking* truncated NDJSON stream behind, which a
+        // pipeline that loses the exit status cannot tell from a complete one.
+        if output.is_none() {
+            precheck(&mut reopen)?;
+        }
         let input = open_reader(&file)?;
-        let mut out = open_output(&output)?;
+        let mut out = AtomicOutput::open(&output)?;
         let count = synxl_to_json(input, &label, ndjson, validate, &mut out)?;
-        out.flush().map_err(write_err)?;
+        out.commit()?;
         Ok(count)
     })();
 
     if let Err(e) = result {
-        let cleanup: Vec<&PathBuf> = output.iter().collect();
-        fail(&label, e, &cleanup);
+        fail(&label, e, &[]);
     }
 }
 
@@ -298,7 +362,12 @@ fn cmd_convert(
     let mut reopen = move || open_reader(&path).map(|r| Box::new(r) as Box<dyn BufRead>);
 
     let result = (|| {
-        let mut out = open_output(&output)?;
+        // §11.1 — see `cmd_parse`: a stdout target gets a full pre-flight so a
+        // hard error never leaves a partial projection behind.
+        if output.is_none() && from == "synxl" {
+            precheck(&mut reopen)?;
+        }
+        let mut out = AtomicOutput::open(&output)?;
         let count = match (from.as_str(), to.as_str()) {
             ("jsonl", "synxl") => jsonl_to_synxl(&mut reopen, &mut out)?,
             ("csv", "synxl") => csv_to_synxl(&mut reopen, delim, &mut out)?,
@@ -316,13 +385,12 @@ fn cmd_convert(
                 process::exit(1);
             }
         };
-        out.flush().map_err(write_err)?;
+        out.commit()?;
         Ok(count)
     })();
 
     if let Err(e) = result {
-        let cleanup: Vec<&PathBuf> = output.iter().collect();
-        fail(&label, e, &cleanup);
+        fail(&label, e, &[]);
     }
 }
 
@@ -348,28 +416,45 @@ fn cmd_split(file: PathBuf, records: usize, output_dir: Option<PathBuf>, prefix:
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "shard".to_string())
     });
+    // The prefix names a file, not a path. Left unchecked it is a traversal
+    // primitive whenever it comes from somewhere automated — a batch name in
+    // CI, say — since it is interpolated straight into the shard path and the
+    // shard is created with plain truncation.
+    if prefix.is_empty()
+        || prefix.contains('/')
+        || prefix.contains('\\')
+        || prefix.contains(':')
+        || prefix == ".."
+        || prefix == "."
+    {
+        eprintln!(
+            "error: --prefix must be a plain file-name prefix (no `/`, `\\`, `:`, and not `.` or `..`)"
+        );
+        process::exit(1);
+    }
     let shard_path = |index: usize| dir.join(format!("{}-{:05}.synxl", prefix, index));
 
     let mut shards = 0usize;
-    // The shard currently being written; removed if the split aborts, so no
-    // half shard is left behind looking complete. Both callbacks touch it.
-    let in_flight: std::cell::RefCell<Option<PathBuf>> = std::cell::RefCell::new(None);
+    // Every shard this run created. §11.1 forbids a partial result, and a
+    // finished-looking shard is exactly that, so an abort removes all of them —
+    // not just the one that was mid-write.
+    let created: std::cell::RefCell<Vec<PathBuf>> = std::cell::RefCell::new(Vec::new());
 
     let result = (|| {
         let input = open_reader(&file)?;
         split_shards(
             input,
+            &label,
             records,
             |index| {
                 let path = shard_path(index);
                 let handle = File::create(&path)
                     .map_err(|e| CmdError::Io(format!("cannot write {}: {}", path.display(), e)))?;
-                *in_flight.borrow_mut() = Some(path);
+                created.borrow_mut().push(path);
                 Ok(BufWriter::new(handle))
             },
             |index, mut writer, count| {
                 writer.flush().map_err(write_err)?;
-                *in_flight.borrow_mut() = None;
                 println!("{} ({} records)", shard_path(index).display(), count);
                 shards += 1;
                 Ok(())
@@ -378,9 +463,27 @@ fn cmd_split(file: PathBuf, records: usize, output_dir: Option<PathBuf>, prefix:
     })();
 
     match result {
-        Ok(total) => println!("{}: {} records → {} shard(s)", label, total, shards),
+        Ok(total) => {
+            // Shards left by an earlier, longer split of the same file would
+            // otherwise be picked up by a glob over the directory and read as
+            // extra records — duplicates of data this run already wrote.
+            let mut stale = 0usize;
+            for index in (shards + 1)..=(shards + 1_000) {
+                let path = shard_path(index);
+                if !path.exists() {
+                    break;
+                }
+                if fs::remove_file(&path).is_ok() {
+                    stale += 1;
+                }
+            }
+            if stale > 0 {
+                println!("removed {} stale shard(s) from a previous split", stale);
+            }
+            println!("{}: {} records → {} shard(s)", label, total, shards);
+        }
         Err(e) => {
-            let partial = in_flight.borrow();
+            let partial = created.borrow();
             let cleanup: Vec<&PathBuf> = partial.iter().collect();
             fail(&label, e, &cleanup);
         }
@@ -398,6 +501,7 @@ fn cmd_split(file: PathBuf, records: usize, output_dir: Option<PathBuf>, prefix:
 /// body underneath it would produce a shard that parses to different data.
 fn split_shards<R: BufRead, W: Write>(
     input: R,
+    label: &str,
     per_shard: usize,
     mut open: impl FnMut(usize) -> Result<W, CmdError>,
     mut close: impl FnMut(usize, W, usize) -> Result<(), CmdError>,
@@ -412,6 +516,10 @@ fn split_shards<R: BufRead, W: Write>(
 
     while let Some(item) = reader.next() {
         let rec = item?;
+        // §11.2 — split is the one subcommand after which the original is
+        // usually deleted, so swallowing a `RecordTruncated` here is where a
+        // lost megabyte becomes unrecoverable and unreported.
+        report_diagnostics(label, &rec.diagnostics);
 
         while headers.len() < reader.field_lists().len() {
             let fl = &reader.field_lists()[headers.len()];
@@ -450,6 +558,8 @@ fn split_shards<R: BufRead, W: Write>(
         }
         total += 1;
     }
+
+    report_diagnostics(label, reader.trailing_diagnostics());
 
     if let Some((index, writer, count, _)) = current.take() {
         close(index, writer, count)?;
@@ -532,6 +642,10 @@ fn synxl_to_csv(
     let mut reader = SynxlStreamReader::new(input)?;
     let mut header: Option<(usize, Vec<String>, Vec<bool>)> = None;
     let mut count = 0usize;
+    // Cells defused against spreadsheet formula execution. Reported at the end
+    // rather than applied in silence: the export is no longer byte-identical to
+    // the source values, and the operator has to know that.
+    let mut neutralised = 0usize;
 
     while let Some(item) = reader.next() {
         let rec = item?;
@@ -556,7 +670,7 @@ re-run with --block-json to write them as JSON inside the cell",
             }
             let names: Vec<String> = fl.fields().iter().map(|f| f.name.clone()).collect();
             let block_flags: Vec<bool> = fl.fields().iter().map(|f| f.block).collect();
-            write_csv_row(out, &names, delim)?;
+            write_csv_row(out, &names, delim, &mut neutralised)?;
             header = Some((rec.field_list, names, block_flags));
         }
 
@@ -585,10 +699,27 @@ re-run with --block-json to write them as JSON inside the cell",
                 }
             })
             .collect();
-        write_csv_row(out, &cells, delim)?;
+        write_csv_row(out, &cells, delim, &mut neutralised)?;
         count += 1;
     }
     report_diagnostics(label, reader.trailing_diagnostics());
+    // A dataset with a schema but no rows is a valid document (§4.2). Emitting
+    // nothing at all would make it indistinguishable from a failed conversion,
+    // and a consumer reading the CSV back would find no columns.
+    if header.is_none() {
+        if let Some(fl) = reader.field_lists().first() {
+            let names: Vec<String> = fl.fields().iter().map(|f| f.name.clone()).collect();
+            if !names.is_empty() {
+                write_csv_row(out, &names, delim, &mut neutralised)?;
+            }
+        }
+    }
+    if neutralised > 0 {
+        eprintln!(
+            "warning: {}: {} cell(s) began with `=`, `+`, `-`, `@`, TAB or CR and were prefixed with a tab so a spreadsheet does not execute them as formulas",
+            label, neutralised
+        );
+    }
     Ok(count)
 }
 
@@ -611,23 +742,48 @@ fn csv_cell(value: &Value) -> String {
     }
 }
 
-fn write_csv_row(out: &mut dyn Write, cells: &[String], delim: char) -> Result<(), CmdError> {
+fn write_csv_row(
+    out: &mut dyn Write,
+    cells: &[String],
+    delim: char,
+    neutralised: &mut usize,
+) -> Result<(), CmdError> {
     let mut line = String::new();
     for (i, cell) in cells.iter().enumerate() {
         if i > 0 {
             line.push(delim);
         }
-        line.push_str(&csv_escape(cell, delim));
+        let (text, was_formula) = csv_escape(cell, delim);
+        if was_formula {
+            *neutralised += 1;
+        }
+        line.push_str(&text);
     }
     line.push('\n');
     out.write_all(line.as_bytes()).map_err(write_err)
 }
 
-fn csv_escape(cell: &str, delim: char) -> String {
-    if cell.contains(delim) || cell.contains('"') || cell.contains('\n') || cell.contains('\r') {
-        format!("\"{}\"", cell.replace('"', "\"\""))
+fn csv_escape(cell: &str, delim: char) -> (String, bool) {
+    // Spreadsheets read a leading `=`, `+`, `-`, `@`, TAB or CR as the start of
+    // a formula, and quoting does not stop them — DDE payloads execute on open.
+    // The records here come from datasets §16 assumes are untrusted, and
+    // exporting one to CSV for a human to open is precisely the workflow, so
+    // the cell is prefixed with a tab: the value survives, the formula does not.
+    let formula = matches!(cell.as_bytes().first(), Some(b'=' | b'+' | b'-' | b'@' | b'\t' | b'\r'));
+    let needs_quote = formula
+        || cell.contains(delim)
+        || cell.contains('"')
+        || cell.contains('\n')
+        || cell.contains('\r');
+    if needs_quote {
+        let escaped = cell.replace('"', "\"\"");
+        if formula {
+            (format!("\"\t{}\"", escaped), true)
+        } else {
+            (format!("\"{}\"", escaped), false)
+        }
     } else {
-        cell.to_string()
+        (cell.to_string(), false)
     }
 }
 
@@ -838,7 +994,25 @@ fn jsonl_to_synxl(reopen: Reopen<'_>, out: &mut dyn Write) -> Result<usize, CmdE
         if let (Some(name), Value::Object(map)) = (&index_field, &mut value) {
             map.insert(name.clone(), Value::Int(count as i64));
         }
-        emitter.write_record(&fields, &value)?;
+        // §12.1 — a field the record does not have MUST NOT appear in its
+        // object. Declaring the union of all columns for every record would
+        // add `"lang":null` to rows written before that column existed, so the
+        // field list is narrowed per record and `RecordEmitter` re-declares it
+        // whenever the shape changes (§4.2), exactly as the source did.
+        let present: Vec<FieldDecl> = fields
+            .iter()
+            .filter(|f| {
+                value.as_object().map(|m| m.contains_key(&f.name)).unwrap_or(false)
+            })
+            .cloned()
+            .collect();
+        if present.is_empty() {
+            return Err(CmdError::Format(format!(
+                "line {}: object has no fields; SYNXL needs at least one (§5.3.4)",
+                i + 1
+            )));
+        }
+        emitter.write_record(&present, &value)?;
         count += 1;
     }
     if count == 0 {
@@ -1116,8 +1290,66 @@ fn normalize_format(name: &str) -> String {
     }
 }
 
+/// The machine-readable diagnostic channel opened by `--diagnostics-out`.
+///
+/// §11.2 forbids stderr text from being the *only* channel, and for good
+/// reason: a consumer that decides whether to accept a batch by counting
+/// `CastFailed` should not have to parse an unversioned human-readable line.
+static DIAG_SINK: Mutex<Option<BufWriter<File>>> = Mutex::new(None);
+
+/// A `-` input path means stdin, spooled to a temporary file for the duration
+/// of the command.
+///
+/// Every direction here either re-reads its input (schema inference, §11.1
+/// pre-flight) or could be asked to, and stdin cannot be rewound. Spooling
+/// keeps live memory at one record — which is the §15.1 guarantee — at the
+/// cost of disk, rather than holding a dataset §13 deliberately does not bound.
+struct StdinSpool {
+    path: PathBuf,
+}
+
+impl StdinSpool {
+    fn take(file: &Path) -> Result<Option<Self>, CmdError> {
+        if file.as_os_str() != "-" {
+            return Ok(None);
+        }
+        let path = std::env::temp_dir().join(format!("synxl-stdin-{}.synxl", process::id()));
+        let mut sink = BufWriter::new(
+            File::create(&path)
+                .map_err(|e| CmdError::Io(format!("cannot spool stdin: {}", e)))?,
+        );
+        io::copy(&mut io::stdin().lock(), &mut sink)
+            .map_err(|e| CmdError::Io(format!("cannot read stdin: {}", e)))?;
+        sink.flush().map_err(write_err)?;
+        Ok(Some(Self { path }))
+    }
+}
+
+impl Drop for StdinSpool {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// Point the machine-readable channel at `path`, one JSON object per line.
+fn open_diagnostics(path: &Path) -> Result<(), CmdError> {
+    let file = File::create(path)
+        .map_err(|e| CmdError::Io(format!("cannot write {}: {}", path.display(), e)))?;
+    *DIAG_SINK.lock().unwrap() = Some(BufWriter::new(file));
+    Ok(())
+}
+
+fn flush_diagnostics() {
+    if let Ok(mut guard) = DIAG_SINK.lock() {
+        if let Some(sink) = guard.as_mut() {
+            let _ = sink.flush();
+        }
+    }
+}
+
 /// §11.2 — diagnostics are recoverable, so they go to stderr as warnings and
-/// leave stdout carrying only data.
+/// leave stdout carrying only data. With `--diagnostics-out` they are also
+/// written as NDJSON, which is what a pipeline can actually act on.
 fn report_diagnostics(label: &str, diagnostics: &[Diagnostic]) {
     for d in diagnostics {
         eprintln!(
@@ -1125,6 +1357,43 @@ fn report_diagnostics(label: &str, diagnostics: &[Diagnostic]) {
             label, d.line, d.record_index, d.kind, d.message
         );
     }
+    if diagnostics.is_empty() {
+        return;
+    }
+    if let Ok(mut guard) = DIAG_SINK.lock() {
+        if let Some(sink) = guard.as_mut() {
+            for d in diagnostics {
+                let line = format!(
+                    "{{\"file\":{},\"record\":{},\"line\":{},\"kind\":{},\"message\":{}}}\n",
+                    json_string(label),
+                    d.record_index,
+                    d.line,
+                    json_string(&d.kind.to_string()),
+                    json_string(&d.message),
+                );
+                let _ = sink.write_all(line.as_bytes());
+            }
+        }
+    }
+}
+
+/// Minimal RFC 8259 string escaping for the diagnostic channel.
+fn json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 fn open_reader(path: &Path) -> Result<BufReader<File>, CmdError> {
@@ -1133,13 +1402,90 @@ fn open_reader(path: &Path) -> Result<BufReader<File>, CmdError> {
         .map_err(|e| CmdError::Io(format!("cannot read {}: {}", path.display(), e)))
 }
 
-fn open_output(output: &Option<PathBuf>) -> Result<Box<dyn Write>, CmdError> {
-    match output {
-        Some(path) => File::create(path)
-            .map(|f| Box::new(BufWriter::new(f)) as Box<dyn Write>)
-            .map_err(|e| CmdError::Io(format!("cannot write {}: {}", path.display(), e))),
-        None => Ok(Box::new(BufWriter::new(io::stdout()))),
+/// An output that only becomes visible if the whole command succeeds (§11.1).
+///
+/// A file target is written to a sibling temporary and renamed into place on
+/// [`commit`](AtomicOutput::commit); dropping without committing removes the
+/// temporary. That keeps a pre-existing `--output` file intact when the parse
+/// turns out to be a hard error — truncating it up front and then deleting it,
+/// as a plain `File::create` plus cleanup does, destroys data the command was
+/// never asked to touch.
+///
+/// A stdout target cannot be rolled back once bytes have left the process, so
+/// the caller pre-flights the input instead (see [`precheck`]).
+struct AtomicOutput {
+    sink: Box<dyn Write>,
+    temp: Option<(PathBuf, PathBuf)>,
+}
+
+impl AtomicOutput {
+    fn open(output: &Option<PathBuf>) -> Result<Self, CmdError> {
+        match output {
+            Some(path) => {
+                let temp = temp_sibling(path);
+                let file = File::create(&temp).map_err(|e| {
+                    CmdError::Io(format!("cannot write {}: {}", temp.display(), e))
+                })?;
+                Ok(Self {
+                    sink: Box::new(BufWriter::new(file)),
+                    temp: Some((temp, path.clone())),
+                })
+            }
+            None => Ok(Self { sink: Box::new(BufWriter::new(io::stdout())), temp: None }),
+        }
     }
+
+    fn commit(mut self) -> Result<(), CmdError> {
+        self.sink.flush().map_err(write_err)?;
+        if let Some((temp, dest)) = self.temp.take() {
+            // Drop the writer before renaming: Windows refuses to rename a file
+            // that still has an open handle.
+            self.sink = Box::new(io::sink());
+            fs::rename(&temp, &dest).map_err(|e| {
+                let _ = fs::remove_file(&temp);
+                CmdError::Io(format!("cannot write {}: {}", dest.display(), e))
+            })?;
+        }
+        Ok(())
+    }
+}
+
+impl Write for AtomicOutput {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.sink.write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.sink.flush()
+    }
+}
+
+impl Drop for AtomicOutput {
+    fn drop(&mut self) {
+        if let Some((temp, _)) = self.temp.take() {
+            self.sink = Box::new(io::sink());
+            let _ = fs::remove_file(&temp);
+        }
+    }
+}
+
+/// A temporary path next to `path`, so the later rename stays on one filesystem.
+fn temp_sibling(path: &Path) -> PathBuf {
+    let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    name.push(format!(".synxl-tmp-{}", process::id()));
+    path.with_file_name(name)
+}
+
+/// Read the document through once, discarding output, so that a hard error
+/// (§11.1) surfaces *before* the first byte of a partial result reaches stdout.
+///
+/// Only needed for an un-rewindable sink; a file target is made atomic by
+/// [`AtomicOutput`] instead, and pays no second pass.
+fn precheck(reopen: Reopen<'_>) -> Result<(), CmdError> {
+    let mut reader = SynxlStreamReader::new(reopen()?)?;
+    while let Some(item) = reader.next() {
+        item?;
+    }
+    Ok(())
 }
 
 // ─── Tests ───────────────────────────────────────────────────
@@ -1431,6 +1777,7 @@ mod tests {
         let mut out: Vec<String> = Vec::new();
         split_shards(
             Cursor::new(src),
+            "test",
             n,
             |_| Ok(Vec::<u8>::new()),
             |_, w, _| {
@@ -1440,6 +1787,91 @@ mod tests {
         )
         .expect("split failed");
         out
+    }
+
+    /// §15.3 across the whole conformance corpus, at several shard sizes.
+    ///
+    /// "A shard of a SYNXL document is itself a valid SYNXL document only if it
+    /// begins with a prologue and the field list in effect at the split point"
+    /// — so every shard must parse standalone, and concatenating their
+    /// projections must reproduce the original's. Checking it on the corpus
+    /// rather than on one hand-written document is what makes it a property of
+    /// the splitter instead of a property of one example: the interesting
+    /// inputs are the ones with a mid-file field-list change, promoted block
+    /// fields and diagnostics, and the corpus already collects those.
+    #[test]
+    fn split_is_lossless_across_the_conformance_corpus() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("tests")
+            .join("conformance-synxl")
+            .join("cases");
+
+        let mut cases: Vec<std::path::PathBuf> = fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("cannot read {}: {}", dir.display(), e))
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|ext| ext == "synxl"))
+            .collect();
+        cases.sort();
+        assert!(!cases.is_empty(), "no cases found in {}", dir.display());
+
+        let mut failures: Vec<String> = Vec::new();
+        let mut checked = 0usize;
+        for path in &cases {
+            let src = fs::read_to_string(path).expect("read case");
+            // Hard-error cases (§11.1) have nothing to shard.
+            let Ok(whole) = parse_lines(&src) else { continue };
+            let name = path.file_stem().unwrap().to_string_lossy().to_string();
+
+            for per_shard in [1usize, 2, 3, 1000] {
+                checked += 1;
+                let shards = match std::panic::catch_unwind(|| shards_of(&src, per_shard)) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        failures.push(format!("{name} @ n={per_shard}: split panicked"));
+                        continue;
+                    }
+                };
+
+                let mut rejoined: Vec<Value> = Vec::new();
+                let mut bad = false;
+                for (i, shard) in shards.iter().enumerate() {
+                    match parse_lines(shard) {
+                        Ok(doc) => rejoined.extend(doc.records),
+                        Err(err) => {
+                            failures.push(format!(
+                                "{name} @ n={per_shard}: shard {i} does not parse standalone: {err}\n       shard: {}",
+                                shard.replace('\n', "\\n")
+                            ));
+                            bad = true;
+                            break;
+                        }
+                    }
+                }
+                if bad {
+                    continue;
+                }
+
+                let rejoined_json = synx_core::synxl::records_to_json_array(&rejoined);
+                if rejoined_json != whole.to_json() {
+                    failures.push(format!(
+                        "{name} @ n={per_shard}: rejoined shards differ from the source\n       got:      {rejoined_json}\n       expected: {}",
+                        whole.to_json()
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "\n\n{} of {checked} shard checks failed:\n  - {}\n",
+            failures.len(),
+            failures.join("\n  - ")
+        );
     }
 
     #[test]
@@ -1593,6 +2025,7 @@ mod tests {
 
         let total = split_shards(
             BufReader::new(GeneratedDoc::new(STREAM_RECORDS)),
+            "test",
             50_000,
             |_| Ok(CountingSink::new()),
             |_, sink, count| {

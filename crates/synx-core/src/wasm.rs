@@ -293,25 +293,37 @@ impl WasmMarkerRuntime {
     }
 }
 
-/// Convert a SYNX Value to a JSON string for passing to WASM.
+/// Convert a SYNX Value to the `value` payload for WASM: a top-level string
+/// passes through bare, anything nested is proper JSON. Secrets are masked —
+/// a plugin is less trusted than the core and must never see the raw value.
 fn value_to_json_string(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        Value::Secret(_) => "[SECRET]".to_string(),
+        other => nested_json(other),
+    }
+}
+
+fn nested_json(value: &Value) -> String {
     match value {
         Value::Null => "null".to_string(),
         Value::Bool(b) => b.to_string(),
         Value::Int(i) => i.to_string(),
-        Value::Float(f) => {
+        Value::Float(f) if f.is_finite() => {
             let mut buf = ryu::Buffer::new();
             buf.format(*f).to_string()
         }
-        Value::String(s) | Value::Secret(s) => s.clone(),
+        Value::Float(_) => "null".to_string(),
+        Value::String(s) => serde_json::Value::String(s.clone()).to_string(),
+        Value::Secret(_) => "\"[SECRET]\"".to_string(),
         Value::Array(arr) => {
-            let items: Vec<String> = arr.iter().map(value_to_json_string).collect();
+            let items: Vec<String> = arr.iter().map(nested_json).collect();
             format!("[{}]", items.join(","))
         }
         Value::Object(map) => {
             let pairs: Vec<String> = map
                 .iter()
-                .map(|(k, v)| format!("\"{}\":{}", k, value_to_json_string(v)))
+                .map(|(k, v)| format!("{}:{}", serde_json::Value::String(k.clone()), nested_json(v)))
                 .collect();
             format!("{{{}}}", pairs.join(","))
         }
@@ -485,6 +497,11 @@ mod tests {
         assert_eq!(value_to_json_string(&Value::Bool(true)), "true");
         assert_eq!(value_to_json_string(&Value::Int(42)), "42");
         assert_eq!(value_to_json_string(&Value::String("hi".into())), "hi");
+        assert_eq!(value_to_json_string(&Value::Secret("k".into())), "[SECRET]");
+        let mut m = HashMap::new();
+        m.insert("a\"b".to_string(), Value::Array(vec![Value::String("x\"y".into()), Value::Secret("k".into())]));
+        let json = value_to_json_string(&Value::Object(m));
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&json).unwrap(), serde_json::json!({"a\"b": ["x\"y", "[SECRET]"]}));
     }
 
     #[test]

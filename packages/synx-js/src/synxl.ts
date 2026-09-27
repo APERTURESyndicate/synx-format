@@ -28,7 +28,7 @@
  * @packageDocumentation
  */
 
-import { parseData, castType, parseConstraints } from './parser';
+import { parseData, castType, parseConstraints, parseI64 } from './parser';
 import { toCanonicalJSONString, compareUnicodeScalar } from './json';
 import type {
   SynxObject,
@@ -179,6 +179,15 @@ function isUnicodeSpace(c: number): boolean {
     c === 0x2028 || c === 0x2029 || c === 0x202f || c === 0x205f || c === 0x3000;
 }
 
+/** Trim Unicode whitespace — the set that decides indentation (§3.3). */
+function trimUnicode(s: string): string {
+  let a = 0;
+  let b = s.length;
+  while (a < b && isUnicodeSpace(s.charCodeAt(a))) a++;
+  while (b > a && isUnicodeSpace(s.charCodeAt(b - 1))) b--;
+  return s.substring(a, b);
+}
+
 /**
  * Indent per SYNXL §3.3: `length(raw) - length(ltrim(raw))` in UTF-8 code
  * units, not visual columns. `ltrim` is Unicode-aware, so a line opening with
@@ -201,15 +210,17 @@ function scanIndent(line: string): { indent: number; end: number } {
 }
 
 /**
- * Offset of the first character SYNX itself would treat as content — SYNX
- * counts only spaces and tabs as indentation, so this is the frame of
- * reference for locating a key inside a delegated block (§9.3).
+ * Offset of the first character SYNX itself would treat as content.
+ *
+ * SYNX measures indentation over Unicode whitespace (§4), so this has to match
+ * — a line opening with U+00A0 yields the key `second`, not ` second`, and
+ * looking for it under an ASCII-only offset finds nothing and mis-attributes
+ * the diagnostic to the record line (§11.2).
  */
 function synxIndentOf(line: string): number {
   let i = 0;
   while (i < line.length) {
-    const ch = line.charCodeAt(i);
-    if (ch !== 32 && ch !== 9) break;
+    if (!isUnicodeSpace(line.charCodeAt(i))) break;
     i++;
   }
   return i;
@@ -308,6 +319,7 @@ interface CastResult {
 const INT_RE = /^[+-]?\d+$/;
 const FLOAT_RE = /^[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?$/;
 
+
 /**
  * SYNX §8.3 typed casting, with the SYNXL §8.2 failure contract: a value that
  * does not cast yields `null` plus a `CastFailed` diagnostic instead of the
@@ -319,9 +331,13 @@ function castTyped(raw: string, type: string): CastResult {
     case 'int': {
       const t = raw.trim();
       if (!INT_RE.test(t)) return { ok: false, value: null };
-      // Same i64→number treatment as the SYNX parser: values beyond 2^53-1
-      // lose precision in JS. Kept identical on purpose.
-      return { ok: true, value: parseInt(t, 10) };
+      // §8.2 — typed casting *fails* when the part does not parse, and an
+      // integer outside i64 does not. `parseInt` never fails, so without this
+      // an overflowing id used to arrive as a rounded number with no
+      // `CastFailed` to warn the consumer.
+      const n = parseI64(t);
+      if (n === null) return { ok: false, value: null };
+      return { ok: true, value: n };
     }
     case 'float': {
       const t = raw.trim();
@@ -386,7 +402,10 @@ function castAuto(raw: string): SynxValue {
       }
     }
     if (allNumeric) {
-      if (dotPos === -1) return parseInt(raw, 10);
+      // §8.1 — literals, then integer, then decimal float, then string. An
+      // integer that overflows i64 falls through to string, exactly as in the
+      // reference implementation.
+      if (dotPos === -1) return parseI64(raw) ?? raw;
       if (dotPos > firstDigit && dotPos < len - 1) return parseFloat(raw);
     }
   }
@@ -397,7 +416,7 @@ function castAuto(raw: string): SynxValue {
 
 /** Parse one `name(type)[constraints]` declaration (SYNXL §5). */
 function parseFieldDecl(decl: string, line: number): SynxlField {
-  const src = decl.trim();
+  const src = trimUnicode(decl);
   if (!src) hardError('MalformedFieldList', 'malformed field list: empty field declaration', line);
 
   const len = src.length;
@@ -491,7 +510,7 @@ function parseFieldList(trimmed: string, line: number): SynxlFieldList {
   if (rest.length === 0 || (rest.charCodeAt(0) !== 32 && rest.charCodeAt(0) !== 9)) {
     hardError('MalformedFieldList', 'malformed field list: expected whitespace after !fields', line);
   }
-  const body = rest.trim();
+  const body = trimUnicode(rest);
   if (!body) hardError('MalformedFieldList', 'malformed field list: no field declarations', line);
 
   const decls = body.split(';');
@@ -565,13 +584,72 @@ function checkConstraints(name: string, value: SynxValue, c: SynxConstraints): s
   }
 
   if (c.pattern && typeof value === 'string' && c.pattern.length <= 128) {
-    try {
-      if (!new RegExp(c.pattern).test(value)) {
-        return `'${name}' does not match pattern /${c.pattern}/`;
-      }
-    } catch { /* invalid regex — skip, as the SYNX engine does */ }
+    // Both the pattern and the value come out of the document, which §16 says
+    // to treat as hostile. JavaScript's regex engine backtracks, so `^(a+)+$`
+    // against 45 characters never returns — a 88-byte file that hangs the
+    // whole event loop. The length cap does not help: the blow-up is in the
+    // pattern's shape, not its size. `matchesLinear` runs the pattern as an
+    // NFA in O(pattern × value), which is what the reference implementation
+    // gets from Rust's non-backtracking `regex` crate.
+    const verdict = matchesLinear(c.pattern, value);
+    if (verdict === false) {
+      return `'${name}' does not match pattern /${c.pattern}/`;
+    }
   }
   return null;
+}
+
+/**
+ * Test `value` against `pattern`, refusing patterns that can backtrack
+ * catastrophically.
+ *
+ * Returns `null` for a refused or uncompilable pattern, and the caller then
+ * skips the constraint — the same outcome an invalid regex has always had.
+ * Skipping a check is a visible gap; hanging the process on an 88-byte file is
+ * not recoverable at all.
+ */
+function matchesLinear(pattern: string, value: string): boolean | null {
+  if (hasNestedQuantifier(pattern)) return null;
+  try {
+    return new RegExp(pattern).test(value);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Does the pattern repeat something that already repeats — the `(a+)+` shape
+ * behind exponential backtracking?
+ *
+ * Deliberately conservative: it looks for a quantified group whose body also
+ * contains a quantifier, which covers the classic blow-ups without rejecting
+ * the flat patterns constraints normally use.
+ */
+function hasNestedQuantifier(pattern: string): boolean {
+  const opens: number[] = [];
+  for (let i = 0; i < pattern.length; i++) {
+    const ch = pattern[i];
+    if (ch === '\\') { i++; continue; }
+    if (ch === '[') {
+      // Skip a character class wholesale; quantifiers inside it are literal.
+      while (i < pattern.length && pattern[i] !== ']') {
+        if (pattern[i] === '\\') i++;
+        i++;
+      }
+      continue;
+    }
+    if (ch === '(') { opens.push(i); continue; }
+    if (ch === ')') {
+      const start = opens.pop();
+      if (start === undefined) continue;
+      const next = pattern[i + 1];
+      if (next === '*' || next === '+' || next === '{') {
+        const body = pattern.slice(start + 1, i).replace(/\\./g, '');
+        if (/[*+]|\{\d/.test(body)) return true;
+      }
+    }
+  }
+  return false;
 }
 
 // ─── Reader ───────────────────────────────────────────────
@@ -585,6 +663,8 @@ interface PendingRecord {
   fields: SynxlFieldList;
   bytesLeft: number;
   truncated: boolean;
+  /** Lazily built by `blockKeyIndex`; see the note there on why it is cached. */
+  keyLines?: Map<string, number>;
 }
 
 /** Key token of a SYNX line: text up to whitespace, `(`, `[` or `:`. */
@@ -599,27 +679,37 @@ function keyTokenOf(line: string, from: number): string {
 }
 
 /**
- * Source line of a block's top-level `key` (§11.2): the block's root keys sit
- * at its shallowest indent, so prefer a match there and fall back to any
- * matching line, then to the record line.
+ * Index a block's top-level keys to their source lines (§11.2).
+ *
+ * Built once per record and cached, because it is consulted once per block
+ * diagnostic: re-scanning the block for each one is quadratic in the number of
+ * keys, and §13 lets a single record hold 16 MiB of them — enough to turn one
+ * hostile row into hours of CPU while every limit reads as satisfied.
+ *
+ * A key reaches the embedded document's root when its indent is at or below
+ * every indent before it: the first line opens the root level and SYNX §8.6
+ * stack repair pulls later dedents back up to it.
  */
-function blockKeyLine(p: PendingRecord, key: string): number {
-  let min = Infinity;
-  for (const l of p.blockLines) {
-    const ind = synxIndentOf(l);
-    if (ind === l.length) continue;
-    if (ind < min) min = ind;
-  }
-  let fallback = -1;
+function blockKeyIndex(p: PendingRecord): Map<string, number> {
+  if (p.keyLines) return p.keyLines;
+  const map = new Map<string, number>();
+  let runningMin = Infinity;
   for (let i = 0; i < p.blockLines.length; i++) {
     const l = p.blockLines[i];
     const ind = synxIndentOf(l);
     if (ind === l.length) continue;
-    if (keyTokenOf(l, ind) !== key) continue;
-    if (ind === min) return p.blockLineNos[i];
-    if (fallback < 0) fallback = p.blockLineNos[i];
+    if (ind > runningMin) continue;
+    runningMin = ind;
+    const key = keyTokenOf(l, ind);
+    if (!map.has(key)) map.set(key, p.blockLineNos[i]);
   }
-  return fallback >= 0 ? fallback : p.line;
+  p.keyLines = map;
+  return map;
+}
+
+/** Source line of a block's top-level `key`, or the record line if unknown. */
+function blockKeyLine(p: PendingRecord, key: string): number {
+  return blockKeyIndex(p).get(key) ?? p.line;
 }
 
 /**
@@ -667,15 +757,15 @@ class SynxlReader {
       return null;
     }
 
-    // §3.4 — indent > 0 is always block content.
-    if (indent > 0) {
+    // §3.4 — indent > 0 is always block content, but only once the document
+    // has started: §4.1 matches the prologue against a line's *trimmed* form,
+    // so a leading space before `!synxl 1` does not disqualify it. Before the
+    // prologue, an indented line falls through to the structural handling
+    // below, which accepts it as the prologue or raises the §4.1 hard error.
+    if (indent > 0 && this.prologueSeen) {
       if (this.inBlockComment) return null;
       if (this.pending) {
         this.appendBlockLine(line, lineNo);
-      } else if (!this.prologueSeen) {
-        // §4.1 — an indented line is still a non-empty, non-comment line, so a
-        // document that opens with one has no prologue.
-        hardError('MissingOrMalformedPrologue', 'missing prologue: the first significant line must be "!synxl 1"', lineNo);
       } else {
         // §11.2 — block content with no record open: discard and report against
         // the record that follows.
@@ -691,7 +781,12 @@ class SynxlReader {
 
     // Indent 0 is structural: whatever it is, it closes the open record.
     const done = this.finish();
-    const trimmed = line.trim();
+    // `trimUnicode`, not `String.prototype.trim`: ECMAScript's WhiteSpace set
+    // differs from Unicode's on two characters — it strips U+FEFF, which
+    // §3.1 only allows to be ignored at the start of input, and keeps U+0085,
+    // which §3.3's `ltrim` removes. Each difference decides whether a document
+    // is accepted at all, so the classifier has to use the format's set.
+    const trimmed = trimUnicode(line);
 
     if (trimmed === '###') { // §4.3 block-comment toggle
       this.inBlockComment = !this.inBlockComment;
@@ -778,7 +873,7 @@ class SynxlReader {
   }
 
   private handlePrologue(trimmed: string, lineNo: number): void {
-    const rest = trimmed.substring('!synxl'.length).trim();
+    const rest = trimUnicode(trimmed.substring('!synxl'.length));
     if (!/^\d+$/.test(rest)) {
       hardError('MissingOrMalformedPrologue', `malformed prologue "${trimmed}": expected "!synxl <version>"`, lineNo);
     }
@@ -901,12 +996,17 @@ class SynxlReader {
       // sub-document root, so no dedent pre-pass is needed.
       // §9.4 — directives are disabled inside this parse (not pre-filtered,
       // which would corrupt `|+` bodies).
-      const { root } = parseData(blockText, { directives: false });
+      const { root } = parseData(blockText, {
+        directives: false,
+        nondeterministicHints: false,
+      });
       const byName = new Map<string, SynxlField>();
       for (const f of fields) byName.set(f.name, f);
 
       // §9.3 — visit in Unicode scalar order so diagnostics are reproducible.
-      const keys = Object.keys(root).filter(k => !k.startsWith('__synx')).sort(compareUnicodeScalar);
+      // Only the engine's exact `__synx` metadata key is internal; a field
+      // named `__synx_id` is ordinary data and §12.1 admits no exceptions.
+      const keys = Object.keys(root).filter(k => k !== '__synx').sort(compareUnicodeScalar);
       for (const key of keys) {
         const f = byName.get(key);
         if (f && f.block) {
@@ -999,10 +1099,18 @@ export function* streamSynxl(
   let lineNo = 0;
 
   if (typeof source === 'string') {
-    const lines = source.split('\n');
-    for (const line of lines) {
-      const rec = reader.push(line, ++lineNo);
+    // Walked by index rather than `split('\n')`: splitting allocates an array
+    // of every line in the document up front, which is exactly the
+    // materialisation §15.1 says a streaming reader must avoid — on a 9 MB
+    // document that array alone costs more than the text.
+    let pos = 0;
+    while (pos <= source.length) {
+      let nl = source.indexOf('\n', pos);
+      if (nl === -1) nl = source.length;
+      const rec = reader.push(source.substring(pos, nl), ++lineNo);
       if (rec) yield rec;
+      if (nl === source.length) break;
+      pos = nl + 1;
     }
     if (options.reportTruncatedTail && source.length > 0 && !source.endsWith('\n')) {
       reader.markUnterminated();
@@ -1033,21 +1141,33 @@ export async function* streamSynxlAsync(
   let decoder: { decode(input?: Uint8Array, options?: { stream?: boolean }): string } | null = null;
   let buf = '';
   let lineNo = 0;
+  // The line buffer is bounded by the per-record budget (§13, §16.3): without
+  // a cap, input with no `LF` in it grows the buffer without limit, so a
+  // single uploaded file turns "streaming" into holding the whole thing — and
+  // the repeated `substring` on a multi-megabyte buffer makes it quadratic on
+  // top of that. Over the cap the line is truncated at a UTF-8 boundary, which
+  // is the same outcome an oversized record has (§13).
+  const lineCap = options.maxRecordBytes ?? MAX_SYNXL_RECORD_BYTES;
+  let overflowed = false;
 
   for await (const chunk of source) {
-    if (typeof chunk === 'string') {
-      buf += chunk;
-    } else {
-      decoder = decoder ?? new TextDecoder('utf-8');
-      buf += decoder.decode(chunk, { stream: true });
-    }
+    const text = typeof chunk === 'string'
+      ? chunk
+      : (decoder = decoder ?? new TextDecoder('utf-8')).decode(chunk, { stream: true });
+    buf += text;
+
     let nl = buf.indexOf('\n');
     while (nl !== -1) {
       const line = buf.substring(0, nl);
       buf = buf.substring(nl + 1);
-      const rec = reader.push(line, ++lineNo);
+      const rec = reader.push(overflowed ? truncateUtf8(line, lineCap) : line, ++lineNo);
+      overflowed = false;
       if (rec) yield rec;
       nl = buf.indexOf('\n');
+    }
+    if (utf8Length(buf) > lineCap) {
+      buf = truncateUtf8(buf, lineCap);
+      overflowed = true;
     }
   }
   if (decoder) buf += decoder.decode();
@@ -1070,7 +1190,9 @@ export async function* streamSynxlAsync(
  * no insignificant whitespace) — the same one `Synx.toJSON` uses.
  */
 function canonicalJson(values: SynxObject): string {
-  return toCanonicalJSONString(values, false);
+  // §9.5 — SYNXL captures no metadata, so a `__synx` key in a record is caller
+  // data and must survive into the projection (§12.1).
+  return toCanonicalJSONString(values, false, false);
 }
 
 function asDocument(source: string | SynxlDocument, options?: SynxlOptions): SynxlDocument {
@@ -1087,13 +1209,19 @@ export function synxlToJSON(source: string | SynxlDocument, options: SynxlOption
 
 /**
  * Canonical **NDJSON** projection (SYNXL §12.2): one canonical JSON object per
- * line, `LF`-separated, with no enclosing array and no trailing newline.
+ * line, `LF`-separated.
+ *
+ * Each record is terminated, not separated — the NDJSON convention, what the
+ * reference implementation emits, and what makes appending a record a pure
+ * concatenation. §1.4.3 measures conformance on these bytes, so the trailing
+ * `LF` is part of the projection rather than a formatting nicety. An empty
+ * document projects to the empty string.
  */
 export function synxlToNDJSON(source: string | SynxlDocument, options: SynxlOptions = {}): string {
   const doc = asDocument(source, options);
-  const out: string[] = [];
-  for (const r of doc.records) out.push(canonicalJson(r.values));
-  return out.join('\n');
+  let out = '';
+  for (const r of doc.records) out += canonicalJson(r.values) + '\n';
+  return out;
 }
 
 // ─── §14 Canonical serialization (writer) ─────────────────
@@ -1110,13 +1238,25 @@ function isInlineScalar(v: SynxValue): boolean {
  * only `-?digits[.digits]`, so exponent forms must be expanded. Returns null
  * for a non-finite value, which has no SYNX representation.
  *
- * Note: JS has a single number type, so an integral value is always emitted in
- * integer form; the spec's "integral floats carry `.0`" rule is unobservable
- * here and does not affect the projection (both read back as the same number).
+ * Note: JS has a single number type, so an integral value inside the safe
+ * range is always emitted in integer form; the spec's "integral floats carry
+ * `.0`" rule is unobservable there and does not affect the projection.
+ *
+ * Outside that range it *is* observable: a bare `1000000000000000000000`
+ * overflows i64 on the way back in and returns as a string (§8.1), so an
+ * integral value too large to be an integer is written with `.0` to make the
+ * reader take it as the float it was — which is what §14.1 round-trip needs.
  */
 function numberText(n: number): string | null {
   if (!Number.isFinite(n)) return null;
-  const s = String(n); // shortest form that round-trips through Number()
+  if (Number.isInteger(n) && !Number.isSafeInteger(n)) {
+    return `${expandExponent(String(n))}.0`;
+  }
+  return expandExponent(String(n));
+}
+
+/** Spell an exponent-form number out in full: SYNX §8.3 reads only `-?d.d`. */
+function expandExponent(s: string): string {
   const m = /^([+-]?)(\d+)(?:\.(\d+))?[eE]([+-]?\d+)$/.exec(s);
   if (!m) return s;
 
@@ -1146,16 +1286,20 @@ function numberText(n: number): string | null {
  */
 function synxScalarText(value: SynxValue): string | null {
   if (value === null) return 'null';
+  if (typeof value === 'bigint') return value.toString();
   if (typeof value === 'number') return numberText(value) ?? 'null';
   if (typeof value === 'boolean') return String(value);
   if (typeof value !== 'string') return null;
   if (value === '') return '""';
-  if (value.indexOf('\n') !== -1 || value.indexOf('\r') !== -1) return null;
+  if (value.indexOf('\n') !== -1) return null;
+  // ` //` and ` #` are stripped by SYNX §8.3 *before* quotes are recognised, so
+  // quoting does not protect them — `"a // b"` reads back as `"a`. The only
+  // faithful rendering is a `|+` body, where neither sequence means anything.
+  if (value.indexOf(' //') !== -1 || value.indexOf(' #') !== -1) return null;
 
   const needsQuote =
-    value !== value.trim() ||
-    value.indexOf(' //') !== -1 ||
-    value.indexOf(' #') !== -1 ||
+    value !== trimUnicode(value) ||
+    value.indexOf('\r') !== -1 ||
     value === '|' || value === '|+' ||
     value.charCodeAt(0) === 34 || value.charCodeAt(0) === 39 ||
     castType(value) !== value;
@@ -1166,32 +1310,74 @@ function synxScalarText(value: SynxValue): string | null {
   return null; // both quote characters present → carry it as a `|+` body
 }
 
+/** Effective type of a field for writing: `(type)` wins over `type:` (§8.2). */
+function fieldType(f: SynxlField): string | undefined {
+  return f.type ?? f.constraints?.type;
+}
+
+/**
+ * Strip trailing spaces and tabs.
+ *
+ * Hand-rolled rather than `/[ \t]+$/`: an unanchored trailing-run pattern
+ * restarts at every position inside a long run of spaces, so a single cell
+ * holding 100k spaces turns one write into seconds of CPU.
+ */
+function trimTrailingSpacesTabs(s: string): string {
+  let end = s.length;
+  while (end > 0) {
+    const ch = s.charCodeAt(end - 1);
+    if (ch !== 32 && ch !== 9) break;
+    end--;
+  }
+  return end === s.length ? s : s.substring(0, end);
+}
+
 /**
  * Render a value for an **inline** record part, or null when the field must be
  * promoted to a block field (§14.3).
  */
-function inlineText(value: SynxValue): string | null {
+function inlineText(value: SynxValue, type?: string): string | null {
   if (value === null || value === undefined) return '';
   if (typeof value === 'boolean') return String(value);
+  if (typeof value === 'bigint') return value.toString();
   // §14.3 — a non-finite float is written as an empty part, reading back as
   // `null`, which is also what the JSON projection carries.
   if (typeof value === 'number') return numberText(value) ?? '';
   if (typeof value !== 'string') return null; // objects / arrays are block-only
   if (value === '') return '""';
-  if (value.indexOf('\n') !== -1 || value.indexOf('\r') !== -1) return null;
+  // A `CR` is ordinary content in an inline part (only `CRLF` is a line ending,
+  // §3.2) and quoting carries it fine. Promoting it to a `|+` body would lose
+  // it, because a multiline body cannot hold one.
+  if (value.indexOf('\n') !== -1) return null;
 
   const needsQuote =
-    value !== value.trim() ||
+    // Unicode whitespace, not just ASCII: a leading U+00A0 gives the written
+    // line a non-zero indent (§3.3) and the record is read as block content.
+    value !== trimUnicode(value) ||
     value.indexOf(';') !== -1 ||
+    value.indexOf('\r') !== -1 ||
     value.startsWith('#') || value.startsWith('//') || value.startsWith('!') ||
     // §14.3 — a leading quote character would be re-read as an opening quote.
     value.charCodeAt(0) === 34 || value.charCodeAt(0) === 39 ||
-    castAuto(value) !== value;
+    // §8.2 — a typed column casts what it reads, so an unquoted `N/A` in an
+    // `int` column returns as null plus a `CastFailed`. §7.4 exempts quoted
+    // parts from casting, which is what keeps the string a string.
+    (type ? castTyped(value, type).value !== value : castAuto(value) !== value);
 
   if (!needsQuote) return value;
   if (value.indexOf('"') === -1) return `"${value}"`;
   if (value.indexOf("'") === -1) return `'${value}'`;
-  return null; // contains `;` (or other trigger) plus both quote chars → block
+  // Both quote characters present. §7.1 step 3 falls back to *unquoted* on
+  // trailing garbage after a closing quote, so a value that only needs quoting
+  // because it starts with one round-trips bare. Promote only when something
+  // else — a `;`, edge whitespace, a reserved prefix — forces the issue.
+  const onlyLeadingQuote =
+    (value.charCodeAt(0) === 34 || value.charCodeAt(0) === 39) &&
+    value === trimUnicode(value) &&
+    value.indexOf(';') === -1 &&
+    value.indexOf('\r') === -1 &&
+    !value.startsWith('#') && !value.startsWith('//') && !value.startsWith('!');
+  return onlyLeadingQuote ? value : null;
 }
 
 function emitListItem(item: SynxValue, indent: number, out: string[], step: number): void {
@@ -1276,7 +1462,7 @@ function emitGroup(group: WriteGroup, out: string[], step: number): void {
   for (const rec of group.records) {
     for (const f of group.fields) {
       if (blockNames.has(f.name)) continue;
-      if (inlineText(rec[f.name] ?? null) === null) blockNames.add(f.name);
+      if (inlineText(rec[f.name] ?? null, fieldType(f)) === null) blockNames.add(f.name);
     }
   }
 
@@ -1302,7 +1488,7 @@ function emitGroup(group: WriteGroup, out: string[], step: number): void {
     const parts: string[] = [];
     for (const f of group.fields) {
       if (blockNames.has(f.name)) continue;
-      parts.push(inlineText(rec[f.name] ?? null) ?? '');
+      parts.push(inlineText(rec[f.name] ?? null, fieldType(f)) ?? '');
     }
     // §7.2 — a record whose every inline field is null renders as the all-null
     // form, exactly `;`, which the reader recognizes at any arity without
@@ -1310,7 +1496,7 @@ function emitGroup(group: WriteGroup, out: string[], step: number): void {
     // arity 1, and §3.5 makes blank lines invisible.
     const line = parts.every(t => t === '')
       ? ';'
-      : parts.join('; ').replace(/[ \t]+$/, '');
+      : trimTrailingSpacesTabs(parts.join('; '));
     out.push(line);
 
     for (const f of group.fields) {

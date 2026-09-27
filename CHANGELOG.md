@@ -14,6 +14,253 @@ All notable changes to this repository are documented in this file.
 > for `3.7.0` was free, so npm and every other registry — plus the
 > git tag — now publish on the same version number.
 
+## [3.7.2] — 2026-09-27
+
+A correctness and hardening pass over SYNXL and the SYNX parser underneath it,
+from a full audit of all four implementations against
+[`SYNXL-1-NORMATIVE.md`](docs/spec/SYNXL-1-NORMATIVE.md). Every item below was
+reproduced before it was fixed; none of them was covered by the existing suites,
+which is itself addressed at the end.
+
+The whole conformance corpus now agrees byte-for-byte across Rust, TypeScript
+and Python — 86 documents through both projections, including the audit's own
+repro set.
+
+### Fixed — secrets and active-mode parity
+
+- **`:secret` printed in clear by `console.log`** (`packages/synx-js/src/engine.ts`).
+  `SynxSecret` masked `String()` and `JSON.stringify`, but its value sat in an
+  ordinary own property, so `util.inspect` — and with it `console.log(config)` —
+  printed `SynxSecret { _value: '<the key>' }`. The value is now a runtime-private
+  field and `util.inspect` shows `[SECRET]`; spread and `Object.entries` see nothing.
+  `reveal()` is unchanged.
+
+- **`:secret` handed unmasked to WASM marker plugins** (`crates/synx-core/src/wasm.rs`).
+  The payload for `synx_apply()` passed `Value::Secret` through raw; a plugin is
+  less trusted than the core and now receives `[SECRET]`, as every other output
+  does. The same payload built invalid JSON for any nested string (no quotes, no
+  escaping) and for non-finite floats; nested values are now real JSON.
+
+- **`{:?}` printed secrets** (`crates/synx-core/src/value.rs`). `Value` derived
+  `Debug`; it is now hand-written and shows `Secret([SECRET])`.
+
+- **TypeScript diverged from `synx-core` in three active-mode cases**, found by a
+  4 000-document differential run:
+  - `(int)` on a non-integer (`-404.3`) truncated to `-404`; it now yields `0`,
+    like the reference `parse::<i64>().unwrap_or(0)`.
+  - `[enum:…]` accepted `null`; it now reports `CONSTRAINT_ERR` as the reference does.
+  - no `TYPE_ERR` pass: a `(type)` hint the resolved value no longer matches
+    now becomes `TYPE_ERR: '<key>' expected <type> but got <type>`.
+
+### Fixed — parser crashes
+
+- **Panic on a Unicode indent inside a `|+` body** (`crates/synx-core/src/parser.rs`).
+  Indentation is measured over Unicode whitespace (SYNX §4) but the body slice
+  was taken at that byte count, so a continuation line opening with U+00A0 cut
+  into the middle of a character and aborted the process. 53 bytes of input were
+  enough; roughly one random document in two hundred hit it. Reached from
+  `synx parse`, the SYNXL block delegation (§9.3) and the Python binding alike,
+  where it surfaced as a `PanicException` that `except Exception` cannot catch.
+
+- **Panic at the multiline body cap.** The 1 MiB `MAX_MULTILINE_BLOCK_BYTES`
+  cut was a raw byte slice, so a body whose limit fell inside a multi-byte
+  character panicked — any long field of Cyrillic, CJK or emoji text. The
+  TypeScript parser had the mirror-image bug: it measured the cap in UTF-16
+  units and split surrogate pairs, emitting a lone surrogate that strict JSON
+  consumers reject.
+
+- **Unbounded recursion in the Python value converter**
+  (`bindings/python/src/lib.rs`). `synxl_write({"self": itself})` overflowed the
+  native stack and killed the interpreter outright — no traceback, nothing to
+  catch. Conversion now refuses anything deeper than the parser's own nesting
+  cap, which also covers cycles.
+
+### Fixed — silent data loss
+
+- **`#`, `//` and `###` were deleted from inside `|` and `|+` bodies.** A
+  multiline body is raw text (SYNX §8.4.1), but the comment rules ran before the
+  block-continuation branch, so every Python/C/JS comment and Markdown heading
+  in a dataset disappeared on the first read, with no diagnostic and exit 0.
+  Worse, a `###` pair inside a body toggled block-comment mode and swallowed the
+  *following* field. Directives had the same ordering bug and are fixed with it,
+  which is what SYNXL §9.4 requires. Both parsers now consult the block branch
+  first, as the `!` case already did.
+
+- **Writers dropped values that only quoting could carry.** The quoting
+  predicate looked at ASCII space and tab only, so a value with a leading
+  U+00A0 was written bare, read back with a non-zero indent (§3.3) and the whole
+  record vanished. It also ignored the column's declared type, so `"N/A"` in an
+  `int` column lost its quotes and returned as `null` plus a `CastFailed`. In
+  TypeScript, a value containing ` #` or ` //` was quoted rather than promoted —
+  quoting does not protect those, since SYNX strips the comment first — and a
+  value containing `CR` was promoted to a `|+` body, which cannot hold one.
+
+- **SYNX's internal limits truncated block content without a word.** The 1 MiB
+  body cap and the two-million-line cap both dropped input while `validate`
+  still reported `0 diagnostics`. Parse results now carry a `truncated` flag,
+  which SYNXL turns into the `RecordTruncated` diagnostic §11.2 requires — the
+  signal §16.4 tells consumers to rely on.
+
+- **`synx synxl split` swallowed every diagnostic**, `RecordTruncated`
+  included. It is the one subcommand after which the original is usually
+  deleted.
+
+- **64-bit integers lost precision in TypeScript.** `parseInt` rounded a
+  19-digit snowflake id to a different id, with no diagnostic, and a typed
+  `int` column never failed on overflow at all. Integers outside JavaScript's
+  safe range but inside i64 are now exact (`bigint`), and one that overflows i64
+  falls through to the string rule, matching the reference implementation.
+
+- **The canonical JSON writer dropped fields** (`packages/synx-js/src/json.ts`).
+  Sorting through a `JSON.stringify` replacer was undone on the way out —
+  JavaScript emits integer-like keys first — and assigning `__proto__` onto a
+  plain object hit the prototype setter, so that field never appeared. The
+  writer is now hand-rolled: key order holds, `__proto__` survives as data, and
+  numbers and escapes match the reference byte for byte.
+
+### Fixed — denial of service
+
+- **Catastrophic backtracking via `pattern:`** in TypeScript validating mode:
+  `^(a+)+$` against 45 characters hung the event loop indefinitely, from an
+  88-byte document in which both the pattern and the value are attacker-supplied.
+  Patterns that nest one quantifier inside another are now refused rather than
+  run.
+
+- **`streamSynxlAsync` held the whole input.** With no `LF` in sight the line
+  buffer grew without limit and the repeated `substring` made it quadratic:
+  100 MB took 21 s and 1.5 GiB. It is now bounded by the per-record budget
+  (§13, §16.3) — 60 MB in 0.2 s and 13 MB of heap.
+
+- **Quadratic block-diagnostic attribution.** Each block diagnostic re-scanned
+  the whole block, so 60 000 keys took 55 s against Rust's 1.6 s. The scan is
+  now a single indexed pass.
+
+- **Quadratic trailing-whitespace strip in the writer** (`/[ \t]+$/`): a cell of
+  100 k spaces cost 7.5 s.
+
+- **The Python binding held the GIL through every parse**, freezing all other
+  threads in the process for the duration. Parsing, file reading and both
+  projections now release it.
+
+### Fixed — non-determinism and injection
+
+- **The same document parsed differently on each read.** The §8.3 ban on
+  `random` hints was enforced for `!fields` but not inherited by the delegated
+  block parse, so `r1(random) x` in a record produced a fresh number every time
+  — defeating hashing, de-duplication and the byte-identical projection §1.4 is
+  measured on. Both parsers now disable the hints for embedded parses, alongside
+  the existing directive switch.
+
+- **CSV formula injection.** `synx synxl convert --to csv` wrote cells opening
+  with `=`, `+`, `-`, `@`, TAB or CR verbatim, so exporting an untrusted dataset
+  and opening it in a spreadsheet executed them. Such cells are now defused, and
+  the count is reported rather than applied in silence.
+
+- **`--prefix` was a path-traversal primitive** in `split`: it was interpolated
+  straight into the shard path.
+
+- **`__proto__` could reshape a record in TypeScript.** The key was rejected
+  after the parser repaired its indentation stack rather than before, so a
+  rejected key still closed a real field's subtree and the lines beneath it
+  overwrote the sibling the document declared.
+
+### Fixed — partial results and exit codes
+
+- **A hard error left a valid-looking partial projection on stdout.** §11.1
+  forbids a partial result, but the buffered writer flushed on the way out, so
+  `parse -f ndjson` emitted a truncated-but-well-formed stream that a pipeline
+  losing `$?` cannot tell from a complete one. stdout targets are now
+  pre-flighted, and file targets go through a temporary and a rename.
+
+- **A failed command deleted a pre-existing `--output` file.** Cleanup removed
+  the path whether or not the command had created it.
+
+- **`split` left finished shards behind on an abort**, and a re-split with a
+  larger `-n` left the previous run's extra shards in place, where a glob reads
+  them as duplicate records.
+
+- **Invalid UTF-8 exited 2 (I/O) instead of 1 (specification).** A caller that
+  retries on 2 would retry forever.
+
+- **`convert jsonl→synxl` wrote `null` into fields a record never had**,
+  contradicting §12.1. Field lists are now re-declared per record shape, exactly
+  as a source document would (§4.2). It also produced an unreadable document
+  from empty objects, and `write_lines` accepted field names containing `;`,
+  newlines or brackets — which read back as a *different schema*, silently.
+
+### Added
+
+- `--diagnostics-out FILE` on every `synx synxl` subcommand, writing diagnostics
+  as NDJSON. §11.2 forbids stderr text from being the only channel.
+- `-` as an input path, reading stdin.
+- `synxl→csv` now writes the header row for a dataset with a schema but no
+  records.
+- The Python binding accepts `os.PathLike` paths, rejects a bare string for
+  `fields`, converts tuples to arrays, and `SynxlRecord` completes the mapping
+  protocol (`__iter__`, `get`, `items`, `KeyError` instead of `IndexError`).
+  `doc.records` returns a fresh list, so mutating it can no longer leave the
+  document contradicting itself.
+- **PyO3 upgraded from 0.24 to 0.29**, which is what actually fixes the Python
+  binding failing to build against CPython 3.14 — 0.24 refused outright, and no
+  `PYO3_USE_ABI3_FORWARD_COMPATIBILITY` escape hatch is needed any more. It is
+  gone from both workflows.
+
+  The migration was mechanical: `PyObject` left the prelude (it is `Py<PyAny>`),
+  `Python::allow_threads` became `Python::detach`, and `Bound::downcast` became
+  `Bound::cast`. 0.29 supports CPython 3.8 and up, which is exactly the range
+  `requires-python` already advertised, so the wheel matrix is unaffected.
+  Verified on 3.14: the full binding suite passes and the GIL is still released
+  for the duration of a parse.
+
+### Added — test coverage for the gaps that let all of this through
+
+Three holes explain why 33 defects survived a green CI, and each is now closed:
+
+- **The conformance suite only ever exercised the parser.** §14 (writer,
+  round-trip) and §15.3 (shardability) had no coverage at all. Both runners now
+  check §14.1 — `parse(write(parse(D)))` against `parse(D)` — on every accepted
+  case, and `synx-cli` checks §15.3 across the whole corpus at four shard sizes:
+  every shard must parse standalone and the rejoined projections must equal the
+  source's. Three cases failed round-trip on the first run.
+
+- **SYNXL had no fuzz target**, though §16 names it the format that reads
+  untrusted input. `fuzz_synxl` asserts crash-freedom plus the two invariants a
+  reader/writer pair must hold (§1.4.3 reader agreement, §14.1 round-trip).
+  Because cargo-fuzz needs a nightly toolchain and a sanitizer runtime, and so
+  never gates a commit, `tests/property_synxl.rs` runs the same invariants over
+  8 000 generated documents in the ordinary `cargo test` path, alongside a
+  regression set of the minimised hostile inputs and two superlinearity guards.
+
+- **Nothing compared the implementations to each other.**
+  `scripts/ci/diff-implementations.mjs` runs the corpus plus the audit's
+  minimised divergences through the Rust CLI and the TypeScript package and
+  compares both projections byte for byte — 105 documents. A new `synxl-cross`
+  CI job runs all of the above together.
+
+Seventeen conformance cases were added for the defects a fixture can pin down.
+That distinction matters and is now written into the suite's README: a
+self-checking invariant like round-trip cannot catch *symmetric* loss — a parser
+that drops the same content going in and coming out still round-trips perfectly
+— which is exactly what comment lines vanishing from a `|+` body looked like.
+Only an independently derived expectation catches that.
+
+Regression suites were added for the two implementations whose defects lie
+outside the fixtures' reach: `packages/synx-js/tests/synxl-hardening.test.ts`
+(27 cases, including the denial-of-service bounds) and
+`bindings/python/tests/test_synxl_hardening.py` (25 cases, covering the
+Python→SYNXL direction the conformance suite cannot see).
+
+### Notes
+
+- `SynxPrimitive` (TypeScript) gains `bigint`, and `ParseResult` (Rust) gains
+  `truncated`. Both are additive.
+- The NDJSON projection now terminates each record with `LF` rather than
+  separating them, matching the reference implementation and making an append a
+  plain concatenation.
+- One documented divergence remains: JavaScript cannot distinguish `5.0` from
+  `5`, so an integral float projects as `5` there and `5.0` in Rust. §14.3
+  already admits this.
+
 ## [3.7.1] — 2026-07-31
 
 A release-integrity fix. 3.7.0 reached crates.io and NuGet but not npm, PyPI or

@@ -3,8 +3,16 @@
  * Core type definitions for the SYNX parser.
  */
 
-/** Primitive value types that SYNX supports */
-export type SynxPrimitive = string | number | boolean | null;
+/**
+ * Primitive value types that SYNX supports.
+ *
+ * `bigint` appears only for integers outside JavaScript's safe range that are
+ * still inside i64 — the range the reference implementation represents exactly
+ * and `number` cannot. Snowflake ids and BIGINT primary keys live there, and
+ * rounding them to the nearest float silently rewrites the key a row is joined
+ * on. Everything inside ±2^53-1 stays a plain `number`.
+ */
+export type SynxPrimitive = string | number | bigint | boolean | null;
 
 /** A SYNX value can be a primitive, an array, or a nested object */
 export type SynxValue = SynxPrimitive | SynxArray | SynxObject;

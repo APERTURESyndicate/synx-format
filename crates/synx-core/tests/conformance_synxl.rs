@@ -122,6 +122,63 @@ fn cross_check_streaming(name: &str, input: &str, doc: &synxl::SynxlDocument) ->
     None
 }
 
+/// §14.1 — `parse(write(parse(D)))` must project identically to `parse(D)`.
+///
+/// Self-checking, so it applies to every accepted case in the suite without a
+/// fixture of its own: §14.1's scope is documents obtained by parsing, which is
+/// exactly what these are. The writer is otherwise untested by the suite, and
+/// its failures are the quiet kind — a value that comes back as a different
+/// type, or a record that disappears because its line acquired an indent.
+fn cross_check_round_trip(name: &str, doc: &synxl::SynxlDocument) -> Option<String> {
+    // §4.2 — a document may switch field lists mid-file, and each group has to
+    // be written under the list that was in effect for it.
+    let mut written = String::from("!synxl 1\n");
+    let mut start = 0usize;
+    while start < doc.records.len() {
+        let fl_idx = doc.record_field_lists.get(start).copied().unwrap_or(0);
+        let mut end = start + 1;
+        while end < doc.records.len()
+            && doc.record_field_lists.get(end).copied().unwrap_or(0) == fl_idx
+        {
+            end += 1;
+        }
+        let fields = match doc.field_lists.get(fl_idx) {
+            Some(fl) => fl.fields(),
+            None => return Some(format!("{name}: record {start} names field list {fl_idx}, which does not exist")),
+        };
+        let group = match synxl::write_lines(fields, &doc.records[start..end]) {
+            Ok(text) => text,
+            Err(err) => {
+                return Some(format!(
+                    "{name}: §14 writer refused a document it had just parsed: {err}"
+                ))
+            }
+        };
+        // Each group is written as a whole document; drop the repeated prologue.
+        written.push_str(group.strip_prefix("!synxl 1\n").unwrap_or(&group));
+        start = end;
+    }
+
+    match synxl::parse_lines(&written) {
+        Ok(reparsed) => {
+            if reparsed.to_json() == doc.to_json() {
+                None
+            } else {
+                Some(format!(
+                    "{name}: §14.1 round-trip changed the projection\n       written:  {}\n       got:      {}\n       expected: {}",
+                    written.replace('\n', "\\n"),
+                    reparsed.to_json(),
+                    doc.to_json()
+                ))
+            }
+        }
+        Err(err) => Some(format!(
+            "{name}: §14.1 round-trip produced a document the parser rejects: {err}\n       written: {}",
+            written.replace('\n', "\\n")
+        )),
+    }
+}
+
 fn read(path: &Path) -> String {
     fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {}", path.display(), e))
 }
@@ -211,6 +268,10 @@ fn run_case(input_path: &Path) -> Result<(), String> {
         .collect();
 
     if let Some(msg) = cross_check_streaming(&name, &input, &doc) {
+        return Err(msg);
+    }
+
+    if let Some(msg) = cross_check_round_trip(&name, &doc) {
         return Err(msg);
     }
 

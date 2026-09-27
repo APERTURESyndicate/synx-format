@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 /// SYNX value types.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(untagged))]
 pub enum Value {
@@ -16,6 +16,22 @@ pub enum Value {
     Object(HashMap<std::string::String, Value>),
     /// Secret value — displays as [SECRET], real value accessible via as_secret()
     Secret(std::string::String),
+}
+
+// Hand-written so `{:?}` in a log line never prints a secret.
+impl std::fmt::Debug for Value {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Value::String(s) => f.debug_tuple("String").field(s).finish(),
+            Value::Int(i) => f.debug_tuple("Int").field(i).finish(),
+            Value::Float(x) => f.debug_tuple("Float").field(x).finish(),
+            Value::Bool(b) => f.debug_tuple("Bool").field(b).finish(),
+            Value::Null => f.write_str("Null"),
+            Value::Array(a) => f.debug_tuple("Array").field(a).finish(),
+            Value::Object(o) => f.debug_tuple("Object").field(o).finish(),
+            Value::Secret(_) => f.write_str("Secret([SECRET])"),
+        }
+    }
 }
 
 impl Value {
@@ -196,6 +212,13 @@ pub struct ParseResult {
     pub includes: Vec<IncludeDirective>,
     /// !use directives parsed from the file (package imports).
     pub uses: Vec<UseDirective>,
+    /// One of the parser's resource limits dropped input: the total byte cap,
+    /// the indexed-line cap, or a multiline block body cap.
+    ///
+    /// Callers that treat "parsed without complaint" as "nothing was lost"
+    /// need this — SYNXL §11.2 turns it into a `RecordTruncated` diagnostic
+    /// rather than discarding the overflow in silence.
+    pub truncated: bool,
 }
 
 /// Options for active mode resolution.

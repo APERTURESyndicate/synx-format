@@ -19,6 +19,20 @@ no `.dll` / `.so` dependency to ship.
 | [`swift/`](swift/)     | **Swift 5** | SwiftPM `Synx`, no FFI |
 | [`../integrations/godot/synx-gdscript/`](../integrations/godot/synx-gdscript/) | **GDScript / Godot 4** | Pure-GDScript engine packaged as a Godot editor addon (`addons/synx`); lives under `integrations/` because it ships as a Godot plugin, but is a from-scratch parser on par with the entries above |
 
+## Development status
+
+Active development — new releases, fixes, fuzzing and differential testing —
+currently goes into the implementations that carry real demand:
+
+- **Rust `synx-core`** and everything built on it: the `synx` CLI and the
+  Python, Node and WASM bindings;
+- **TypeScript `packages/synx-js`** (npm `@aperturesyndicate/synx-format`).
+
+The native ports (C++, Dart, .NET, Go, Java, Swift, Godot/GDScript) remain
+supported on SYNX 3.7 but track releases with a lag: their demand is an order
+of magnitude lower, so fixes land there after they have settled in the two
+implementations above. For a new project, prefer Rust or TypeScript.
+
 `../tree-sitter-synx/` holds the editor/Linguist grammar (separate from the
 runtime parsers above). `../crates/synx-lsp` is the language server, not a
 parser — see [`../integrations/README.md`](../integrations/README.md).
@@ -45,6 +59,25 @@ engine do **not** read `.synxl`. Adding it means implementing the whole of
 SYNXL-1 and passing [`../tests/conformance-synxl/cases/`](../tests/conformance-synxl/cases/),
 which is the practical conformance contract; block-field parsing delegates to
 the parser's existing SYNX 3.7 implementation rather than a second tree builder.
+
+Passing the fixtures is necessary but not sufficient — a full audit of the four
+implementations above found 33 defects while every suite was green. A new
+implementation should also satisfy the four obligations in
+[the suite's README](../tests/conformance-synxl/README.md#what-a-runner-must-check),
+and the two checks that live outside the fixtures:
+
+| Check | Where | What it catches |
+|---|---|---|
+| §14.1 round-trip on every accepted case | in the conformance runner itself | a writer that emits values it cannot read back |
+| §15.3 shardability on every accepted case | [`../crates/synx-cli/src/synxl.rs`](../crates/synx-cli/src/synxl.rs) tests | a splitter that loses the field list in effect at the split point |
+| randomised invariants and known-hostile inputs | [`../crates/synx-core/tests/property_synxl.rs`](../crates/synx-core/tests/property_synxl.rs) | panics, superlinear blow-ups, reader disagreement |
+| deep fuzzing | [`../crates/synx-core/fuzz/fuzz_targets/fuzz_synxl.rs`](../crates/synx-core/fuzz/fuzz_targets/fuzz_synxl.rs) | the same, far deeper (needs nightly) |
+| cross-implementation differential | [`../scripts/ci/diff-implementations.mjs`](../scripts/ci/diff-implementations.mjs) | §1.4.3 divergence on inputs no fixture covers |
+
+The last one is the important one for a *new* parser: §1.4.3 measures
+conformance on byte-identical projections against the reference
+implementation, and two suites can both be green while the implementations
+disagree on everything the fixtures happen not to cover.
 
 The `../bindings/` tree holds the **non-native** language surfaces that
 still need to call into the canonical engine:

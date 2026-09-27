@@ -24,6 +24,8 @@ jobs:
             os: windows-latest
           - check: kotlin-smoke
             os: ubuntu-latest
+          - check: synxl-cross
+            os: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -51,7 +53,6 @@ jobs:
       - name: Python smoke (Rust unit tests)
         if: matrix.check == 'python-smoke'
         env:
-          PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
           PYO3_PYTHON: ${{ steps.setup-python.outputs.python-path }}
         run: cargo test -p synx-python --lib --no-default-features
 
@@ -100,3 +101,36 @@ jobs:
         env:
           SYNX_LIB_DIR: ${{ github.workspace }}/target/release
         run: chmod +x ./gradlew && ./gradlew test --no-daemon
+
+      # SYNXL §1.4.3 measures conformance on byte-identical projections, so
+      # the two implementations have to be compared against *each other*, not
+      # only against the fixtures. Both suites were green while 21 divergences
+      # existed; this is what would have caught them.
+      - name: Setup Node (SYNXL cross-check)
+        if: matrix.check == 'synxl-cross'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Build the CLI and the TypeScript package
+        if: matrix.check == 'synxl-cross'
+        run: |
+          cargo build -p synx-cli
+          npm --prefix packages/synx-js ci
+          npm --prefix packages/synx-js run build
+
+      - name: SYNXL conformance, round-trip and property tests (Rust)
+        if: matrix.check == 'synxl-cross'
+        run: cargo test -p synx-core --test conformance_synxl --test property_synxl
+
+      - name: SYNXL shardability and CLI tests (Rust)
+        if: matrix.check == 'synxl-cross'
+        run: cargo test -p synx-cli
+
+      - name: SYNXL conformance and round-trip (TypeScript)
+        if: matrix.check == 'synxl-cross'
+        run: npm --prefix packages/synx-js test
+
+      - name: Rust vs TypeScript differential
+        if: matrix.check == 'synxl-cross'
+        run: node scripts/ci/diff-implementations.mjs

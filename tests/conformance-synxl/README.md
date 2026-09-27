@@ -19,7 +19,11 @@ fixture without discussion.
 > `String.trim()` was eating the NBSP in `118`) and one genuinely incompatible reading of quoting between the
 > two implementations; two fixtures (`080`, `118`) that themselves violated §7.1/§3.3 were corrected, `§7.2`
 > gained the "all-null record" rule, and `§3.3` gained a normative note on the indent/trim asymmetry. All of
-> that is folded into the spec and into the cases below.
+> that is folded into the spec and into the cases below. Round 3: a full audit of all four implementations
+> found 33 defects, none of which any suite caught — including panics on a Unicode indent, comment lines being
+> deleted out of `|` / `|+` bodies, and a document whose projection differed between two reads of the same
+> bytes. Seventeen cases were added for the shapes that a fixture can pin down, and the runners gained the
+> §14.1 round-trip check described below for the ones it cannot.
 
 ## Directory layout
 
@@ -45,6 +49,26 @@ definition non-fatal and a result is still produced.
 All fixture files are UTF-8, no BOM, `LF` line endings only. Two cases (`118-non-breaking-space-not-trimmed`,
 `162-nbsp-leading-line-is-block-content-not-record`) deliberately embed a literal U+00A0 (NO-BREAK SPACE) byte
 sequence (`C2 A0`) — that is not a mistake, do not "fix" it to an ASCII space.
+
+## What a runner must check
+
+A conforming runner does more than compare the fixture files. For every case it MUST:
+
+1. compare the §12.1 array projection against `.expected.json`, byte for byte, or confirm the hard error
+   named by `.expected.error`;
+2. compare the §11.2 diagnostics against `.expected.diagnostics` — kind, record index and line, in order;
+3. confirm that every reader the implementation exposes (in-memory, streaming, whatever else) produces the
+   *same* projection for the same input (§1.4.3, §15.1);
+4. confirm §14.1 round-trip: `parse(write(parse(D)))` must project identically to `parse(D)`.
+
+Points 3 and 4 need no fixture of their own — they are self-checking, and they cover the writer, which the
+fixtures otherwise never exercise. That gap was not theoretical: three cases in this suite failed round-trip
+while their `.expected.json` matched, because the writer emitted values it could not read back.
+
+**What a self-checking invariant cannot catch:** loss that is symmetric. If a parser drops the same content
+on the way in and on the way out, round-trip still holds and the data is still gone — which is exactly what
+comment lines disappearing from a `|+` body looked like. Only a fixture with an independently derived
+expectation catches that, which is why cases `032` and `033` exist.
 
 ## File formats
 
@@ -145,21 +169,29 @@ One line per diagnostic, **in the order** the reference algorithm would record t
 | `014-unknown-directive-line-at-indent0` | §4.1 | `!active` at indent 0 (neither prologue nor field list) → hard error. |
 | `015-repeated-prologue-different-version` | §4.1 | A second `!synxl 2` later in the document, after `!synxl 1` → hard error. |
 | `016-repeated-prologue-same-version-accepted` | §4.1, §15.3 | A second `!synxl 1` (same version) later in the document is accepted and ignored — the shard-concatenation case. |
+| `017-prologue-indented` | §4.1, §3.4 | The prologue is matched against a line’s *trimmed* form, so a leading space does not disqualify it. |
+| `018-bom-after-prologue-token` | §3.1, §4.1 | U+FEFF is not whitespace and is ignored only at the start of input, so `!synxl 1<BOM>` is not a prologue → hard error. |
+| `019-nel-after-prologue-token` | §3.3, §4.1 | U+0085 *is* Unicode whitespace, so `!synxl 1<NEL>` trims to a valid prologue. |
 | `020-record-without-field-list` | §4.2 | Record line with no `!fields` in effect → hard error. |
 | `021-field-list-redeclared-mid-file` | §4.2 | A second `!fields` line, with a **different** field set, replaces the first; earlier/later records keep their own schema. |
 | `022-field-list-malformed-empty` | §5 | `!fields` with zero declarations → hard error. |
 | `030-comments-hash-and-slash` | §4.3 | `#` and `//` line comments at indent 0. |
 | `031-comments-block-toggle` | §4.3 | `###` toggles block-comment mode, hiding a record between two `###` lines. |
+| `032-comments-inside-multiline-are-content` | SYNX §8.4.1, §9.3 | `#` and `//` lines inside a `\|+` body are data, not comments — a body is a raw byte slice and is not line-classified. |
+| `033-hash-fence-inside-multiline-is-content` | §4.3, SYNX §8.4.1 | A `###` line inside a body is content and must not toggle block-comment mode, which would swallow the following field. |
 | `040-duplicate-field-name` | §5.1 | Duplicate field name in one field list → hard error. |
 | `041-marker-chain-in-field-decl` | §5.2 | A 2-segment marker chain (`:custom:tag`) on a field declaration → hard error. |
 | `042-unknown-constraint-and-flag-ignored` | §5.2 | Unrecognized bare flag and unrecognized `key:value` constraint part are silently ignored; recognized parts still apply. |
 | `043-single-marker-in-field-decl` | §5.2 | A lone single marker (`:custom`, no second segment) → hard error, same as a chain. |
+| `044-field-name-keeps-bom` | §5.1 | Field names compare by exact Unicode scalar sequence; U+FEFF is not whitespace, so it stays part of the name. |
 | `050-block-combined-with-type-paren` | §5.3 | `(type)` combined with `[block]` → hard error. |
 | `051-block-combined-with-type-constraint` | §5.3 | `type:` inside `[...]` combined with `block` → hard error. |
 | `052-arity-excludes-block-field` | §5.3, §7.3 | A 3-field list with one `[block]` field has inline arity 2; the block field never occupies a record-line position. |
 | `053-field-list-arity-zero` | §5.3 | Every field is `[block]` → inline arity 0 → hard error. |
 | `060-record-reserved-prefixes-are-data` | §6 | Record lines starting with `-`, `[`, `:`, `(`, `/`, `@` are ordinary data, not filtered like SYNX key lines. |
 | `061-slash-vs-slashslash` | §4.3, §6 | `/var/log/app` is data; `//var` is a comment and produces no record. |
+| `062-numeric-looking-field-names` | §12.1 | Keys sort by Unicode scalar order: `10` before `2`. A projection built on a plain JS object re-orders these numerically. |
+| `063-reserved-js-field-names` | §12.1 | `__proto__` and `constructor` are ordinary field names and must appear in the projection. |
 | `070-quoted-semicolon` | §7.1 | A quoted part containing `;` is not split; comparison unquoted part alongside it. |
 | `071-quote-unterminated-fallback` | §7.1, §8.1 | An opening quote with no matching close falls back to unquoted (quote char kept as literal content). |
 | `072-quote-trailing-garbage-fallback` | §7.1, §8.1 | Non-whitespace after a closing quote (before the next `;`) falls back to unquoted. |
@@ -170,6 +202,8 @@ One line per diagnostic, **in the order** the reference algorithm would record t
 | `082-all-null-record-arity-2` | §7.2 | Same all-null rule at arity 2 — both fields `null`. No `.expected.diagnostics` file. |
 | `083-all-null-record-arity-3` | §7.2, §7.3 | Same all-null rule at arity 3 — all three fields `null`, and critically **no** `MissingFields` diagnostic, even though a naive split (one empty part vs. arity 3) would produce one. No `.expected.diagnostics` file. |
 | `084-all-null-record-with-block-field` | §7.2, §9 | All-null rule at arity 2 (with a third, block-declared field) — the inline fields go `null` while a non-empty block still populates the block field normally. No `.expected.diagnostics` file. |
+| `085-all-null-form-requires-ascii-trim` | §7.1, §3.3 | Trimming *within* a record line takes only spaces and tabs, so `;<NBSP>` is a two-part record, not the all-null form. |
+| `086-unicode-whitespace-at-value-edges` | §7.1, §3.3, §14.3 | Unicode whitespace at either edge of an inline value is content. Placed first in the record, so a writer that fails to quote it gives the line an indent and the record disappears. |
 | `090-missing-fields-diagnostic` | §7.3, §11.2 | Fewer parts than field-list arity → trailing `null`s + `MissingFields` diagnostic on the record line. |
 | `091-extra-fields-diagnostic` | §7.3, §11.2 | More parts than arity → surplus dropped + `ExtraFields` diagnostic on the record line. |
 | `100-inline-values-not-truncated` | §7.5 | Values containing ` //`, a leading `#`, and a URL fragment `#` are kept whole — SYNX's inline comment stripping does NOT apply to SYNXL inline values. |
@@ -185,6 +219,9 @@ One line per diagnostic, **in the order** the reference algorithm would record t
 | `119-leading-null-field-no-indent` | §7.1 | `; a ; b` at indent 0 (no leading space) is a valid record line whose first field is `null`. |
 | `120-random-hint-forbidden` | §8.3 | `(random)` type hint in a field list → hard error. |
 | `121-random-hint-forbidden-variant` | §8.3 | `(random:int)` → hard error (same family as 120). |
+| `122-random-hint-inside-block-not-interpreted` | §8.3, §1.4 | A `random` hint carried by block data must not be honoured; two reads of one document have to project identically. |
+| `123-integer-beyond-i64-is-a-string` | §8.1 | Integers are parsed as i64; one that overflows falls through to the string rule, since a SYNX float needs a dot. |
+| `124-typed-int-overflow-fails` | §8.2 | A typed `int` that does not parse yields `null` plus `CastFailed` — overflow is a parse failure. |
 | `130-block-list-of-objects` | §9.3, SYNX §8.5 | Chat-style `messages[block]`: a list of `{role, content}` objects, mirroring the §10 worked example's dash-plus-nested-key pattern. |
 | `131-block-nested-object` | §9.3, SYNX §8.6 | A block field resolving to a plain nested SYNX object. |
 | `132-block-multiline-pipe` | §9.3, SYNX §8.4 | `\|` multiline block inside a record block (trimmed-line-per-line semantics, unchanged from SYNX 3.6). |
@@ -192,16 +229,20 @@ One line per diagnostic, **in the order** the reference algorithm would record t
 | `134-block-empty-yields-null` | §9.2 | A record with no block at all → every declared block field is `null`. |
 | `135-block-unknown-key-diagnostic` | §9.3, §11.2 | A block top-level key matching no declared field → discarded + `UnknownBlockKey`, reported on the offending block line. |
 | `136-block-field-not-declared-diagnostic` | §9.3, §11.2 | A block top-level key matching a field that is declared but NOT `[block]` → discarded + `BlockFieldNotDeclared`; the inline value stays authoritative. |
+| `137-block-root-is-not-an-object` | §9.3 | The delegated parse produces an *object*; a block whose only line is `-` contributes nothing. |
 | `140-block-directive-outside-multiline-discarded` | §9.4 | A `!`-prefixed line inside a block, outside any multiline body, is discarded like a comment (not a directive, not data). |
 | `141-block-directive-inside-multiline-preserved` | §9.4 | The same kind of `!`-prefixed line, when it is itself a continuation line of a `\|+` body, is preserved verbatim as data. Contrast with 140 — this pair is the critical §9.4 test. |
 | `150-blank-lines-inside-block` | §3.5 | A blank line inside a block does not terminate it; both sides of the blank line join the same sub-document. |
 | `160-unicode-field-name-and-value` | §5.1, §7, Unicode | Non-ASCII field name and non-ASCII/emoji inline value; verifies Unicode-scalar key sort order (`emoji` < `имя`). |
 | `161-unicode-in-multiline-block` | §9.3, SYNX §8.4.1, Unicode | Non-ASCII text inside a `\|+` block body. |
 | `162-nbsp-leading-line-is-block-content-not-record` | §3.3 | A line beginning with U+00A0 has non-zero indent (§3.3's `ltrim` uses Unicode whitespace, unlike §7.1's field-trim) — it is NOT a second record but block content of the previous one; the document still has one record, and the block's single delegated key doesn't match the (block-less) field list, producing `UnknownBlockKey`. |
+| `163-unicode-space-indent-inside-block` | §3.3, SYNX §4 | Indentation is measured over Unicode whitespace, so a block line opening with U+00A0 yields the key `b`, not `<NBSP>b`. |
 | `170-orphan-block-line-diagnostic` | §11.2 | An indented line right after `!fields`, before any record is open, is discarded with `OrphanBlockLine` attached to the *following* record's index. |
 | `180-diagnostic-order-across-kinds` | §11.2 | One record with `CastFailed`, `MissingFields`, and `UnknownBlockKey` all at once — verifies they appear in the normative order, not encounter order. |
 | `181-block-diagnostic-order-by-sorted-key` | §9.3, §11.2 | A block with three problematic keys written `zzz`, `label`, `aaa` (deliberately unsorted) — diagnostics must appear in `aaa`, `label`, `zzz` order (lexicographic), not document order. |
 | `182-leading-space-before-semicolon-is-block-content` | §7.1, §9.1 | `  ; a ; b` (indented) after a record is block content, not a second record — it delegates to SYNX, produces a key `";"`, which is unknown → `UnknownBlockKey`, and the document still has only one record. |
+| `183-indented-line-inside-block-comment` | §4.3 | Every line between `###` markers is ignored, indent included — an ignored line is not an `OrphanBlockLine`. |
+| `184-block-key-line-after-stack-repair` | §11.2, SYNX §8.6 | A block diagnostic reports the line the key is on, including keys that stack repair lifted to the sub-document root. |
 | `900-spec-worked-example` | §10 (verbatim) | Direct transcription of the normative worked example, including schema evolution — anchor case cross-checked against the JSON the spec itself gives for record 1. |
 
 **Total: 67 cases** (15 hard-error, 12 with diagnostics, 40 plain accept).
