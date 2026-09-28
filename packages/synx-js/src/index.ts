@@ -431,7 +431,10 @@ class Synx {
 
     for (let i = 0; i < lines.length; i++) {
       const t = lines[i].trim();
-      if (t === '!active' || t === '!lock' || t === '#!mode:active') {
+      // Match the Rust canonical formatter's preserved-directive set — it kept
+      // !tool / !schema / !llm too, so the JS formatter was silently dropping
+      // them from a reformatted document.
+      if (t === '!active' || t === '!lock' || t === '!tool' || t === '!schema' || t === '!llm' || t === '#!mode:active') {
         directives.push(t);
         bodyStart = i + 1;
       } else if (!t || t.startsWith('#') || t.startsWith('//')) {
@@ -710,11 +713,16 @@ class Synx {
     const payloadBytes = Uint8Array.from(payload);
     const compressed = compressRawDeflate(payloadBytes);
 
-    // Header
-    const isActive = text.trimStart().startsWith('!active');
+    // Header. All flag bits the reader honours must be written, or a compiled
+    // `!lock` / `!tool` / `!schema` / `!llm` document silently loses its flags
+    // on the round trip (only active/resolved were emitted before).
     let flags = 0;
-    if (isActive) flags |= 0x01;
-    if (resolved) flags |= 0x08;
+    if (parsed.mode === 'active') flags |= 0x01; // active
+    if (parsed.locked) flags |= 0x02;            // locked
+    if (resolved) flags |= 0x08;                 // resolved
+    if (parsed.tool) flags |= 0x10;              // tool
+    if (parsed.schema) flags |= 0x20;            // schema
+    if (parsed.llm) flags |= 0x40;               // llm
 
     const out = new Uint8Array(11 + compressed.length);
     out[0] = 0x53; out[1] = 0x59; out[2] = 0x4e; out[3] = 0x58; out[4] = 0x42; // SYNXB
@@ -758,10 +766,17 @@ class Synx {
     const flags = data[6];
     const isActive = (flags & 0x01) !== 0;
     const isLocked = (flags & 0x02) !== 0;
+    const isTool = (flags & 0x10) !== 0;
+    const isSchema = (flags & 0x20) !== 0;
+    const isLlm = (flags & 0x40) !== 0;
 
-    // Uncompressed size, little-endian u32
+    // Uncompressed size, little-endian u32 (>>> 0 keeps it unsigned; a shift
+    // by 24 on a high byte would otherwise sign-flip the length).
     const uncompSize =
-      (data[7]) | (data[8] << 8) | (data[9] << 16) | (data[10] << 24);
+      ((data[7]) | (data[8] << 8) | (data[9] << 16) | (data[10] << 24)) >>> 0;
+    if (uncompSize > MAX_DECODED_BYTES) {
+      throw new SynxError(`.synxb declared size ${uncompSize} exceeds limit ${MAX_DECODED_BYTES}`);
+    }
 
     // Decompress raw-deflate payload
     const compressed = data.slice(11);
@@ -773,54 +788,106 @@ class Synx {
     // String table
     let offset = 0;
     const [strCount, o1] = readVarint(payload, offset); offset = o1;
+    // A count taken from the file can be astronomically large (u64::MAX); each
+    // entry costs at least one byte, so it can never exceed the bytes left.
+    // Without this clamp the loop below spins for ~2^64 iterations (a hang).
+    if (strCount > payload.length - offset) {
+      throw new SynxError(`.synxb string-table count ${strCount} exceeds remaining bytes`);
+    }
     const strings: string[] = [];
     const decoder = new TextDecoder();
     for (let i = 0; i < strCount; i++) {
       const [len, o2] = readVarint(payload, offset); offset = o2;
+      if (len > payload.length - offset) {
+        throw new SynxError('.synxb string table truncated');
+      }
       strings.push(decoder.decode(payload.slice(offset, offset + len)));
       offset += len;
     }
 
+    // Bounds-checked string-table lookup: an out-of-range index is a corrupt
+    // or hostile file, not a silent `undefined` key/value.
+    const str = (idx: number): string => {
+      if (idx < 0 || idx >= strings.length) {
+        throw new SynxError(`.synxb string index ${idx} out of bounds (table size ${strings.length})`);
+      }
+      return strings[idx];
+    };
+    let depth = 0;
+    const MAX_DEPTH = 1024;
     // Value tree
     function readValue(): unknown {
-      const tag = payload[offset++];
-      switch (tag) {
-        case 0x00: return null;
-        case 0x01: return false;
-        case 0x02: return true;
-        case 0x03: { const [v, o] = readZigzag(payload, offset); offset = o; return v; }
-        case 0x04: {
-          const view = new DataView(payload.buffer, payload.byteOffset + offset, 8);
-          offset += 8;
-          return view.getFloat64(0, true);
-        }
-        case 0x05: { const [idx, o] = readVarint(payload, offset); offset = o; return strings[idx]; }
-        case 0x06: {
-          const [len, o] = readVarint(payload, offset); offset = o;
-          const arr: unknown[] = [];
-          for (let i = 0; i < len; i++) arr.push(readValue());
-          return arr;
-        }
-        case 0x07: {
-          const [len, o] = readVarint(payload, offset); offset = o;
-          const obj: Record<string, unknown> = {};
-          for (let i = 0; i < len; i++) {
-            const [ki, o2] = readVarint(payload, offset); offset = o2;
-            obj[strings[ki]] = readValue();
+      if (++depth > MAX_DEPTH) throw new SynxError('.synxb nesting too deep');
+      try {
+        const tag = payload[offset++];
+        switch (tag) {
+          case 0x00: return null;
+          case 0x01: return false;
+          case 0x02: return true;
+          case 0x03: { const [v, o] = readZigzag(payload, offset); offset = o; return v; }
+          case 0x04: {
+            if (offset + 8 > payload.length) throw new SynxError('.synxb truncated float');
+            const view = new DataView(payload.buffer, payload.byteOffset + offset, 8);
+            offset += 8;
+            return view.getFloat64(0, true);
           }
-          return obj;
+          case 0x05: { const [idx, o] = readVarint(payload, offset); offset = o; return str(idx); }
+          case 0x06: {
+            const [len, o] = readVarint(payload, offset); offset = o;
+            // Each element is at least one byte; a count beyond the remaining
+            // bytes is corrupt/hostile and would otherwise spin the loop.
+            if (len > payload.length - offset) throw new SynxError('.synxb array count exceeds remaining bytes');
+            const arr: unknown[] = [];
+            for (let i = 0; i < len; i++) arr.push(readValue());
+            return arr;
+          }
+          case 0x07: {
+            const [len, o] = readVarint(payload, offset); offset = o;
+            if (len > payload.length - offset) throw new SynxError('.synxb object count exceeds remaining bytes');
+            const obj: Record<string, unknown> = {};
+            for (let i = 0; i < len; i++) {
+              const [ki, o2] = readVarint(payload, offset); offset = o2;
+              const key = str(ki);
+              const val = readValue();
+              // `obj.__proto__ = x` would hit the prototype setter and poison
+              // the object; define it as an own data property so a `__proto__`
+              // key from the file stays plain data, matching the Rust HashMap,
+              // while the object keeps a normal prototype (nested values still
+              // stringify — a null-proto object would throw in the serializer).
+              if (key === '__proto__' || key === 'constructor' || key === 'prototype') {
+                Object.defineProperty(obj, key, { value: val, writable: true, enumerable: true, configurable: true });
+              } else {
+                obj[key] = val;
+              }
+            }
+            return obj;
+          }
+          case 0x08: { const [idx, o] = readVarint(payload, offset); offset = o; void str(idx); return '[SECRET]'; }
+          default: throw new SynxError(`Unknown value tag: 0x${(tag ?? 0).toString(16)}`);
         }
-        case 0x08: { const [idx, o] = readVarint(payload, offset); offset = o; void idx; return '[SECRET]'; }
-        default: throw new SynxError(`Unknown value tag: 0x${tag.toString(16)}`);
+      } finally {
+        depth--;
       }
     }
-    const value = readValue() as SynxObject;
+    const value = readValue();
 
+    // Emit directives in the same order as the Rust decompiler (Synx::decompile):
+    // tool, schema, llm, active, lock.
     let header = '';
+    if (isTool) header += '!tool\n';
+    if (isSchema) header += '!schema\n';
+    if (isLlm) header += '!llm\n';
     if (isActive) header += '!active\n';
     if (isLocked) header += '!lock\n';
     if (header) header += '\n';
-    return header + serializeObject(value, 0);
+    // A well-formed `.synxb` has an object root, but a crafted file can carry a
+    // bare scalar/null/array. Rust's decompiler renders that as a primitive
+    // line; matching it here keeps `serializeObject` from being handed a
+    // non-object (it did `Object.entries(null)` and threw).
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+      return header + primitiveToSynx(value) + '\n';
+    }
+    return header + serializeObject(value as SynxObject, 0);
   }
 
   /**
@@ -1011,46 +1078,75 @@ function compressRawDeflate(payload: Uint8Array): Uint8Array {
   return new Uint8Array(out.buffer, out.byteOffset, out.byteLength);
 }
 
+/** Upper bound on a decompiled `.synxb` payload — mirrors the Rust decoder's
+ *  MAX_DECODED_BYTES so a decompression bomb cannot expand into gigabytes. */
+const MAX_DECODED_BYTES = 256 * 1024 * 1024;
+
 /** Raw-inflate decompression (matches Rust `miniz_oxide::inflate::decompress_to_vec`). */
 function decompressRawDeflate(compressed: Uint8Array, uncompressedSize: number): Uint8Array {
   const z = getZlib();
   const out = z.inflateRawSync(Buffer.from(compressed), {
     // Hint to the decoder to pre-allocate the right buffer size.
     chunkSize: Math.max(uncompressedSize | 0, 1024),
+    // Hard ceiling: zlib aborts instead of materialising a bomb.
+    maxOutputLength: MAX_DECODED_BYTES,
   });
   return new Uint8Array(out.buffer, out.byteOffset, out.byteLength);
 }
 
+// Varints/zigzag carry i64/u64 on the Rust side. JavaScript's bitwise
+// operators are 32-bit, so the previous `>>>`/`<<` forms silently corrupted any
+// value past 2^31 (string-table indices and integers alike). These use
+// arithmetic on plain numbers, exact up to 2^53, and BigInt beyond, matching
+// `synx_core::binary` for the whole i64 range.
+// Varints/zigzag carry u64/i64 on the Rust side. JavaScript bitwise operators
+// are 32-bit and even plain-number arithmetic loses precision past 2^53 — and a
+// zigzag value is ~twice its integer's magnitude, so an int as small as ~4.5e15
+// (well inside the JS-safe range) would overflow 2^53 mid-encode. Both writers
+// accumulate in BigInt; readers return a Number, exact through the whole
+// JS-safe range and matching `synx_core::binary` byte for byte.
+function writeVarintBig(buf: number[], value: bigint): void {
+  let b = value;
+  if (b < 0n) throw new SynxError('varint cannot encode a negative value');
+  while (b > 0x7fn) { buf.push(Number(b & 0x7fn) | 0x80); b >>= 7n; }
+  buf.push(Number(b));
+}
+
 function writeVarint(buf: number[], value: number): void {
-  let v = value >>> 0;
-  while (v > 0x7f) {
-    buf.push((v & 0x7f) | 0x80);
-    v >>>= 7;
+  if (value < 0 || !Number.isFinite(value)) throw new SynxError('varint cannot encode this value');
+  writeVarintBig(buf, BigInt(Math.trunc(value)));
+}
+
+function readVarintBig(data: Uint8Array | Buffer, offset: number): [bigint, number] {
+  let result = 0n;
+  let shift = 0n;
+  while (offset < data.length) {
+    const byte = data[offset++];
+    result |= BigInt(byte & 0x7f) << shift;
+    if ((byte & 0x80) === 0) break;
+    shift += 7n;
+    if (shift >= 64n) break; // malformed / overlong — stop like the Rust decoder
   }
-  buf.push(v);
+  return [result, offset];
 }
 
 function readVarint(data: Uint8Array | Buffer, offset: number): [number, number] {
-  let result = 0;
-  let shift = 0;
-  while (offset < data.length) {
-    const byte = data[offset++];
-    result |= (byte & 0x7f) << shift;
-    if ((byte & 0x80) === 0) break;
-    shift += 7;
-  }
-  return [result >>> 0, offset];
+  const [big, o] = readVarintBig(data, offset);
+  return [Number(big), o];
 }
 
 function writeZigzag(buf: number[], value: number): void {
-  const zigzag = (value << 1) ^ (value >> 31);
-  writeVarint(buf, zigzag >>> 0);
+  // zigzag: (n << 1) ^ (n >> 63), kept in BigInt so the doubled magnitude never
+  // rounds before it is written.
+  const n = BigInt(Math.trunc(value));
+  const zz = ((n << 1n) ^ (n >> 63n)) & ((1n << 64n) - 1n);
+  writeVarintBig(buf, zz);
 }
 
 function readZigzag(data: Uint8Array | Buffer, offset: number): [number, number] {
-  const [raw, newOffset] = readVarint(data, offset);
-  const value = (raw >>> 1) ^ -(raw & 1);
-  return [value, newOffset];
+  const [raw, newOffset] = readVarintBig(data, offset);
+  const value = (raw >> 1n) ^ -(raw & 1n);
+  return [Number(value), newOffset];
 }
 
 function deepEqual(a: unknown, b: unknown): boolean {
@@ -1076,6 +1172,16 @@ function deepEqual(a: unknown, b: unknown): boolean {
 }
 
 // ─── Serializer ───────────────────────────────────────────
+
+/** Render a non-object root value the way Rust's `format_primitive` does. */
+function primitiveToSynx(v: unknown): string {
+  if (v === null || v === undefined) return 'null';
+  if (typeof v === 'boolean') return v ? 'true' : 'false';
+  if (typeof v === 'number' || typeof v === 'bigint') return String(v);
+  if (typeof v === 'string') return v;
+  if (Array.isArray(v)) return '[' + v.map(primitiveToSynx).join(', ') + ']';
+  return '[Object]';
+}
 
 function serializeObject(obj: SynxObject, indent: number): string {
   let out = '';

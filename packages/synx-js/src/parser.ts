@@ -149,7 +149,12 @@ export function castType(val: string, nondeterministic = true): SynxValue {
   // is left untouched as a plain string.
   if (c0 === 40 && len > 2) { // '('
     const closeIdx = val.indexOf(')');
-    if (closeIdx > 1) {
+    // The type hint the caller threaded in is glued straight onto the value
+    // (`(int)5`, no gap). A whitespace after `)` means the parentheses are part
+    // of the value text (e.g. the literal value `(int) 5` produced for a
+    // malformed `key (type) value` with a space), not a cast — the Rust
+    // reference keeps such a value as a string, and so must this.
+    if (closeIdx > 1 && !/\s/.test(val.charAt(closeIdx + 1))) {
       const hint = val.substring(1, closeIdx);
       if (/^[A-Za-z_][A-Za-z0-9_:]*$/.test(hint)) {
         const raw = val.substring(closeIdx + 1);
@@ -458,6 +463,9 @@ export function parseData(text: string, options?: ParseDataOptions): SynxParseRe
   let currentBlock: {
     indent: number; obj: SynxObject; key: string;
     preserveIndent: boolean; baseIndent: number;
+    // Accumulated continuation lines and their running UTF-8 byte length,
+    // materialised (joined) only when the block closes — keeps it O(n).
+    parts: string[]; byteLen: number;
   } | null = null;
   let currentList: { indent: number; arr: SynxArray } | null = null;
   let inBlockComment = false;
@@ -501,8 +509,12 @@ export function parseData(text: string, options?: ParseDataOptions): SynxParseRe
     // lets a stray `###` swallow the rest of the document, and — for `!` —
     // turns a data row into a directive, which SYNXL §9.4 forbids outright.
     if (currentBlock && indent > currentBlock.indent) {
-      const existing = currentBlock.obj[currentBlock.key] as string;
-      if (utf8Length(existing) < MAX_MULTILINE_BLOCK_BYTES) {
+      // Accumulate into an array with a running byte count. Reading back the
+      // whole `obj[key]` string and calling utf8Length on it every line made
+      // this O(n²) — a block of a few thousand lines took tens of seconds. The
+      // running counter and a single join at close keep it linear (Rust tracks
+      // the byte length the same way).
+      if (currentBlock.byteLen < MAX_MULTILINE_BLOCK_BYTES) {
         let line: string;
         if (currentBlock.preserveIndent) {
           // SYNX 3.7 `|+`: lock the base indent to the FIRST non-empty
@@ -516,16 +528,20 @@ export function parseData(text: string, options?: ParseDataOptions): SynxParseRe
         } else {
           line = trimmed;
         }
-        const room = MAX_MULTILINE_BLOCK_BYTES - utf8Length(existing);
-        const sep = existing ? '\n' : '';
-        const append = sep + line;
-        // Byte budget, UTF-8 boundary: `substring(0, room)` counts UTF-16
-        // units, so it both overshoots the cap and can split a surrogate pair,
-        // leaving a lone surrogate no strict JSON consumer will accept.
-        currentBlock.obj[currentBlock.key] = existing + truncateUtf8Prefix(append, room);
+        const sepBytes = currentBlock.parts.length ? 1 : 0; // the '\n' join adds
+        const room = MAX_MULTILINE_BLOCK_BYTES - currentBlock.byteLen - sepBytes;
+        if (room > 0) {
+          // Byte budget, UTF-8 boundary: `substring(0, room)` counts UTF-16
+          // units, so it both overshoots the cap and can split a surrogate
+          // pair, leaving a lone surrogate no strict JSON consumer accepts.
+          const taken = truncateUtf8Prefix(line, room);
+          currentBlock.parts.push(taken);
+          currentBlock.byteLen += sepBytes + utf8Length(taken);
+        }
       }
       continue;
-    } else {
+    } else if (currentBlock) {
+      currentBlock.obj[currentBlock.key] = currentBlock.parts.join('\n');
       currentBlock = null;
     }
 
@@ -556,6 +572,11 @@ export function parseData(text: string, options?: ParseDataOptions): SynxParseRe
           }
           continue;
         }
+        // `!use @scope/pkg [as alias]` is a directive, not data. The Rust
+        // reference (parser.rs) consumes it; without this branch it fell through
+        // to key-line parsing and surfaced as a literal `"!use"` key — the
+        // divergence conformance case 012-use-directive catches.
+        if (trimmed.startsWith('!use ')) { continue; }
       } else {
         // Directives disabled (SYNXL §9.4): a `!` line reaching here is not
         // multiline body — the branch above already consumed and preserved
@@ -743,6 +764,8 @@ export function parseData(text: string, options?: ParseDataOptions): SynxParseRe
         indent, obj: parent, key,
         preserveIndent: rawValue === '|+',
         baseIndent: -1,
+        parts: [],
+        byteLen: 0,
       };
       saveMeta(parent, key, markers, markerArgs, constraints, mode, typeHint);
     } else if (!rawValue && markers.length > 0 &&
@@ -784,6 +807,11 @@ export function parseData(text: string, options?: ParseDataOptions): SynxParseRe
       parent[key] = castType(rawValue, nondeterministic);
       saveMeta(parent, key, markers, markerArgs, constraints, mode, typeHint);
     }
+  }
+
+  // Flush a block still open at end of input (no dedent line closed it).
+  if (currentBlock) {
+    currentBlock.obj[currentBlock.key] = currentBlock.parts.join('\n');
   }
 
   return {

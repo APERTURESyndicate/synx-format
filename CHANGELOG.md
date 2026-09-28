@@ -14,6 +14,83 @@ All notable changes to this repository are documented in this file.
 > for `3.7.0` was free, so npm and every other registry — plus the
 > git tag — now publish on the same version number.
 
+## [3.7.3] — 2026-09-28
+
+A security, robustness and cross-implementation-parity pass driven by a
+fuzzing + differential audit of the Rust core and the TypeScript parser, with a
+focus on hostile input to `.synxb` and SYNXL and on denial-of-service through
+pathological-but-valid documents. Every item was reproduced before it was
+fixed and carries a regression test. No conformance golden changed: the fixes
+either restore the normative spec, close a security hole, or make one
+implementation match the other on input the frozen suite did not cover.
+
+### Fixed — security
+
+- **`:secret` leaked in clear through `{interpolation}`, `:join`, `:prompt`
+  and `:map`** (`crates/synx-core/src/engine.rs`). `value_to_string` returned
+  the raw secret, so `msg hello {token} world` resolved the marked value into
+  plain text in the output. Every string sink now sees the `[SECRET]` mask,
+  matching `write_json`.
+- **A `:secret` value serialised as `{}` instead of `[SECRET]` in the
+  TypeScript canonical JSON writer** (`packages/synx-js/src/json.ts`). The
+  hand-written writer ignored `SynxSecret.toJSON`, dropping the redaction
+  marker. `SynxSecret` now carries a global-symbol brand the writer recognises.
+- **`.synxb` decode was a decompression-bomb and OOM vector**
+  (`crates/synx-core/src/binary.rs`, `packages/synx-js/src/index.ts`). The
+  decoder trusted the declared uncompressed size (up to 4 GiB) and pre-allocated
+  `Vec`/array capacities straight from untrusted counts. Decoding is now bounded
+  (256 MiB cap, `decompress_to_vec_with_limit`), capacities are clamped to the
+  bytes that remain, and recursion is depth-limited — hostile containers return
+  a clean error instead of aborting, hanging, or overflowing the stack.
+- **A `__proto__` key in a `.synxb` payload hit the prototype setter in
+  TypeScript** (`packages/synx-js/src/index.ts`). Object keys from the file are
+  now defined as own data properties, matching the Rust `HashMap` and blocking
+  prototype pollution.
+
+### Fixed — denial of service
+
+- **Quadratic SYNX parse under a long ancestor key** (`crates/synx-core/src/parser.rs`).
+  A multi-megabyte parent key was re-hashed on every child line, so an 8 MiB
+  document (inside the 16 MiB cap) took tens of seconds. A parent-navigation
+  cache, invalidated on every stack mutation, restores linear time.
+- **Quadratic multiline-block accumulation in TypeScript**
+  (`packages/synx-js/src/parser.ts`). Each `|`/`|+` continuation line rescanned
+  the whole growing string (`utf8Length`), making a few-thousand-line block take
+  tens of seconds. Lines now accumulate in an array with a running byte count.
+- **`:unique` was O(n²)** (`crates/synx-core/src/engine.rs`). De-duplication
+  used `Vec::contains`; it now uses a `HashSet`.
+
+### Fixed — correctness and cross-implementation parity
+
+- **A leading BOM disabled `!active` in Rust** (`crates/synx-core/src/parser.rs`).
+  `str::trim` does not treat U+FEFF as whitespace, so a BOM-prefixed `!active`
+  (as Windows editors emit) became a `"\u{feff}!active"` key and left the
+  document Static — silently disabling markers, including `:secret`. A single
+  leading BOM is now stripped (SYNX §2.1/§6), matching TypeScript.
+- **Non-ASCII literal text was corrupted by `{interpolation}` in Rust**
+  (`crates/synx-core/src/engine.rs`). A byte-wise copy (`bytes[i] as char`)
+  turned `мир` into `Ð¼Ð¸Ñ`; literal text is now copied whole UTF-8 scalars.
+- **`i64` values beyond 2^31 (and negatives) were corrupted in the TypeScript
+  `.synxb` codec** (`packages/synx-js/src/index.ts`). Varint/zigzag used 32-bit
+  bitwise ops and then rounded at 2^53; they now use BigInt end to end, exact
+  across the JS-safe range and byte-compatible with Rust.
+- **`!lock` / `!tool` / `!schema` / `!llm` flags were dropped when compiling
+  `.synxb` in TypeScript**, `!use` was parsed as a literal `"!use"` key
+  (conformance case 012), and `format()` dropped `!tool`/`!schema`/`!llm`
+  (`packages/synx-js/`). All now match the Rust reference.
+- **A type hint written after a space (`key (int) 5`) was applied as a cast in
+  TypeScript** (`packages/synx-js/src/parser.ts`). SYNX §7 requires the hint to
+  follow the key immediately; the value `(int) 5` is now kept as a string, as in
+  Rust.
+
+### Tests
+
+New regression coverage: `.synxb` hardening (Rust + TypeScript), the linear
+parse/multiline guarantees, BOM handling, secret redaction across sinks, the
+non-ASCII interpolation fix, and the `(type)`-after-space case. Rust 190+ tests
+and the full TypeScript suite pass; the SYNX and SYNXL conformance corpora are
+unchanged and green on both implementations.
+
 ## [3.7.2] — 2026-09-27
 
 A correctness and hardening pass over SYNXL and the SYNX parser underneath it,

@@ -187,6 +187,15 @@ pub fn resolve(result: &mut ParseResult, options: &Options) {
         root_map.retain(|k, _| !k.starts_with('_'));
     }
 
+    // ── :secret pre-pass ──
+    // safety: mask literal `:secret` values *before* any resolution so a field
+    // that interpolates `{that_key}` can never observe the plaintext. Marker
+    // application runs after child recursion (depth-first), so a nested field
+    // referencing a root-level secret would otherwise read it unmasked. Only
+    // plain values are pre-masked here; a secret that itself needs resolving
+    // (`:env:secret`, etc.) is left for its own marker to mask in place.
+    mask_secret_literals(&mut result.root, &metadata, "");
+
     // ── Build type registry ──
     let type_registry = build_type_registry(&metadata);
     // ── Build constraint registry ──
@@ -758,21 +767,29 @@ fn apply_markers(
 
     // ── :secret ──
     if markers.contains(&"secret".to_string()) {
-        if let Some(val) = map.get(key) {
-            let s = value_to_string(val);
-            map.insert(key.to_string(), Value::Secret(s));
+        // Idempotent: the :secret pre-pass may already have wrapped a literal
+        // secret. `value_to_string` masks a Secret to "[SECRET]", so re-wrapping
+        // would replace the stored value with the mask itself.
+        match map.get(key) {
+            Some(Value::Secret(_)) => {}
+            Some(val) => {
+                let s = value_to_string(val);
+                map.insert(key.to_string(), Value::Secret(s));
+            }
+            None => {}
         }
     }
 
     // ── :unique ──
     if markers.contains(&"unique".to_string()) {
         if let Some(Value::Array(arr)) = map.get(key) {
-            let mut seen = Vec::new();
+            // A HashSet membership test keeps this linear; the previous
+            // `Vec::contains` made de-duping an N-item list O(N²).
+            let mut seen = std::collections::HashSet::new();
             let mut unique = Vec::new();
             for item in arr {
                 let s = value_to_string(item);
-                if !seen.contains(&s) {
-                    seen.push(s);
+                if seen.insert(s) {
                     unique.push(item.clone());
                 }
             }
@@ -1635,7 +1652,12 @@ fn value_to_string(v: &Value) -> String {
         Value::Float(f) => format_number(*f as f64),
         Value::Bool(b) => b.to_string(),
         Value::Null => "null".to_string(),
-        Value::Secret(s) => s.clone(),
+        // safety: a `:secret` value MUST NOT reach a string sink as plaintext.
+        // value_to_string feeds interpolation (`{key}`), `:join`, `:prompt`,
+        // `:map`, spam bucket keys — every one of which would otherwise leak the
+        // secret. The masked form matches `write_json` (`"[SECRET]"`); callers
+        // that legitimately need the raw value use the typed `Value::Secret` API.
+        Value::Secret(_) => "[SECRET]".to_string(),
         Value::Array(_) | Value::Object(_) => String::new(),
     }
 }
@@ -1729,6 +1751,61 @@ fn weighted_random(items: &[Value], weights: &[f64]) -> Value {
 }
 
 // ─── Inheritance pre-pass ─────────────────────────────────
+
+/// Markers whose value must be resolved (read from env, a file, another key, an
+/// expression) before it becomes a secret — those are masked by `:secret` in
+/// place, not pre-masked here.
+fn needs_resolution_before_secret(markers: &[String]) -> bool {
+    const RESOLVING: &[&str] = &[
+        "env", "include", "import", "watch", "ref", "alias", "calc", "map", "i18n", "default",
+        "fallback", "once", "split", "join", "format", "replace",
+    ];
+    markers.iter().any(|m| RESOLVING.contains(&m.as_str()))
+}
+
+/// Convert every literal `:secret`-marked value to `Value::Secret` before
+/// resolution, so no later interpolation can read the plaintext.
+fn mask_secret_literals(value: &mut Value, metadata: &HashMap<String, MetaMap>, path: &str) {
+    let map = match value {
+        Value::Object(m) => m,
+        _ => return,
+    };
+    if let Some(mm) = metadata.get(path) {
+        let secret_keys: Vec<String> = mm
+            .iter()
+            .filter(|(_, meta)| {
+                meta.markers.iter().any(|m| m == "secret")
+                    && !needs_resolution_before_secret(&meta.markers)
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in secret_keys {
+            if let Some(v) = map.get(key.as_str()) {
+                if !matches!(v, Value::Secret(_) | Value::Object(_) | Value::Array(_)) {
+                    let raw = value_to_string(v);
+                    map.insert(key, Value::Secret(raw));
+                }
+            }
+        }
+    }
+    let keys: Vec<String> = map.keys().cloned().collect();
+    for key in keys {
+        let child_path = if path.is_empty() { key.clone() } else { format!("{}.{}", path, key) };
+        if let Some(child) = map.get_mut(&key) {
+            match child {
+                Value::Object(_) => mask_secret_literals(child, metadata, &child_path),
+                Value::Array(arr) => {
+                    for item in arr.iter_mut() {
+                        if let Value::Object(_) = item {
+                            mask_secret_literals(item, metadata, &child_path);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
 
 fn apply_inheritance(root: &mut Value, metadata: &HashMap<String, MetaMap>) {
     let root_meta = match metadata.get("") {
@@ -1896,10 +1973,14 @@ fn resolve_interpolation(
                 }
             }
         }
+        // Copy one whole UTF-8 scalar of literal text. `bytes[i] as char`
+        // reinterpreted each UTF-8 byte as a code point, turning any non-ASCII
+        // literal in the template into mojibake (`мир` → `Ð¼Ð¸Ñ`).
+        let ch = tpl[i..].chars().next().unwrap_or('\u{fffd}');
         if result.len() < MAX_ENGINE_SCRATCH_STRING {
-            result.push(bytes[i] as char);
+            result.push(ch);
         }
-        i += 1;
+        i += ch.len_utf8();
     }
     result
 }
@@ -2424,6 +2505,51 @@ mod tests {
         resolve(&mut r, &Options::default());
         let map = r.root.as_object().unwrap();
         assert_eq!(map["greeting"], Value::String("Hello, Wario!".into()));
+    }
+
+    // Non-ASCII literal text in a template must survive interpolation — the
+    // byte-wise `bytes[i] as char` copy corrupted it (`мир` → `Ð¼Ð¸Ñ`).
+    #[test]
+    fn test_interpolation_preserves_non_ascii() {
+        let mut r = parse("!active\ngreeting Привет\nmsg {greeting} мир\n");
+        resolve(&mut r, &Options::default());
+        let map = r.root.as_object().unwrap();
+        assert_eq!(map["msg"], Value::String("Привет мир".into()));
+    }
+
+    // A `:secret` value must never reach a string sink as plaintext.
+    #[test]
+    fn test_secret_never_leaks_through_string_sinks() {
+        let mut r = parse("!active\ntoken:secret abc123\nmsg hello {token} world\njoined:join\n  - {token}\n  - x\n");
+        resolve(&mut r, &Options::default());
+        let json = crate::to_json(&r.root);
+        assert!(!json.contains("abc123"), "secret leaked into output: {json}");
+        let map = r.root.as_object().unwrap();
+        assert_eq!(map["msg"], Value::String("hello [SECRET] world".into()));
+    }
+
+    // A nested field interpolating a root-level secret must not observe the
+    // plaintext — the :secret pre-pass masks literals before resolution.
+    #[test]
+    fn test_secret_not_leaked_via_nested_interpolation() {
+        let mut r = parse("!active\ntoken:secret abc123\nsection\n  msg use {token} now\n");
+        resolve(&mut r, &Options::default());
+        let json = crate::to_json(&r.root);
+        assert!(!json.contains("abc123"), "secret leaked: {json}");
+        let section = r.root.as_object().unwrap()["section"].as_object().unwrap();
+        assert_eq!(section["msg"], Value::String("use [SECRET] now".into()));
+    }
+
+    #[test]
+    fn test_unique_dedupes_large_list() {
+        let mut src = String::from("!active\nl:unique\n");
+        for i in 0..5000 {
+            src.push_str(&format!("  - v{}\n", i % 100));
+        }
+        let mut r = parse(&src);
+        resolve(&mut r, &Options::default());
+        let arr = r.root.as_object().unwrap()["l"].as_array().unwrap();
+        assert_eq!(arr.len(), 100);
     }
 
     #[test]

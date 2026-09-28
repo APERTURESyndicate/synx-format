@@ -72,6 +72,10 @@ export class SynxSecret {
 
   constructor(value: string) {
     this.#value = value;
+    // Brand under a global symbol so the runtime-agnostic canonical JSON writer
+    // (json.ts) can recognise a secret and emit `"[SECRET]"` without importing
+    // this module (which would pull the whole engine, and fs/path, into it).
+    Object.defineProperty(this, Symbol.for('synx.secret'), { value: true, enumerable: false });
   }
 
   toString(): string {
@@ -133,6 +137,12 @@ export function resolve(
     for (const k of Object.keys(obj)) {
       if (k.startsWith('_')) delete obj[k];
     }
+    // ── :secret pre-pass ──
+    // Mask literal `:secret` values before any resolution so a field that
+    // interpolates `{that_key}` can never read the plaintext. Marker
+    // application runs after child recursion, so a nested field referencing a
+    // root-level secret would otherwise observe it unmasked.
+    maskSecretLiterals(obj);
     // ── Load !include directives ──
     if (!includesMap) {
       const inc = (options as any)._includes;
@@ -408,7 +418,9 @@ export function resolve(
     }
 
     // ── :secret ──
-    if (markers.includes('secret')) {
+    // Idempotent: the pre-pass (maskSecretLiterals) may already have wrapped a
+    // literal secret. Re-wrapping would mask the mask and destroy reveal().
+    if (markers.includes('secret') && !(obj[key] instanceof SynxSecret)) {
       obj[key] = new SynxSecret(String(obj[key])) as any;
     }
 
@@ -698,6 +710,38 @@ export function resolve(
 }
 
 // ─── Inheritance pre-pass ─────────────────────────────────
+
+/** Markers whose value must be resolved before it becomes a secret — masked by
+ *  `:secret` in place, not pre-masked. */
+const RESOLVING_BEFORE_SECRET = new Set([
+  'env', 'include', 'import', 'watch', 'ref', 'alias', 'calc', 'map', 'i18n',
+  'default', 'fallback', 'once', 'split', 'join', 'format', 'replace',
+]);
+
+/** Convert every literal `:secret`-marked value to a SynxSecret before
+ *  resolution, so no later interpolation can read the plaintext. */
+function maskSecretLiterals(obj: SynxObject): void {
+  const metaMap: SynxMetaMap | undefined = (obj as any).__synx;
+  for (const key of Object.keys(obj)) {
+    if (key === '__synx') continue;
+    const meta = metaMap?.[key];
+    if (
+      meta &&
+      meta.markers.includes('secret') &&
+      !meta.markers.some((m) => RESOLVING_BEFORE_SECRET.has(m))
+    ) {
+      const v = obj[key];
+      if (!(v instanceof SynxSecret) && (v === null || typeof v !== 'object')) {
+        obj[key] = new SynxSecret(String(v)) as any;
+        continue;
+      }
+    }
+    const child = obj[key];
+    if (child && typeof child === 'object' && !Array.isArray(child) && !(child instanceof SynxSecret)) {
+      maskSecretLiterals(child as SynxObject);
+    }
+  }
+}
 
 function applyInheritance(obj: SynxObject): void {
   const metaMap: SynxMetaMap | undefined = (obj as any).__synx;

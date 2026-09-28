@@ -33,6 +33,31 @@ use std::collections::HashMap;
 const MAGIC: &[u8; 5] = b"SYNXB";
 const FORMAT_VERSION: u8 = 1;
 
+/// Upper bound on the decompressed payload a `.synxb` decode will materialise.
+///
+/// safety: `decompile` receives an untrusted byte slice. The declared
+/// uncompressed size is a `u32` (up to 4 GiB) and the deflate stream can expand
+/// far beyond its own length (a "zip bomb"), so decompression MUST be bounded
+/// rather than trusting the header. 256 MiB comfortably exceeds any tree a
+/// 16 MiB `.synx` source (SYNX §3) produces while refusing the pathological case.
+const MAX_DECODED_BYTES: usize = 256 * 1024 * 1024;
+
+/// Depth limit for the recursive value decoder. Mirrors the parser's
+/// `MAX_PARSE_NESTING_DEPTH` headroom (a hostile `.synxb` can nest ARRAY/OBJECT
+/// tags arbitrarily even though `parse` caps text at 128) so decoding a crafted
+/// container cannot overflow the stack.
+const MAX_DECODE_DEPTH: usize = 1024;
+
+/// Bound a `Vec::with_capacity` request taken from untrusted input.
+///
+/// safety: element counts are read as varints straight from the file. A crafted
+/// count of `u64::MAX` would abort the process inside `with_capacity` before a
+/// single element is read. Every element costs at least one byte on the wire, so
+/// the count can never exceed the bytes that remain; clamp to that.
+fn safe_capacity(count: usize, remaining: usize) -> usize {
+    count.min(remaining)
+}
+
 const FLAG_ACTIVE: u8 = 0b0000_0001;
 const FLAG_LOCKED: u8 = 0b0000_0010;
 const FLAG_HAS_META: u8 = 0b0000_0100;
@@ -175,7 +200,7 @@ struct StringTableReader {
 impl StringTableReader {
     fn decode(data: &[u8], pos: &mut usize) -> Result<Self, String> {
         let count = decode_varint(data, pos)? as usize;
-        let mut strings = Vec::with_capacity(count);
+        let mut strings = Vec::with_capacity(safe_capacity(count, data.len().saturating_sub(*pos)));
         for _ in 0..count {
             let len = decode_varint(data, pos)? as usize;
             if *pos + len > data.len() {
@@ -242,6 +267,13 @@ fn encode_value(out: &mut Vec<u8>, val: &Value, st: &StringTable) {
 }
 
 fn decode_value(data: &[u8], pos: &mut usize, st: &StringTableReader) -> Result<Value, String> {
+    decode_value_depth(data, pos, st, 0)
+}
+
+fn decode_value_depth(data: &[u8], pos: &mut usize, st: &StringTableReader, depth: usize) -> Result<Value, String> {
+    if depth > MAX_DECODE_DEPTH {
+        return Err(format!("nesting exceeds {} — refusing to decode", MAX_DECODE_DEPTH));
+    }
     if *pos >= data.len() {
         return Err("unexpected end of data".into());
     }
@@ -271,19 +303,19 @@ fn decode_value(data: &[u8], pos: &mut usize, st: &StringTableReader) -> Result<
         }
         TAG_ARRAY => {
             let count = decode_varint(data, pos)? as usize;
-            let mut arr = Vec::with_capacity(count);
+            let mut arr = Vec::with_capacity(safe_capacity(count, data.len().saturating_sub(*pos)));
             for _ in 0..count {
-                arr.push(decode_value(data, pos, st)?);
+                arr.push(decode_value_depth(data, pos, st, depth + 1)?);
             }
             Ok(Value::Array(arr))
         }
         TAG_OBJECT => {
             let count = decode_varint(data, pos)? as usize;
-            let mut map = HashMap::with_capacity(count);
+            let mut map = HashMap::with_capacity(safe_capacity(count, data.len().saturating_sub(*pos)));
             for _ in 0..count {
                 let key_idx = decode_varint(data, pos)? as u32;
                 let key = st.get(key_idx)?.to_string();
-                let val = decode_value(data, pos, st)?;
+                let val = decode_value_depth(data, pos, st, depth + 1)?;
                 map.insert(key, val);
             }
             Ok(Value::Object(map))
@@ -351,7 +383,7 @@ fn decode_constraints(data: &[u8], pos: &mut usize, st: &StringTableReader) -> R
     }
     if bits & 0x40 != 0 {
         let count = decode_varint(data, pos)? as usize;
-        let mut vals = Vec::with_capacity(count);
+        let mut vals = Vec::with_capacity(safe_capacity(count, data.len().saturating_sub(*pos)));
         for _ in 0..count {
             let idx = decode_varint(data, pos)? as u32;
             vals.push(st.get(idx)?.to_string());
@@ -382,14 +414,14 @@ fn encode_meta(out: &mut Vec<u8>, meta: &Meta, st: &StringTable) {
 
 fn decode_meta(data: &[u8], pos: &mut usize, st: &StringTableReader) -> Result<Meta, String> {
     let marker_count = decode_varint(data, pos)? as usize;
-    let mut markers = Vec::with_capacity(marker_count);
+    let mut markers = Vec::with_capacity(safe_capacity(marker_count, data.len().saturating_sub(*pos)));
     for _ in 0..marker_count {
         let idx = decode_varint(data, pos)? as u32;
         markers.push(st.get(idx)?.to_string());
     }
 
     let arg_count = decode_varint(data, pos)? as usize;
-    let mut args = Vec::with_capacity(arg_count);
+    let mut args = Vec::with_capacity(safe_capacity(arg_count, data.len().saturating_sub(*pos)));
     for _ in 0..arg_count {
         let idx = decode_varint(data, pos)? as u32;
         args.push(st.get(idx)?.to_string());
@@ -430,12 +462,12 @@ fn encode_metadata(out: &mut Vec<u8>, metadata: &HashMap<String, MetaMap>, st: &
 
 fn decode_metadata(data: &[u8], pos: &mut usize, st: &StringTableReader) -> Result<HashMap<String, MetaMap>, String> {
     let outer_count = decode_varint(data, pos)? as usize;
-    let mut metadata = HashMap::with_capacity(outer_count);
+    let mut metadata = HashMap::with_capacity(safe_capacity(outer_count, data.len().saturating_sub(*pos)));
     for _ in 0..outer_count {
         let path_idx = decode_varint(data, pos)? as u32;
         let key_path = st.get(path_idx)?.to_string();
         let inner_count = decode_varint(data, pos)? as usize;
-        let mut meta_map = HashMap::with_capacity(inner_count);
+        let mut meta_map = HashMap::with_capacity(safe_capacity(inner_count, data.len().saturating_sub(*pos)));
         for _ in 0..inner_count {
             let key_idx = decode_varint(data, pos)? as u32;
             let field_key = st.get(key_idx)?.to_string();
@@ -457,7 +489,7 @@ fn encode_includes(out: &mut Vec<u8>, includes: &[IncludeDirective], st: &String
 
 fn decode_includes(data: &[u8], pos: &mut usize, st: &StringTableReader) -> Result<Vec<IncludeDirective>, String> {
     let count = decode_varint(data, pos)? as usize;
-    let mut includes = Vec::with_capacity(count);
+    let mut includes = Vec::with_capacity(safe_capacity(count, data.len().saturating_sub(*pos)));
     for _ in 0..count {
         let path_idx = decode_varint(data, pos)? as u32;
         let alias_idx = decode_varint(data, pos)? as u32;
@@ -545,8 +577,14 @@ pub fn decompile(data: &[u8]) -> Result<ParseResult, String> {
         data[7..11].try_into().map_err(|_| "failed to read size")?
     ) as usize;
 
-    // Decompress payload
-    let payload = miniz_oxide::inflate::decompress_to_vec(&data[11..])
+    // safety: reject an oversized declared size before allocating, then bound
+    // the actual inflate so a small crafted stream cannot expand into gigabytes
+    // (a decompression bomb) — the length check alone runs only *after* the
+    // buffer has already grown.
+    if uncomp_size > MAX_DECODED_BYTES {
+        return Err(format!("declared size {} exceeds limit {}", uncomp_size, MAX_DECODED_BYTES));
+    }
+    let payload = miniz_oxide::inflate::decompress_to_vec_with_limit(&data[11..], MAX_DECODED_BYTES)
         .map_err(|e| format!("decompression failed: {:?}", e))?;
     if payload.len() != uncomp_size {
         return Err(format!("size mismatch: expected {}, got {}", uncomp_size, payload.len()));
@@ -971,5 +1009,96 @@ mod tests {
         let original = crate::parse(text);
         let reparsed = crate::parse(&decompiled);
         assert_eq!(original.root, reparsed.root);
+    }
+
+    // ── Hardening against hostile `.synxb` input (decompile is a decoder for
+    //    untrusted bytes; none of these may panic, OOM, or overflow the stack) ──
+
+    /// Build a minimal valid `.synxb` header wrapping a raw (already-deflated) body.
+    fn wrap_synxb(uncomp_size: u32, flags: u8, deflated: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(MAGIC);
+        out.push(FORMAT_VERSION);
+        out.push(flags);
+        out.extend_from_slice(&uncomp_size.to_le_bytes());
+        out.extend_from_slice(deflated);
+        out
+    }
+
+    #[test]
+    fn test_decompile_rejects_oversized_declared_size() {
+        // Declared uncompressed size beyond the cap must be refused before any
+        // large allocation, regardless of the (here trivial) body.
+        let bomb = wrap_synxb(u32::MAX, 0, &[]);
+        assert!(decompile(&bomb).is_err());
+    }
+
+    #[test]
+    fn test_decompile_bounds_decompression() {
+        // A tiny deflate stream that expands past the cap must error, not
+        // materialise gigabytes. 4 MiB of zeros compresses to a few KiB.
+        let payload = vec![0u8; 4 * 1024 * 1024];
+        let deflated = miniz_oxide::deflate::compress_to_vec(&payload, 9);
+        // Under-declare the size; the with_limit inflate still refuses to grow
+        // past MAX_DECODED_BYTES if a crafted stream tried to.
+        let framed = wrap_synxb(payload.len() as u32, 0, &deflated);
+        // Valid here (4 MiB < cap) — it must decode without panicking…
+        let _ = decompile(&framed);
+        // …and a stream whose declared size exceeds the cap is rejected.
+        let lie = wrap_synxb((MAX_DECODED_BYTES + 1) as u32, 0, &deflated);
+        assert!(decompile(&lie).is_err());
+    }
+
+    #[test]
+    fn test_decompile_huge_count_does_not_abort() {
+        // A string-table count of u64::MAX must produce a clean Err, not abort
+        // the process inside `with_capacity`.
+        let mut payload = Vec::new();
+        encode_varint(&mut payload, u64::MAX); // string table count
+        let deflated = miniz_oxide::deflate::compress_to_vec(&payload, 9);
+        let framed = wrap_synxb(payload.len() as u32, 0, &deflated);
+        assert!(decompile(&framed).is_err());
+    }
+
+    #[test]
+    fn test_decompile_deep_nesting_does_not_overflow_stack() {
+        // Value tree of nothing but ARRAY tags, far past the depth cap.
+        let mut payload = Vec::new();
+        encode_varint(&mut payload, 0); // empty string table
+        for _ in 0..(MAX_DECODE_DEPTH + 500) {
+            payload.push(TAG_ARRAY);
+            encode_varint(&mut payload, 1); // one child
+        }
+        payload.push(TAG_NULL);
+        let deflated = miniz_oxide::deflate::compress_to_vec(&payload, 9);
+        let framed = wrap_synxb(payload.len() as u32, 0, &deflated);
+        assert!(decompile(&framed).is_err());
+    }
+
+    #[test]
+    fn test_decompile_string_index_out_of_bounds_errors() {
+        // Empty string table, then a STRING value referencing index 5.
+        let mut payload = Vec::new();
+        encode_varint(&mut payload, 0);
+        payload.push(TAG_STRING);
+        encode_varint(&mut payload, 5);
+        let deflated = miniz_oxide::deflate::compress_to_vec(&payload, 9);
+        let framed = wrap_synxb(payload.len() as u32, 0, &deflated);
+        assert!(decompile(&framed).is_err());
+    }
+
+    #[test]
+    fn test_binary_roundtrip_large_int() {
+        // Values beyond 2^53 exercise the full i64 zigzag path.
+        let mut root = HashMap::new();
+        root.insert("big".to_string(), Value::Int(9_000_000_000_000_000_007));
+        root.insert("neg".to_string(), Value::Int(-9_000_000_000_000_000_007));
+        let result = ParseResult {
+            root: Value::Object(root), mode: Mode::Static, locked: false, tool: false,
+            schema: false, llm: false, metadata: HashMap::new(), includes: Vec::new(),
+            uses: Vec::new(), truncated: false,
+        };
+        let restored = decompile(&compile(&result, false)).unwrap();
+        assert_eq!(restored.root, result.root);
     }
 }

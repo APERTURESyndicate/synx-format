@@ -79,6 +79,13 @@ function writeValue(v: unknown, hideMeta: boolean, indent: number, depth: number
   if (t === 'number') return formatNumber(v as number);
   if (t === 'bigint') return (v as bigint).toString();
   if (t === 'string') return escapeString(v as string);
+  // A `:secret` value must serialise as the redaction mask, never as its
+  // fields. Without this a SynxSecret fell through to the object branch and
+  // came out as `{}`, diverging from the Rust writer's `"[SECRET]"` and losing
+  // the marker. Detected via a global-symbol brand (see engine.ts SynxSecret).
+  if (t === 'object' && (v as Record<symbol, unknown>)[Symbol.for('synx.secret')] === true) {
+    return escapeString('[SECRET]');
+  }
 
   const nl = indent > 0 ? '\n' : '';
   const pad = indent > 0 ? ' '.repeat(indent * (depth + 1)) : '';

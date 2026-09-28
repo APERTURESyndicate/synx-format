@@ -34,7 +34,15 @@ const MAX_CONSTRAINT_ENUM_PARTS: usize = 4096;
 const MAX_MARKER_CHAIN_SEGMENTS: usize = 512;
 
 /// Truncate `text` to a UTF-8-safe prefix (used by `parse` and canonical `format`).
+///
+/// A single leading U+FEFF byte-order mark is dropped first (SYNX §2.1: a BOM at
+/// the start MAY be treated as whitespace; §6 requires directives to be matched
+/// with a leading BOM ignored). `str::trim` does not treat U+FEFF as whitespace,
+/// so without this a BOM-prefixed `!active` produced a `"\u{feff}!active"` key
+/// and silently disabled Active mode — the JS parser already strips it, so this
+/// also removes a cross-implementation divergence.
 pub(crate) fn clamp_synx_text(text: &str) -> &str {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     if text.len() <= MAX_SYNX_INPUT_BYTES {
         return text;
     }
@@ -170,6 +178,8 @@ pub fn parse_with(text: &str, opts: ParserOptions) -> ParseResult {
 
     let mut root = HashMap::new();
     let mut stack: Vec<(i32, StackEntry)> = vec![(-1, StackEntry::Root)];
+    // Parent-navigation cache; cleared on every stack mutation (see NavCache).
+    let mut nav_cache: NavCache = None;
     let mut mode = Mode::Static;
     let mut locked = false;
     let mut tool = false;
@@ -255,7 +265,7 @@ pub fn parse_with(text: &str, opts: ParserOptions) -> ParseResult {
                 let blk_key = blk.key.clone();
                 let blk_stack_idx = blk.stack_idx;
                 block = None;
-                insert_value(&mut root, &stack, blk_stack_idx, &blk_key, Value::String(content));
+                insert_value(&mut root, &stack, blk_stack_idx, &blk_key, Value::String(content), &mut nav_cache);
             }
         }
 
@@ -366,7 +376,7 @@ pub fn parse_with(text: &str, opts: ParserOptions) -> ParseResult {
                     // at the same or deeper indent so items don't accumulate.
                     while stack.len() > 1 {
                         match stack.last() {
-                            Some((d, StackEntry::ListItem { .. })) if *d >= indent => { stack.pop(); }
+                            Some((d, StackEntry::ListItem { .. })) if *d >= indent => { pop_frame(&mut stack, &mut nav_cache); }
                             _ => break,
                         }
                     }
@@ -403,7 +413,7 @@ pub fn parse_with(text: &str, opts: ParserOptions) -> ParseResult {
                     let list_stack_idx = lst.stack_idx;
 
                     // Locate the items array, creating it lazily in the parent map.
-                    if let Some(parent_map) = navigate_to_parent(&mut root, &stack, list_stack_idx) {
+                    if let Some(parent_map) = navigate_cached(&mut root, &stack, list_stack_idx, &mut nav_cache) {
                         let arr_entry = parent_map
                             .entry(list_key.clone())
                             .or_insert_with(|| Value::Array(Vec::new()));
@@ -434,7 +444,7 @@ pub fn parse_with(text: &str, opts: ParserOptions) -> ParseResult {
                                 let item_idx = arr.len();
                                 arr.push(Value::Object(item_obj));
                                 if stack.len() < MAX_PARSE_NESTING_DEPTH {
-                                    stack.push((indent, StackEntry::ListItem { list_key, item_idx }));
+                                    push_frame(&mut stack, &mut nav_cache, (indent, StackEntry::ListItem { list_key, item_idx }));
                                 }
                             } else {
                                 arr.push(cast(&val_str));
@@ -454,7 +464,7 @@ pub fn parse_with(text: &str, opts: ParserOptions) -> ParseResult {
                 // Pop any list-item frames at-or-above this indent.
                 while stack.len() > 1 {
                     match stack.last() {
-                        Some((d, StackEntry::ListItem { .. })) if *d >= indent => { stack.pop(); }
+                        Some((d, StackEntry::ListItem { .. })) if *d >= indent => { pop_frame(&mut stack, &mut nav_cache); }
                         _ => break,
                     }
                 }
@@ -473,7 +483,7 @@ pub fn parse_with(text: &str, opts: ParserOptions) -> ParseResult {
 
             // Pop stack to correct parent
             while stack.len() > 1 && stack.last().unwrap().0 >= indent {
-                stack.pop();
+                pop_frame(&mut stack, &mut nav_cache);
             }
 
             let parent_idx = stack.len() - 1;
@@ -515,6 +525,7 @@ pub fn parse_with(text: &str, opts: ParserOptions) -> ParseResult {
                     parent_idx,
                     &parsed.key,
                     Value::String(String::new()),
+                    &mut nav_cache,
                 );
                 block = Some(BlockState {
                     indent,
@@ -533,6 +544,7 @@ pub fn parse_with(text: &str, opts: ParserOptions) -> ParseResult {
                     parent_idx,
                     &parsed.key,
                     Value::Array(Vec::new()),
+                    &mut nav_cache,
                 );
                 list = Some(ListState {
                     indent,
@@ -573,6 +585,7 @@ pub fn parse_with(text: &str, opts: ParserOptions) -> ParseResult {
                             parent_idx,
                             &parsed.key,
                             Value::Array(Vec::new()),
+                            &mut nav_cache,
                         );
                         list = Some(ListState {
                             indent,
@@ -590,12 +603,13 @@ pub fn parse_with(text: &str, opts: ParserOptions) -> ParseResult {
                     parent_idx,
                     &parsed.key,
                     Value::Object(HashMap::new()),
+                    &mut nav_cache,
                 );
                 // Guard against pathological inputs that create extremely deep nesting,
                 // which can lead to large allocations (metadata path building, parent navigation, etc).
                 // If the cap is hit, we still insert the object but stop increasing nesting.
                 if stack.len() < MAX_PARSE_NESTING_DEPTH {
-                    stack.push((indent, StackEntry::Key(parsed.key)));
+                    push_frame(&mut stack, &mut nav_cache, (indent, StackEntry::Key(parsed.key)));
                 }
             } else {
                 let value = if let Some(ref hint) = parsed.type_hint {
@@ -603,7 +617,7 @@ pub fn parse_with(text: &str, opts: ParserOptions) -> ParseResult {
                 } else {
                     cast(&parsed.value)
                 };
-                insert_value(&mut root, &stack, parent_idx, &parsed.key, value);
+                insert_value(&mut root, &stack, parent_idx, &parsed.key, value, &mut nav_cache);
             }
         }
 
@@ -618,6 +632,7 @@ pub fn parse_with(text: &str, opts: ParserOptions) -> ParseResult {
             blk.stack_idx,
             &blk.key,
             Value::String(blk.content),
+            &mut nav_cache,
         );
     }
 
@@ -1034,14 +1049,70 @@ fn build_path(stack: &[(i32, StackEntry)]) -> String {
     parts.join(".")
 }
 
+/// Cache of the last resolved parent map: `(stack index of the parent, pointer)`.
+///
+/// Re-navigating the stack on every inserted line re-hashes each ancestor key.
+/// With a multi-megabyte ancestor key that is O(children × key_len) — a
+/// documented DoS: an 8 MiB file (well under the 16 MiB cap) took tens of
+/// seconds. The cache reuses the parent pointer across consecutive inserts to
+/// the same parent, making it linear again.
+type NavCache = Option<(usize, *mut HashMap<String, Value>)>;
+
+/// Push a stack frame and invalidate the navigation cache.
+///
+/// safety: every stack mutation clears the cache, which is what makes reusing a
+/// cached parent pointer sound. Between two mutations the cached map does not
+/// move: inserts only ever target the current top (or an open list's parent),
+/// never an ancestor, so no ancestor's bucket array reallocates under a live
+/// pointer, and inserting into the cached map itself relocates only its own
+/// buckets, not the `HashMap` struct the pointer refers to.
+#[inline]
+fn push_frame(stack: &mut Vec<(i32, StackEntry)>, cache: &mut NavCache, frame: (i32, StackEntry)) {
+    stack.push(frame);
+    *cache = None;
+}
+
+/// Pop a stack frame and invalidate the navigation cache (see [`push_frame`]).
+#[inline]
+fn pop_frame(stack: &mut Vec<(i32, StackEntry)>, cache: &mut NavCache) -> Option<(i32, StackEntry)> {
+    let popped = stack.pop();
+    *cache = None;
+    popped
+}
+
+/// Resolve the parent map for `parent_idx`, reusing the cached pointer when the
+/// stack has not changed since it was cached (see [`NavCache`]).
+fn navigate_cached<'a>(
+    root: &'a mut HashMap<String, Value>,
+    stack: &[(i32, StackEntry)],
+    parent_idx: usize,
+    cache: &mut NavCache,
+) -> Option<&'a mut HashMap<String, Value>> {
+    if let Some((idx, ptr)) = *cache {
+        if idx == parent_idx {
+            // SAFETY: `cache` is cleared by push_frame/pop_frame on every stack
+            // mutation, so a non-None entry means the stack is unchanged since
+            // `ptr` was taken and the pointed-to map has not moved (see
+            // push_frame docs). We hand out a single &mut re-borrowed for 'a.
+            return Some(unsafe { &mut *ptr });
+        }
+    }
+    let ptr = navigate_to_parent(root, stack, parent_idx)? as *mut HashMap<String, Value>;
+    *cache = Some((parent_idx, ptr));
+    // SAFETY: as above — `ptr` was just derived from the exclusive borrow of
+    // `root` and no other reference to the same map is live.
+    Some(unsafe { &mut *ptr })
+}
+
 fn insert_value(
     root: &mut HashMap<String, Value>,
     stack: &[(i32, StackEntry)],
     parent_idx: usize,
     key: &str,
     value: Value,
+    cache: &mut NavCache,
 ) {
-    if let Some(target) = navigate_to_parent(root, stack, parent_idx) {
+    if let Some(target) = navigate_cached(root, stack, parent_idx, cache) {
         target.insert(key.to_string(), value);
     }
     // If the path is broken the line is silently skipped — this should not
@@ -1372,6 +1443,61 @@ mod tests {
             data.root.as_object().unwrap()["body"],
             Value::String("!include /etc/passwd".into())
         );
+    }
+
+    // A leading BOM (Notepad/Windows editors emit one) must not hide the
+    // `!active` directive — SYNX §2.1/§6. Regression for the divergence where
+    // BOM+!active produced a "\u{feff}!active" key and stayed Static.
+    #[test]
+    fn test_leading_bom_does_not_disable_active() {
+        let data = parse("\u{feff}!active\nsum:calc 2 + 3\n");
+        assert_eq!(data.mode, Mode::Active);
+        assert!(data.root.as_object().unwrap().get("\u{feff}!active").is_none());
+    }
+
+    #[test]
+    fn test_leading_bom_stripped_from_first_key() {
+        let data = parse("\u{feff}name Wario\n");
+        let root = data.root.as_object().unwrap();
+        assert_eq!(root["name"], Value::String("Wario".into()));
+        assert!(root.get("\u{feff}name").is_none());
+    }
+
+    // A multi-megabyte ancestor key with many children used to re-hash the key
+    // on every child (O(children × key_len)) — an 8 MiB file took tens of
+    // seconds. This must stay well under a second and produce the right tree.
+    #[test]
+    fn test_long_parent_key_is_linear() {
+        let key = "K".repeat(1024 * 1024);
+        let mut doc = String::with_capacity(2 * 1024 * 1024);
+        doc.push_str(&key);
+        doc.push('\n');
+        for i in 0..20_000 {
+            doc.push_str(&format!("  c{i} {i}\n"));
+        }
+        let start = std::time::Instant::now();
+        let data = parse(&doc);
+        assert!(start.elapsed().as_secs() < 5, "long-parent parse took {:?}", start.elapsed());
+        let root = data.root.as_object().unwrap();
+        let inner = root[&key].as_object().unwrap();
+        assert_eq!(inner.len(), 20_000);
+        assert_eq!(inner["c0"], Value::Int(0));
+        assert_eq!(inner["c19999"], Value::Int(19_999));
+    }
+
+    // The navigation cache must not leak a parent pointer across sibling
+    // subtrees at the same depth (would misattach keys or alias maps).
+    #[test]
+    fn test_nav_cache_distinguishes_siblings() {
+        let data = parse("a\n  x 1\nb\n  x 2\nc\n  y 3\n  z 4\n");
+        let root = data.root.as_object().unwrap();
+        assert_eq!(root["a"].as_object().unwrap()["x"], Value::Int(1));
+        assert_eq!(root["b"].as_object().unwrap()["x"], Value::Int(2));
+        let c = root["c"].as_object().unwrap();
+        assert_eq!(c["y"], Value::Int(3));
+        assert_eq!(c["z"], Value::Int(4));
+        assert_eq!(c.len(), 2);
+        assert_eq!(root["a"].as_object().unwrap().len(), 1);
     }
 
     #[test]
