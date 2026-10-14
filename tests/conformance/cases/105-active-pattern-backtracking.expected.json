@@ -1,0 +1,2 @@
+{"escaped":"(aa)","flat":"a+a","flat_bad":"CONSTRAINT_ERR: 'flat_bad' does not match pattern /^[a+]+$/","nested":"aaaa!","nested_counted":"CONSTRAINT_ERR: 'nested_counted' does not match pattern /^(ab){2}$/"}
+

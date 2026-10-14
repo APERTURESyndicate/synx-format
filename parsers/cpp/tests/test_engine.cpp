@@ -10,8 +10,8 @@ SYNX_TEST(engine_env_default) {
     ParseResult r = parse("!active\nport:env:default:3000 APP_PORT\n");
     resolve(r, opts);
     const Value* port = r.root.get("port");
-    EXPECT_TRUE(port && port->is_string());
-    EXPECT_EQ(*port->as_string(), std::string("9090"));
+    EXPECT_TRUE(port && port->is_int());
+    EXPECT_TRUE(port && port->is_int() && *port->as_int() == 9090);
 }
 
 SYNX_TEST(engine_env_falls_back_to_default) {
@@ -20,8 +20,8 @@ SYNX_TEST(engine_env_falls_back_to_default) {
     ParseResult r = parse("!active\nport:env:default:3000 NOT_SET\n");
     resolve(r, opts);
     const Value* port = r.root.get("port");
-    EXPECT_TRUE(port && port->is_string());
-    EXPECT_EQ(*port->as_string(), std::string("3000"));
+    EXPECT_TRUE(port && port->is_int());
+    EXPECT_TRUE(port && port->is_int() && *port->as_int() == 3000);
 }
 
 SYNX_TEST(engine_calc_basic) {

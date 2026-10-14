@@ -46,3 +46,28 @@ func TestJSONEscapes(t *testing.T) {
 		}
 	}
 }
+
+// Expected strings come from the Rust reference (`ryu`) via `synx parse`.
+func TestJSONFloatShortestRoundTrip(t *testing.T) {
+	cases := []struct {
+		in   float64
+		want string
+	}{
+		{3.14, "3.14"},
+		{100, "100.0"},
+		{0.0001, "0.0001"},
+		{0.00001, "0.00001"},
+		{0.000001, "1e-6"},
+		{0.000123, "0.000123"},
+		{1234567890123456.5, "1234567890123456.5"},
+		{12345678901234567.0, "1.2345678901234568e16"},
+		{123456789012345678901.5, "1.2345678901234568e20"},
+		{-2.5, "-2.5"},
+		{1e21, "1e21"},
+	}
+	for _, c := range cases {
+		if got := ToJSON(Float(c.in)); got != c.want {
+			t.Errorf("ToJSON(Float(%v)) = %s, want %s", c.in, got, c.want)
+		}
+	}
+}

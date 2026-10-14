@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 // Resource caps (parity with crates/synx-core/src/parser.rs).
@@ -21,7 +22,12 @@ const (
 )
 
 // ClampText truncates `text` to a UTF-8-safe prefix bounded by MaxInputBytes.
+//
+// A single leading U+FEFF byte-order mark is dropped first (SYNX §2.1). It is
+// not whitespace to `strings.TrimSpace`, so left in place it would glue itself
+// to the first key and silently turn a BOM-prefixed `!active` into a plain key.
 func ClampText(text string) string {
+	text = strings.TrimPrefix(text, "\uFEFF")
 	b := []byte(text)
 	if len(b) <= MaxInputBytes {
 		return text
@@ -79,6 +85,63 @@ func Parse(text string) ParseResult {
 		raw := lineBytes(b, lineStarts, i)
 		rawStr := string(raw)
 		t := strings.TrimSpace(rawStr)
+
+		// A blank line is never structural and never body: SYNX §8.4.1 does not
+		// preserve blank lines inside a multiline body.
+		if t == "" {
+			i++
+			continue
+		}
+
+		indent := indentOf(raw)
+
+		// Continue multiline block.
+		//
+		// This branch runs before every line-class rule below, and that order
+		// is load-bearing: a `|` / `|+` body is raw text (SYNX §8.4.1), so `#`,
+		// `//`, `###` and `!…` lines are ordinary content there. Classifying
+		// first would delete comment lines out of code samples, let a stray
+		// `###` swallow the rest of the record and turn a dataset row into a
+		// directive.
+		if block != nil {
+			if indent > block.indent {
+				if block.content.Len() < MaxMultilineBytes {
+					if block.content.Len() > 0 {
+						block.content.WriteByte('\n')
+					}
+					room := MaxMultilineBytes - block.content.Len()
+					// `|+` (SYNX 3.7): lock base indent to the first non-empty
+					// continuation line and strip that many leading whitespace
+					// bytes; anything indented further is preserved. The cut is
+					// walked rune by rune so a multi-byte indent character
+					// (U+00A0, U+3000…) is never split.
+					var slice string
+					if block.preserveIndent {
+						if block.baseIndent < 0 {
+							block.baseIndent = indent
+						}
+						strip := block.baseIndent
+						if indent < strip {
+							strip = indent
+						}
+						trimEnd := strings.TrimRightFunc(rawStr, unicode.IsSpace)
+						cut := stripBoundary(trimEnd, strip)
+						if cut < len(trimEnd) {
+							slice = trimEnd[cut:]
+						} else {
+							slice = ""
+						}
+					} else {
+						slice = t
+					}
+					block.content.WriteString(slice[:utf8PrefixLen(slice, room)])
+				}
+				i++
+				continue
+			}
+			insertValue(rootObj, stack, block.stackIdx, block.key, String(block.content.String()))
+			block = nil
+		}
 
 		// Directives
 		switch t {
@@ -168,53 +231,9 @@ func Parse(text string) ParseResult {
 			i++
 			continue
 		}
-		if t == "" || t[0] == '#' || strings.HasPrefix(t, "//") {
+		if t[0] == '#' || strings.HasPrefix(t, "//") {
 			i++
 			continue
-		}
-
-		indent := indentOf(raw)
-
-		// Continue multiline block
-		if block != nil {
-			if indent > block.indent {
-				if block.content.Len() < MaxMultilineBytes {
-					if block.content.Len() > 0 {
-						block.content.WriteByte('\n')
-					}
-					room := MaxMultilineBytes - block.content.Len()
-					// `|+` (SYNX 3.7): lock base indent to the first non-empty
-					// continuation line and strip exactly that many leading
-					// whitespace bytes; anything indented further is preserved.
-					var slice string
-					if block.preserveIndent {
-						if block.baseIndent < 0 {
-							block.baseIndent = indent
-						}
-						strip := block.baseIndent
-						if indent < strip {
-							strip = indent
-						}
-						trimEnd := strings.TrimRight(rawStr, " \t\r\n")
-						if strip < len(trimEnd) {
-							slice = trimEnd[strip:]
-						} else {
-							slice = ""
-						}
-					} else {
-						slice = t
-					}
-					if room < len(slice) {
-						block.content.WriteString(slice[:room])
-					} else {
-						block.content.WriteString(slice)
-					}
-				}
-				i++
-				continue
-			}
-			insertValue(rootObj, stack, block.stackIdx, block.key, String(block.content.String()))
-			block = nil
 		}
 
 		// List items
@@ -743,12 +762,55 @@ func lineBytes(b []byte, starts []int, i int) []byte {
 	return b[s:e]
 }
 
+// indentOf measures leading whitespace in bytes over Unicode whitespace
+// (SYNX §4), so U+00A0 or U+3000 count as indentation like a space does.
 func indentOf(line []byte) int {
 	i := 0
-	for i < len(line) && (line[i] == ' ' || line[i] == '\t') {
-		i++
+	for i < len(line) {
+		c := line[i]
+		if c < utf8.RuneSelf {
+			if c != ' ' && c != '\t' && c != '\v' && c != '\f' {
+				break
+			}
+			i++
+			continue
+		}
+		r, size := utf8.DecodeRune(line[i:])
+		if !unicode.IsSpace(r) {
+			break
+		}
+		i += size
 	}
 	return i
+}
+
+// stripBoundary returns the byte offset of the first rune at or past `strip`
+// bytes of leading whitespace; it never lands inside a multi-byte rune.
+func stripBoundary(s string, strip int) int {
+	off := 0
+	for _, r := range s {
+		if off >= strip || !unicode.IsSpace(r) {
+			break
+		}
+		off += utf8.RuneLen(r)
+	}
+	return off
+}
+
+// utf8PrefixLen is the longest prefix of s that fits in limit bytes without
+// splitting a rune.
+func utf8PrefixLen(s string, limit int) int {
+	if limit < 0 {
+		limit = 0
+	}
+	if len(s) <= limit {
+		return len(s)
+	}
+	end := limit
+	for end > 0 && !utf8.RuneStart(s[end]) {
+		end--
+	}
+	return end
 }
 
 func firstWhitespace(s string) int {
@@ -906,5 +968,3 @@ func mutateArrayPath(obj *Object, path []stackFrame, listKey string, transform f
 	}
 }
 
-// suppress "unused" for unicode import in some build configurations.
-var _ = unicode.IsSpace

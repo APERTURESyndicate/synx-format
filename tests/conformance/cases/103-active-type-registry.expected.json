@@ -1,0 +1,2 @@
+{"boss":{"hp":"TYPE_ERR: 'hp' expected int but got string"},"hp":100,"monster":{"hp":50}}
+

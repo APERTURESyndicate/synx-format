@@ -134,3 +134,76 @@ jobs:
       - name: Rust vs TypeScript differential
         if: matrix.check == 'synxl-cross'
         run: node scripts/ci/diff-implementations.mjs
+
+  # Every native parser reads the shared corpus in tests/conformance/cases and
+  # compares its projection with the .expected.json goldens byte for byte.
+  # Until 3.7.4 none of these ran in CI, and five of the six runners only
+  # checked that a parse returned an object — so the 3.7.2/3.7.3 parser fixes
+  # reached Rust and TypeScript alone while the suites stayed green.
+  native-parsers:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        parser: [go, dotnet, java, dart, swift, cpp]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Go
+        if: matrix.parser == 'go'
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+      - name: Go tests
+        if: matrix.parser == 'go'
+        working-directory: parsers/go
+        run: go test ./...
+
+      - name: .NET
+        if: matrix.parser == 'dotnet'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+      - name: .NET tests
+        if: matrix.parser == 'dotnet'
+        working-directory: parsers/dotnet
+        run: dotnet test --nologo
+
+      - name: Java
+        if: matrix.parser == 'java'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Java tests
+        if: matrix.parser == 'java'
+        working-directory: parsers/java
+        run: mvn -B -q test
+
+      - name: Dart
+        if: matrix.parser == 'dart'
+        uses: dart-lang/setup-dart@v1
+      - name: Dart tests
+        if: matrix.parser == 'dart'
+        working-directory: parsers/dart
+        run: |
+          dart pub get
+          dart analyze --fatal-infos
+          dart test
+
+      # Swift ships preinstalled on the ubuntu-latest image.
+      - name: Swift tests
+        if: matrix.parser == 'swift'
+        working-directory: parsers/swift
+        run: swift test
+
+      - name: C++ tests
+        if: matrix.parser == 'cpp'
+        working-directory: parsers/cpp
+        run: |
+          cmake -S . -B build -DSYNX_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel
+          ctest --test-dir build --output-on-failure

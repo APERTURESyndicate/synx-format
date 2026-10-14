@@ -14,6 +14,197 @@ All notable changes to this repository are documented in this file.
 > for `3.7.0` was free, so npm and every other registry — plus the
 > git tag — now publish on the same version number.
 
+## [3.7.4] — 2026-10-14
+
+A parity release. The parser fixes of 3.7.2 and 3.7.3 reached Rust, TypeScript
+and Python only: the six native parsers never received them, and nothing
+noticed, because CI did not run their suites and most of their conformance
+runners never compared a result with its golden. This release closes that gap,
+puts every implementation under one byte-exact gate — now covering active mode
+too — and carries errata for active-mode constraints.
+
+### Erratum — `[type:string]` on `:env` and `:default`
+
+- **`[type:string]` now keeps text taken from the environment as text.**
+  `:env` and `:default` cast their value like a literal, so a value that only
+  looks numeric — a 19-digit snowflake id, a zero-padded `007` — became a
+  number, and `[type:string]` then rejected its own declared type with
+  `CONSTRAINT_ERR`. Only the `(string)` hint escaped the cast. Both now do, in
+  every implementation (`wants_string` in `crates/synx-core/src/engine.rs`).
+  In synx-core and TypeScript, a document that previously produced that
+  `CONSTRAINT_ERR` now produces the string; no other output changes.
+  Active-mode markers sit outside the frozen core
+  (`docs/spec/CORE-FREEZE.md` §1), and the rule is now written into
+  `SPECIFICATION_EN.md` / `SPECIFICATION_RU.md`.
+- **`[type:string]` accepts a `:secret`.** `key[type:string]:secret:env VAR` —
+  the usual shape of an API key in a config — always failed the type check,
+  because a secret is not a plain string value.
+
+### Erratum — constraints
+
+- **A string's `[min]` / `[max]` length is its count of Unicode characters.**
+  synx-core counted UTF-8 bytes, so `[max:4]` rejected the three-letter `мир`
+  (6 bytes) and `[min:3]` let a two-letter Cyrillic nickname through, while
+  TypeScript counted UTF-16 units and split emoji in two. Every implementation
+  now counts Unicode scalar values.
+- **A `[pattern]` that nests one quantifier inside another (`^(a+)+$`) is
+  skipped, as an invalid pattern always was.** Backtracking regex engines —
+  TypeScript, Java, .NET, Dart, Swift, C++ — can spend exponential time on
+  such a pattern, which a document controls. TypeScript refused it in SYNXL
+  since 3.7.2 but not in active mode, where the same 88-byte document still
+  hung the event loop. The `regex` crate is linear and ran it, so Rust and
+  TypeScript already disagreed on SYNXL; synx-core now refuses the same shape
+  (`has_nested_quantifier`), in active mode and in SYNXL, and the projection
+  is identical everywhere.
+- **TypeScript skipped the document-wide constraint pass.** A constraint
+  declared once applies to every field of that name, merged with the
+  strictest bound winning (`validate_field_constraints`); TypeScript only
+  checked the line that declared it, so `port[max:65535]` under one section
+  left `port 70000` under another unchecked.
+
+### Fixed — `.synxb` decode depth
+
+- **The 3.7.3 stack guard overflowed the stack.** The decoder refused nesting
+  beyond 1024 levels, but 1024 recursive frames are enough to overflow a 2 MiB
+  thread in a Windows debug build — `cargo test -p synx-core` aborted with
+  `STATUS_STACK_OVERFLOW` on the very test meant to prove the guard — and sit
+  close to the 1 MiB main-thread stack Windows gives a process. The cap is now
+  256 in Rust and TypeScript, twice the parser's 128-level nesting limit, and a
+  new test checks that the deepest tree `parse` can produce still decodes.
+
+### Fixed — TypeScript
+
+- **A leading BOM stuck to the first key of a static document**
+  (`packages/synx-js/src/parser.ts`). `trim()` hid it in front of `!active`,
+  which is why 3.7.3 recorded TypeScript as already correct, but `\uFEFFname x`
+  produced the key `"\uFEFFname"`. A single leading U+FEFF is now dropped
+  before parsing, as in Rust.
+- **`:env` lost precision on 64-bit integers** (`packages/synx-js/src/engine.ts`).
+  3.7.2 made the parser keep i64 values exact, but the active-mode engine kept
+  its own `parseInt` cast, so `id:env DISCORD_APP_ID` still turned a snowflake
+  into a different id. The engine cast now mirrors `cast_primitive`: quotes keep
+  the literal, integers are exact i64 (`bigint` beyond 2^53), and an i64
+  overflow is tried as a float. `[type:int]`, `[type:float]` and the `(int)`
+  type registry accept a `bigint`, which they rejected since 3.7.2.
+- **A value that began with `(word)` was taken for a type cast**
+  (`packages/synx-js/src/parser.ts`). The parser glued the key-line hint onto
+  the value as `(hint)value` and re-detected it later, so a value that merely
+  started that way was cast too: `key (aa)` read as `""`, `key (random:bool)`
+  as a random boolean, `key (int)5` as `5`. Gluing also broke the key line
+  itself — `key(int)` with children or `key(string) |` lost its object or
+  block. The hint now travels separately (`castTyped`) and a value is always
+  text, as in synx-core. Two existing tests that relied on the old reading are
+  rewritten to the documented `key(hint) value` form.
+- **Importing `src/index.ts` as an ES module threw `ReferenceError: module is
+  not defined`.** The CommonJS export block is now guarded; the published
+  CommonJS build is unchanged.
+
+### Fixed — native parsers
+
+Go, .NET, Java, Dart, Swift and C++ now produce every conformance golden byte
+for byte. Five of their six "conformance" runners (all but .NET) only checked
+that a case parsed to an object; each is now a byte-exact comparison, and
+running them for real is what surfaced most of what follows.
+
+- **Parser parity with 3.7.2/3.7.3, in all six:** a leading BOM is dropped
+  (so `\uFEFF!active` switches to active mode instead of becoming a key);
+  `|` / `|+` bodies are read before comment, `###` and directive handling, so
+  `#`, `//` and `!…` lines in a body are kept rather than deleted; indentation
+  is measured over Unicode whitespace and `|+` bodies and the 1 MiB cap are
+  cut on character boundaries. .NET also measured non-ASCII keys in UTF-8 byte
+  offsets used as string indexes, and dropped an unknown `!foo bar` line that
+  Rust keeps as the key `"!foo"`.
+- **Floats were printed with `%.17g` or the platform default** in Go, Java,
+  Swift, C++ and Dart — `3.1400000000000001`, `99.500000000000000` — which
+  failed case 004 outright. JSON output now uses the shortest round-trip
+  digits in the reference (`ryu`) layout; stringify and interpolation use the
+  reference `Display` form.
+- **Active mode:** the `[type:string]` erratum above; `:env` / `:default`
+  values are cast like `cast_primitive` (exact i64, quotes keep the literal,
+  the fallback is every segment after `default` rejoined with `:`); a
+  `:secret` is applied after the rest of the marker chain — before, Java,
+  Swift and Go masked the variable *name* of `:secret:env`, or lost the secret
+  entirely — and interpolates as `[SECRET]`.
+- **`{interpolation}` did not exist** in the Go, Dart, Java and Swift engines;
+  it is added with the reference semantics (children first, `{a.b}`,
+  `{key:alias}`, non-ASCII literal text intact, secrets masked).
+- **`:env` without an env map returned the variable name** in Go, Dart, Java,
+  Swift and C++. It now reads the process environment, as Rust does; an explicitly
+  empty map still means "no variables".
+- **.NET: list items with fields.** `- key value` followed by deeper lines
+  did not become an object item, so the fields below it broke the tree; items
+  now follow the reference list logic (fields, nested objects and lists, `|`
+  bodies inside an item).
+- **Swift and C++ `:calc`** are byte-level ports of `calc.rs`: a failing
+  expression now yields the reference `CALC_ERR: …` text instead of the raw
+  expression, operands are substituted in the reference number format rather
+  than `%.17g` (`0.1 * 3` → `0.30000000000000004`, as in Rust), and sibling
+  keys and dotted paths (`base.hp`) resolve as in Rust.
+- **C++: dangling namespace pointers.** `namespaces` pointed into `root`, which
+  a second `!include` or `!use` could reallocate; they are refreshed after
+  every load.
+- **`|+` suites for Java, Swift and C++**, closing the gap 3.7.1 left open,
+  plus engine suites for the erratum, secret masking and non-ASCII
+  interpolation in every port.
+
+- **A failed constraint only reached stderr** in Go, Dart, Java, Swift and
+  C++, and only in strict mode; the value went through unchecked. It now
+  becomes the reference `CONSTRAINT_ERR: …` string, with the per-key pass, the
+  document-wide pass and the `TYPE_ERR` pass in the reference order. A
+  `strict` option still echoes each error to stderr.
+- **C++: an invalid `[pattern]` aborted the process.** The library is built
+  with `-fno-exceptions`, so a pattern `std::regex` rejects — `[`, `a{2,1}` —
+  ended the host process. Patterns are now checked before compilation and an
+  invalid one is skipped, as everywhere else.
+
+### Fixed — CLI
+
+- **`synx parse` printed an `!active` document unresolved when it began with a
+  BOM** (`crates/synx-cli/src/main.rs`). The command scanned lines for
+  `!active` itself, and `str::trim` keeps U+FEFF; it now relies on the
+  parser's mode flag, which 3.7.3 already made BOM-aware.
+
+### Tests and CI
+
+- **Six new static conformance cases** (`tests/conformance/cases/013`–`018`):
+  leading BOM, comment syntax inside `|` / `|+` bodies, directives inside
+  bodies, a type hint after a space, Unicode indentation inside `|+`, and
+  values that begin with parentheses.
+- **The first active-mode conformance cases** (`100`–`105`): every constraint
+  and its message, constraints after markers, the document-wide constraint
+  pass, the `(type)` registry, interpolation with secrets and non-ASCII text,
+  and pattern backtracking. A runner resolves a document the parser reports as
+  `!active` before comparing; the cases never depend on the environment.
+  Goldens come from `synx-core`; all eight implementations match all 24 cases
+  byte for byte.
+- **TypeScript now runs the SYNX conformance suite**
+  (`packages/synx-js/tests/conformance.test.ts`). It ran only the SYNXL one,
+  which is how the BOM case above slipped through.
+- **New `native-parsers` CI job** (`.github/workflows/bindings-smoke.yml`):
+  Go, .NET, Java, Dart, Swift and C++ run their full suites on every push.
+- Regression tests for the erratum in Rust and TypeScript.
+
+### Notes
+
+- **Swift API:** `SynxMarkers.applyCalc` now also takes the key and the
+  enclosing object, which sibling and dotted references need. It is an
+  engine-internal entry point, but it is public, so a direct caller has to
+  pass the two new arguments.
+- **Behaviour change in the native packages:** `port:env PORT` is now an
+  integer and `:env` without an env map reads the process environment, as the
+  reference always did; constraint failures now replace the value.
+- **C++ patterns:** `std::regex` speaks ECMAScript only, so a pattern that is
+  valid in Rust but outside that dialect (`\p{L}`, `(?i)`, `\A`) is skipped
+  rather than enforced in C++.
+
+### Docs
+
+- Removed links to `docs/dev/plugins-roadmap.md`, deleted in 3.6.1, from the
+  root README, the VS Code and Visual Studio READMEs, `SYNX_AT_A_GLANCE.md` and
+  `repository-layout.md`. The stub described `!use` as not shipped; the package
+  system behind it landed in 3.6.1.
+- `tests/conformance/README.md` lists every runner and how to start it.
+
 ## [3.7.3] — 2026-09-28
 
 A security, robustness and cross-implementation-parity pass driven by a

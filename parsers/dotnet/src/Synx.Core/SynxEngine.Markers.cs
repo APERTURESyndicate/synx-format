@@ -86,7 +86,7 @@ public static partial class SynxEngine
                     envVal = evm;
                 else
                     envVal = Environment.GetEnvironmentVariable(varName.Value);
-                var forceStr = meta.TypeHint == "string";
+                var forceStr = WantsString(meta);
                 var di = markers.IndexOf("default");
                 if (!string.IsNullOrEmpty(envVal))
                 {
@@ -275,7 +275,9 @@ public static partial class SynxEngine
 
         if (markers.Contains("secret"))
         {
-            if (map.TryGetValue(key, out var sv))
+            // Idempotent: the pre-pass may already have wrapped a literal secret, and
+            // ValueToString masks a Secret, so re-wrapping would store the mask itself.
+            if (map.TryGetValue(key, out var sv) && sv is not SynxValue.Secret)
                 map[key] = new SynxValue.Secret(ValueToString(sv));
         }
 
@@ -356,7 +358,7 @@ public static partial class SynxEngine
                 if (markers.Count > di + 1)
                 {
                     var fallback = string.Join(":", markers.Skip(di + 1));
-                    map[key] = meta.TypeHint == "string" ? new SynxValue.Str(fallback) : CastPrimitive(fallback);
+                    map[key] = WantsString(meta) ? new SynxValue.Str(fallback) : CastPrimitive(fallback);
                 }
             }
         }

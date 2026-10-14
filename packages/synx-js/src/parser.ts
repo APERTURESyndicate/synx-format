@@ -121,6 +121,45 @@ export function truncateUtf8Prefix(s: string, maxBytes: number): string {
  * numeric/boolean/quote semantics instead of growing a second caster —
  * SYNXL §8.1 defines inline casting by reference to this function.
  */
+/**
+ * Casts `raw` under an explicit `(hint)` from the key line — `cast_typed_with`
+ * in synx-core. Until 3.7.4 the hint was glued onto the value as `(hint)raw`
+ * and `castType` re-detected it, so any value that merely *began* with an
+ * identifier in parentheses was taken for a cast: `key (aa)` read as `""`,
+ * `key (random:bool)` as a random boolean, and `key(int)` with children or a
+ * `|` body lost them. A value is always plain text now; only the key line can
+ * carry a hint.
+ */
+export function castTyped(raw: string, hint: string, nondeterministic = true): SynxValue {
+  switch (hint) {
+    case 'int': {
+      const exact = parseI64(raw);
+      if (exact !== null) return exact;
+      // spec: the reference `parse::<i64>().unwrap_or(0)` yields 0 for
+      // anything that is not an in-range integer literal — `42.99` too.
+      return 0;
+    }
+    case 'float': { const n = parseFloat(raw); return isNaN(n) ? 0 : n; }
+    case 'bool': return raw.trim() === 'true';
+    case 'string': return raw;
+    // Match Rust `rng::random_i64()` as closely as JS can — full safe-integer
+    // range including negatives. JS Number caps at 2^53-1 precisely; values
+    // beyond that lose precision in any roundtrip with .synxb.
+    case 'random':
+    case 'random:int':
+      if (!nondeterministic) return castType(raw, false);
+      return Math.floor(Math.random() * Number.MAX_SAFE_INTEGER * 2) - Number.MAX_SAFE_INTEGER;
+    case 'random:float':
+      if (!nondeterministic) return castType(raw, false);
+      return Math.random();
+    case 'random:bool':
+      if (!nondeterministic) return castType(raw, false);
+      return Math.random() < 0.5;
+    // Unknown hint — the bare value is cast as usual (Rust falls back to `cast`).
+    default: return castType(raw, nondeterministic);
+  }
+}
+
 export function castType(val: string, nondeterministic = true): SynxValue {
   const len = val.length;
 
@@ -141,54 +180,6 @@ export function castType(val: string, nondeterministic = true): SynxValue {
   if (len === 0) return val;
 
   const c0 = val.charCodeAt(0);
-
-  // Explicit cast: (int)007, (string)90210, (float)3.0, (bool)true, (random), (random:bool)
-  // Only treat the leading `(...)` as a type hint when it looks like an
-  // identifier-shaped token (`[A-Za-z_][A-Za-z0-9_:]*`). Anything else (e.g.
-  // a value that happens to start with a parenthesised arithmetic expression)
-  // is left untouched as a plain string.
-  if (c0 === 40 && len > 2) { // '('
-    const closeIdx = val.indexOf(')');
-    // The type hint the caller threaded in is glued straight onto the value
-    // (`(int)5`, no gap). A whitespace after `)` means the parentheses are part
-    // of the value text (e.g. the literal value `(int) 5` produced for a
-    // malformed `key (type) value` with a space), not a cast — the Rust
-    // reference keeps such a value as a string, and so must this.
-    if (closeIdx > 1 && !/\s/.test(val.charAt(closeIdx + 1))) {
-      const hint = val.substring(1, closeIdx);
-      if (/^[A-Za-z_][A-Za-z0-9_:]*$/.test(hint)) {
-        const raw = val.substring(closeIdx + 1);
-        switch (hint) {
-          case 'int': {
-            const exact = parseI64(raw);
-            if (exact !== null) return exact;
-            // spec: the reference `parse::<i64>().unwrap_or(0)` yields 0 for
-            // anything that is not an in-range integer literal — `42.99` too.
-            return 0;
-          }
-          case 'float': { const n = parseFloat(raw); return isNaN(n) ? 0 : n; }
-          case 'bool': return raw.trim() === 'true';
-          case 'string': return raw;
-          // Match Rust `rng::random_i64()` as closely as JS can — full safe-integer
-          // range including negatives. JS Number caps at 2^53-1 precisely; values
-          // beyond that lose precision in any roundtrip with .synxb.
-          case 'random':
-          case 'random:int':
-            if (!nondeterministic) return castType(raw, false);
-            return Math.floor(Math.random() * Number.MAX_SAFE_INTEGER * 2) - Number.MAX_SAFE_INTEGER;
-          case 'random:float':
-            if (!nondeterministic) return castType(raw, false);
-            return Math.random();
-          case 'random:bool':
-            if (!nondeterministic) return castType(raw, false);
-            return Math.random() < 0.5;
-          // Unknown hint — strip the (hint) wrapper and re-cast the bare value
-          // (matches the Rust `cast_typed` fallback to `cast`).
-          default: return castType(raw, nondeterministic);
-        }
-      }
-    }
-  }
 
   // Auto number detection via charCode (no regex)
   let firstDigit = 0;
@@ -436,6 +427,13 @@ export function parseData(text: string, options?: ParseDataOptions): SynxParseRe
   const directivesEnabled = options?.directives !== false;
   const nondeterministic = options?.nondeterministicHints !== false;
 
+  // A single leading U+FEFF is dropped (SYNX §2.1), as in synx-core. `trim()`
+  // already hid it in front of `!active`, but a static document kept it glued
+  // to its first key.
+  if (text.charCodeAt(0) === 0xfeff) {
+    text = text.slice(1);
+  }
+
   // Truncate input to MAX_SYNX_INPUT_BYTES (UTF-16 code-unit boundary).
   if (text.length > MAX_SYNX_INPUT_BYTES) {
     text = text.substring(0, MAX_SYNX_INPUT_BYTES);
@@ -627,9 +625,10 @@ export function parseData(text: string, options?: ParseDataOptions): SynxParseRe
             const itemObj: SynxObject = {};
             const parsed = parseKeyLine(val);
             if (parsed) {
-              let iValue = parsed.rawValue;
-              if (parsed.typeHint) iValue = `(${parsed.typeHint})${iValue}`;
-              itemObj[parsed.key] = iValue ? castType(stripInlineComment(iValue), nondeterministic) : {};
+              const iValue = parsed.rawValue ? stripInlineComment(parsed.rawValue) : '';
+              itemObj[parsed.key] = !iValue ? {}
+                : parsed.typeHint ? castTyped(iValue, parsed.typeHint, nondeterministic)
+                : castType(iValue, nondeterministic);
             } else {
               itemObj['_value'] = castType(val, nondeterministic);
             }
@@ -711,9 +710,6 @@ export function parseData(text: string, options?: ParseDataOptions): SynxParseRe
       markerChain = parsed.markerChain;
       rawValue = parsed.rawValue ? stripInlineComment(parsed.rawValue) : '';
     }
-
-    // Apply explicit type cast
-    if (typeHint) rawValue = `(${typeHint})${rawValue}`;
 
     // Parse markers chain (with segment cap)
     let markers: string[] = [];
@@ -804,7 +800,9 @@ export function parseData(text: string, options?: ParseDataOptions): SynxParseRe
       saveMeta(parent, key, markers, markerArgs, constraints, mode, typeHint);
     } else {
       // Simple key-value
-      parent[key] = castType(rawValue, nondeterministic);
+      parent[key] = typeHint
+        ? castTyped(rawValue, typeHint, nondeterministic)
+        : castType(rawValue, nondeterministic);
       saveMeta(parent, key, markers, markerArgs, constraints, mode, typeHint);
     }
   }

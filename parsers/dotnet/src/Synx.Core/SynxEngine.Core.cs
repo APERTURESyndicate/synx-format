@@ -88,6 +88,8 @@ public static partial class SynxEngine
         ApplyInheritance(result.Root, metadata);
         StripPrivateKeys(result.Root);
 
+        MaskSecretLiterals(result.Root, metadata, "");
+
         var typeRegistry = BuildTypeRegistry(metadata);
         var constraintRegistry = BuildConstraintRegistry(metadata);
 
@@ -495,7 +497,12 @@ public static partial class SynxEngine
         if (value is not SynxValue.Obj o) return;
         foreach (var key in o.Map.Keys.ToList())
         {
-            if (registry.TryGetValue(key, out var c))
+            // A value the per-key pass already turned into an error must not be validated
+            // again: the second pass would measure the error text, not the original value.
+            if (registry.TryGetValue(key, out var c)
+                && !(o.Map[key] is SynxValue.Str es
+                     && (es.Value.StartsWith("CONSTRAINT_ERR:", StringComparison.Ordinal)
+                         || es.Value.StartsWith("TYPE_ERR:", StringComparison.Ordinal))))
                 ValidateConstraintsOnMap(o.Map, key, c);
             var child = o.Map[key];
             switch (child)
@@ -594,7 +601,9 @@ public static partial class SynxEngine
     private static string ValueToString(SynxValue v) => v switch
     {
         SynxValue.Str s => s.Value,
-        SynxValue.Secret s => s.Value,
+        // safety: a `:secret` value must never reach a string sink (interpolation,
+        // :join, :map, ...) as plaintext; matches Rust `value_to_string` and `write_json`.
+        SynxValue.Secret => "[SECRET]",
         SynxValue.Int n => n.Value.ToString(CultureInfo.InvariantCulture),
         SynxValue.Float f => FormatNumber(f.Value),
         SynxValue.Bool b => b.Value ? "true" : "false",
@@ -621,9 +630,58 @@ public static partial class SynxEngine
         if (val == "true") return new SynxValue.Bool(true);
         if (val == "false") return new SynxValue.Bool(false);
         if (val == "null") return new SynxValue.Null();
-        if (long.TryParse(val, CultureInfo.InvariantCulture, out var i)) return new SynxValue.Int(i);
-        if (double.TryParse(val, CultureInfo.InvariantCulture, out var d)) return new SynxValue.Float(d);
+        // Plain `parse::<i64>()` / `parse::<f64>()` semantics: no padding, no thousands separators.
+        if (long.TryParse(val, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out var i)) return new SynxValue.Int(i);
+        if (double.TryParse(val, NumberStyles.Float & ~NumberStyles.AllowLeadingWhite & ~NumberStyles.AllowTrailingWhite,
+                CultureInfo.InvariantCulture, out var d)) return new SynxValue.Float(d);
         return new SynxValue.Str(val);
+    }
+
+    /// <summary>
+    /// <c>(string)</c> or <c>[type:string]</c> keeps env/default text as text instead of casting it
+    /// to a number first (<c>007</c>, 19-digit ids).
+    /// </summary>
+    private static bool WantsString(SynxMeta meta) =>
+        meta.TypeHint == "string" || meta.Constraints?.TypeName == "string";
+
+    private static readonly string[] s_resolvingBeforeSecret =
+    [
+        "env", "include", "import", "watch", "ref", "alias", "calc", "map", "i18n", "default",
+        "fallback", "once", "split", "join", "format", "replace",
+    ];
+
+    /// <summary>
+    /// Wrap every literal <c>:secret</c> value in <see cref="SynxValue.Secret"/> before resolution so no
+    /// later interpolation can read the plaintext. A secret that itself needs resolving
+    /// (<c>:env:secret</c>, ...) is left for its own marker to mask in place.
+    /// </summary>
+    private static void MaskSecretLiterals(SynxValue value, Dictionary<string, Dictionary<string, SynxMeta>> metadata, string path)
+    {
+        if (value is not SynxValue.Obj o) return;
+        if (metadata.TryGetValue(path, out var mm))
+        {
+            foreach (var (key, meta) in mm)
+            {
+                if (!meta.Markers.Contains("secret") || meta.Markers.Any(m => s_resolvingBeforeSecret.Contains(m)))
+                    continue;
+                if (o.Map.TryGetValue(key, out var v) && v is not (SynxValue.Secret or SynxValue.Obj or SynxValue.Arr))
+                    o.Map[key] = new SynxValue.Secret(ValueToString(v));
+            }
+        }
+        foreach (var key in o.Map.Keys.ToList())
+        {
+            var childPath = path.Length == 0 ? key : $"{path}.{key}";
+            switch (o.Map[key])
+            {
+                case SynxValue.Obj child:
+                    MaskSecretLiterals(child, metadata, childPath);
+                    break;
+                case SynxValue.Arr arr:
+                    foreach (var item in arr.Items.Where(i => i is SynxValue.Obj))
+                        MaskSecretLiterals(item, metadata, childPath);
+                    break;
+            }
+        }
     }
 
     private static string ApplyFormatPattern(string pattern, SynxValue value) => value switch
@@ -982,7 +1040,7 @@ public static partial class SynxEngine
                 "int" => val is SynxValue.Int,
                 "float" => val is SynxValue.Float or SynxValue.Int,
                 "bool" => val is SynxValue.Bool,
-                "string" => val is SynxValue.Str,
+                "string" => val is SynxValue.Str or SynxValue.Secret,
                 _ => true,
             };
             if (!ok)
@@ -1014,15 +1072,110 @@ public static partial class SynxEngine
         {
             SynxValue.Int n => n.Value,
             SynxValue.Float f => f.Value,
-            SynxValue.Str s when c.Min.HasValue || c.Max.HasValue => s.Value.Length,
+            // Length is the count of Unicode scalar values (not UTF-16 units, not UTF-8 bytes).
+            SynxValue.Str s when c.Min.HasValue || c.Max.HasValue => s.Value.EnumerateRunes().Count(),
             _ => null,
         };
         if (num is { } nn)
         {
             if (c.Min is { } mn && nn < mn)
-                map[key] = new SynxValue.Str($"CONSTRAINT_ERR: '{key}' value {nn} is below min {mn}");
-            else if (c.Max is { } mx && nn > mx)
-                map[key] = new SynxValue.Str($"CONSTRAINT_ERR: '{key}' value {nn} exceeds max {mx}");
+            {
+                map[key] = new SynxValue.Str($"CONSTRAINT_ERR: '{key}' value {FormatF64(nn)} is below min {FormatF64(mn)}");
+                return;
+            }
+            if (c.Max is { } mx && nn > mx)
+            {
+                map[key] = new SynxValue.Str($"CONSTRAINT_ERR: '{key}' value {FormatF64(nn)} exceeds max {FormatF64(mx)}");
+                return;
+            }
         }
+
+        // Longer patterns, invalid patterns and refused (ReDoS-shaped) patterns are skipped silently.
+        if (c.Pattern is { } pat && val is SynxValue.Str ps
+            && Encoding.UTF8.GetByteCount(pat) <= MaxConstraintPatternBytes
+            && MatchesLinear(pat, ps.Value) == false)
+        {
+            map[key] = new SynxValue.Str($"CONSTRAINT_ERR: '{key}' does not match pattern /{pat}/");
+        }
+    }
+
+    private const int MaxConstraintPatternBytes = 256;
+
+    /// <summary>
+    /// Test <paramref name="value"/> against <paramref name="pattern"/> (unanchored, like Rust
+    /// <c>is_match</c>). Returns <c>null</c> for a refused, invalid or timed-out pattern; the caller
+    /// then skips the constraint. .NET's regex backtracks, so <c>^(a+)+$</c> would otherwise hang.
+    /// </summary>
+    internal static bool? MatchesLinear(string pattern, string value)
+    {
+        if (HasNestedQuantifier(pattern)) return null;
+        try
+        {
+            return System.Text.RegularExpressions.Regex.IsMatch(
+                value, pattern, System.Text.RegularExpressions.RegexOptions.None, TimeSpan.FromSeconds(1));
+        }
+        catch (ArgumentException) { return null; }
+        catch (System.Text.RegularExpressions.RegexMatchTimeoutException) { return null; }
+    }
+
+    /// <summary>
+    /// Does the pattern repeat something that already repeats (the <c>(a+)+</c> shape behind
+    /// exponential backtracking)? Conservative: a quantified group whose body also holds a quantifier.
+    /// Port of <c>hasNestedQuantifier</c> in <c>packages/synx-js/src/synxl.ts</c>.
+    /// </summary>
+    private static bool HasNestedQuantifier(string pattern)
+    {
+        var opens = new Stack<int>();
+        for (var i = 0; i < pattern.Length; i++)
+        {
+            var ch = pattern[i];
+            if (ch == '\\') { i++; continue; }
+            if (ch == '[')
+            {
+                // Skip a character class wholesale; quantifiers inside it are literal.
+                while (i < pattern.Length && pattern[i] != ']')
+                {
+                    if (pattern[i] == '\\') i++;
+                    i++;
+                }
+                continue;
+            }
+            if (ch == '(') { opens.Push(i); continue; }
+            if (ch == ')')
+            {
+                if (opens.Count == 0) continue;
+                var start = opens.Pop();
+                var next = i + 1 < pattern.Length ? pattern[i + 1] : '\0';
+                if (next is '*' or '+' or '{')
+                {
+                    var body = System.Text.RegularExpressions.Regex.Replace(
+                        pattern.Substring(start + 1, i - start - 1), @"\\.", "");
+                    if (System.Text.RegularExpressions.Regex.IsMatch(body, @"[*+]|\{\d")) return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /// <summary>Rust <c>f64</c> <c>Display</c>: shortest round-trip digits, plain decimal, no exponent.</summary>
+    private static string FormatF64(double d)
+    {
+        if (double.IsNaN(d)) return "NaN";
+        if (double.IsInfinity(d)) return d > 0 ? "inf" : "-inf";
+        var r = d.ToString("R", CultureInfo.InvariantCulture);
+        var e = r.IndexOfAny(['E', 'e']);
+        if (e < 0) return r;
+        var mant = r[..e];
+        var exp = int.Parse(r[(e + 1)..], CultureInfo.InvariantCulture);
+        var neg = mant.StartsWith('-');
+        if (neg) mant = mant[1..];
+        var dot = mant.IndexOf('.');
+        var digits = dot < 0 ? mant : mant.Remove(dot, 1);
+        var point = (dot < 0 ? mant.Length : dot) + exp;
+        string plain;
+        if (point <= 0) plain = "0." + new string('0', -point) + digits;
+        else if (point >= digits.Length) plain = digits + new string('0', point - digits.Length);
+        else plain = digits[..point] + "." + digits[point..];
+        return neg ? "-" + plain : plain;
     }
 }

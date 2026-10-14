@@ -9,6 +9,8 @@ type MarkerFn func(key string, args []string, value Value) Value
 
 // Options for active-mode resolution. The zero value is fine for static parsing.
 type Options struct {
+	// Env is the variable set `:env` reads. nil means the process environment;
+	// a non-nil map (even an empty one) is the complete set of variables.
 	Env             map[string]string
 	Region          string
 	Lang            string

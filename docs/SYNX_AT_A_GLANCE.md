@@ -125,7 +125,6 @@ Exact numbers drift by CPU; always **re-run locally** for procurement (`benchmar
 | [**claude.md**](claude.md) | Claude Desktop + MCP + grounding |
 | [**anthropic-system-prompt.txt**](anthropic-system-prompt.txt) | Optional strict system prompt for models |
 | [**anthropic-token-notes.md**](anthropic-token-notes.md) | Informal token / format samples |
-| [**plugins-roadmap.md**](dev/plugins-roadmap.md) | Registry / plugins (**stub**) |
 | [**synx-mcp**](../integrations/mcp/synx-mcp/) | `validate` / `parse` / `format` (+ optional FS tools) |
 | [**synx-visualizer**](../integrations/artifacts/synx-visualizer/) | React snippet for Claude Artifacts |
 

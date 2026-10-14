@@ -1,0 +1,2 @@
+{"base":7,"copy":7,"copy_bad":"CONSTRAINT_ERR: 'copy_bad' must be one of [1|2]","fallback":5,"fallback_text":"007","small":14,"token":"[SECRET]","total":"CONSTRAINT_ERR: 'total' value 14 exceeds max 10"}
+

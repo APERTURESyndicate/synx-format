@@ -1,0 +1,16 @@
+a (aa)
+b (int)5
+c (random:bool)
+e (aa) tail
+f[enum:x|y] (x)
+g(aa) 5
+h(int)
+i(int)
+  child 1
+j(string) |
+  kept
+list
+  - (int)5
+  - (aa)
+  - m(int) 5
+    n 1

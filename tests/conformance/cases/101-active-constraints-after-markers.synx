@@ -1,0 +1,9 @@
+!active
+base 7
+total[max:10]:calc base * 2
+small[max:20]:calc base * 2
+fallback[type:int]:default:5 null
+fallback_text[type:string]:default:007 null
+copy[enum:7|8]:alias base
+copy_bad[enum:1|2]:alias base
+token[type:string]:secret sk-123

@@ -1,0 +1,4 @@
+﻿name synx
+port 8080
+nested
+  key value

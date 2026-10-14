@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <optional>
 #include <regex>
 #include <sstream>
 #include <string>
@@ -30,6 +31,22 @@ inline std::string_view trim_sv(std::string_view s) noexcept {
     size_t b = s.size();
     while (b > a && (s[b - 1] == ' ' || s[b - 1] == '\t' || s[b - 1] == '\r')) --b;
     return s.substr(a, b - a);
+}
+
+// Process environment lookup (used by `:env` when `Options::env` is not given).
+std::optional<std::string> read_process_env(const std::string& name) {
+#if defined(_MSC_VER)
+    char* buf = nullptr;
+    size_t len = 0;
+    if (_dupenv_s(&buf, &len, name.c_str()) != 0 || buf == nullptr) return std::nullopt;
+    std::string value(buf);
+    std::free(buf);
+    return value;
+#else
+    const char* raw = std::getenv(name.c_str());
+    if (raw == nullptr) return std::nullopt;
+    return std::string(raw);
+#endif
 }
 
 // In-place word-boundary replace (used by :calc identifier substitution).
@@ -93,70 +110,144 @@ std::string format_pattern(std::string_view pattern, double n, const std::string
 // ─── markers ────────────────────────────────────────────────────────────────
 
 void Resolver::apply_env(Value& v, const Meta& m) {
-    if (!options.env.has_value()) return;
-    // Value at this point is the env-var name (text).
-    std::string var = value_to_string(v);
-    auto it = options.env->find(var);
-    std::string fallback;
-    // Find the :default marker following :env (if any) for fallback chain.
-    int idx = m.marker_index("env");
-    if (idx >= 0 && static_cast<size_t>(idx + 1) < m.markers.size()
-        && m.markers[idx + 1] == "default"
-        && static_cast<size_t>(idx + 2) < m.markers.size()) {
-        fallback = m.markers[idx + 2];
-    }
-    if (it != options.env->end()) {
-        v = Value::make_string(it->second);
-    } else if (!fallback.empty()) {
-        v = Value::make_string(fallback);
+    // The value on the line is the env-var name; anything else is left alone.
+    const std::string* name_ptr = v.as_string();
+    if (!name_ptr) return;
+    const std::string var = *name_ptr;
+
+    std::optional<std::string> env_val;
+    if (options.env.has_value()) {
+        auto it = options.env->find(var);
+        if (it != options.env->end()) env_val = it->second;
     } else {
-        v = Value::make_null();
+        env_val = read_process_env(var);
     }
+
+    // `(string)` / `[type:string]` keep the env text verbatim (`007`, 64-bit ids).
+    const bool force_string = wants_string(m);
+    if (env_val.has_value() && !env_val->empty()) {
+        v = force_string ? Value::make_string(*env_val) : cast_primitive(*env_val);
+        return;
+    }
+    // Fallback: every marker after `default`, rejoined with ':' (IPs, compound values).
+    int di = m.marker_index("default");
+    if (di >= 0 && static_cast<size_t>(di + 1) < m.markers.size()) {
+        std::string fallback;
+        for (size_t k = static_cast<size_t>(di) + 1; k < m.markers.size(); ++k) {
+            if (k > static_cast<size_t>(di) + 1) fallback.push_back(':');
+            fallback.append(m.markers[k]);
+        }
+        v = force_string ? Value::make_string(std::move(fallback)) : cast_primitive(fallback);
+        return;
+    }
+    v = Value::make_null();
 }
 
 void Resolver::apply_default(Value& v, const Meta& m) {
     // If preceded by :env, :env handled the default fallback already.
     if (m.has_marker("env")) return;
     if (v.is_null() || (v.is_string() && v.as_string()->empty())) {
-        // Default value is the marker arg (markers[idx+1]).
+        // Default value is every marker after `default`, rejoined with ':'.
         int idx = m.marker_index("default");
         if (idx >= 0 && static_cast<size_t>(idx + 1) < m.markers.size()) {
-            v = Value::make_string(m.markers[idx + 1]);
+            std::string fallback;
+            for (size_t k = static_cast<size_t>(idx) + 1; k < m.markers.size(); ++k) {
+                if (k > static_cast<size_t>(idx) + 1) fallback.push_back(':');
+                fallback.append(m.markers[k]);
+            }
+            v = wants_string(m) ? Value::make_string(std::move(fallback)) : cast_primitive(fallback);
         }
     }
 }
 
-void Resolver::apply_calc(Value& v, const Meta& /*m*/, const std::string& /*path*/) {
-    std::string expr = value_to_string(v);
-    if (expr.empty()) return;
-    // Interpolate referenced keys.
-    // Strategy: word-replace any bare identifier (no dots/braces) whose name
-    // matches a sibling/parent numeric value with its number.
-    {
-        // Collect candidates: walk root once, look up matches in expr.
-        std::vector<std::pair<std::string, double>> nums;
-        // Simple sweep: scan all top-level numeric keys; mirrors Rust behaviour
-        // when expressions reference siblings by bare name.
-        for (const auto& p : root) {
-            double d = 0.0;
-            if (value_to_number(p.value, d)) {
-                nums.emplace_back(p.key, d);
-            }
-        }
-        // Also: support `{key}` interpolation.
-        expr = interpolate(expr);
-        // Word-replace bare identifiers.
-        std::sort(nums.begin(), nums.end(),
-            [](const auto& a, const auto& b) { return a.first.size() > b.first.size(); });
-        for (const auto& kv : nums) {
-            char buf[64];
-            std::snprintf(buf, sizeof(buf), "%.17g", kv.second);
-            replace_word(expr, kv.first, buf);
-        }
+void Resolver::apply_calc(Value& v, const Meta& /*m*/, const std::string& key, const Object& local) {
+    // Port of the Rust `:calc` handler: substitute numeric root keys, then numeric
+    // siblings, then dotted paths, then evaluate. A failure writes the exact
+    // `CALC_ERR: …` string into the value.
+    constexpr size_t kMaxExprLen = 4096;
+    constexpr size_t kMaxResolvedLen = 64 * 1024;
+
+    const std::string* src = v.as_string();
+    if (!src) return;
+    const std::string expr = *src;
+    if (expr.size() > kMaxExprLen) {
+        v = Value::make_string("CALC_ERR: expression too long (" + std::to_string(expr.size())
+                               + " chars, max " + std::to_string(kMaxExprLen) + ")");
+        return;
     }
-    CalcResult r = safe_calc(expr);
-    if (!r.ok) return;
-    if (std::trunc(r.value) == r.value && std::fabs(r.value) <= 9.2233720368547758e18) {
+    auto too_long = [&v]() {
+        v = Value::make_string("CALC_ERR: resolved expression too long (max "
+                               + std::to_string(kMaxResolvedLen) + " bytes)");
+    };
+    // Only real numbers are substituted (Rust `value_as_number`): not bools or numeric text.
+    auto number = [](const Value& x, double& d) {
+        if (x.is_int()) { d = static_cast<double>(*x.as_int()); return true; }
+        if (x.is_float()) { d = *x.as_float(); return true; }
+        return false;
+    };
+
+    std::string resolved = expr;
+    for (const auto& p : root) {
+        double d = 0.0;
+        if (!number(p.value, d)) continue;
+        replace_word(resolved, p.key, format_number(d));
+        if (resolved.size() > kMaxResolvedLen) { too_long(); return; }
+    }
+    for (const auto& p : local) {
+        double d = 0.0;
+        if (p.key == key || !number(p.value, d)) continue;
+        replace_word(resolved, p.key, format_number(d));
+        if (resolved.size() > kMaxResolvedLen) { too_long(); return; }
+    }
+
+    // Dotted references (`base.hp`). Every other byte is widened to U+00xx as
+    // Rust's `byte as char` does, which is what a later error message shows.
+    auto is_word = [](unsigned char b) { return std::isalnum(b) != 0 && b < 0x80 ? true : b == '_'; };
+    std::string dot_resolved;
+    size_t i = 0;
+    while (i < resolved.size()) {
+        if (is_word(static_cast<unsigned char>(resolved[i]))) {
+            size_t start = i;
+            bool has_dot = false;
+            while (i < resolved.size()
+                   && (is_word(static_cast<unsigned char>(resolved[i])) || resolved[i] == '.')) {
+                if (resolved[i] == '.') has_dot = true;
+                ++i;
+            }
+            std::string token = resolved.substr(start, i - start);
+            if (has_dot) {
+                const Value* val = nullptr;
+                for (const auto& p : root) {
+                    if (p.key == token) { val = &p.value; break; }
+                }
+                if (!val) val = deep_get(root, token);
+                double d = 0.0;
+                if (val && number(*val, d)) {
+                    dot_resolved.append(format_number(d));
+                    if (dot_resolved.size() > kMaxResolvedLen) { too_long(); return; }
+                    continue;
+                }
+            }
+            dot_resolved.append(token);
+        } else {
+            unsigned char b = static_cast<unsigned char>(resolved[i]);
+            if (b < 0x80) {
+                dot_resolved.push_back(static_cast<char>(b));
+            } else {
+                dot_resolved.push_back(static_cast<char>(0xC0 | (b >> 6)));
+                dot_resolved.push_back(static_cast<char>(0x80 | (b & 0x3F)));
+            }
+            ++i;
+        }
+        if (dot_resolved.size() > kMaxResolvedLen) { too_long(); return; }
+    }
+
+    CalcResult r = safe_calc(dot_resolved);
+    if (!r.ok) {
+        v = Value::make_string("CALC_ERR: " + r.error);
+        return;
+    }
+    if (std::trunc(r.value) == r.value && std::fabs(r.value) < 9.223372036854775807e18) {
         v = Value::make_int(static_cast<int64_t>(r.value));
     } else {
         v = Value::make_float(r.value);

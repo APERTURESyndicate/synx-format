@@ -1,5 +1,6 @@
 // Value → SYNX text serializer.
 #include "synx/stringify.hpp"
+#include "synx/json.hpp"
 
 #include <algorithm>
 #include <cinttypes>
@@ -29,15 +30,7 @@ std::string format_primitive(const Value& v) {
             if (std::isnan(f) || std::isinf(f)) {
                 return "null";
             }
-            char buf[64];
-            std::snprintf(buf, sizeof(buf), "%.17g", f);
-            std::string s(buf);
-            if (s.find('.') == std::string::npos
-                && s.find('e') == std::string::npos
-                && s.find('E') == std::string::npos) {
-                s.append(".0");
-            }
-            return s;
+            return float_to_display_string(f);
         }
         case Value::Kind::Bool:
             return *v.as_bool() ? "true" : "false";

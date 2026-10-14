@@ -17,16 +17,19 @@ public enum SynxMarkers {
     // MARK: - simple markers
 
     public static func applyEnv(_ v: SynxValue, meta: SynxMeta, options: SynxOptions) -> SynxValue {
-        guard let env = options.env else { return v }
-        let varName = valueToString(v)
-        var fallback = ""
-        if let idx = meta.markerIndex("env"),
-           idx + 1 < meta.markers.count, meta.markers[idx + 1] == "default",
-           idx + 2 < meta.markers.count {
-            fallback = meta.markers[idx + 2]
+        guard case .string(let varName) = v else { return v }
+        let envVal: String?
+        if let env = options.env { envVal = env[varName] } else { envVal = ProcessInfo.processInfo.environment[varName] }
+        // `(string)` / `[type:string]` keep the env text verbatim (`007`, 64-bit ids).
+        let forceString = wantsString(meta)
+        if let val = envVal, !val.isEmpty {
+            return forceString ? .string(val) : castPrimitive(val)
         }
-        if let val = env[varName] { return .string(val) }
-        if !fallback.isEmpty { return .string(fallback) }
+        // Fallback: every marker after `default`, rejoined with ':'.
+        if let di = meta.markerIndex("default"), di + 1 < meta.markers.count {
+            let fallback = meta.markers[(di + 1)...].joined(separator: ":")
+            return forceString ? .string(fallback) : castPrimitive(fallback)
+        }
         return .null
     }
 
@@ -40,35 +43,101 @@ public enum SynxMarkers {
         guard isEmpty else { return v }
         if let idx = meta.markerIndex("default"),
            idx + 1 < meta.markers.count {
-            return .string(meta.markers[idx + 1])
+            let fallback = meta.markers[(idx + 1)...].joined(separator: ":")
+            return wantsString(meta) ? .string(fallback) : castPrimitive(fallback)
         }
         return v
     }
 
-    public static func applyCalc(_ v: SynxValue, meta: SynxMeta,
-                                  root: SynxObject,
-                                  interpolate: (String) -> String) -> SynxValue {
-        var expr = valueToString(v)
-        if expr.isEmpty { return v }
-        expr = interpolate(expr)
+    static let maxCalcExprLen = 4096
+    static let maxCalcResolvedLen = 64 * 1024
 
-        // Word-replace sibling numeric identifiers — sort longest-first to avoid
-        // partial overlaps (e.g. `price` vs `price2`).
-        let pairs: [(String, Double)] = root.entries.compactMap { (k, val) in
-            valueToNumber(val).map { (k, $0) }
+    /// `:calc` — port of the Rust engine handler: substitute numeric root keys,
+    /// then numeric siblings, then dotted paths, then evaluate. A failure writes
+    /// the exact `CALC_ERR: …` string into the value.
+    public static func applyCalc(_ v: SynxValue, key: String,
+                                  root: SynxObject, local: SynxObject) -> SynxValue {
+        guard case .string(let expr) = v else { return v }
+        let exprLen = expr.utf8.count
+        if exprLen > maxCalcExprLen {
+            return .string("CALC_ERR: expression too long (\(exprLen) chars, max \(maxCalcExprLen))")
         }
-        let sorted = pairs.sorted { $0.0.count > $1.0.count }
-        for (k, d) in sorted {
-            expr = replaceWord(in: expr, word: k, with: String(format: "%.17g", d))
+        let tooLong = SynxValue.string(
+            "CALC_ERR: resolved expression too long (max \(maxCalcResolvedLen) bytes)")
+
+        func number(_ val: SynxValue) -> Double? {
+            switch val {
+            case .int(let n):   return Double(n)
+            case .float(let f): return f
+            default:            return nil
+            }
         }
 
-        let r = SynxCalc.evaluate(expr)
-        if !r.ok { return v }
-        if r.value.truncatingRemainder(dividingBy: 1) == 0
-            && abs(r.value) < 9.2233720368547758e18 {
+        var resolved = Array(expr.utf8)
+        for (k, val) in root.entries {
+            guard let n = number(val) else { continue }
+            resolved = replaceWord(in: resolved, word: Array(k.utf8), with: Array(formatNumber(n).utf8))
+            if resolved.count > maxCalcResolvedLen { return tooLong }
+        }
+        for (k, val) in local.entries where k != key {
+            guard let n = number(val) else { continue }
+            resolved = replaceWord(in: resolved, word: Array(k.utf8), with: Array(formatNumber(n).utf8))
+            if resolved.count > maxCalcResolvedLen { return tooLong }
+        }
+
+        // Dotted references (`base.hp`). Every other byte is widened to U+00xx as
+        // Rust's `byte as char` does, which is what a later error message shows.
+        func isWord(_ b: UInt8) -> Bool {
+            return (b >= 0x30 && b <= 0x39) || (b >= 0x41 && b <= 0x5A) || (b >= 0x61 && b <= 0x7A) || b == 0x5F
+        }
+        var dotResolved: [UInt8] = []
+        var i = 0
+        while i < resolved.count {
+            if isWord(resolved[i]) {
+                let start = i
+                var hasDot = false
+                while i < resolved.count && (isWord(resolved[i]) || resolved[i] == 0x2E) {
+                    if resolved[i] == 0x2E { hasDot = true }
+                    i += 1
+                }
+                let token = Array(resolved[start..<i])
+                if hasDot,
+                   let n = number(deepGetCalc(root, String(decoding: token, as: UTF8.self)) ?? .null) {
+                    dotResolved.append(contentsOf: Array(formatNumber(n).utf8))
+                    if dotResolved.count > maxCalcResolvedLen { return tooLong }
+                    continue
+                }
+                dotResolved.append(contentsOf: token)
+            } else {
+                let b = resolved[i]
+                if b < 0x80 {
+                    dotResolved.append(b)
+                } else {
+                    dotResolved.append(0xC0 | (b >> 6))
+                    dotResolved.append(0x80 | (b & 0x3F))
+                }
+                i += 1
+            }
+            if dotResolved.count > maxCalcResolvedLen { return tooLong }
+        }
+
+        let r = SynxCalc.evaluate(String(decoding: dotResolved, as: UTF8.self))
+        if !r.ok { return .string("CALC_ERR: \(r.error)") }
+        if r.value.truncatingRemainder(dividingBy: 1) == 0 && abs(r.value) < 9.223372036854775807e18 {
             return .int(Int64(r.value))
         }
         return .float(r.value)
+    }
+
+    /// Direct key first, then dot-path traversal through objects (Rust `deep_get`).
+    private static func deepGetCalc(_ root: SynxObject, _ path: String) -> SynxValue? {
+        if let direct = root[path] { return direct }
+        var current: SynxValue = .object(root)
+        for seg in path.split(separator: ".", omittingEmptySubsequences: false) {
+            guard case .object(let obj) = current, let next = obj[String(seg)] else { return nil }
+            current = next
+        }
+        return current
     }
 
     public static func applyRef(_ v: SynxValue,
@@ -337,34 +406,26 @@ func deepGet(_ path: String, in root: SynxObject) -> SynxValue? {
     return current
 }
 
-func replaceWord(in s: String, word: String, with replacement: String) -> String {
-    guard !word.isEmpty else { return s }
-    var out = ""
-    out.reserveCapacity(s.count)
-    let chars = Array(s)
-    let wchars = Array(word)
+/// Whole-word replace over bytes; word characters are ASCII alphanumerics and `_`.
+func replaceWord(in hay: [UInt8], word: [UInt8], with replacement: [UInt8]) -> [UInt8] {
+    guard !word.isEmpty, word.count <= hay.count else { return hay }
+    func isWord(_ b: UInt8) -> Bool {
+        return (b >= 0x30 && b <= 0x39) || (b >= 0x41 && b <= 0x5A) || (b >= 0x61 && b <= 0x7A) || b == 0x5F
+    }
+    var out: [UInt8] = []
+    out.reserveCapacity(hay.count)
     var i = 0
-    while i < chars.count {
-        if i + wchars.count <= chars.count
-            && Array(chars[i..<i + wchars.count]) == wchars {
-            let leftOK: Bool = {
-                if i == 0 { return true }
-                let prev = chars[i - 1]
-                return !(prev.isLetter || prev.isNumber || prev == "_")
-            }()
-            let rightOK: Bool = {
-                let after = i + wchars.count
-                if after == chars.count { return true }
-                let next = chars[after]
-                return !(next.isLetter || next.isNumber || next == "_")
-            }()
-            if leftOK && rightOK {
-                out.append(replacement)
-                i += wchars.count
+    while i < hay.count {
+        if i + word.count <= hay.count && Array(hay[i..<i + word.count]) == word {
+            let beforeOK = i == 0 || !isWord(hay[i - 1])
+            let afterOK = i + word.count >= hay.count || !isWord(hay[i + word.count])
+            if beforeOK && afterOK {
+                out.append(contentsOf: replacement)
+                i += word.count
                 continue
             }
         }
-        out.append(chars[i])
+        out.append(hay[i])
         i += 1
     }
     return out

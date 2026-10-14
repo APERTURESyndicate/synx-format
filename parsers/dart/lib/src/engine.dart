@@ -4,6 +4,7 @@ import 'dart:io';
 import 'dart:math';
 
 import 'calc.dart';
+import 'constraints.dart';
 import 'meta.dart';
 import 'options.dart';
 import 'parser.dart' as parser;
@@ -58,6 +59,7 @@ class _Resolver {
     _applyInheritPass();
     _stripUnderscoreKeys();
     _walk('', 0);
+    _autoInterpolate(root, 0);
     _validateAll();
     _flushOnce();
   }
@@ -200,7 +202,8 @@ class _Resolver {
           value = _applyRef(value);
           break;
         case 'secret':
-          value = _applySecret(value);
+          // Applied after the loop: `:secret:env` must resolve the variable
+          // first and only then mask what it produced.
           break;
         case 'random':
           value = _applyRandom(value, meta);
@@ -274,59 +277,20 @@ class _Resolver {
       }
     }
 
+    if (meta.hasMarker('secret')) value = _applySecret(value);
     if (meta.typeHint != null) {
       value = _coerceTypeHint(value, meta.typeHint!);
     }
     parent.set(key, value);
+    final constraints = meta.constraints;
+    if (constraints != null) {
+      ConstraintChecker(strict: opts.strict).validate(parent, key, constraints);
+    }
   }
 
   void _validateAll() {
-    result.metadata.forEach((path, fields) {
-      final container = _getObjectAt(path);
-      if (container == null) return;
-      fields.forEach((fk, meta) {
-        final c = meta.constraints;
-        if (c == null) return;
-        final fv = container[fk];
-        if (fv == null) {
-          if (c.required && opts.strict) {
-            stderr.writeln("synx: required '$path.$fk' missing");
-          }
-          return;
-        }
-        if (c.typeName != null) {
-          final match = (c.typeName == 'int' && fv is SynxInt) ||
-              (c.typeName == 'float' && fv is SynxFloat) ||
-              (c.typeName == 'bool' && fv is SynxBool) ||
-              (c.typeName == 'string' && fv is SynxStr) ||
-              (c.typeName == 'array' && fv is SynxArr) ||
-              (c.typeName == 'object' && fv is SynxObj);
-          if (!match && opts.strict) {
-            stderr.writeln(
-                "synx: type mismatch '$path.$fk' want ${c.typeName}, got ${fv.typeName}");
-          }
-        }
-        final dv = fv.asDouble;
-        if (dv != null) {
-          if (c.min != null && dv < c.min! && opts.strict) {
-            stderr.writeln("synx: '$path.$fk' below min");
-          }
-          if (c.max != null && dv > c.max! && opts.strict) {
-            stderr.writeln("synx: '$path.$fk' above max");
-          }
-        }
-        if (c.enumValues != null && fv is SynxStr) {
-          if (!c.enumValues!.contains(fv.value) && opts.strict) {
-            stderr.writeln("synx: '$path.$fk' '${fv.value}' not in enum");
-          }
-        }
-        if (c.pattern != null && fv is SynxStr) {
-          if (!_regexMatches(fv.value, c.pattern!) && opts.strict) {
-            stderr.writeln("synx: '$path.$fk' fails pattern '${c.pattern}'");
-          }
-        }
-      });
-    });
+    ConstraintChecker(strict: opts.strict)
+        .validateDocument(root, result.metadata);
   }
 
   SynxValue _applyOnce(SynxValue v, String path, String key) {
@@ -397,6 +361,65 @@ class _Resolver {
     return null;
   }
 
+  /// Expands `{key}`, `{a.b}` and `{key:alias}` in every plain string value,
+  /// depth first. A reference to a `:secret` resolves to its mask.
+  void _autoInterpolate(SynxObject obj, int depth) {
+    if (depth > maxResolveDepth) return;
+    for (final e in obj.entries) {
+      final v = e.value;
+      if (v is SynxObj) {
+        _autoInterpolate(v.map, depth + 1);
+      } else if (v is SynxArr) {
+        for (final item in v.values) {
+          if (item is SynxObj) _autoInterpolate(item.map, depth + 1);
+        }
+      } else if (v is SynxStr && v.value.contains('{')) {
+        final out = _expandPlaceholders(v.value);
+        if (out != v.value) obj.set(e.key, synxString(out));
+      }
+    }
+  }
+
+  static final RegExp _placeholderName =
+      RegExp(r'^[\p{L}\p{N}_.]+$', unicode: true);
+
+  /// Replaces `{ref}` / `{ref:scope}` where ref is a dotted identifier; any
+  /// other brace text (`{ x }`, JSON) is literal and copied unchanged.
+  String _expandPlaceholders(String s) {
+    final out = StringBuffer();
+    var i = 0;
+    while (i < s.length) {
+      if (s.codeUnitAt(i) == 0x7B) {
+        final end = s.indexOf('}', i + 1);
+        if (end >= 0) {
+          final inner = s.substring(i + 1, end);
+          final colon = inner.indexOf(':');
+          final name = colon < 0 ? inner : inner.substring(0, colon);
+          if (_placeholderName.hasMatch(name)) {
+            final scope = colon < 0 ? null : inner.substring(colon + 1);
+            final v = _resolvePlaceholder(name, scope);
+            out.write(v != null ? valueToString(v) : '{$inner}');
+            i = end + 1;
+            continue;
+          }
+        }
+      }
+      out.writeCharCode(s.codeUnitAt(i));
+      i++;
+    }
+    return out.toString();
+  }
+
+  SynxValue? _resolvePlaceholder(String name, String? scope) {
+    if (scope == null) return _deepGet(name, root);
+    if (scope == 'include') {
+      if (namespaces.length != 1) return null;
+      return _deepGet(name, namespaces.values.first);
+    }
+    final ns = namespaces[scope];
+    return ns == null ? null : _deepGet(name, ns);
+  }
+
   String _interpolate(String s) {
     if (!s.contains('{')) return s;
     final out = StringBuffer();
@@ -453,7 +476,7 @@ class _Resolver {
         if (d != null) return synxFloat(d);
         return v;
       case 'string':
-        if (v is SynxStr) return v;
+        if (v is SynxStr || v is SynxSecret) return v;
         return synxString(valueToString(v));
       case 'bool':
         if (v is SynxBool) return v;
@@ -466,19 +489,18 @@ class _Resolver {
   // ─── markers ─────────────────────────────────────────────────────────────
 
   SynxValue _applyEnv(SynxValue v, SynxMeta meta) {
-    if (opts.env == null) return v;
-    final varName = valueToString(v);
-    var fallback = '';
-    final idx = meta.markerIndex('env');
-    if (idx >= 0 &&
-        idx + 1 < meta.markers.length &&
-        meta.markers[idx + 1] == 'default' &&
-        idx + 2 < meta.markers.length) {
-      fallback = meta.markers[idx + 2];
+    if (v is! SynxStr) return v;
+    final forceString = _wantsString(meta);
+    // A null map reads the process environment; an explicit (even empty) map
+    // is the complete set of variables.
+    final val = (opts.env ?? Platform.environment)[v.value];
+    if (val != null && val.isNotEmpty) return _castEngineText(val, forceString);
+    // Everything after `default` is rejoined with ':' so IPs (0.0.0.0) and
+    // compound values survive the marker split.
+    final idx = meta.markerIndex('default');
+    if (idx >= 0 && idx + 1 < meta.markers.length) {
+      return _castEngineText(meta.markers.sublist(idx + 1).join(':'), forceString);
     }
-    final val = opts.env![varName];
-    if (val != null) return synxString(val);
-    if (fallback.isNotEmpty) return synxString(fallback);
     return synxNull();
   }
 
@@ -488,10 +510,21 @@ class _Resolver {
     if (!empty) return v;
     final idx = meta.markerIndex('default');
     if (idx >= 0 && idx + 1 < meta.markers.length) {
-      return synxString(meta.markers[idx + 1]);
+      return _castEngineText(
+          meta.markers.sublist(idx + 1).join(':'), _wantsString(meta));
     }
     return v;
   }
+
+  /// Whether text taken from outside the document (`:env`, `:default`) must
+  /// stay a string instead of going through [_castPrimitive]. Both `(string)`
+  /// and `[type:string]` ask for that; honouring only the hint cast `007` to a
+  /// number and then failed the constraint's own type check.
+  bool _wantsString(SynxMeta meta) =>
+      meta.typeHint == 'string' || meta.constraints?.typeName == 'string';
+
+  SynxValue _castEngineText(String text, bool forceString) =>
+      forceString ? synxString(text) : _castPrimitive(text);
 
   SynxValue _applyCalc(SynxValue v) {
     var expr = valueToString(v);
@@ -783,24 +816,52 @@ String valueToString(SynxValue v) => switch (v) {
           return s;
         }(),
       SynxStr(value: var s) => s,
-      SynxSecret(value: var s) => s,
+      // safety: valueToString feeds interpolation, :join, :map, :prompt — a
+      // secret must reach none of those sinks as plaintext.
+      SynxSecret() => '[SECRET]',
       SynxArr(values: var arr) =>
         '[${arr.map(valueToString).join(', ')}]',
       SynxObj() => '[Object]',
     };
 
+/// Types engine-sourced text. Integers go through a decimal-only `int.tryParse`
+/// (64-bit ids stay exact; no hex), floats reject Dart-only spellings.
+SynxValue _castPrimitive(String val) {
+  if (val.length >= 2) {
+    final f = val[0];
+    final l = val[val.length - 1];
+    if ((f == '"' && l == '"') || (f == "'" && l == "'")) {
+      return synxString(val.substring(1, val.length - 1));
+    }
+  }
+  switch (val) {
+    case 'true':
+      return synxBool(true);
+    case 'false':
+      return synxBool(false);
+    case 'null':
+      return synxNull();
+  }
+  final n = int.tryParse(val, radix: 10);
+  if (n != null) return synxInt(n);
+  final lower = val.toLowerCase();
+  final unsigned =
+      lower.startsWith('-') || lower.startsWith('+') ? lower.substring(1) : lower;
+  if (unsigned == 'inf' || unsigned == 'infinity') {
+    return synxFloat(lower.startsWith('-') ? double.negativeInfinity : double.infinity);
+  }
+  if (unsigned == 'nan') return synxFloat(double.nan);
+  if (!lower.contains('x') && !lower.contains('i') && !lower.contains('n')) {
+    final d = double.tryParse(val);
+    if (d != null) return synxFloat(d);
+  }
+  return synxString(val);
+}
+
 String _floatPrecision(double d) {
   var s = d.toString();
   if (!s.contains('.') && !s.contains('e') && !s.contains('E')) s = '$s.0';
   return s;
-}
-
-bool _regexMatches(String value, String pattern) {
-  try {
-    return RegExp(pattern).hasMatch(value);
-  } on FormatException {
-    return true;
-  }
 }
 
 String _replaceWord(String s, String word, String repl) {

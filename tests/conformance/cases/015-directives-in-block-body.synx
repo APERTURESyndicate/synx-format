@@ -1,0 +1,8 @@
+notes |
+  !active
+  !include other.synx
+  !llm
+kept |+
+  !tool
+    !schema
+tail end

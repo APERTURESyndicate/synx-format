@@ -88,7 +88,6 @@ synx-format/
 
 │   ├── guides/                # Long-form guides per locale (+ MCP Desktop, token samples)
 
-│   ├── dev/                   # Contributor stubs (e.g. plugins roadmap — not normative)
 
 │   └── spec/                  # Normative specs: SYNX-3.6 (frozen), SYNX-3.7 (`|+`), SYNXL-1 (`.synxl`), EN/RU guides
 

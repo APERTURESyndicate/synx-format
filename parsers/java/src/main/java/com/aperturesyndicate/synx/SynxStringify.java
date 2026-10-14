@@ -68,9 +68,7 @@ public final class SynxStringify {
         if (v instanceof SynxValue.Float f) {
             double d = f.value();
             if (Double.isNaN(d) || Double.isInfinite(d)) return "null";
-            String s = String.format(java.util.Locale.ROOT, "%.17g", d);
-            if (s.indexOf('.') < 0 && s.indexOf('e') < 0 && s.indexOf('E') < 0) s += ".0";
-            return s;
+            return SynxJson.formatPlain(d);
         }
         if (v instanceof SynxValue.Bool b) return b.value() ? "true" : "false";
         if (v instanceof SynxValue.Null) return "null";

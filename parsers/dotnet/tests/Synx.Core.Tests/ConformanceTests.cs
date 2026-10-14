@@ -1,3 +1,4 @@
+using System.Text;
 using Synx;
 using Xunit;
 
@@ -33,8 +34,10 @@ public class ConformanceTests
     [MemberData(nameof(Cases))]
     public void Conformance_case_matches_rust_json(string synxPath, string expectedPath)
     {
-        var input = File.ReadAllText(synxPath);
-        var expected = File.ReadAllText(expectedPath).Trim();
+        // GetString keeps a leading BOM (ReadAllText would drop it): stripping it is the parser's job.
+        var utf8 = new UTF8Encoding(false);
+        var input = utf8.GetString(File.ReadAllBytes(synxPath));
+        var expected = utf8.GetString(File.ReadAllBytes(expectedPath)).Trim();
 
         var isTool = input.TrimStart().StartsWith("!tool", StringComparison.Ordinal);
         string json;
@@ -45,10 +48,18 @@ public class ConformanceTests
         }
         else
         {
-            var map = SynxFormat.Parse(input);
-            json = SynxFormat.ToJson(map);
+            // Active documents (also behind a BOM) are resolved with default options; static ones are not.
+            var parsed = SynxFormat.ParseFullActive(input);
+            json = SynxFormat.ToJson(parsed.Root);
         }
 
-        Assert.Equal(expected, json);
+        Assert.True(expected == json,
+            $"{Path.GetFileName(synxPath)}{Environment.NewLine}  got:      {json}{Environment.NewLine}  expected: {expected}");
+    }
+
+    [Fact]
+    public void Conformance_suite_is_not_empty()
+    {
+        Assert.True(Cases().Count() >= 24, "expected at least 24 conformance cases (001-018, 100-105)");
     }
 }

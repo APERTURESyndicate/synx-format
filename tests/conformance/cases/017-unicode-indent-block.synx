@@ -1,0 +1,9 @@
+body |+
+  first
+    second
+  　third
+after ok
+text |
+   мир
+  東京
+end ✓

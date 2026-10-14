@@ -65,15 +65,47 @@ void _write(StringBuffer out, SynxValue v, int depth) {
   }
 }
 
+/// Shortest round-trip form with the same layout as Rust's `ryu` (what the
+/// reference `to_json` emits): plain decimals while the decimal exponent stays
+/// within [-5, 16), otherwise `d.ddde<N>`, and a mandatory `.0` on whole
+/// numbers. Dart's own `toString` switches layout at different magnitudes
+/// (`1e16` prints as `10000000000000000.0`, `1e-6` as `0.000001`).
 String _floatString(double f) {
-  // Dart's `toStringAsPrecision(17)` keeps integer values as `1.0000000000000000`,
-  // which differs from Rust ryu. Match Rust shortest-round-trip by using
-  // `toString()` (returns "1.0" for 1.0, "99.5" for 99.5, "1.5e-10" for tiny).
-  var s = f.toString();
-  if (!s.contains('.') && !s.contains('e') && !s.contains('E')) {
-    s = '$s.0';
+  if (f == 0) return f.isNegative ? '-0.0' : '0.0';
+  final e = f.abs().toStringAsExponential();
+  final ePos = e.indexOf('e');
+  final digits = e.substring(0, ePos).replaceFirst('.', '');
+  final exp = int.parse(e.substring(ePos + 1));
+  final length = digits.length;
+  final kk = exp + 1;
+  final k = kk - length;
+
+  final sb = StringBuffer();
+  if (f < 0) sb.write('-');
+  if (k >= 0 && kk <= 16) {
+    sb.write(digits);
+    sb.write('0' * k);
+    sb.write('.0');
+  } else if (kk > 0 && kk <= 16) {
+    sb.write(digits.substring(0, kk));
+    sb.write('.');
+    sb.write(digits.substring(kk));
+  } else if (kk > -5 && kk <= 0) {
+    sb.write('0.');
+    sb.write('0' * -kk);
+    sb.write(digits);
+  } else if (length == 1) {
+    sb.write(digits);
+    sb.write('e');
+    sb.write(kk - 1);
+  } else {
+    sb.write(digits.substring(0, 1));
+    sb.write('.');
+    sb.write(digits.substring(1));
+    sb.write('e');
+    sb.write(kk - 1);
   }
-  return s;
+  return sb.toString();
 }
 
 void _escape(StringBuffer out, String s) {

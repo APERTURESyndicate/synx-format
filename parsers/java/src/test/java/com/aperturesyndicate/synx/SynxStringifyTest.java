@@ -36,4 +36,28 @@ class SynxStringifyTest {
         String out = SynxFormatter.format("!active\nname X\n");
         assertTrue(out.startsWith("!active"));
     }
+
+    @Test
+    void stringify_prints_floats_like_rust() {
+        SynxObject o = new SynxObject();
+        o.set("a", SynxValue.ofFloat(99.5));
+        o.set("b", SynxValue.ofFloat(3.0));
+        o.set("c", SynxValue.ofFloat(0.1));
+        o.set("d", SynxValue.ofFloat(1e20));
+        o.set("e", SynxValue.ofFloat(0.0000001));
+        String out = SynxStringify.stringify(SynxValue.ofObject(o));
+        java.util.List<String> lines = java.util.Arrays.asList(out.split("\n"));
+        assertTrue(lines.contains("a 99.5"), out);
+        assertTrue(lines.contains("b 3.0"), out);
+        assertTrue(lines.contains("c 0.1"), out);
+        assertTrue(lines.contains("d 100000000000000000000.0"), out);
+        assertTrue(lines.contains("e 0.0000001"), out);
+    }
+
+    @Test
+    void stringify_float_roundtrips_through_parse() {
+        SynxObject back = Synx.parse(Synx.stringify(Synx.parse("a 99.5\nb 3.0\n")));
+        assertEquals(SynxValue.ofFloat(99.5), back.get("a"));
+        assertEquals(SynxValue.ofFloat(3.0), back.get("b"));
+    }
 }

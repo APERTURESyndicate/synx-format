@@ -168,6 +168,60 @@ port:env:default:3000 NONEXISTENT_PORT
     expect(data.port).toBe(3000);
   });
 
+  // 3.7.4: `[type:string]` keeps env text a string instead of failing its own check.
+  test(':env with [type:string] keeps numeric-looking text', () => {
+    const data = Synx.parse(`
+!active
+id[type:string]:env SNOW
+zip[type:string]:env ZIP
+fallback[type:string]:env:default:0042 MISSING
+plain:env ZIP
+    `, { env: { SNOW: '1550184245153112174', ZIP: '007' } });
+    expect(data.id).toBe('1550184245153112174');
+    expect(data.zip).toBe('007');
+    expect(data.fallback).toBe('0042');
+    expect(data.plain).toBe(7);
+  });
+
+  test(':env casts a 64-bit id exactly, like synx-core', () => {
+    const data = Synx.parse(`
+!active
+id:env SNOW
+    `, { env: { SNOW: '1550184245153112174' } });
+    expect(data.id).toBe(1550184245153112174n);
+  });
+
+  test('[type:string] accepts a :secret', () => {
+    const data = Synx.parse(`
+!active
+token[type:string]:secret:env SNOW
+    `, { env: { SNOW: 'sk-123' } });
+    expect(String(data.token)).toBe('[SECRET]');
+    expect((data.token as unknown as { reveal(): string }).reveal()).toBe('sk-123');
+  });
+
+  test('a backtracking [pattern] is refused instead of hanging (ReDoS)', () => {
+    const started = Date.now();
+    const data = Synx.parse(`
+!active
+v[pattern:^(a+)+$] ${'a'.repeat(45)}!
+    `);
+    expect(Date.now() - started).toBeLessThan(1000);
+    expect(data.v).toBe(`${'a'.repeat(45)}!`);
+  });
+
+  test('[min]/[max] count a string in Unicode characters', () => {
+    const data = Synx.parse(`
+!active
+short[max:4] мир
+long[max:4] мирок
+emoji[max:2] 😀😀
+    `);
+    expect(data.short).toBe('мир');
+    expect(data.long).toBe("CONSTRAINT_ERR: 'long' value 5 exceeds max 4");
+    expect(data.emoji).toBe('😀😀');
+  });
+
   test(':alias references another key', () => {
     const data = Synx.parse(`
 !active

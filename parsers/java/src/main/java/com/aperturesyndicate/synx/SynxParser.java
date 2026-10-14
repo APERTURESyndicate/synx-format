@@ -31,6 +31,10 @@ public final class SynxParser {
     }
 
     public static SynxParseResult parse(String rawText) {
+        // A single leading U+FEFF is dropped before anything else (SYNX §2.1); `trim`
+        // does not treat it as whitespace, so it would otherwise stay glued to the
+        // first key or hide a leading `!active`.
+        if (!rawText.isEmpty() && rawText.charAt(0) == '﻿') rawText = rawText.substring(1);
         byte[] bytes = clampText(rawText).getBytes(StandardCharsets.UTF_8);
 
         // Bound number of indexed newlines.
@@ -71,6 +75,50 @@ public final class SynxParser {
             byte[] raw = lineBytes(bytes, lineStarts, i);
             String rawStr = new String(raw, StandardCharsets.UTF_8);
             String t = trim(rawStr);
+
+            // A blank line is never structural and never body (SYNX §8.4.1).
+            if (t.isEmpty()) { i++; continue; }
+
+            int indent = indentOf(rawStr);
+
+            // Block continuation runs before every line-class rule below: a `|` / `|+`
+            // body is raw text, so `#`, `//`, `###` and `!…` are ordinary content there.
+
+            // Continue multiline block
+            if (block != null) {
+                if (indent > block.indent) {
+                    if (block.content.length() < MAX_MULTILINE_BYTES) {
+                        if (block.content.length() > 0) block.content.append('\n');
+                        int room = MAX_MULTILINE_BYTES - block.content.length();
+                        String slice;
+                        if (block.preserveIndent) {
+                            // `|+` (SYNX 3.7): lock base indent to the first
+                            // non-empty continuation line, then strip exactly
+                            // that many leading whitespace chars from each
+                            // subsequent line. See spec §8.4.1.
+                            if (block.baseIndent < 0) block.baseIndent = indent;
+                            int strip = Math.min(block.baseIndent, indent);
+                            // rstrip trailing whitespace from the raw line
+                            int end = rawStr.length();
+                            while (end > 0 && isWs(rawStr.charAt(end - 1))) end--;
+                            slice = strip < end ? rawStr.substring(strip, end) : "";
+                        } else {
+                            slice = t;
+                        }
+                        int n = Math.min(slice.length(), room);
+                        // never cut between the halves of a surrogate pair
+                        if (n < slice.length() && n > 0 && Character.isHighSurrogate(slice.charAt(n - 1))) n--;
+                        block.content.append(slice, 0, n);
+                    }
+                    i++; continue;
+                }
+                insertValue(rootObj, stack, block.stackIdx, block.key,
+                        SynxValue.ofString(block.content.toString()));
+                block = null;
+            }
+
+            if (t.equals("###")) { inBlockComment = !inBlockComment; i++; continue; }
+            if (inBlockComment) { i++; continue; }
 
             // Directives
             switch (t) {
@@ -130,46 +178,7 @@ public final class SynxParser {
                 i++; continue;
             }
 
-            if (t.equals("###")) { inBlockComment = !inBlockComment; i++; continue; }
-            if (inBlockComment) { i++; continue; }
-            if (t.isEmpty() || t.startsWith("#") || t.startsWith("//")) { i++; continue; }
-
-            int indent = indentOf(raw);
-
-            // Continue multiline block
-            if (block != null) {
-                if (indent > block.indent) {
-                    if (block.content.length() < MAX_MULTILINE_BYTES) {
-                        if (block.content.length() > 0) block.content.append('\n');
-                        int room = MAX_MULTILINE_BYTES - block.content.length();
-                        String slice;
-                        if (block.preserveIndent) {
-                            // `|+` (SYNX 3.7): lock base indent to the first
-                            // non-empty continuation line, then strip exactly
-                            // that many leading whitespace chars from each
-                            // subsequent line. See spec §8.4.1.
-                            if (block.baseIndent < 0) block.baseIndent = indent;
-                            int strip = Math.min(block.baseIndent, indent);
-                            // rstrip trailing whitespace from the raw line
-                            int end = rawStr.length();
-                            while (end > 0) {
-                                char c = rawStr.charAt(end - 1);
-                                if (c != ' ' && c != '\t' && c != '\r' && c != '\n') break;
-                                end--;
-                            }
-                            slice = strip < end ? rawStr.substring(strip, end) : "";
-                        } else {
-                            slice = t;
-                        }
-                        int n = Math.min(slice.length(), room);
-                        block.content.append(slice, 0, n);
-                    }
-                    i++; continue;
-                }
-                insertValue(rootObj, stack, block.stackIdx, block.key,
-                        SynxValue.ofString(block.content.toString()));
-                block = null;
-            }
+            if (t.startsWith("#") || t.startsWith("//")) { i++; continue; }
 
             // Continue list items
             if (t.startsWith("- ")) {
@@ -186,8 +195,8 @@ public final class SynxParser {
                     boolean nested = false;
                     int peek = i + 1;
                     while (peek < lineCount) {
-                        byte[] pl = lineBytes(bytes, lineStarts, peek);
-                        String pt = trim(new String(pl, StandardCharsets.UTF_8));
+                        String pl = new String(lineBytes(bytes, lineStarts, peek), StandardCharsets.UTF_8);
+                        String pt = trim(pl);
                         if (pt.isEmpty()) { peek++; continue; }
                         int pi = indentOf(pl);
                         if (pi > indent && !pt.startsWith("- ") && !pt.startsWith("#") && !pt.startsWith("//")) {
@@ -368,17 +377,25 @@ public final class SynxParser {
         return out;
     }
 
-    private static int indentOf(byte[] line) {
+    /** Indentation in UTF-16 units over Unicode whitespace (SYNX §4), e.g. U+00A0 or U+3000. */
+    private static int indentOf(String line) {
         int i = 0;
-        while (i < line.length && (line[i] == ' ' || line[i] == '\t')) i++;
+        while (i < line.length() && isWs(line.charAt(i))) i++;
         return i;
+    }
+
+    /** Same set as Rust {@code char::is_whitespace} (Unicode White_Space); {@code Character.isWhitespace} misses NBSP and NEL. */
+    static boolean isWs(char c) {
+        return (c >= 0x09 && c <= 0x0D) || c == 0x20 || c == 0x85 || c == 0xA0 || c == 0x1680
+            || (c >= 0x2000 && c <= 0x200A) || c == 0x2028 || c == 0x2029 || c == 0x202F
+            || c == 0x205F || c == 0x3000;
     }
 
     static String trim(String s) {
         int a = 0;
-        while (a < s.length() && (s.charAt(a) == ' ' || s.charAt(a) == '\t' || s.charAt(a) == '\r')) a++;
+        while (a < s.length() && isWs(s.charAt(a))) a++;
         int b = s.length();
-        while (b > a && (s.charAt(b - 1) == ' ' || s.charAt(b - 1) == '\t' || s.charAt(b - 1) == '\r')) b--;
+        while (b > a && isWs(s.charAt(b - 1))) b--;
         return s.substring(a, b);
     }
 
@@ -396,7 +413,7 @@ public final class SynxParser {
         p = r.indexOf(" #");
         if (p >= 0) r = r.substring(0, p);
         int end = r.length();
-        while (end > 0 && (r.charAt(end - 1) == ' ' || r.charAt(end - 1) == '\t' || r.charAt(end - 1) == '\r')) end--;
+        while (end > 0 && isWs(r.charAt(end - 1))) end--;
         return r.substring(0, end);
     }
 

@@ -14,20 +14,26 @@ import (
 // table is in engine.go.
 
 func (r *resolver) applyEnv(v Value, meta Meta) Value {
-	if r.opts.Env == nil {
+	name, ok := AsString(v)
+	if !ok {
 		return v
 	}
-	varName := valueToString(v)
-	fallback := ""
-	idx := meta.MarkerIndex("env")
-	if idx >= 0 && idx+1 < len(meta.Markers) && meta.Markers[idx+1] == "default" && idx+2 < len(meta.Markers) {
-		fallback = meta.Markers[idx+2]
+	forceString := wantsString(meta)
+	// A nil map reads the process environment; an explicit (even empty) map
+	// is the complete set of variables.
+	var val string
+	if r.opts.Env != nil {
+		val = r.opts.Env[name]
+	} else {
+		val, _ = os.LookupEnv(name)
 	}
-	if val, ok := r.opts.Env[varName]; ok {
-		return String(val)
+	if val != "" {
+		return castEngineText(val, forceString)
 	}
-	if fallback != "" {
-		return String(fallback)
+	// Everything after `default` is rejoined with ':' so IPs (0.0.0.0) and
+	// compound values survive the marker split.
+	if idx := meta.MarkerIndex("default"); idx >= 0 && idx+1 < len(meta.Markers) {
+		return castEngineText(strings.Join(meta.Markers[idx+1:], ":"), forceString)
 	}
 	return Null
 }
@@ -47,9 +53,55 @@ func (r *resolver) applyDefault(v Value, meta Meta) Value {
 	}
 	idx := meta.MarkerIndex("default")
 	if idx >= 0 && idx+1 < len(meta.Markers) {
-		return String(meta.Markers[idx+1])
+		return castEngineText(strings.Join(meta.Markers[idx+1:], ":"), wantsString(meta))
 	}
 	return v
+}
+
+// wantsString reports whether text taken from outside the document (`:env`,
+// `:default`) must stay a string instead of going through castPrimitive.
+// Both `(string)` and `[type:string]` ask for that; with only the hint
+// honoured, `[type:string]:env ZIP` cast `007` to a number and then failed
+// its own type check.
+func wantsString(meta Meta) bool {
+	return meta.TypeHint == "string" ||
+		(meta.Constraints != nil && meta.Constraints.TypeName == "string")
+}
+
+func castEngineText(text string, forceString bool) Value {
+	if forceString {
+		return String(text)
+	}
+	return castPrimitive(text)
+}
+
+// castPrimitive types engine-sourced text. Integers go through ParseInt, so
+// 64-bit ids stay exact instead of passing through a float64.
+func castPrimitive(val string) Value {
+	if len(val) >= 2 {
+		f, l := val[0], val[len(val)-1]
+		if (f == '"' && l == '"') || (f == '\'' && l == '\'') {
+			return String(val[1 : len(val)-1])
+		}
+	}
+	switch val {
+	case "true":
+		return Bool(true)
+	case "false":
+		return Bool(false)
+	case "null":
+		return Null
+	}
+	if n, err := strconv.ParseInt(val, 10, 64); err == nil {
+		return Int(n)
+	}
+	// ParseFloat also takes Go-only spellings (hex floats, underscores).
+	if !strings.ContainsAny(val, "xXpP_") {
+		if f, err := strconv.ParseFloat(val, 64); err == nil {
+			return Float(f)
+		}
+	}
+	return String(val)
 }
 
 func (r *resolver) applyCalc(v Value) Value {

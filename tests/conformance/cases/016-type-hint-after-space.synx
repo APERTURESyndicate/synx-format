@@ -1,0 +1,4 @@
+spaced (int) 5
+attached(int) 5
+flag (bool) true
+label(string) 42

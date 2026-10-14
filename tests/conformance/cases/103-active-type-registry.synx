@@ -1,0 +1,6 @@
+!active
+hp(int) 100
+monster
+  hp 50
+boss
+  hp lots

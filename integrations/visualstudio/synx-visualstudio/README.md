@@ -29,7 +29,6 @@ As of **April 2026**, **SYNX 3.6.0** is **frozen**: the normative definition is 
 - **[parsers/README.md](parsers/README.md)** — parser implementations (Rust, TS, C#, C++, Go cgo, Swift, Kotlin/JVM, Mojo↔Python, tree-sitter)  
 - **[integrations/README.md](integrations/README.md)** — VS Code, Visual Studio, Sublime, Neovim, MCP, LSP  
 - **[docs/claude.md](docs/claude.md)** — Claude Desktop (MCP), Anthropic prompt helpers, tokenizer notes  
-- **[docs/dev/plugins-roadmap.md](docs/dev/plugins-roadmap.md)** — planned registry / plugins (**stub only**; not shipped in the engine yet)  
 
 ---
 

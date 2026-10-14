@@ -10,6 +10,8 @@ typedef SynxMarkerFn = SynxValue Function(
     String key, List<String> args, SynxValue value);
 
 class SynxOptions {
+  /// Variables `:env` reads. null means the process environment; a non-null
+  /// map (even an empty one) is the complete set of variables.
   Map<String, String>? env;
   String? region;
   String? lang;

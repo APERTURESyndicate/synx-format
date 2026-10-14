@@ -13,6 +13,14 @@ public enum SynxParser {
     public static let maxEnumParts       = 4096
     public static let maxMarkerSegments  = 512
 
+    /// Drop a single leading U+FEFF (SYNX §2.1; §6 matches directives with a
+    /// leading BOM ignored). Trimming does not treat U+FEFF as whitespace, so
+    /// without this a BOM-prefixed `!active` becomes a "\u{FEFF}!active" key.
+    static func stripBOM(_ text: String) -> String {
+        guard text.unicodeScalars.first == "\u{FEFF}" else { return text }
+        return String(text.unicodeScalars.dropFirst())
+    }
+
     /// Truncate to a UTF-8-safe prefix.
     public static func clamp(_ text: String) -> String {
         let bytes = Array(text.utf8)
@@ -25,7 +33,7 @@ public enum SynxParser {
 
     /// Parse a SYNX text into a `SynxParseResult`.
     public static func parse(_ rawText: String) -> SynxParseResult {
-        var text = clamp(rawText)
+        var text = clamp(stripBOM(rawText))
         var bytes = Array(text.utf8)
 
         // Bound number of indexed newlines.
@@ -69,7 +77,57 @@ public enum SynxParser {
         while i < lineCount {
             let rawSlice = lineSlice(bytes: bytes, starts: lineStarts, index: i)
             let raw = String(decoding: rawSlice, as: UTF8.self)
-            let t = raw.trimmingTrailing().trimmingLeading()
+            let t = raw.trimmingLeadingTrailing()
+
+            // A blank line is never structural and never body (§8.4.1).
+            if t.isEmpty { i += 1; continue }
+
+            let indent = indentOf(slice: rawSlice)
+
+            // Continue multiline block. Runs before every line-class rule
+            // below on purpose: a `|` / `|+` body is raw text (§8.4.1), so
+            // `#`, `//`, `###` and `!…` are ordinary content there.
+            if var blk = block {
+                if indent > blk.indent {
+                    if blk.content.utf8.count < maxMultilineBytes {
+                        if !blk.content.isEmpty { blk.content.append("\n") }
+                        let room = maxMultilineBytes - blk.content.utf8.count
+                        if room > 0 {
+                            let slice: String
+                            if blk.preserveIndent {
+                                // `|+` (SYNX 3.7): lock base indent on the first
+                                // non-empty continuation line, then strip exactly
+                                // that many leading whitespace bytes per line,
+                                // never cutting inside a character. Spec §8.4.1.
+                                if blk.baseIndent < 0 { blk.baseIndent = indent }
+                                let strip = min(blk.baseIndent, indent)
+                                let trimmedEnd = raw.trimmingTrailing()
+                                let cut = stripBoundary(trimmedEnd, strip: strip)
+                                if cut < trimmedEnd.utf8.count {
+                                    let from = trimmedEnd.utf8.index(trimmedEnd.utf8.startIndex, offsetBy: cut)
+                                    slice = String(decoding: trimmedEnd.utf8[from...], as: UTF8.self)
+                                } else {
+                                    slice = ""
+                                }
+                            } else {
+                                slice = t
+                            }
+                            let n = utf8PrefixLen(slice, limit: room)
+                            if n == slice.utf8.count {
+                                blk.content.append(slice)
+                            } else {
+                                let prefix = slice.utf8.prefix(n)
+                                blk.content.append(String(decoding: prefix, as: UTF8.self))
+                            }
+                        }
+                    }
+                    block = blk
+                    i += 1; continue
+                }
+                insertValue(into: &rootObj, stack: stack, parentIdx: blk.stackIdx,
+                            key: blk.key, value: .string(blk.content))
+                block = nil
+            }
 
             // Directives
             switch t {
@@ -135,49 +193,7 @@ public enum SynxParser {
 
             if t == "###" { inBlockComment.toggle(); i += 1; continue }
             if inBlockComment { i += 1; continue }
-            if t.isEmpty || t.first == "#" || t.hasPrefix("//") { i += 1; continue }
-
-            let indent = indentOf(slice: rawSlice)
-
-            // Continue multiline block
-            if var blk = block {
-                if indent > blk.indent {
-                    if blk.content.utf8.count < maxMultilineBytes {
-                        if !blk.content.isEmpty { blk.content.append("\n") }
-                        let room = maxMultilineBytes - blk.content.utf8.count
-                        if room > 0 {
-                            let slice: String
-                            if blk.preserveIndent {
-                                // `|+` (SYNX 3.7): lock base indent on the first
-                                // non-empty continuation line, then strip exactly
-                                // that many leading WS chars per line. Spec §8.4.1.
-                                if blk.baseIndent < 0 { blk.baseIndent = indent }
-                                let strip = min(blk.baseIndent, indent)
-                                let trimmedEnd = raw.trimmingTrailing()
-                                if strip < trimmedEnd.count {
-                                    slice = String(trimmedEnd.dropFirst(strip))
-                                } else {
-                                    slice = ""
-                                }
-                            } else {
-                                slice = t
-                            }
-                            let n = min(slice.utf8.count, room)
-                            if n == slice.utf8.count {
-                                blk.content.append(slice)
-                            } else {
-                                let prefix = slice.utf8.prefix(n)
-                                blk.content.append(String(decoding: prefix, as: UTF8.self))
-                            }
-                        }
-                    }
-                    block = blk
-                    i += 1; continue
-                }
-                insertValue(into: &rootObj, stack: stack, parentIdx: blk.stackIdx,
-                            key: blk.key, value: .string(blk.content))
-                block = nil
-            }
+            if t.first == "#" || t.hasPrefix("//") { i += 1; continue }
 
             // List items
             if t.hasPrefix("- ") {
@@ -409,12 +425,39 @@ private func lineSlice(bytes: [UInt8], starts: [Int], index: Int) -> [UInt8] {
     return Array(bytes[s..<e])
 }
 
+/// Indent in UTF-8 bytes of leading Unicode whitespace (SYNX §4), so a
+/// multi-byte indent character such as U+00A0 counts as more than one.
 private func indentOf(slice: [UInt8]) -> Int {
-    var i = 0
-    while i < slice.count && (slice[i] == 0x20 /* ' ' */ || slice[i] == 0x09 /* \t */) {
-        i += 1
+    var n = 0
+    for scalar in String(decoding: slice, as: UTF8.self).unicodeScalars {
+        if !scalar.properties.isWhitespace { break }
+        n += UTF8.width(scalar)
     }
-    return i
+    return n
+}
+
+/// Byte offset of the first character at or past `strip` bytes of leading
+/// whitespace; always lands on a character boundary.
+private func stripBoundary(_ s: String, strip: Int) -> Int {
+    var off = 0
+    for scalar in s.unicodeScalars {
+        if off >= strip || !scalar.properties.isWhitespace { break }
+        off += UTF8.width(scalar)
+    }
+    return off
+}
+
+/// Longest prefix of `s` that fits in `limit` bytes without splitting a character.
+private func utf8PrefixLen(_ s: String, limit: Int) -> Int {
+    let bytes = s.utf8
+    if bytes.count <= limit { return bytes.count }
+    var end = limit
+    while end > 0 {
+        let idx = bytes.index(bytes.startIndex, offsetBy: end)
+        if (bytes[idx] & 0xC0) != 0x80 { break }
+        end -= 1
+    }
+    return end
 }
 
 // MARK: - Line parser
@@ -730,27 +773,32 @@ private func setValue(in obj: inout SynxObject,
 // MARK: - String trimming helpers
 
 extension String {
+    /// Trim Unicode whitespace (Rust `str::trim`): U+00A0, U+3000 etc. included.
     fileprivate func trimmingLeadingTrailing() -> String {
-        return self.trimmingCharacters(in: .whitespaces)
+        return trimmingTrailing().trimmingLeading()
     }
     fileprivate func trimmingLeading() -> String {
-        var i = self.startIndex
-        while i < endIndex, self[i] == " " || self[i] == "\t" || self[i] == "\r" {
-            i = self.index(after: i)
+        let scalars = self.unicodeScalars
+        var i = scalars.startIndex
+        while i < scalars.endIndex, scalars[i].properties.isWhitespace {
+            i = scalars.index(after: i)
         }
-        return String(self[i...])
+        return String(scalars[i...])
     }
     fileprivate func trimmingTrailing() -> String {
-        var s = self
-        while let last = s.last, last == " " || last == "\t" || last == "\r" {
-            s.removeLast()
+        let scalars = self.unicodeScalars
+        var e = scalars.endIndex
+        while e > scalars.startIndex {
+            let prev = scalars.index(before: e)
+            if !scalars[prev].properties.isWhitespace { break }
+            e = prev
         }
-        return s
+        return String(scalars[..<e])
     }
 }
 
 extension Substring {
     fileprivate func trimmingLeadingTrailing() -> String {
-        return self.trimmingCharacters(in: .whitespaces)
+        return String(self).trimmingLeadingTrailing()
     }
 }

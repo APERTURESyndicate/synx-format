@@ -5,7 +5,9 @@
 //! expected file.  Keys are sorted deterministically by `synx_core::to_json`.
 //!
 //! Tool-mode cases (files starting with `!tool`) are routed through
-//! `Synx::parse_tool` instead of `Synx::parse`.
+//! `Synx::parse_tool` instead of `Synx::parse`. A document the parser reports
+//! as `!active` (the `100`–`199` cases) is resolved with default options before
+//! the projection is taken; those cases must not depend on the environment.
 
 use std::fs;
 use std::path::Path;
@@ -42,7 +44,10 @@ fn run_case(synx_path: &Path) {
         let map = synx_core::Synx::parse_tool(&input, &opts);
         synx_core::to_json(&synx_core::Value::Object(map))
     } else {
-        let result = synx_core::parse(&input);
+        let mut result = synx_core::parse(&input);
+        if result.mode == synx_core::Mode::Active {
+            synx_core::resolve(&mut result, &synx_core::Options::default());
+        }
         synx_core::to_json(&result.root)
     };
 

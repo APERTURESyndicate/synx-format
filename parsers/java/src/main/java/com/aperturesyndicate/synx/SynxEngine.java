@@ -8,6 +8,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
@@ -49,6 +50,8 @@ public final class SynxEngine {
         final SynxOptions options;
         final SynxObject root;
         final Map<String, SynxObject> namespaces = new HashMap<>();
+        /** {@code !include} aliases only (no packages): the scope table for {@code {key:alias}}. */
+        final Map<String, SynxObject> includeScopes = new LinkedHashMap<>();
         final Random rng;
         boolean onceLoaded;
         final Set<String> onceKeys = new HashSet<>();
@@ -71,8 +74,11 @@ public final class SynxEngine {
             loadIncludes();
             applyInheritPass();
             stripUnderscoreKeys();
+            maskSecretLiterals();
             walk("", 0);
-            validateAll();
+            interpolateAll(root, 0);
+            validateFieldConstraints(root, buildConstraintRegistry());
+            validateFieldTypes(root, buildTypeRegistry());
             flushOnce();
         }
 
@@ -118,6 +124,7 @@ public final class SynxEngine {
                 }
                 if (!(sub.root instanceof SynxValue.Obj o)) continue;
                 namespaces.put(inc.alias(), o.map());
+                includeScopes.put(inc.alias(), o.map());
                 root.set(inc.alias(), SynxValue.ofObject(o.map()));
             }
         }
@@ -167,6 +174,97 @@ public final class SynxEngine {
             }
         }
 
+        /**
+         * Wrap every literal {@code :secret} value in {@link SynxValue.Secret} before resolution so no
+         * later interpolation can read the plaintext. A secret that itself needs resolving
+         * ({@code :env:secret}, ...) is left for its own marker to mask in place.
+         */
+        void maskSecretLiterals() {
+            for (var pathEntry : result.metadata.entrySet()) {
+                SynxObject container = getObjectAt(pathEntry.getKey());
+                if (container == null) continue;
+                for (var fieldEntry : pathEntry.getValue().entrySet()) {
+                    SynxMeta meta = fieldEntry.getValue();
+                    if (!meta.hasMarker("secret") || needsResolutionBeforeSecret(meta)) continue;
+                    SynxValue v = container.get(fieldEntry.getKey());
+                    if (v == null || v instanceof SynxValue.Secret || v instanceof SynxValue.Obj
+                            || v instanceof SynxValue.Arr) continue;
+                    container.set(fieldEntry.getKey(), SynxValue.ofSecret(valueToString(v)));
+                }
+            }
+        }
+
+        static boolean needsResolutionBeforeSecret(SynxMeta meta) {
+            for (String m : meta.markers) {
+                if (RESOLVES_BEFORE_SECRET.contains(m)) return true;
+            }
+            return false;
+        }
+
+        /** Auto-{@code {}} interpolation on every string value, children first (as in Rust {@code resolve_value}). */
+        void interpolateAll(SynxObject obj, int depth) {
+            if (depth > MAX_RESOLVE_DEPTH) return;
+            for (var e : new ArrayList<>(obj.entriesList())) {
+                SynxValue v = e.getValue();
+                if (v instanceof SynxValue.Obj o) {
+                    interpolateAll(o.map(), depth + 1);
+                } else if (v instanceof SynxValue.Arr a) {
+                    for (SynxValue item : a.values()) {
+                        if (item instanceof SynxValue.Obj io) interpolateAll(io.map(), depth + 1);
+                    }
+                }
+            }
+            for (var e : new ArrayList<>(obj.entriesList())) {
+                if (e.getValue() instanceof SynxValue.Str s && s.value().indexOf('{') >= 0) {
+                    String out = resolveTemplate(s.value(), obj);
+                    if (!out.equals(s.value())) obj.set(e.getKey(), SynxValue.ofString(out));
+                }
+            }
+        }
+
+        private static boolean isRefName(String s) {
+            for (int i = 0; i < s.length(); i++) {
+                char c = s.charAt(i);
+                if (!(Character.isLetterOrDigit(c) || c == '_' || c == '.')) return false;
+            }
+            return true;
+        }
+
+        /** Rust {@code resolve_interpolation}: {@code {key}}, {@code {key:alias}}, {@code {key:include}}. */
+        String resolveTemplate(String tpl, SynxObject local) {
+            StringBuilder out = new StringBuilder(tpl.length());
+            int i = 0;
+            while (i < tpl.length()) {
+                char c = tpl.charAt(i);
+                int close = c == '{' ? tpl.indexOf('}', i + 1) : -1;
+                if (close > i) {
+                    String inner = tpl.substring(i + 1, close);
+                    int colon = inner.indexOf(':');
+                    String refName = colon >= 0 ? inner.substring(0, colon) : inner;
+                    if (isRefName(refName)) {
+                        SynxValue resolved;
+                        if (colon >= 0) {
+                            String scope = inner.substring(colon + 1);
+                            SynxObject ns = scope.equals("include")
+                                ? (includeScopes.size() == 1 ? includeScopes.values().iterator().next() : null)
+                                : includeScopes.get(scope);
+                            resolved = ns == null ? null : deepGet(refName, ns);
+                        } else {
+                            resolved = deepGet(refName, root);
+                            if (resolved == null) resolved = local.get(refName);
+                        }
+                        if (resolved != null) out.append(valueToString(resolved));
+                        else out.append('{').append(inner).append('}');
+                        i = close + 1;
+                        continue;
+                    }
+                }
+                out.append(c);
+                i++;
+            }
+            return out.toString();
+        }
+
         void walk(String path, int depth) {
             if (depth > MAX_RESOLVE_DEPTH) return;
             Map<String, SynxMeta> fields = result.metadata.get(path);
@@ -198,7 +296,7 @@ public final class SynxEngine {
                     case "calc":     value = applyCalc(value);                     break;
                     case "ref":
                     case "alias":    value = applyRef(value);                      break;
-                    case "secret":   value = applySecret(value);                   break;
+                    case "secret":   break; // applied after the chain: it masks the *resolved* value
                     case "random":   value = applyRandom(value, meta);             break;
                     case "unique":   value = applyUnique(value);                   break;
                     case "geo":      value = applyGeo(value, meta);                break;
@@ -231,60 +329,171 @@ public final class SynxEngine {
                 }
             }
 
+            if (meta.hasMarker("secret")) value = applySecret(value);
+
             if (meta.typeHint != null) {
                 value = coerceTypeHint(value, meta.typeHint);
             }
             parent.set(key, value);
+            if (meta.constraints != null) validateConstraints(parent, key, meta.constraints);
         }
 
-        void validateAll() {
-            for (var pathEntry : result.metadata.entrySet()) {
-                String path = pathEntry.getKey();
-                SynxObject container = getObjectAt(path);
-                if (container == null) continue;
-                for (var fieldEntry : pathEntry.getValue().entrySet()) {
-                    String fk = fieldEntry.getKey();
-                    SynxMeta meta = fieldEntry.getValue();
-                    if (meta.constraints == null) continue;
-                    SynxConstraints c = meta.constraints;
-                    SynxValue fv = container.get(fk);
-                    if (fv == null) {
-                        if (c.required && options.strict) {
-                            System.err.println("synx: required '" + path + "." + fk + "' missing");
-                        }
-                        continue;
-                    }
-                    if (c.typeName != null) {
-                        boolean ok = (c.typeName.equals("int")    && fv instanceof SynxValue.Int)
-                                  || (c.typeName.equals("float")  && fv instanceof SynxValue.Float)
-                                  || (c.typeName.equals("bool")   && fv instanceof SynxValue.Bool)
-                                  || (c.typeName.equals("string") && fv instanceof SynxValue.Str)
-                                  || (c.typeName.equals("array")  && fv instanceof SynxValue.Arr)
-                                  || (c.typeName.equals("object") && fv instanceof SynxValue.Obj);
-                        if (!ok && options.strict) {
-                            System.err.println("synx: type mismatch '" + path + "." + fk + "'"
-                                + " want " + c.typeName + ", got " + fv.typeName());
-                        }
-                    }
-                    Double dv = fv.asDouble();
-                    if (dv != null) {
-                        if (c.min != null && dv < c.min && options.strict) {
-                            System.err.println("synx: '" + path + "." + fk + "' below min");
-                        }
-                        if (c.max != null && dv > c.max && options.strict) {
-                            System.err.println("synx: '" + path + "." + fk + "' above max");
-                        }
-                    }
-                    if (c.enumValues != null && fv instanceof SynxValue.Str s
-                            && !c.enumValues.contains(s.value()) && options.strict) {
-                        System.err.println("synx: '" + path + "." + fk + "' '" + s.value() + "' not in enum");
-                    }
-                    if (c.pattern != null && fv instanceof SynxValue.Str s) {
-                        if (!regexMatches(s.value(), c.pattern) && options.strict) {
-                            System.err.println("synx: '" + path + "." + fk + "' fails pattern '" + c.pattern + "'");
-                        }
+        // ─── constraints: failures go INTO the value (Rust validate_constraints) ───
+        static final int MAX_PATTERN_BYTES = 256;
+
+        /** First failing check wins: required, type, enum, min/max, pattern. {@code null} = valid. */
+        String constraintError(SynxValue val, String key, SynxConstraints c) {
+            if (c.required && (val.isNull() || (val instanceof SynxValue.Str s && s.value().isEmpty()))) {
+                return "'" + key + "' is required";
+            }
+            if (c.typeName != null) {
+                boolean ok;
+                switch (c.typeName) {
+                    case "int":    ok = val instanceof SynxValue.Int; break;
+                    case "float":  ok = val instanceof SynxValue.Float || val instanceof SynxValue.Int; break;
+                    case "bool":   ok = val instanceof SynxValue.Bool; break;
+                    // A `:secret` is a masked string: `[type:string]:secret:env` must accept it.
+                    case "string": ok = val instanceof SynxValue.Str || val instanceof SynxValue.Secret; break;
+                    default:       ok = true;
+                }
+                if (!ok) return "'" + key + "' expected type '" + c.typeName + "'";
+            }
+            if (c.enumValues != null) {
+                String vs;
+                if (val instanceof SynxValue.Str s) vs = s.value();
+                else if (val instanceof SynxValue.Int i) vs = Long.toString(i.value());
+                else if (val instanceof SynxValue.Float f) vs = formatNumber(f.value());
+                else if (val instanceof SynxValue.Bool b) vs = b.value() ? "true" : "false";
+                else vs = "";
+                if (!c.enumValues.contains(vs)) {
+                    return "'" + key + "' must be one of [" + String.join("|", c.enumValues) + "]";
+                }
+            }
+            // Numbers by value; strings by count of Unicode scalar values (not UTF-16 units, not bytes).
+            Double n = null;
+            if (val instanceof SynxValue.Int i) n = (double) i.value();
+            else if (val instanceof SynxValue.Float f) n = f.value();
+            else if (val instanceof SynxValue.Str s && (c.min != null || c.max != null)) {
+                n = (double) s.value().codePointCount(0, s.value().length());
+            }
+            if (n != null) {
+                if (c.min != null && n < c.min) {
+                    return "'" + key + "' value " + formatNumber(n) + " is below min " + formatNumber(c.min);
+                }
+                if (c.max != null && n > c.max) {
+                    return "'" + key + "' value " + formatNumber(n) + " exceeds max " + formatNumber(c.max);
+                }
+            }
+            if (c.pattern != null && val instanceof SynxValue.Str s
+                    && c.pattern.getBytes(java.nio.charset.StandardCharsets.UTF_8).length <= MAX_PATTERN_BYTES
+                    && Boolean.FALSE.equals(matchesLinear(c.pattern, s.value()))) {
+                return "'" + key + "' does not match pattern /" + c.pattern + "/";
+            }
+            return null;
+        }
+
+        void validateConstraints(SynxObject map, String key, SynxConstraints c) {
+            SynxValue val = map.get(key);
+            String err = val == null
+                ? (c.required ? "'" + key + "' is required" : null)
+                : constraintError(val, key, c);
+            if (err == null) return;
+            if (options.strict) System.err.println("synx: " + err);
+            map.set(key, SynxValue.ofString("CONSTRAINT_ERR: " + err));
+        }
+
+        Map<String, SynxConstraints> buildConstraintRegistry() {
+            Map<String, SynxConstraints> reg = new HashMap<>();
+            for (var pathEntry : result.metadata.values()) {
+                for (var fieldEntry : pathEntry.entrySet()) {
+                    SynxConstraints c = fieldEntry.getValue().constraints;
+                    if (c == null) continue;
+                    SynxConstraints existing = reg.get(fieldEntry.getKey());
+                    if (existing == null) reg.put(fieldEntry.getKey(), copyConstraints(c));
+                    else mergeConstraints(existing, c);
+                }
+            }
+            return reg;
+        }
+
+        static SynxConstraints copyConstraints(SynxConstraints c) {
+            SynxConstraints o = new SynxConstraints();
+            o.min = c.min; o.max = c.max; o.typeName = c.typeName; o.required = c.required;
+            o.readonly = c.readonly; o.pattern = c.pattern;
+            o.enumValues = c.enumValues == null ? null : new ArrayList<>(c.enumValues);
+            return o;
+        }
+
+        /** required/readonly OR; min = max of mins; max = min of maxes; first type/pattern/enum wins. */
+        static void mergeConstraints(SynxConstraints base, SynxConstraints in) {
+            if (in.required) base.required = true;
+            if (in.readonly) base.readonly = true;
+            if (in.min != null) base.min = base.min == null ? in.min : Math.max(base.min, in.min);
+            if (in.max != null) base.max = base.max == null ? in.max : Math.min(base.max, in.max);
+            if (base.typeName == null) base.typeName = in.typeName;
+            if (base.pattern == null) base.pattern = in.pattern;
+            if (base.enumValues == null && in.enumValues != null) base.enumValues = new ArrayList<>(in.enumValues);
+        }
+
+        /** Registry pass over the whole tree; skips values the per-key pass already turned into errors. */
+        void validateFieldConstraints(SynxObject obj, Map<String, SynxConstraints> registry) {
+            for (String key : new ArrayList<>(obj.keys())) {
+                SynxConstraints c = registry.get(key);
+                SynxValue v = obj.get(key);
+                if (c != null && !(v instanceof SynxValue.Str s && (s.value().startsWith("CONSTRAINT_ERR:")
+                        || s.value().startsWith("TYPE_ERR:")))) {
+                    validateConstraints(obj, key, c);
+                }
+                v = obj.get(key);
+                if (v instanceof SynxValue.Obj o) {
+                    validateFieldConstraints(o.map(), registry);
+                } else if (v instanceof SynxValue.Arr a) {
+                    for (SynxValue item : a.values()) {
+                        if (item instanceof SynxValue.Obj io) validateFieldConstraints(io.map(), registry);
                     }
                 }
+            }
+        }
+
+        Map<String, String> buildTypeRegistry() {
+            Map<String, String> reg = new HashMap<>();
+            for (var pathEntry : result.metadata.values()) {
+                for (var fieldEntry : pathEntry.entrySet()) {
+                    String hint = fieldEntry.getValue().typeHint;
+                    if (hint != null) reg.putIfAbsent(fieldEntry.getKey(), hint);
+                }
+            }
+            return reg;
+        }
+
+        void validateFieldTypes(SynxObject obj, Map<String, String> registry) {
+            for (String key : new ArrayList<>(obj.keys())) {
+                String expected = registry.get(key);
+                SynxValue v = obj.get(key);
+                if (expected != null && v != null && !valueMatchesType(v, expected)) {
+                    obj.set(key, SynxValue.ofString(
+                        "TYPE_ERR: '" + key + "' expected " + expected + " but got " + v.typeName()));
+                    continue;
+                }
+                if (v instanceof SynxValue.Obj o) {
+                    validateFieldTypes(o.map(), registry);
+                } else if (v instanceof SynxValue.Arr a) {
+                    for (SynxValue item : a.values()) {
+                        if (item instanceof SynxValue.Obj io) validateFieldTypes(io.map(), registry);
+                    }
+                }
+            }
+        }
+
+        static boolean valueMatchesType(SynxValue v, String expected) {
+            switch (expected) {
+                case "int":    return v instanceof SynxValue.Int;
+                case "float":  return v instanceof SynxValue.Float || v instanceof SynxValue.Int;
+                case "bool":   return v instanceof SynxValue.Bool;
+                case "string": return v instanceof SynxValue.Str || v instanceof SynxValue.Secret;
+                case "array":  return v instanceof SynxValue.Arr;
+                case "object": return v instanceof SynxValue.Obj;
+                default:       return true; // unknown types are accepted
             }
         }
 
@@ -393,6 +602,7 @@ public final class SynxEngine {
         }
 
         SynxValue coerceTypeHint(SynxValue v, String hint) {
+            if (v instanceof SynxValue.Secret) return v;
             switch (hint) {
                 case "int":
                     if (v instanceof SynxValue.Int) return v;
@@ -417,17 +627,18 @@ public final class SynxEngine {
 
         // ─── markers ──────────────────────────────────────────────────────
         SynxValue applyEnv(SynxValue v, SynxMeta meta) {
-            if (options.env == null) return v;
-            String varName = valueToString(v);
-            String fallback = "";
-            int idx = meta.markerIndex("env");
-            if (idx >= 0 && idx + 1 < meta.markers.size() && meta.markers.get(idx + 1).equals("default")
-                && idx + 2 < meta.markers.size()) {
-                fallback = meta.markers.get(idx + 2);
+            if (!(v instanceof SynxValue.Str)) return v;
+            String varName = ((SynxValue.Str) v).value();
+            String val = options.env != null ? options.env.get(varName) : System.getenv(varName);
+            boolean forceString = wantsString(meta);
+            if (val != null && !val.isEmpty()) {
+                return forceString ? SynxValue.ofString(val) : castPrimitive(val);
             }
-            String val = options.env.get(varName);
-            if (val != null) return SynxValue.ofString(val);
-            if (!fallback.isEmpty()) return SynxValue.ofString(fallback);
+            int di = meta.markerIndex("default");
+            if (di >= 0 && di + 1 < meta.markers.size()) {
+                String fallback = String.join(":", meta.markers.subList(di + 1, meta.markers.size()));
+                return forceString ? SynxValue.ofString(fallback) : castPrimitive(fallback);
+            }
             return SynxValue.ofNull();
         }
 
@@ -437,7 +648,8 @@ public final class SynxEngine {
             if (!empty) return v;
             int idx = meta.markerIndex("default");
             if (idx >= 0 && idx + 1 < meta.markers.size()) {
-                return SynxValue.ofString(meta.markers.get(idx + 1));
+                String fallback = String.join(":", meta.markers.subList(idx + 1, meta.markers.size()));
+                return wantsString(meta) ? SynxValue.ofString(fallback) : castPrimitive(fallback);
             }
             return v;
         }
@@ -703,6 +915,60 @@ public final class SynxEngine {
     }
 
     // ─── shared utilities ───────────────────────────────────────────────────
+    /** Markers whose value must be resolved before it becomes a secret (Rust {@code needs_resolution_before_secret}). */
+    private static final Set<String> RESOLVES_BEFORE_SECRET = Set.of(
+        "env","include","import","watch","ref","alias","calc","map","i18n","default",
+        "fallback","once","split","join","format","replace"
+    );
+
+    private static final Pattern SPECIAL_FLOAT = Pattern.compile("[+-]?(?i:inf|infinity|nan)");
+
+    private static final Pattern FLOAT_TEXT = Pattern.compile("[+-]?(\\d+\\.?\\d*|\\.\\d+)([eE][+-]?\\d+)?");
+
+    /**
+     * {@code (string)} or {@code [type:string]} keeps env/default text as text instead of casting it
+     * to a number first ({@code 007}, 19-digit ids).
+     */
+    static boolean wantsString(SynxMeta meta) {
+        return "string".equals(meta.typeHint)
+            || (meta.constraints != null && "string".equals(meta.constraints.typeName));
+    }
+
+    /** Rust {@code cast_primitive}: quotes, bool, null, exact i64, then f64, else the text. */
+    static SynxValue castPrimitive(String val) {
+        if (val.length() >= 2) {
+            char f = val.charAt(0), l = val.charAt(val.length() - 1);
+            if ((f == '"' && l == '"') || (f == '\'' && l == '\'')) {
+                return SynxValue.ofString(val.substring(1, val.length() - 1));
+            }
+        }
+        switch (val) {
+            case "true":  return SynxValue.ofBool(true);
+            case "false": return SynxValue.ofBool(false);
+            case "null":  return SynxValue.ofNull();
+            default: break;
+        }
+        try { return SynxValue.ofInt(Long.parseLong(val)); }
+        catch (NumberFormatException ignored) {}
+        // Rust `parse::<f64>()` also takes inf / infinity / nan in any case, with an optional sign.
+        if (SPECIAL_FLOAT.matcher(val).matches()) {
+            String body = val.charAt(0) == '+' || val.charAt(0) == '-' ? val.substring(1) : val;
+            if (body.equalsIgnoreCase("nan")) return SynxValue.ofFloat(Double.NaN);
+            return SynxValue.ofFloat(val.charAt(0) == '-' ? Double.NEGATIVE_INFINITY : Double.POSITIVE_INFINITY);
+        }
+        if (FLOAT_TEXT.matcher(val).matches()) {
+            try { return SynxValue.ofFloat(Double.parseDouble(val)); }
+            catch (NumberFormatException ignored) {}
+        }
+        return SynxValue.ofString(val);
+    }
+
+    /** Rust {@code format_number}: integral values print without a fraction, others as plain shortest decimal. */
+    static String formatNumber(double d) {
+        if (d == Math.rint(d) && Math.abs(d) < 9.223372036854775807e18) return Long.toString((long) d);
+        return new java.math.BigDecimal(Double.toString(d)).stripTrailingZeros().toPlainString();
+    }
+
     static String valueToString(SynxValue v) {
         if (v instanceof SynxValue.Null) return "null";
         if (v instanceof SynxValue.Bool b) return b.value() ? "true" : "false";
@@ -710,12 +976,12 @@ public final class SynxEngine {
         if (v instanceof SynxValue.Float f) {
             double d = f.value();
             if (Double.isNaN(d) || Double.isInfinite(d)) return "null";
-            String s = String.format(Locale.ROOT, "%.17g", d);
-            if (s.indexOf('.') < 0 && s.indexOf('e') < 0 && s.indexOf('E') < 0) s += ".0";
-            return s;
+            return formatNumber(d);
         }
         if (v instanceof SynxValue.Str s) return s.value();
-        if (v instanceof SynxValue.Secret s) return s.value();
+        // safety: a `:secret` value must never reach a string sink (interpolation, :join,
+        // :map, ...) as plaintext; matches Rust `value_to_string` and the JSON writer.
+        if (v instanceof SynxValue.Secret) return "[SECRET]";
         if (v instanceof SynxValue.Arr a) {
             List<String> parts = new ArrayList<>();
             for (SynxValue x : a.values()) parts.add(valueToString(x));
@@ -729,14 +995,53 @@ public final class SynxEngine {
         catch (IOException e) { return null; }
     }
 
-    static boolean regexMatches(String value, String pattern) {
+    /**
+     * Test {@code value} against {@code pattern} (unanchored, like Rust {@code is_match}). Returns
+     * {@code null} for a refused or invalid pattern; the caller then skips the constraint. Java's regex
+     * backtracks, so {@code ^(a+)+$} would otherwise hang on a 45-character value.
+     */
+    static Boolean matchesLinear(String pattern, String value) {
+        if (hasNestedQuantifier(pattern)) return null;
         try {
-            Pattern p = Pattern.compile(pattern);
-            return p.matcher(value).find();
+            return Pattern.compile(pattern).matcher(value).find();
         } catch (PatternSyntaxException e) {
-            return true; // Invalid pattern — do not reject.
+            return null;
         }
     }
+
+    /**
+     * Does the pattern repeat something that already repeats (the {@code (a+)+} shape behind exponential
+     * backtracking)? Conservative: a quantified group whose body also holds a quantifier. Port of
+     * {@code hasNestedQuantifier} in {@code packages/synx-js/src/synxl.ts}.
+     */
+    static boolean hasNestedQuantifier(String pattern) {
+        java.util.ArrayDeque<Integer> opens = new java.util.ArrayDeque<>();
+        for (int i = 0; i < pattern.length(); i++) {
+            char ch = pattern.charAt(i);
+            if (ch == '\\') { i++; continue; }
+            if (ch == '[') {
+                // Skip a character class wholesale; quantifiers inside it are literal.
+                while (i < pattern.length() && pattern.charAt(i) != ']') {
+                    if (pattern.charAt(i) == '\\') i++;
+                    i++;
+                }
+                continue;
+            }
+            if (ch == '(') { opens.push(i); continue; }
+            if (ch == ')') {
+                if (opens.isEmpty()) continue;
+                int start = opens.pop();
+                char next = i + 1 < pattern.length() ? pattern.charAt(i + 1) : '\0';
+                if (next == '*' || next == '+' || next == '{') {
+                    String body = pattern.substring(start + 1, i).replaceAll("\\\\.", "");
+                    if (NESTED_QUANT_BODY.matcher(body).find()) return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private static final Pattern NESTED_QUANT_BODY = Pattern.compile("[*+]|\\{\\d");
 
     static String replaceWord(String s, String word, String repl) {
         if (word.isEmpty()) return s;

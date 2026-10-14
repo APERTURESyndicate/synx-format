@@ -1,0 +1,14 @@
+code |+
+  # python comment
+  x = 1 // trailing
+  ### markdown heading
+  y = 2
+  ###
+after ok
+plain |
+  // js comment
+  # hash line
+  ###
+next yes
+# real comment
+last done

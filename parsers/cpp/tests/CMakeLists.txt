@@ -10,6 +10,9 @@ add_executable(synx_tests
     test_diff.cpp
     test_binary.cpp
     test_engine.cpp
+    test_engine_env.cpp
+    test_multiline.cpp
+    test_constraints.cpp
     test_conformance.cpp)
 
 target_link_libraries(synx_tests PRIVATE synx)
@@ -23,3 +26,8 @@ target_compile_definitions(synx_tests PRIVATE
 
 # Run every registered test by name.
 add_test(NAME synx_tests COMMAND synx_tests)
+
+# Test sources carry UTF-8 literals (Cyrillic / CJK); tell MSVC to read them as such.
+if(MSVC)
+    target_compile_options(synx_tests PRIVATE /utf-8)
+endif()

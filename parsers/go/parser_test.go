@@ -137,3 +137,57 @@ func TestParseToolDirective(t *testing.T) {
 		t.Fatalf("tool name mismatch")
 	}
 }
+
+func TestParseLeadingBOMDoesNotHideActive(t *testing.T) {
+	r := Parse("\U0000FEFF!active\nname synx\n")
+	if r.Mode != ModeActive {
+		t.Fatalf("mode = %v, want active", r.Mode)
+	}
+	o, _ := AsObject(r.Root)
+	if _, ok := o.Get("name"); !ok || len(o.Keys()) != 1 {
+		t.Fatalf("keys = %v, want just name", o.Keys())
+	}
+	o = ParseRoot("\U0000FEFFname synx\n")
+	if v, _ := o.Get("name"); !Equal(v, String("synx")) {
+		t.Fatalf("BOM glued to first key: %v", o.Keys())
+	}
+}
+
+func TestParseBlockBodyIsRawText(t *testing.T) {
+	o := ParseRoot("code |+\n  # keep\n  ### fence\n  !active\nnext 1\n")
+	if v, _ := o.Get("code"); !Equal(v, String("# keep\n### fence\n!active")) {
+		t.Fatalf("code = %v", v)
+	}
+	if v, _ := o.Get("next"); !Equal(v, Int(1)) {
+		t.Fatalf("next = %v", v)
+	}
+}
+
+func TestParseParenthesisedValuesArePlainText(t *testing.T) {
+	src := "a (aa)\nb (int)5\nc (random:bool)\ne (aa) tail\nf[enum:x|y] (x)\ng(aa) 5\nh(int)\ni(int)\n  child 1\nj(string) |\n  kept\nlist\n  - (int)5\n  - (aa)\n  - m(int) 5\n    n 1\n"
+	want := `{"a":"(aa)","b":"(int)5","c":"(random:bool)","e":"(aa) tail","f":"(x)","g":5,"h":{},"i":{"child":1},"j":"kept","list":["(int)5","(aa)",{"m":5,"n":1}]}`
+	if got := ToJSON(Parse(src).Root); got != want {
+		t.Fatalf("got  %s\nwant %s", got, want)
+	}
+}
+
+func TestParseTypeHintOnlyAttachedToKey(t *testing.T) {
+	o := ParseRoot("a (int) 5\nb(int) 5\n")
+	if v, _ := o.Get("a"); !Equal(v, String("(int) 5")) {
+		t.Errorf("a = %v", v)
+	}
+	if v, _ := o.Get("b"); !Equal(v, Int(5)) {
+		t.Errorf("b = %v", v)
+	}
+}
+
+func TestParseUnicodeIndentInPreservedBlock(t *testing.T) {
+	// Indent is Unicode whitespace; the base-indent cut lands on a rune boundary.
+	o := ParseRoot("body |+\n\U000000A0\U000000A0a\n\U000000A0\U000000A0\U000000A0b\nafter 1\n")
+	if v, _ := o.Get("body"); !Equal(v, String("a\n\U000000A0b")) {
+		t.Fatalf("body = %q", v)
+	}
+	if v, _ := o.Get("after"); !Equal(v, Int(1)) {
+		t.Fatalf("after = %v", v)
+	}
+}

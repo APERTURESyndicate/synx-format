@@ -2157,7 +2157,11 @@ fn check_constraints(key: &str, value: &Value, c: &Constraints) -> Option<String
     if let Some(ref pattern) = c.pattern {
         if pattern.len() <= 256 {
             if let Value::String(ref s) = value {
-                // An invalid regex is skipped silently, matching the engine.
+                // An invalid or backtracking-prone regex is skipped silently,
+                // matching the engine and the TypeScript reader.
+                if crate::engine::has_nested_quantifier(pattern) {
+                    return None;
+                }
                 if let Ok(re) = regex::Regex::new(pattern) {
                     if !re.is_match(s) {
                         return Some(format!("`{}` does not match pattern /{}/", key, pattern));

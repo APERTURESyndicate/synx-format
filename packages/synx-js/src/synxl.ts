@@ -608,7 +608,7 @@ function checkConstraints(name: string, value: SynxValue, c: SynxConstraints): s
  * Skipping a check is a visible gap; hanging the process on an 88-byte file is
  * not recoverable at all.
  */
-function matchesLinear(pattern: string, value: string): boolean | null {
+export function matchesLinear(pattern: string, value: string): boolean | null {
   if (hasNestedQuantifier(pattern)) return null;
   try {
     return new RegExp(pattern).test(value);

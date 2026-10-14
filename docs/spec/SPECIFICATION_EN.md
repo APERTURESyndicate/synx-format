@@ -360,6 +360,17 @@ port:env:default:8080 PORT
 ```
 If `PORT` is not set → returns `8080`.
 
+**Keeping text as text.** The variable's value is cast like any literal (`8080` → int). Values that only look numeric — 64-bit ids, zero-padded codes — keep their text with a `(string)` hint or a `[type:string]` constraint; the same rule applies to the `:default` fallback:
+```synx
+!active
+
+discord_app_id[type:string]:env DISCORD_APP_ID
+zip(string):env:default:007 ZIP
+api_key[type:string]:secret:env API_KEY
+```
+
+> Since 3.7.4 `[type:string]` keeps the text too. Earlier only `(string)` did: the value was cast first, so `[type:string]` rejected the resulting number with `CONSTRAINT_ERR`. A `:secret` value satisfies `[type:string]`.
+
 ---
 
 #### `:alias` — Reference to Another Key
@@ -1003,13 +1014,17 @@ version[readonly] 2.0.0
 
 | Constraint | Description | Syntax |
 |---|---|---|
-| `min` | Minimum (length or value) | `[min:3]` |
-| `max` | Maximum (length or value) | `[max:100]` |
+| `min` | Minimum (length in characters, or value) | `[min:3]` |
+| `max` | Maximum (length in characters, or value) | `[max:100]` |
 | `type` | Data type | `[type:int]` |
 | `required` | Required field | `[required]` |
 | `pattern` | Regex validation | `[pattern:^\d+$]` |
 | `enum` | List of allowed values | `[enum:a\|b\|c]` |
 | `readonly` | Modification forbidden | `[readonly]` |
+
+A string's length is its number of Unicode characters (scalar values): `мир` and `東京都` are 3, `😀` is 1. Until 3.7.4 the Rust engine counted UTF-8 bytes.
+
+A failed constraint replaces the value with a `CONSTRAINT_ERR: …` string. Constraints are also collected by field name across the whole document — the strictest declaration wins — and checked against every field of that name once all markers are resolved. A `pattern` that nests one quantifier inside another (`^(a+)+$`) is skipped rather than run, so a hostile document cannot stall the parser.
 
 Constraints can be combined with commas:
 ```synx

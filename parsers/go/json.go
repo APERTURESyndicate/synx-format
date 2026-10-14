@@ -40,11 +40,7 @@ func writeJSON(out *strings.Builder, v Value, depth int) {
 			out.WriteString("null")
 			return
 		}
-		s := fmt.Sprintf("%.17g", x.V)
-		if !strings.ContainsAny(s, ".eE") {
-			s += ".0"
-		}
-		out.WriteString(s)
+		out.WriteString(formatFloat(x.V))
 	case StringValue:
 		out.WriteByte('"')
 		escapeJSON(out, x.V)
@@ -82,6 +78,56 @@ func writeJSON(out *strings.Builder, v Value, depth int) {
 		}
 		out.WriteByte('}')
 	}
+}
+
+// formatFloat renders the shortest round-trip form of f with the same layout
+// as Rust's `ryu` (what the reference `to_json` emits): plain decimals while
+// the decimal exponent stays within [-5, 16), otherwise `d.ddde±N`, and a
+// mandatory `.0` on whole numbers.
+func formatFloat(f float64) string {
+	if f == 0 {
+		if math.Signbit(f) {
+			return "-0.0"
+		}
+		return "0.0"
+	}
+	e := strconv.FormatFloat(math.Abs(f), 'e', -1, 64)
+	mant, expStr, _ := strings.Cut(e, "e")
+	digits := strings.Replace(mant, ".", "", 1)
+	exp, _ := strconv.Atoi(expStr)
+	length := len(digits)
+	kk := exp + 1
+	k := kk - length
+
+	var sb strings.Builder
+	if f < 0 {
+		sb.WriteByte('-')
+	}
+	switch {
+	case k >= 0 && kk <= 16:
+		sb.WriteString(digits)
+		sb.WriteString(strings.Repeat("0", k))
+		sb.WriteString(".0")
+	case kk > 0 && kk <= 16:
+		sb.WriteString(digits[:kk])
+		sb.WriteByte('.')
+		sb.WriteString(digits[kk:])
+	case kk > -5 && kk <= 0:
+		sb.WriteString("0.")
+		sb.WriteString(strings.Repeat("0", -kk))
+		sb.WriteString(digits)
+	case length == 1:
+		sb.WriteString(digits)
+		sb.WriteByte('e')
+		sb.WriteString(strconv.Itoa(kk - 1))
+	default:
+		sb.WriteString(digits[:1])
+		sb.WriteByte('.')
+		sb.WriteString(digits[1:])
+		sb.WriteByte('e')
+		sb.WriteString(strconv.Itoa(kk - 1))
+	}
+	return sb.String()
 }
 
 func escapeJSON(out *strings.Builder, s string) {

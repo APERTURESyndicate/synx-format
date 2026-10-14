@@ -28,8 +28,7 @@ public final class SynxJson {
         } else if (v instanceof SynxValue.Float f) {
             double d = f.value();
             if (Double.isNaN(d) || Double.isInfinite(d)) { out.append("null"); return; }
-            String s = String.format(java.util.Locale.ROOT, "%.17g", d);
-            if (s.indexOf('.') < 0 && s.indexOf('e') < 0 && s.indexOf('E') < 0) s += ".0";
+            String s = formatFloat(d);
             out.append(s);
         } else if (v instanceof SynxValue.Str s) {
             out.append('"'); escape(out, s.value()); out.append('"');
@@ -58,6 +57,47 @@ public final class SynxJson {
             }
             out.append('}');
         }
+    }
+
+    /**
+     * Shortest round-trip digits laid out like Rust {@code ryu::Buffer::format}: plain decimal for
+     * decimal exponents in (-5, 16], {@code d.ddde<exp>} beyond, and a mandatory {@code .0} on integers.
+     */
+    static String formatFloat(double d) {
+        if (d == 0) return (1 / d < 0) ? "-0.0" : "0.0";
+        java.math.BigDecimal bd = new java.math.BigDecimal(Double.toString(Math.abs(d))).stripTrailingZeros();
+        String digits = bd.unscaledValue().toString();
+        int kk = digits.length() - bd.scale();   // position of the decimal point relative to digits
+        StringBuilder sb = new StringBuilder(24);
+        if (d < 0) sb.append('-');
+        if (kk > 0 && kk <= 16) {
+            if (digits.length() <= kk) {
+                sb.append(digits);
+                for (int i = digits.length(); i < kk; i++) sb.append('0');
+                sb.append(".0");
+            } else {
+                sb.append(digits, 0, kk).append('.').append(digits, kk, digits.length());
+            }
+        } else if (kk <= 0 && kk > -5) {
+            sb.append("0.");
+            for (int i = 0; i < -kk; i++) sb.append('0');
+            sb.append(digits);
+        } else {
+            sb.append(digits.charAt(0));
+            if (digits.length() > 1) sb.append('.').append(digits, 1, digits.length());
+            sb.append('e').append(kk - 1);
+        }
+        return sb.toString();
+    }
+
+    /**
+     * Rust {@code f64::to_string} as used by {@code stringify}: shortest round-trip digits in plain
+     * decimal (never an exponent), with {@code .0} appended when there is no fraction.
+     */
+    static String formatPlain(double d) {
+        if (d == 0) return (1 / d < 0) ? "-0.0" : "0.0";
+        String s = new java.math.BigDecimal(Double.toString(d)).stripTrailingZeros().toPlainString();
+        return s.indexOf('.') < 0 ? s + ".0" : s;
     }
 
     private static void escape(StringBuilder out, String s) {

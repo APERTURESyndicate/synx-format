@@ -1,6 +1,7 @@
 // SYNX `!active` engine — control flow, helpers, marker dispatch.
 // Mirrors crates/synx-core/src/engine.rs (control-flow half).
 #include "synx/engine.hpp"
+#include "synx/json.hpp"
 #include "synx/parser.hpp"
 #include "engine_internal.hpp"
 
@@ -40,6 +41,59 @@ inline std::string trim_str(const std::string& s) {
     return std::string(trim_sv(s));
 }
 
+// Longest prefix of `s` that fits in `limit` bytes without splitting a character.
+inline size_t utf8_prefix_len(std::string_view s, size_t limit) noexcept {
+    if (s.size() <= limit) return s.size();
+    size_t end = limit;
+    while (end > 0 && (static_cast<unsigned char>(s[end]) & 0xC0) == 0x80) --end;
+    return end;
+}
+
+constexpr size_t kMaxScratchString = 4u * 1024 * 1024;
+
+// `{name}` reference names: alphanumerics (any non-ASCII byte counts), `_` and `.`.
+bool is_ref_name(std::string_view s) noexcept {
+    for (unsigned char c : s) {
+        if (!(std::isalnum(c) || c == '_' || c == '.' || c >= 0x80)) return false;
+    }
+    return true;
+}
+
+// Markers that must resolve the value before it can become a secret.
+bool needs_resolution_before_secret(const Meta& m) {
+    static const char* const kResolving[] = {
+        "env", "include", "import", "watch", "ref", "alias", "calc", "map", "i18n", "default",
+        "fallback", "once", "split", "join", "format", "replace",
+    };
+    for (const auto& marker : m.markers) {
+        for (const char* r : kResolving) {
+            if (marker == r) return true;
+        }
+    }
+    return false;
+}
+
+// Exact int64 parse of the whole string (Rust `str::parse::<i64>`): optional sign, digits only.
+bool parse_i64(std::string_view s, int64_t& out) noexcept {
+    size_t i = 0;
+    bool neg = false;
+    if (!s.empty() && (s[0] == '-' || s[0] == '+')) {
+        neg = s[0] == '-';
+        i = 1;
+    }
+    if (i >= s.size()) return false;
+    uint64_t v = 0;
+    const uint64_t limit = neg ? 9223372036854775808ull : 9223372036854775807ull;
+    for (; i < s.size(); ++i) {
+        if (s[i] < '0' || s[i] > '9') return false;
+        uint64_t d = static_cast<uint64_t>(s[i] - '0');
+        if (v > (limit - d) / 10) return false;
+        v = v * 10 + d;
+    }
+    out = neg ? static_cast<int64_t>(0 - v) : static_cast<int64_t>(v);
+    return true;
+}
+
 bool starts_with(std::string_view s, std::string_view prefix) noexcept {
     return s.size() >= prefix.size()
         && std::memcmp(s.data(), prefix.data(), prefix.size()) == 0;
@@ -70,6 +124,33 @@ FileText read_text_file(const std::string& path) {
 }
 
 // ─── value helpers ──────────────────────────────────────────────────────────
+bool wants_string(const Meta& m) {
+    return (m.type_hint.has_value() && *m.type_hint == "string")
+        || (m.constraints.has_value() && m.constraints->type_name.has_value()
+            && *m.constraints->type_name == "string");
+}
+
+Value cast_primitive(std::string_view val) {
+    if (val.size() >= 2
+        && ((val.front() == '"' && val.back() == '"') || (val.front() == '\'' && val.back() == '\''))) {
+        return Value::make_string(std::string(val.substr(1, val.size() - 2)));
+    }
+    if (val == "true") return Value::make_bool(true);
+    if (val == "false") return Value::make_bool(false);
+    if (val == "null") return Value::make_null();
+    int64_t n = 0;
+    if (parse_i64(val, n)) return Value::make_int(n);
+    // Decimal floats only: strtod also takes leading blanks, hex and `nan(...)`.
+    if (!val.empty() && !std::isspace(static_cast<unsigned char>(val.front()))
+        && val.find_first_of("xX(") == std::string_view::npos) {
+        std::string tmp(val);
+        char* end = nullptr;
+        double d = std::strtod(tmp.c_str(), &end);
+        if (end != tmp.c_str() && *end == '\0') return Value::make_float(d);
+    }
+    return Value::make_string(std::string(val));
+}
+
 std::string value_to_string(const Value& v) {
     switch (v.kind()) {
         case Value::Kind::Null:   return "null";
@@ -79,23 +160,13 @@ std::string value_to_string(const Value& v) {
             std::snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(*v.as_int()));
             return buf;
         }
-        case Value::Kind::Float: {
-            double f = *v.as_float();
-            if (std::isnan(f) || std::isinf(f)) return "null";
-            char buf[64];
-            std::snprintf(buf, sizeof(buf), "%.17g", f);
-            std::string s(buf);
-            if (s.find('.') == std::string::npos
-                && s.find('e') == std::string::npos
-                && s.find('E') == std::string::npos) {
-                s.append(".0");
-            }
-            return s;
-        }
+        case Value::Kind::Float:
+            return format_number(*v.as_float());
         case Value::Kind::String:
             return *v.as_string();
         case Value::Kind::Secret:
-            return *v.as_secret();
+            // safety: a `:secret` value MUST NOT reach a string sink as plaintext.
+            return "[SECRET]";
         case Value::Kind::Array: {
             std::string out = "[";
             const auto& a = *v.as_array();
@@ -109,6 +180,21 @@ std::string value_to_string(const Value& v) {
         case Value::Kind::Object: return "[Object]";
     }
     return {};
+}
+
+std::string display_number(double n) {
+    if (std::isnan(n)) return "NaN";
+    if (std::isinf(n)) return n < 0 ? "-inf" : "inf";
+    std::string s = float_to_display_string(n);
+    if (s.size() >= 2 && s.compare(s.size() - 2, 2, ".0") == 0) s.resize(s.size() - 2);
+    return s;
+}
+
+std::string format_number(double n) {
+    if (std::isfinite(n) && std::fmod(n, 1.0) == 0.0 && std::fabs(n) < 9.223372036854775807e18) {
+        return std::to_string(static_cast<long long>(n));
+    }
+    return display_number(n);
 }
 
 bool value_to_number(const Value& v, double& out) {
@@ -200,7 +286,222 @@ bool is_builtin_marker(const std::string& name) {
     return builtins.count(name) != 0;
 }
 
+bool regex_pattern_is_supported(std::string_view p) {
+    enum class Prev { None, Atom, Assertion, Quant };
+    constexpr size_t kMaxGroupDepth = 32;
+    constexpr unsigned kMaxRepeat = 1000;
+
+    auto is_hex = [](char c) {
+        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+    };
+    auto is_ascii_alpha = [](char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); };
+
+    // Escape at p[i] == '\\'. Returns the index after it, or npos if unsupported.
+    // `class_escape` reports \d \w \s \D \W \S (valid atoms but not range endpoints).
+    auto escape_end = [&](size_t i, bool& class_escape) -> size_t {
+        class_escape = false;
+        if (i + 1 >= p.size()) return std::string_view::npos;      // trailing backslash
+        char e = p[i + 1];
+        if (e == 'd' || e == 'D' || e == 'w' || e == 'W' || e == 's' || e == 'S') {
+            class_escape = true;
+            return i + 2;
+        }
+        if (e == 'n' || e == 'r' || e == 't' || e == 'f' || e == 'v') return i + 2;
+        if (e == 'x' || e == 'u') {
+            size_t digits = e == 'x' ? 2 : 4;
+            if (i + 2 + digits > p.size()) return std::string_view::npos;
+            for (size_t k = 0; k < digits; ++k) {
+                if (!is_hex(p[i + 2 + k])) return std::string_view::npos;
+            }
+            return i + 2 + digits;
+        }
+        // Back-references, \0, \c, \k, \p, unknown letters: not worth the risk.
+        if (is_ascii_alpha(e) || (e >= '0' && e <= '9')) return std::string_view::npos;
+        if (static_cast<unsigned char>(e) >= 0x80) return std::string_view::npos;
+        return i + 2; // identity escape of punctuation
+    };
+
+    Prev prev = Prev::None;
+    bool lazy_ok = false;
+    std::vector<bool> lookahead; // one entry per open group
+    size_t i = 0;
+    const size_t n = p.size();
+    while (i < n) {
+        char c = p[i];
+        switch (c) {
+            case '\\': {
+                if (p[std::min(i + 1, n - 1)] == 'b' || p[std::min(i + 1, n - 1)] == 'B') {
+                    if (i + 1 >= n) return false;
+                    prev = Prev::Assertion;
+                    i += 2;
+                    break;
+                }
+                bool cls = false;
+                size_t next = escape_end(i, cls);
+                if (next == std::string_view::npos) return false;
+                prev = Prev::Atom;
+                i = next;
+                break;
+            }
+            case '(': {
+                bool look = false;
+                size_t skip = 1;
+                if (i + 1 < n && p[i + 1] == '?') {
+                    if (i + 2 >= n) return false;
+                    char k = p[i + 2];
+                    if (k == ':') { skip = 3; }
+                    else if (k == '=' || k == '!') { skip = 3; look = true; }
+                    else return false; // lookbehind, named groups, inline flags
+                }
+                if (lookahead.size() >= kMaxGroupDepth) return false;
+                lookahead.push_back(look);
+                prev = Prev::None;
+                i += skip;
+                break;
+            }
+            case ')':
+                if (lookahead.empty()) return false;
+                prev = lookahead.back() ? Prev::Assertion : Prev::Atom;
+                lookahead.pop_back();
+                ++i;
+                break;
+            case '|':
+                prev = Prev::None;
+                ++i;
+                break;
+            case '^':
+            case '$':
+                prev = Prev::Assertion;
+                ++i;
+                break;
+            case '*':
+            case '+':
+            case '?':
+                if (prev == Prev::Quant) {
+                    // `?` right after a quantifier makes it lazy, once.
+                    if (c == '?' && lazy_ok) { lazy_ok = false; ++i; break; }
+                    return false;
+                }
+                if (prev != Prev::Atom) return false; // nothing to repeat
+                prev = Prev::Quant;
+                lazy_ok = true;
+                ++i;
+                break;
+            case '{': {
+                if (prev != Prev::Atom) return false;
+                size_t k = i + 1;
+                unsigned lo = 0, hi = 0;
+                bool have_lo = false, have_hi = false, comma = false;
+                while (k < n && p[k] >= '0' && p[k] <= '9') {
+                    lo = lo * 10 + static_cast<unsigned>(p[k] - '0');
+                    if (lo > kMaxRepeat) return false;
+                    have_lo = true;
+                    ++k;
+                }
+                if (!have_lo) return false;
+                if (k < n && p[k] == ',') {
+                    comma = true;
+                    ++k;
+                    while (k < n && p[k] >= '0' && p[k] <= '9') {
+                        hi = hi * 10 + static_cast<unsigned>(p[k] - '0');
+                        if (hi > kMaxRepeat) return false;
+                        have_hi = true;
+                        ++k;
+                    }
+                }
+                if (k >= n || p[k] != '}') return false;
+                if (comma && have_hi && lo > hi) return false;
+                prev = Prev::Quant;
+                lazy_ok = true;
+                i = k + 1;
+                break;
+            }
+            case '}':
+                return false;
+            case '[': {
+                ++i;
+                if (i < n && p[i] == '^') ++i;
+                if (i >= n || p[i] == ']') return false; // unclosed or empty class
+                // last: -1 none, otherwise the single-character code of the previous item
+                // (0x100 marks a class escape / posix class that cannot start a range).
+                int last = -1;
+                bool dash_pending = false;
+                bool closed = false;
+                while (i < n) {
+                    char k = p[i];
+                    if (k == ']') {
+                        if (dash_pending) return false;
+                        closed = true;
+                        ++i;
+                        break;
+                    }
+                    int item = 0;
+                    if (k == '\\') {
+                        bool cls = false;
+                        size_t next = escape_end(i, cls);
+                        if (next == std::string_view::npos) return false;
+                        // Only simple escapes may bound a range; keep it ASCII-only.
+                        item = cls ? 0x100 : (next == i + 2 ? static_cast<unsigned char>(p[i + 1]) : 0x100);
+                        i = next;
+                    } else if (k == '[') {
+                        // Only `[:name:]` POSIX classes.
+                        if (i + 1 >= n || p[i + 1] != ':') return false;
+                        size_t close = p.find(":]", i + 2);
+                        if (close == std::string_view::npos) return false;
+                        std::string_view name = p.substr(i + 2, close - (i + 2));
+                        static const char* const kNames[] = {
+                            "alpha", "digit", "alnum", "upper", "lower", "space", "punct",
+                            "print", "graph", "cntrl", "xdigit", "blank", "w", "d", "s",
+                        };
+                        bool known = false;
+                        for (const char* nm : kNames) {
+                            if (name == nm) { known = true; break; }
+                        }
+                        if (!known) return false;
+                        item = 0x100;
+                        i = close + 2;
+                    } else if (k == '-') {
+                        // A range operator only between two single characters.
+                        bool at_end = i + 1 < n && p[i + 1] == ']';
+                        if (last == -1 || at_end) {
+                            item = '-';
+                            ++i;
+                        } else {
+                            if (last == 0x100 || dash_pending) return false;
+                            dash_pending = true;
+                            ++i;
+                            continue;
+                        }
+                    } else {
+                        item = static_cast<unsigned char>(k);
+                        ++i;
+                    }
+                    if (dash_pending) {
+                        // `last-item` must be a plain ASCII range with start <= end.
+                        if (item == 0x100 || last < 0 || last >= 0x80 || item >= 0x80 || last > item) return false;
+                        dash_pending = false;
+                        last = -1; // a finished range cannot chain into another
+                    } else {
+                        last = item;
+                    }
+                }
+                if (!closed) return false;
+                prev = Prev::Atom;
+                break;
+            }
+            default:
+                prev = Prev::Atom;
+                ++i;
+                break;
+        }
+    }
+    return lookahead.empty();
+}
+
 bool regex_match_strict(const std::string& value, const std::string& pattern) {
+    // An unsupported or invalid pattern never rejects the value, and is never
+    // handed to std::regex (which aborts the process when exceptions are off).
+    if (!regex_pattern_is_supported(pattern)) return true;
 #if defined(__cpp_exceptions) && __cpp_exceptions
     try {
         std::regex re(pattern);
@@ -209,12 +510,123 @@ bool regex_match_strict(const std::string& value, const std::string& pattern) {
         return true; // Invalid pattern — do not reject the value.
     }
 #else
-    // With exceptions disabled an invalid pattern would abort the process.
-    // Callers compiled with SYNX_NO_EXCEPTIONS=ON must ensure patterns are
-    // well-formed (validated at edit time / CI).
     std::regex re(pattern);
     return std::regex_search(value, re);
 #endif
+}
+
+// ─── constraint enforcement ─────────────────────────────────────────────────
+bool has_nested_quantifier(std::string_view p) {
+    std::vector<size_t> opens;
+    for (size_t i = 0; i < p.size(); ++i) {
+        char ch = p[i];
+        if (ch == '\\') { ++i; continue; }
+        if (ch == '[') {
+            // Skip a character class wholesale; quantifiers inside it are literal.
+            while (i < p.size() && p[i] != ']') {
+                if (p[i] == '\\') ++i;
+                ++i;
+            }
+            continue;
+        }
+        if (ch == '(') { opens.push_back(i); continue; }
+        if (ch == ')') {
+            if (opens.empty()) continue;
+            size_t start = opens.back();
+            opens.pop_back();
+            if (i + 1 < p.size() && (p[i + 1] == '*' || p[i + 1] == '+' || p[i + 1] == '{')) {
+                // Body with escapes (`\x`) removed, then look for `*`, `+` or `{<digit>`.
+                std::string body;
+                for (size_t k = start + 1; k < i; ++k) {
+                    if (p[k] == '\\') { ++k; continue; }
+                    body.push_back(p[k]);
+                }
+                for (size_t n = 0; n < body.size(); ++n) {
+                    if (body[n] == '*' || body[n] == '+') return true;
+                    if (body[n] == '{' && n + 1 < body.size() && body[n + 1] >= '0' && body[n + 1] <= '9') {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    return false;
+}
+
+int matches_linear(const std::string& pattern, const std::string& value) {
+    if (has_nested_quantifier(pattern)) return -1;
+    if (!regex_pattern_is_supported(pattern)) return -1;
+    return regex_match_strict(value, pattern) ? 1 : 0;
+}
+
+std::optional<std::string> constraint_error(const std::string& key, const Value& val,
+                                            const Constraints& c) {
+    if (c.required) {
+        bool empty = val.is_null() || (val.is_string() && val.as_string()->empty());
+        if (empty) return "CONSTRAINT_ERR: '" + key + "' is required";
+    }
+
+    if (c.type_name.has_value()) {
+        const std::string& tn = *c.type_name;
+        bool ok = true;
+        if (tn == "int") ok = val.is_int();
+        else if (tn == "float") ok = val.is_float() || val.is_int();
+        else if (tn == "bool") ok = val.is_bool();
+        else if (tn == "string") ok = val.is_string() || val.is_secret(); // secret = masked string
+        if (!ok) return "CONSTRAINT_ERR: '" + key + "' expected type '" + tn + "'";
+    }
+
+    if (c.enum_values.has_value()) {
+        std::string text;
+        if (val.is_string()) text = *val.as_string();
+        else if (val.is_int()) text = std::to_string(static_cast<long long>(*val.as_int()));
+        else if (val.is_float()) text = display_number(*val.as_float());
+        else if (val.is_bool()) text = *val.as_bool() ? "true" : "false";
+        bool found = false;
+        for (const auto& e : *c.enum_values) {
+            if (e == text) { found = true; break; }
+        }
+        if (!found) {
+            std::string joined;
+            for (size_t i = 0; i < c.enum_values->size(); ++i) {
+                if (i > 0) joined.push_back('|');
+                joined.append((*c.enum_values)[i]);
+            }
+            return "CONSTRAINT_ERR: '" + key + "' must be one of [" + joined + "]";
+        }
+    }
+
+    // Numbers compare by value; strings by count of Unicode scalar values.
+    bool have_n = false;
+    double n = 0.0;
+    if (val.is_int()) { n = static_cast<double>(*val.as_int()); have_n = true; }
+    else if (val.is_float()) { n = *val.as_float(); have_n = true; }
+    else if (val.is_string() && (c.min.has_value() || c.max.has_value())) {
+        size_t count = 0;
+        for (unsigned char ch : *val.as_string()) {
+            if ((ch & 0xC0) != 0x80) ++count;
+        }
+        n = static_cast<double>(count);
+        have_n = true;
+    }
+    if (have_n) {
+        if (c.min.has_value() && n < *c.min) {
+            return "CONSTRAINT_ERR: '" + key + "' value " + display_number(n)
+                 + " is below min " + display_number(*c.min);
+        }
+        if (c.max.has_value() && n > *c.max) {
+            return "CONSTRAINT_ERR: '" + key + "' value " + display_number(n)
+                 + " exceeds max " + display_number(*c.max);
+        }
+    }
+
+    if (c.pattern.has_value() && c.pattern->size() <= 256 && val.is_string()) {
+        // -1 = refused or uncompilable pattern: skipped silently.
+        if (matches_linear(*c.pattern, *val.as_string()) == 0) {
+            return "CONSTRAINT_ERR: '" + key + "' does not match pattern /" + *c.pattern + "/";
+        }
+    }
+    return std::nullopt;
 }
 
 // ─── Resolver ───────────────────────────────────────────────────────────────
@@ -330,8 +742,112 @@ std::string Resolver::interpolate(std::string_view s) const {
     return out;
 }
 
+static const Value* find_in_object(const Object& obj, std::string_view key) {
+    for (const auto& p : obj) {
+        if (p.key == key) return &p.value;
+    }
+    return nullptr;
+}
+
+std::string Resolver::resolve_interpolation(std::string_view tpl, const Object& local) const {
+    std::string out;
+    out.reserve(std::min(tpl.size(), kMaxScratchString));
+    auto push = [&](std::string_view piece) {
+        size_t room = kMaxScratchString > out.size() ? kMaxScratchString - out.size() : 0;
+        out.append(piece.data(), utf8_prefix_len(piece, room));
+    };
+    size_t i = 0;
+    while (i < tpl.size()) {
+        if (out.size() >= kMaxScratchString) break;
+        if (tpl[i] == '{') {
+            size_t close = tpl.find('}', i + 1);
+            if (close != std::string_view::npos) {
+                std::string_view inner = tpl.substr(i + 1, close - i - 1);
+                size_t colon = inner.find(':');
+                std::string_view ref = colon == std::string_view::npos ? inner : inner.substr(0, colon);
+                if (is_ref_name(ref)) {
+                    const Value* val = nullptr;
+                    if (colon != std::string_view::npos) {
+                        std::string_view scope = inner.substr(colon + 1);
+                        const Object* ns = nullptr;
+                        if (scope == "include") {
+                            if (include_aliases.size() == 1) {
+                                auto it = namespaces.find(include_aliases[0]);
+                                if (it != namespaces.end()) ns = it->second;
+                            }
+                        } else {
+                            auto it = namespaces.find(std::string(scope));
+                            if (it != namespaces.end()) ns = it->second;
+                        }
+                        if (ns) val = find_in_object(*ns, ref) ? find_in_object(*ns, ref) : deep_get(*ns, ref);
+                    } else {
+                        val = find_in_object(root, ref);
+                        if (!val) val = deep_get(root, ref);
+                        if (!val) val = find_in_object(local, ref);
+                    }
+                    if (val) {
+                        push(value_to_string(*val));
+                    } else {
+                        push("{");
+                        push(inner);
+                        push("}");
+                    }
+                    i = close + 1;
+                    continue;
+                }
+            }
+        }
+        // Whole bytes of literal text, so multi-byte characters survive intact.
+        out.push_back(tpl[i]);
+        ++i;
+    }
+    return out;
+}
+
+void Resolver::interpolate_level(Object& obj) {
+    for (auto& p : obj) {
+        const std::string* s = p.value.as_string();
+        if (!s || s->find('{') == std::string::npos) continue;
+        std::string resolved = resolve_interpolation(*s, obj);
+        if (resolved != *s) p.value = Value::make_string(std::move(resolved));
+    }
+}
+
+void Resolver::mask_secret_literals() {
+    for (auto& path_entry : result.metadata) {
+        Value* container = path_entry.first.empty()
+            ? &result.root
+            : const_cast<Value*>(deep_get(root, path_entry.first));
+        if (!container) continue;
+        Object* obj = container->as_object_mut();
+        if (!obj) continue;
+        for (auto& field_entry : path_entry.second) {
+            const Meta& m = field_entry.second;
+            if (!m.has_marker("secret") || needs_resolution_before_secret(m)) continue;
+            for (auto& p : *obj) {
+                if (p.key != field_entry.first) continue;
+                if (!p.value.is_secret() && !p.value.is_object() && !p.value.is_array()) {
+                    p.value = Value::make_secret(value_to_string(p.value));
+                }
+                break;
+            }
+        }
+    }
+}
+
+void Resolver::refresh_namespaces() {
+    for (auto& ns : namespaces) {
+        for (auto& p : root) {
+            if (p.key == ns.first) {
+                ns.second = p.value.as_object();
+                break;
+            }
+        }
+    }
+}
+
 // ─── walking + dispatch ─────────────────────────────────────────────────────
-void Resolver::resolve_value(Value& value, const std::string& path,
+void Resolver::resolve_value(Value& value, const Object& local, const std::string& path,
                              const std::string& key, int depth) {
     if (depth > static_cast<int>(kMaxResolveDepth)) return;
 
@@ -346,10 +862,10 @@ void Resolver::resolve_value(Value& value, const std::string& path,
         const std::string& m = meta.markers[i];
         if (m == "env")           apply_env(value, meta);
         else if (m == "default")  apply_default(value, meta);
-        else if (m == "calc")     apply_calc(value, meta, path);
+        else if (m == "calc")     apply_calc(value, meta, key, local);
         else if (m == "ref")      apply_ref(value, meta);
         else if (m == "alias")    apply_alias(value, meta);
-        else if (m == "secret")   apply_secret(value, meta);
+        else if (m == "secret")   { /* applied after the chain, see below */ }
         else if (m == "random")   apply_random(value, meta);
         else if (m == "unique")   apply_unique(value, meta);
         else if (m == "geo")      apply_geo(value, meta);
@@ -384,12 +900,21 @@ void Resolver::resolve_value(Value& value, const std::string& path,
         }
     }
 
+    // `:secret` masks the *resolved* value, so it runs after every other marker
+    // wherever it sits in the chain (`:secret:env`, `:env:secret`).
+    if (meta.has_marker("secret")) apply_secret(value, meta);
+
     // Apply runtime type cast for type hints (when no marker rewrote the value).
-    if (meta.type_hint.has_value()) {
+    if (meta.type_hint.has_value() && !value.is_secret()) {
         const std::string& th = *meta.type_hint;
         if (th == "int" && !value.is_int()) {
+            int64_t exact = 0;
             double d = 0.0;
-            if (value_to_number(value, d)) value = Value::make_int(static_cast<int64_t>(d));
+            if (value.is_string() && parse_i64(*value.as_string(), exact)) {
+                value = Value::make_int(exact);
+            } else if (value_to_number(value, d)) {
+                value = Value::make_int(static_cast<int64_t>(d));
+            }
         } else if (th == "float" && !value.is_float()) {
             double d = 0.0;
             if (value_to_number(value, d)) value = Value::make_float(d);
@@ -400,18 +925,29 @@ void Resolver::resolve_value(Value& value, const std::string& path,
             value = Value::make_bool(s == "true" || s == "1");
         }
     }
+
+    // Constraint validation always runs last, after every marker has resolved;
+    // a failure replaces the value with its error string.
+    if (meta.constraints.has_value()) {
+        if (auto err = constraint_error(key, value, *meta.constraints)) {
+            report_violation(*err);
+            value = Value::make_string(std::move(*err));
+        }
+    }
 }
 
 void Resolver::walk(Value& v, const std::string& path, int depth) {
     if (depth > static_cast<int>(kMaxResolveDepth)) return;
     if (Object* obj = v.as_object_mut()) {
         for (auto& p : *obj) {
-            resolve_value(p.value, path, p.key, depth);
+            resolve_value(p.value, *obj, path, p.key, depth);
             if (p.value.is_object() || p.value.is_array()) {
                 std::string sub = path.empty() ? p.key : path + "." + p.key;
                 walk(p.value, sub, depth + 1);
             }
         }
+        // Auto-`{}` interpolation, after this level's markers and children are resolved.
+        interpolate_level(*obj);
     } else if (Array* arr = v.as_array_mut()) {
         for (auto& item : *arr) {
             if (item.is_object() || item.is_array()) {
@@ -492,79 +1028,128 @@ void Resolver::strip_underscore_keys() {
     }
 }
 
-void Resolver::validate_all() {
-    for (auto& path_entry : result.metadata) {
-        const std::string& path = path_entry.first;
-        Value* container = (path.empty()) ? &result.root :
-            const_cast<Value*>(deep_get(root, path));
-        if (!container || !container->is_object()) continue;
-        Object& obj = *container->as_object_mut();
+void Resolver::report_violation(const std::string& message) const {
+    if (options.strict) std::fprintf(stderr, "synx: %s\n", message.c_str());
+}
 
-        for (auto& field_entry : path_entry.second) {
-            const std::string& fk = field_entry.first;
-            const Meta& m = field_entry.second;
+namespace {
+
+bool is_error_string(const Value& v) {
+    const std::string* s = v.as_string();
+    return s && (s->rfind("CONSTRAINT_ERR:", 0) == 0 || s->rfind("TYPE_ERR:", 0) == 0);
+}
+
+// Merge repeated `[…]` declarations of one field name: stricter bounds win,
+// the first type / pattern / enum wins.
+void merge_constraints(Constraints& base, const Constraints& in) {
+    if (in.required) base.required = true;
+    if (in.readonly) base.readonly = true;
+    if (in.min.has_value()) base.min = base.min.has_value() ? std::max(*base.min, *in.min) : *in.min;
+    if (in.max.has_value()) base.max = base.max.has_value() ? std::min(*base.max, *in.max) : *in.max;
+    if (!base.type_name.has_value()) base.type_name = in.type_name;
+    if (!base.pattern.has_value()) base.pattern = in.pattern;
+    if (!base.enum_values.has_value()) base.enum_values = in.enum_values;
+}
+
+} // namespace
+
+void Resolver::validate_field_constraints() {
+    std::unordered_map<std::string, Constraints> registry;
+    std::vector<std::string> paths;
+    for (const auto& pe : result.metadata) paths.push_back(pe.first);
+    std::sort(paths.begin(), paths.end());
+    for (const auto& path : paths) {
+        const MetaMap& fields = result.metadata.at(path);
+        std::vector<std::string> keys;
+        for (const auto& fe : fields) keys.push_back(fe.first);
+        std::sort(keys.begin(), keys.end());
+        for (const auto& key : keys) {
+            const Meta& m = fields.at(key);
             if (!m.constraints.has_value()) continue;
-            const Constraints& c = *m.constraints;
-            Value* fv = nullptr;
+            auto it = registry.find(key);
+            if (it == registry.end()) registry.emplace(key, *m.constraints);
+            else merge_constraints(it->second, *m.constraints);
+        }
+    }
+    if (registry.empty()) return;
+
+    // Skips values already holding an error string, so the message is not re-judged.
+    struct Pass {
+        Resolver& self;
+        const std::unordered_map<std::string, Constraints>& registry;
+        void run(Object& obj) {
             for (auto& p : obj) {
-                if (p.key == fk) { fv = &p.value; break; }
-            }
-            if (!fv) {
-                if (c.required && options.strict) {
-                    std::fprintf(stderr, "synx: required key '%s.%s' missing\n",
-                                 path.c_str(), fk.c_str());
+                auto it = registry.find(p.key);
+                if (it != registry.end() && !is_error_string(p.value)) {
+                    if (auto err = constraint_error(p.key, p.value, it->second)) {
+                        self.report_violation(*err);
+                        p.value = Value::make_string(std::move(*err));
+                    }
                 }
-                continue;
-            }
-            // Type check
-            if (c.type_name.has_value()) {
-                const std::string& tn = *c.type_name;
-                bool match =
-                    (tn == "int" && fv->is_int())
-                 || (tn == "float" && fv->is_float())
-                 || (tn == "bool" && fv->is_bool())
-                 || (tn == "string" && fv->is_string())
-                 || (tn == "array" && fv->is_array())
-                 || (tn == "object" && fv->is_object());
-                if (!match && options.strict) {
-                    std::fprintf(stderr, "synx: type mismatch for '%s.%s' (want %s, got %s)\n",
-                                 path.c_str(), fk.c_str(), tn.c_str(), fv->type_name());
-                }
-            }
-            // Min/max
-            double dv = 0.0;
-            if ((c.min.has_value() || c.max.has_value()) && value_to_number(*fv, dv)) {
-                if (c.min.has_value() && dv < *c.min) {
-                    if (options.strict) std::fprintf(stderr,
-                        "synx: '%s.%s' below min (%.6g < %.6g)\n",
-                        path.c_str(), fk.c_str(), dv, *c.min);
-                }
-                if (c.max.has_value() && dv > *c.max) {
-                    if (options.strict) std::fprintf(stderr,
-                        "synx: '%s.%s' above max (%.6g > %.6g)\n",
-                        path.c_str(), fk.c_str(), dv, *c.max);
-                }
-            }
-            // Enum
-            if (c.enum_values.has_value() && fv->is_string()) {
-                const std::string& s = *fv->as_string();
-                bool found = false;
-                for (const auto& v : *c.enum_values) {
-                    if (v == s) { found = true; break; }
-                }
-                if (!found && options.strict) std::fprintf(stderr,
-                    "synx: '%s.%s' value '%s' not in enum\n",
-                    path.c_str(), fk.c_str(), s.c_str());
-            }
-            // Pattern
-            if (c.pattern.has_value() && fv->is_string()) {
-                if (!regex_match_strict(*fv->as_string(), *c.pattern) && options.strict) {
-                    std::fprintf(stderr, "synx: '%s.%s' fails pattern '%s'\n",
-                                 path.c_str(), fk.c_str(), c.pattern->c_str());
+                if (Object* child = p.value.as_object_mut()) {
+                    run(*child);
+                } else if (Array* arr = p.value.as_array_mut()) {
+                    for (auto& item : *arr) {
+                        if (Object* o = item.as_object_mut()) run(*o);
+                    }
                 }
             }
         }
+    };
+    Pass{*this, registry}.run(root);
+}
+
+void Resolver::validate_field_types() {
+    std::unordered_map<std::string, std::string> registry;
+    std::vector<std::string> paths;
+    for (const auto& pe : result.metadata) paths.push_back(pe.first);
+    std::sort(paths.begin(), paths.end());
+    for (const auto& path : paths) {
+        const MetaMap& fields = result.metadata.at(path);
+        std::vector<std::string> keys;
+        for (const auto& fe : fields) keys.push_back(fe.first);
+        std::sort(keys.begin(), keys.end());
+        for (const auto& key : keys) {
+            const Meta& m = fields.at(key);
+            if (m.type_hint.has_value() && registry.find(key) == registry.end()) {
+                registry.emplace(key, *m.type_hint);
+            }
+        }
     }
+    if (registry.empty()) return;
+
+    struct Pass {
+        Resolver& self;
+        const std::unordered_map<std::string, std::string>& registry;
+        static bool matches(const Value& v, const std::string& t) {
+            if (t == "int") return v.is_int();
+            if (t == "float") return v.is_float() || v.is_int();
+            if (t == "bool") return v.is_bool();
+            if (t == "string") return v.is_string() || v.is_secret();
+            if (t == "array") return v.is_array();
+            if (t == "object") return v.is_object();
+            return true; // unknown types are accepted
+        }
+        void run(Object& obj) {
+            for (auto& p : obj) {
+                auto it = registry.find(p.key);
+                if (it != registry.end() && !matches(p.value, it->second)) {
+                    std::string err = "TYPE_ERR: '" + p.key + "' expected " + it->second
+                                    + " but got " + p.value.type_name();
+                    self.report_violation(err);
+                    p.value = Value::make_string(std::move(err));
+                }
+                if (Object* child = p.value.as_object_mut()) {
+                    run(*child);
+                } else if (Array* arr = p.value.as_array_mut()) {
+                    for (auto& item : *arr) {
+                        if (Object* o = item.as_object_mut()) run(*o);
+                    }
+                }
+            }
+        }
+    };
+    Pass{*this, registry}.run(root);
 }
 
 void Resolver::load_packages() {
@@ -583,13 +1168,9 @@ void Resolver::load_packages() {
             // Make the sub-object available via alias for interpolation/ref.
             // Move into root under alias so interpolation can resolve `{alias.key}`.
             root.push_back(Pair{use.alias, Value::make_object(std::move(*sub_obj))});
-            // Refresh namespace pointer to the now-installed location.
-            for (auto& p : root) {
-                if (p.key == use.alias) {
-                    namespaces[use.alias] = p.value.as_object();
-                    break;
-                }
-            }
+            namespaces[use.alias] = nullptr;
+            // `root` may have reallocated: refresh every namespace pointer.
+            refresh_namespaces();
         }
     }
 }
@@ -616,12 +1197,10 @@ void Resolver::load_includes() {
         Object* sub_obj = sub.root.as_object_mut();
         if (!sub_obj) continue;
         root.push_back(Pair{inc.alias, Value::make_object(std::move(*sub_obj))});
-        for (auto& p : root) {
-            if (p.key == inc.alias) {
-                namespaces[inc.alias] = p.value.as_object();
-                break;
-            }
-        }
+        namespaces[inc.alias] = nullptr;
+        include_aliases.push_back(inc.alias);
+        // `root` may have reallocated: earlier namespace pointers are stale.
+        refresh_namespaces();
     }
 }
 
@@ -654,11 +1233,14 @@ void resolve(ParseResult& result, const Options& options) {
     r.apply_inherit_pass();
     // 4. Strip `_`-prefixed helper keys at top level.
     r.strip_underscore_keys();
-    // 5. Resolve markers across the whole tree.
+    // 5. Mask literal `:secret` values before anything can interpolate them.
+    r.mask_secret_literals();
+    // 6. Resolve markers across the whole tree.
     r.walk(result.root, std::string{}, 0);
-    // 6. Validate constraints.
-    r.validate_all();
-    // 7. Persist `:once` writes.
+    // 7. Validate constraints.
+    r.validate_field_constraints();
+    r.validate_field_types();
+    // 8. Persist `:once` writes.
     r.flush_once();
 }
 

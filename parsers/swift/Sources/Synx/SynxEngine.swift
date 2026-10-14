@@ -26,6 +26,8 @@ final class Resolver {
     var onceLoaded = false
     var onceKeys: Set<String> = []
     var onceNewKeys: Set<String> = []
+    /// Aliases of `!include`d files (not `!use` packages) — `{key:include}` scope.
+    var includeAliases: [String] = []
     var rng: SystemRandomNumberGenerator
 
     init(result: SynxParseResult, options: SynxOptions) {
@@ -39,8 +41,10 @@ final class Resolver {
         loadIncludes()
         applyInheritPass()
         stripUnderscoreKeys()
+        maskSecretLiterals()
         walk(path: "", depth: 0)
-        validateAll()
+        validateFieldConstraints()
+        validateFieldTypes()
         flushOnce()
     }
 
@@ -82,6 +86,7 @@ final class Resolver {
             }
             guard case .object(let obj) = sub.root else { continue }
             namespaces[inc.alias] = obj
+            includeAliases.append(inc.alias)
             if case .object(var root) = result.root {
                 root.set(inc.alias, to: .object(obj))
                 result.root = .object(root)
@@ -139,30 +144,157 @@ final class Resolver {
 
     private func walk(path: String, depth: Int) {
         guard depth <= SynxEngine.maxResolveDepth else { return }
+        // Children first, so a parent's markers and interpolation see resolved values.
+        if case .object(let root) = result.root,
+           case .object(let obj) = getValueAt(path: path, in: root) ?? .null {
+            for entry in obj.entries {
+                if case .object = entry.value {
+                    let sub = path.isEmpty ? entry.key : path + "." + entry.key
+                    walk(path: sub, depth: depth + 1)
+                } else if case .array(let arr) = entry.value {
+                    let sub = path.isEmpty ? entry.key : path + "." + entry.key
+                    for item in arr {
+                        if case .object = item { walk(path: sub, depth: depth + 1) }
+                    }
+                }
+            }
+        }
         // For every metadata entry at this path level apply markers.
         if let fields = result.metadata[path] {
             for (key, meta) in fields {
                 applyMarkers(meta: meta, key: key, atPath: path)
             }
         }
-        // Recurse into object children at deeper paths.
-        guard case .object(let root) = result.root else { return }
-        let container = getValueAt(path: path, in: root)
-        guard case .object(let obj) = container ?? .null else { return }
-        for entry in obj.entries {
-            if case .object = entry.value {
-                let sub = path.isEmpty ? entry.key : path + "." + entry.key
-                walk(path: sub, depth: depth + 1)
-            } else if case .array(let arr) = entry.value {
-                let sub = path.isEmpty ? entry.key : path + "." + entry.key
-                for (i, item) in arr.enumerated() {
-                    if case .object = item {
-                        walk(path: sub, depth: depth + 1)
-                        _ = i
-                    }
+        interpolateLevel(path: path)
+    }
+
+    // MARK: - :secret pre-pass
+
+    private static let resolvingBeforeSecret: Set<String> = [
+        "env", "include", "import", "watch", "ref", "alias", "calc", "map", "i18n", "default",
+        "fallback", "once", "split", "join", "format", "replace",
+    ]
+
+    /// Wrap every literal `:secret` value in `.secret` before any resolution so
+    /// an `{interpolation}` can never read the plaintext. A secret that itself
+    /// needs resolving (`:secret:env`) is masked by its own marker afterwards.
+    private func maskSecretLiterals() {
+        guard case .object(var root) = result.root else { return }
+        var changed = false
+        for (path, fields) in result.metadata {
+            for (key, meta) in fields where meta.hasMarker("secret")
+                && !meta.markers.contains(where: { Resolver.resolvingBeforeSecret.contains($0) }) {
+                guard var parent = getObjectAt(path: path, in: &root).value,
+                      let v = parent[key] else { continue }
+                switch v {
+                case .secret, .object, .array: continue
+                default: break
                 }
+                parent.set(key, to: .secret(valueToString(v)))
+                setObjectAt(path: path, in: &root, value: parent)
+                changed = true
             }
         }
+        if changed { result.root = .object(root) }
+    }
+
+    // MARK: - auto-{} interpolation
+
+    /// Resolve `{key}` / `{a.b}` / `{key:alias}` / `{key:include}` in every string
+    /// value of the object at `path`. Mirrors the Rust engine's third pass.
+    private func interpolateLevel(path: String) {
+        guard case .object(var root) = result.root else { return }
+        guard var parent = getObjectAt(path: path, in: &root).value else { return }
+        var changed = false
+        for entry in parent.entries {
+            guard case .string(let s) = entry.value, s.contains("{") else { continue }
+            let out = resolveInterpolation(s, root: root, local: parent)
+            if out != s {
+                parent.set(entry.key, to: .string(out))
+                changed = true
+            }
+        }
+        if changed {
+            setObjectAt(path: path, in: &root, value: parent)
+            result.root = .object(root)
+        }
+    }
+
+    private static let maxScratchBytes = 4 * 1024 * 1024
+
+    private func isRefName(_ scalars: ArraySlice<Unicode.Scalar>) -> Bool {
+        scalars.allSatisfy { c in
+            c == "_" || c == "." || c.properties.isAlphabetic || c.properties.numericType != nil
+        }
+    }
+
+    func resolveInterpolation(_ tpl: String, root: SynxObject, local: SynxObject) -> String {
+        let sc = Array(tpl.unicodeScalars)
+        var out = String.UnicodeScalarView()
+        var outBytes = 0
+        func push<S: Sequence>(_ seq: S) where S.Element == Unicode.Scalar {
+            for c in seq {
+                let w = UTF8.width(c)
+                if outBytes + w > Resolver.maxScratchBytes { return }
+                out.append(c)
+                outBytes += w
+            }
+        }
+        var i = 0
+        while i < sc.count {
+            if outBytes >= Resolver.maxScratchBytes { break }
+            if sc[i] == "{", let close = sc[(i + 1)...].firstIndex(of: "}") {
+                let inner = sc[(i + 1)..<close]
+                var refName = inner
+                var scope: String? = nil
+                if let colon = inner.firstIndex(of: ":") {
+                    refName = inner[inner.startIndex..<colon]
+                    var sv = String.UnicodeScalarView()
+                    sv.append(contentsOf: inner[(colon + 1)...])
+                    scope = String(sv)
+                }
+                if isRefName(refName) {
+                    var nameView = String.UnicodeScalarView()
+                    nameView.append(contentsOf: refName)
+                    let name = String(nameView)
+                    let resolved: SynxValue?
+                    if let scope = scope {
+                        if scope == "include" {
+                            if includeAliases.count == 1, let ns = namespaces[includeAliases[0]] {
+                                resolved = deepGetValue(ns, name)
+                            } else {
+                                resolved = nil
+                            }
+                        } else {
+                            resolved = namespaces[scope].flatMap { deepGetValue($0, name) }
+                        }
+                    } else {
+                        resolved = deepGetValue(root, name) ?? local[name]
+                    }
+                    if let val = resolved {
+                        push(valueToString(val).unicodeScalars)
+                    } else {
+                        push(["{"]); push(inner); push(["}"])
+                    }
+                    i = close + 1
+                    continue
+                }
+            }
+            push([sc[i]])
+            i += 1
+        }
+        return String(out)
+    }
+
+    /// Direct key first, then dot-path traversal through objects.
+    private func deepGetValue(_ root: SynxObject, _ path: String) -> SynxValue? {
+        if let direct = root[path] { return direct }
+        var current: SynxValue = .object(root)
+        for seg in path.split(separator: ".", omittingEmptySubsequences: false) {
+            guard case .object(let obj) = current, let next = obj[String(seg)] else { return nil }
+            current = next
+        }
+        return current
     }
 
     private func applyMarkers(meta: SynxMeta, key: String, atPath path: String) {
@@ -171,15 +303,15 @@ final class Resolver {
         guard var parent = parentOpt.value else { return }
         var value = parent[key] ?? .null
 
-        for marker in meta.markers {
+        // `:secret` masks the *resolved* value, so it runs after every other marker
+        // regardless of where it sits in the chain (`:secret:env`, `:env:secret`).
+        for marker in meta.markers where marker != "secret" {
             switch marker {
             case "env":      value = SynxMarkers.applyEnv(value, meta: meta, options: options)
             case "default":  value = SynxMarkers.applyDefault(value, meta: meta)
-            case "calc":     value = SynxMarkers.applyCalc(value, meta: meta, root: root,
-                                                            interpolate: { self.interpolate($0, root: root) })
+            case "calc":     value = SynxMarkers.applyCalc(value, key: key, root: root, local: parent)
             case "ref":      value = SynxMarkers.applyRef(value, root: root, namespaces: namespaces)
             case "alias":    value = SynxMarkers.applyRef(value, root: root, namespaces: namespaces)
-            case "secret":   value = SynxMarkers.applySecret(value)
             case "random":   value = SynxMarkers.applyRandom(value, meta: meta, rng: &rng)
             case "unique":   value = SynxMarkers.applyUnique(value)
             case "geo":      value = SynxMarkers.applyGeo(value, meta: meta, options: options)
@@ -212,19 +344,27 @@ final class Resolver {
             }
         }
 
+        if meta.hasMarker("secret") { value = SynxMarkers.applySecret(value) }
+
         // Apply runtime type cast for type hints (when no marker rewrote the value already).
         if let th = meta.typeHint {
             switch th {
             case "int":
-                if case .int = value {} else {
-                    if let d = valueToNumber(value) { value = .int(Int64(d)) }
+                if case .int = value {} else if case .secret = value {} else {
+                    if case .string(let str) = value, let n = Int64(str) {
+                        value = .int(n)
+                    } else if let d = valueToNumber(value) {
+                        value = .int(Int64(d))
+                    }
                 }
             case "float":
                 if case .float = value {} else {
                     if let d = valueToNumber(value) { value = .float(d) }
                 }
             case "string":
-                if case .string = value {} else { value = .string(valueToString(value)) }
+                if case .string = value {} else if case .secret = value {} else {
+                    value = .string(valueToString(value))
+                }
             case "bool":
                 if case .bool = value {} else {
                     let s = valueToString(value)
@@ -234,69 +374,16 @@ final class Resolver {
             }
         }
 
+        // Constraint validation always runs last, after every marker has resolved.
+        if let c = meta.constraints,
+           let err = SynxValidate.constraintError(key: key, value: value, c: c) {
+            reportViolation(err)
+            value = .string(err)
+        }
+
         parent.set(key, to: value)
         setObjectAt(path: path, in: &root, value: parent)
         result.root = .object(root)
-    }
-
-    // MARK: - validation
-
-    private func validateAll() {
-        for (path, fields) in result.metadata {
-            guard case .object(let root) = result.root else { return }
-            let containerOpt = getValueAt(path: path, in: root)
-            guard case .object(let container) = containerOpt ?? .null else { continue }
-            for (key, meta) in fields {
-                guard let c = meta.constraints else { continue }
-                let fv = container[key]
-                if fv == nil {
-                    if c.required && options.strict {
-                        FileHandle.standardError.write(
-                            Data("synx: required '\(path).\(key)' missing\n".utf8))
-                    }
-                    continue
-                }
-                let v = fv!
-                if let tn = c.typeName {
-                    let match: Bool
-                    switch (tn, v) {
-                    case ("int", .int):         match = true
-                    case ("float", .float):     match = true
-                    case ("bool", .bool):       match = true
-                    case ("string", .string):   match = true
-                    case ("array", .array):     match = true
-                    case ("object", .object):   match = true
-                    default:                    match = false
-                    }
-                    if !match && options.strict {
-                        FileHandle.standardError.write(
-                            Data("synx: type mismatch '\(path).\(key)' want \(tn), got \(v.typeName)\n".utf8))
-                    }
-                }
-                if let dv = valueToNumber(v) {
-                    if let m = c.min, dv < m, options.strict {
-                        FileHandle.standardError.write(
-                            Data("synx: '\(path).\(key)' below min (\(dv) < \(m))\n".utf8))
-                    }
-                    if let m = c.max, dv > m, options.strict {
-                        FileHandle.standardError.write(
-                            Data("synx: '\(path).\(key)' above max (\(dv) > \(m))\n".utf8))
-                    }
-                }
-                if let ev = c.enumValues, case .string(let s) = v {
-                    if !ev.contains(s) && options.strict {
-                        FileHandle.standardError.write(
-                            Data("synx: '\(path).\(key)' value '\(s)' not in enum\n".utf8))
-                    }
-                }
-                if let pat = c.pattern, case .string(let s) = v {
-                    if !regexMatches(s, pattern: pat) && options.strict {
-                        FileHandle.standardError.write(
-                            Data("synx: '\(path).\(key)' fails pattern '\(pat)'\n".utf8))
-                    }
-                }
-            }
-        }
     }
 
     // MARK: - once persistence
@@ -446,19 +533,48 @@ func valueToString(_ v: SynxValue) -> String {
     case .bool(let b): return b ? "true" : "false"
     case .int(let n): return String(n)
     case .float(let f):
-        if f.isNaN || f.isInfinite { return "null" }
-        var s = String(format: "%.17g", f)
-        if !s.contains(".") && !s.contains("e") && !s.contains("E") {
-            s.append(".0")
-        }
-        return s
+        return formatNumber(f)
     case .string(let s): return s
-    case .secret(let s): return s
+    case .secret: return "[SECRET]" // safety: plaintext must never reach a string sink
     case .array(let a):
         let parts = a.map { valueToString($0) }
         return "[" + parts.joined(separator: ", ") + "]"
     case .object: return "[Object]"
     }
+}
+
+/// Rust `format_number`: whole numbers print without a fraction, others as shortest `Display`.
+func formatNumber(_ n: Double) -> String {
+    if n.isFinite && n.truncatingRemainder(dividingBy: 1) == 0 && abs(n) < 9.223372036854775807e18 {
+        return String(Int64(n))
+    }
+    return SynxJSON.displayNumber(n)
+}
+
+/// Does `meta` ask for the text to stay text (`(string)` or `[type:string]`)?
+func wantsString(_ meta: SynxMeta) -> Bool {
+    return meta.typeHint == "string" || meta.constraints?.typeName == "string"
+}
+
+/// Rust `cast_primitive`: quotes strip, `true`/`false`/`null`, exact `Int64`, then `Double`.
+func castPrimitive(_ val: String) -> SynxValue {
+    let scalars = Array(val.unicodeScalars)
+    if scalars.count >= 2, let f = scalars.first, let l = scalars.last,
+       (f == "\"" && l == "\"") || (f == "'" && l == "'") {
+        var inner = String.UnicodeScalarView()
+        inner.append(contentsOf: scalars[1..<(scalars.count - 1)])
+        return .string(String(inner))
+    }
+    switch val {
+    case "true":  return .bool(true)
+    case "false": return .bool(false)
+    case "null":  return .null
+    default: break
+    }
+    if let n = Int64(val) { return .int(n) }
+    // Hex floats (`0x1p3`) are not decimal numbers; Rust's parser rejects them.
+    if !val.contains(where: { $0 == "x" || $0 == "X" }), let d = Double(val) { return .float(d) }
+    return .string(val)
 }
 
 func valueToNumber(_ v: SynxValue) -> Double? {

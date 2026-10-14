@@ -31,3 +31,10 @@ SYNX_TEST(calc_empty) {
     EXPECT_EQ(safe_calc("").value, 0.0);
     EXPECT_TRUE(safe_calc("").ok);
 }
+
+SYNX_TEST(calc_trims_unicode_whitespace) {
+    // U+00A0 and U+3000 around the expression, as Rust `str::trim` strips them.
+    CalcResult r = safe_calc("\xC2\xA0" "2 + 3" "\xE3\x80\x80");
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.value, 5.0);
+}

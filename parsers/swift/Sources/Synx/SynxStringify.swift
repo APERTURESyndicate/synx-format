@@ -63,11 +63,7 @@ public enum SynxStringify {
         case .int(let n): return String(n)
         case .float(let f):
             if f.isNaN || f.isInfinite { return "null" }
-            var s = String(format: "%.17g", f)
-            if !s.contains(".") && !s.contains("e") && !s.contains("E") {
-                s.append(".0")
-            }
-            return s
+            return SynxJSON.displayString(f)
         case .bool(let b): return b ? "true" : "false"
         case .null: return "null"
         case .array(let arr):

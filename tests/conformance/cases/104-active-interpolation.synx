@@ -1,0 +1,5 @@
+!active
+name Wario
+token:secret sk-123
+greet мир {name} 東京
+msg hello {token} world

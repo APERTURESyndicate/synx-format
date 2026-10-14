@@ -6,11 +6,12 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"unicode"
+	"unicode/utf8"
 )
 
 const MaxResolveDepth = 512
@@ -83,6 +84,7 @@ func (r *resolver) run() {
 	r.applyInheritPass()
 	r.stripUnderscoreKeys()
 	r.walk("", 0)
+	r.autoInterpolate(r.root(), 0)
 	r.validateAll()
 	r.flushOnce()
 }
@@ -259,7 +261,8 @@ func (r *resolver) applyMarkers(meta Meta, key, path string) {
 		case "ref", "alias":
 			value = r.applyRef(value)
 		case "secret":
-			value = r.applySecret(value)
+			// applied after the loop: `:secret:env` must resolve the variable
+			// first and only then mask what it produced.
 		case "random":
 			value = r.applyRandom(value, meta)
 		case "unique":
@@ -311,81 +314,15 @@ func (r *resolver) applyMarkers(meta Meta, key, path string) {
 		}
 	}
 
+	if meta.HasMarker("secret") {
+		value = r.applySecret(value)
+	}
 	if meta.TypeHint != "" {
 		value = r.coerceTypeHint(value, meta.TypeHint)
 	}
 	parent.Set(key, value)
-}
-
-func (r *resolver) validateAll() {
-	for path, fields := range r.result.Metadata {
-		container := r.getObjectAt(path)
-		if container == nil {
-			continue
-		}
-		for fk, meta := range fields {
-			c := meta.Constraints
-			if c == nil {
-				continue
-			}
-			fv, ok := container.Get(fk)
-			if !ok {
-				if c.Required && r.opts.Strict {
-					fmt.Fprintf(os.Stderr, "synx: required '%s.%s' missing\n", path, fk)
-				}
-				continue
-			}
-			if c.TypeName != "" {
-				match := false
-				switch c.TypeName {
-				case "int":
-					_, match = fv.(IntValue)
-				case "float":
-					_, match = fv.(FloatValue)
-				case "bool":
-					_, match = fv.(BoolValue)
-				case "string":
-					_, match = fv.(StringValue)
-				case "array":
-					_, match = fv.(ArrayValue)
-				case "object":
-					_, match = fv.(ObjectValue)
-				}
-				if !match && r.opts.Strict {
-					fmt.Fprintf(os.Stderr, "synx: type mismatch '%s.%s' want %s, got %s\n",
-						path, fk, c.TypeName, fv.Kind())
-				}
-			}
-			if d, ok := AsNumber(fv); ok {
-				if c.Min != nil && d < *c.Min && r.opts.Strict {
-					fmt.Fprintf(os.Stderr, "synx: '%s.%s' below min\n", path, fk)
-				}
-				if c.Max != nil && d > *c.Max && r.opts.Strict {
-					fmt.Fprintf(os.Stderr, "synx: '%s.%s' above max\n", path, fk)
-				}
-			}
-			if c.EnumValues != nil {
-				if s, ok := AsString(fv); ok {
-					found := false
-					for _, e := range c.EnumValues {
-						if e == s {
-							found = true
-							break
-						}
-					}
-					if !found && r.opts.Strict {
-						fmt.Fprintf(os.Stderr, "synx: '%s.%s' '%s' not in enum\n", path, fk, s)
-					}
-				}
-			}
-			if c.Pattern != "" {
-				if s, ok := AsString(fv); ok {
-					if !regexMatches(s, c.Pattern) && r.opts.Strict {
-						fmt.Fprintf(os.Stderr, "synx: '%s.%s' fails pattern '%s'\n", path, fk, c.Pattern)
-					}
-				}
-			}
-		}
+	if meta.Constraints != nil {
+		r.validateConstraints(parent, key, meta.Constraints)
 	}
 }
 
@@ -534,6 +471,94 @@ func (r *resolver) interpolate(s string) string {
 	return sb.String()
 }
 
+// autoInterpolate expands `{key}`, `{a.b}` and `{key:alias}` references in
+// every plain string value of an active document, depth first. References to
+// a `:secret` resolve to its mask, never the clear value.
+func (r *resolver) autoInterpolate(obj *Object, depth int) {
+	if obj == nil || depth > MaxResolveDepth {
+		return
+	}
+	for _, p := range obj.Pairs() {
+		switch x := p.Value.(type) {
+		case ObjectValue:
+			r.autoInterpolate(x.V, depth+1)
+		case ArrayValue:
+			for _, item := range x.V {
+				if o, ok := item.(ObjectValue); ok {
+					r.autoInterpolate(o.V, depth+1)
+				}
+			}
+		case StringValue:
+			if strings.IndexByte(x.V, '{') < 0 {
+				continue
+			}
+			if out := r.expandPlaceholders(x.V); out != x.V {
+				obj.Set(p.Key, String(out))
+			}
+		}
+	}
+}
+
+// expandPlaceholders replaces `{ref}` / `{ref:scope}` where ref is a dotted
+// identifier; anything else (`{ x }`, `{"a":1}`) is literal text and is copied
+// rune for rune, so non-ASCII text survives untouched.
+func (r *resolver) expandPlaceholders(s string) string {
+	var sb strings.Builder
+	sb.Grow(len(s))
+	i := 0
+	for i < len(s) {
+		if s[i] == '{' {
+			if end := strings.IndexByte(s[i+1:], '}'); end >= 0 {
+				inner := s[i+1 : i+1+end]
+				name, scope, hasScope := strings.Cut(inner, ":")
+				if isPlaceholderName(name) {
+					if v := r.resolvePlaceholder(name, scope, hasScope); v != nil {
+						sb.WriteString(valueToString(v))
+					} else {
+						sb.WriteString("{" + inner + "}")
+					}
+					i += 2 + end
+					continue
+				}
+			}
+		}
+		_, size := utf8.DecodeRuneInString(s[i:])
+		sb.WriteString(s[i : i+size])
+		i += size
+	}
+	return sb.String()
+}
+
+func isPlaceholderName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, c := range name {
+		if c != '_' && c != '.' && !unicode.IsLetter(c) && !unicode.IsDigit(c) {
+			return false
+		}
+	}
+	return true
+}
+
+func (r *resolver) resolvePlaceholder(name, scope string, hasScope bool) Value {
+	if !hasScope {
+		return deepGet(name, r.root())
+	}
+	if scope == "include" {
+		if len(r.namespaces) != 1 {
+			return nil
+		}
+		for _, ns := range r.namespaces {
+			return deepGet(name, ns)
+		}
+	}
+	if ns, ok := r.namespaces[scope]; ok {
+		return deepGet(name, ns)
+	}
+	return nil
+}
+
 func (r *resolver) jailPath(base, rel string) string {
 	if rel == "" {
 		return ""
@@ -598,7 +623,8 @@ func (r *resolver) coerceTypeHint(v Value, hint string) Value {
 			return Float(d)
 		}
 	case "string":
-		if _, ok := v.(StringValue); ok {
+		switch v.(type) {
+		case StringValue, SecretValue:
 			return v
 		}
 		return String(valueToString(v))
@@ -637,7 +663,9 @@ func valueToString(v Value) string {
 	case StringValue:
 		return x.V
 	case SecretValue:
-		return x.V
+		// safety: valueToString feeds interpolation, :join, :map, :prompt — a
+		// secret must reach none of those sinks as plaintext.
+		return "[SECRET]"
 	case ArrayValue:
 		parts := make([]string, len(x.V))
 		for i, item := range x.V {
@@ -648,12 +676,4 @@ func valueToString(v Value) string {
 		return "[Object]"
 	}
 	return ""
-}
-
-func regexMatches(value, pattern string) bool {
-	re, err := regexp.Compile(pattern)
-	if err != nil {
-		return true // invalid pattern — do not reject value
-	}
-	return re.MatchString(value)
 }

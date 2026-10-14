@@ -8,7 +8,7 @@ void main() {
     final r = parseFull('!active\nport:env:default:3000 APP_PORT\n');
     resolve(r, opts);
     final o = (r.root as SynxObj).map;
-    expect(o['port'], equals(synxString('9090')));
+    expect(o['port'], equals(synxInt(9090)));
   });
 
   test('env falls back to default', () {
@@ -16,7 +16,7 @@ void main() {
     final r = parseFull('!active\nport:env:default:3000 NOT_SET\n');
     resolve(r, opts);
     final o = (r.root as SynxObj).map;
-    expect(o['port'], equals(synxString('3000')));
+    expect(o['port'], equals(synxInt(3000)));
   });
 
   test('calc basic', () {

@@ -20,7 +20,13 @@ const int maxEnumParts = 4096;
 const int maxMarkerSegments = 512;
 
 /// Truncate `text` to a UTF-8-safe prefix bounded by [maxInputBytes].
+///
+/// A single leading U+FEFF byte-order mark is dropped first (SYNX §2.1), so a
+/// BOM-prefixed `!active` still switches the document to active mode.
 String clampText(String text) {
+  if (text.isNotEmpty && text.codeUnitAt(0) == 0xFEFF) {
+    text = text.substring(1);
+  }
   final bytes = utf8.encode(text);
   if (bytes.length <= maxInputBytes) return text;
   var end = maxInputBytes;
@@ -68,8 +74,66 @@ SynxParseResult parse(String rawText) {
   var i = 0;
   while (i < lineCount) {
     final raw = _lineBytes(bytes, lineStarts, i);
-    final rawStr = utf8.decode(raw, allowMalformed: true);
-    final t = rawStr.trim();
+    final rawStr = _decodeLine(raw);
+    final t = _trim(rawStr);
+
+    // A blank line is never structural and never body: SYNX §8.4.1 does not
+    // preserve blank lines inside a multiline body.
+    if (t.isEmpty) {
+      i++;
+      continue;
+    }
+
+    final indent = _indentOf(raw);
+
+    // Continue multiline block.
+    //
+    // This branch runs before every line-class rule below, and that order is
+    // load-bearing: a `|` / `|+` body is raw text (SYNX §8.4.1), so `#`, `//`,
+    // `###` and `!…` lines are ordinary content there. Classifying first would
+    // delete comment lines out of code samples, let a stray `###` swallow the
+    // rest of the record and turn a dataset row into a directive.
+    if (block != null) {
+      if (indent > block.indent) {
+        if (block.content.length < maxMultilineBytes) {
+          if (block.content.isNotEmpty) block.content.write('\n');
+          final room = maxMultilineBytes - block.content.length;
+          String slice;
+          if (block.preserveIndent) {
+            // `|+` (SYNX 3.7): lock base indent to the first non-empty
+            // content line, then strip exactly that many leading WS chars
+            // per subsequent line. See spec §8.4.1.
+            if (block.baseIndent < 0) block.baseIndent = indent;
+            final strip = block.baseIndent < indent ? block.baseIndent : indent;
+            // §8.4.1 counts the strip in UTF-8 bytes, but indentation is Unicode
+            // whitespace (U+00A0, U+3000…), so a line may carry a multi-byte
+            // indent character. Walk whole characters and cut on a boundary.
+            final trimmedEnd = _trimRight(rawStr);
+            var cut = 0;
+            var off = 0;
+            for (final r in trimmedEnd.runes) {
+              if (off >= strip || !_isUnicodeWs(r)) break;
+              off += _utf8Len(r);
+              cut += r > 0xFFFF ? 2 : 1;
+            }
+            slice = cut < trimmedEnd.length ? trimmedEnd.substring(cut) : '';
+          } else {
+            slice = t;
+          }
+          var n = slice.length < room ? slice.length : room;
+          // Never end the cut between the halves of a surrogate pair.
+          if (n > 0 && n < slice.length && _isHighSurrogate(slice.codeUnitAt(n - 1))) {
+            n--;
+          }
+          block.content.write(slice.substring(0, n));
+        }
+        i++;
+        continue;
+      }
+      _insertValue(rootObj, stack, block.stackIdx, block.key,
+          synxString(block.content.toString()));
+      block = null;
+    }
 
     switch (t) {
       case '!active':
@@ -95,13 +159,13 @@ SynxParseResult parse(String rawText) {
     }
     if (t.startsWith('!include ')) {
       if (result.includes.length < maxIncludes) {
-        final rest = t.substring(9).trim();
+        final rest = _trim(t.substring(9));
         var path = rest;
         var alias = '';
         final ws = _firstWs(rest);
         if (ws >= 0) {
           path = rest.substring(0, ws);
-          alias = rest.substring(ws).trim();
+          alias = _trim(rest.substring(ws));
         }
         if (alias.isEmpty) {
           var base = path;
@@ -118,14 +182,14 @@ SynxParseResult parse(String rawText) {
       continue;
     }
     if (t.startsWith('!use ')) {
-      final rest = t.substring(5).trim();
+      final rest = _trim(t.substring(5));
       if (rest.isNotEmpty && rest[0] == '@') {
         var pkg = rest;
         var alias = '';
         final asPos = rest.indexOf(' as ');
         if (asPos >= 0) {
-          pkg = rest.substring(0, asPos).trim();
-          alias = rest.substring(asPos + 4).trim();
+          pkg = _trim(rest.substring(0, asPos));
+          alias = _trim(rest.substring(asPos + 4));
         }
         if (alias.isEmpty) {
           final slash = pkg.lastIndexOf('/');
@@ -139,7 +203,7 @@ SynxParseResult parse(String rawText) {
       continue;
     }
     if (t.startsWith('#!mode:')) {
-      final declared = t.substring(7).trim();
+      final declared = _trim(t.substring(7));
       result.mode = declared == 'active' ? SynxMode.active : SynxMode.static_;
       i++;
       continue;
@@ -154,52 +218,9 @@ SynxParseResult parse(String rawText) {
       i++;
       continue;
     }
-    if (t.isEmpty || t.startsWith('#') || t.startsWith('//')) {
+    if (t.startsWith('#') || t.startsWith('//')) {
       i++;
       continue;
-    }
-
-    final indent = _indentOf(raw);
-
-    // Continue multiline block
-    if (block != null) {
-      if (indent > block.indent) {
-        if (block.content.length < maxMultilineBytes) {
-          if (block.content.isNotEmpty) block.content.write('\n');
-          final room = maxMultilineBytes - block.content.length;
-          String slice;
-          if (block.preserveIndent) {
-            // `|+` (SYNX 3.7): lock base indent to the first non-empty
-            // content line, then strip exactly that many leading WS chars
-            // per subsequent line. See spec §8.4.1.
-            if (block.baseIndent < 0) block.baseIndent = indent;
-            final strip = block.baseIndent < indent ? block.baseIndent : indent;
-            // `raw` is the line's bytes, not a String — and §8.4.1 defines the
-            // slice in byte offsets (indent is counted in UTF-8 code units), so
-            // trim and cut on the byte list and decode once at the end. `strip`
-            // only ever covers leading spaces/tabs, so it cannot split a
-            // multi-byte character.
-            var end = raw.length;
-            while (end > 0) {
-              final c = raw[end - 1];
-              if (c != 0x20 && c != 0x09 && c != 0x0D && c != 0x0A) break;
-              end--;
-            }
-            slice = strip < end
-                ? utf8.decode(raw.sublist(strip, end), allowMalformed: true)
-                : '';
-          } else {
-            slice = t;
-          }
-          final n = slice.length < room ? slice.length : room;
-          block.content.write(slice.substring(0, n));
-        }
-        i++;
-        continue;
-      }
-      _insertValue(rootObj, stack, block.stackIdx, block.key,
-          synxString(block.content.toString()));
-      block = null;
     }
 
     // List items
@@ -210,12 +231,12 @@ SynxParseResult parse(String rawText) {
             stack.last.indent >= indent) {
           stack.removeLast();
         }
-        final valStr = _stripComment(t.substring(2).trim());
+        final valStr = _stripComment(_trim(t.substring(2)));
 
         var nested = false;
         for (var peek = i + 1; peek < lineCount; peek++) {
           final pl = _lineBytes(bytes, lineStarts, peek);
-          final pt = utf8.decode(pl, allowMalformed: true).trim();
+          final pt = _trim(_decodeLine(pl));
           if (pt.isEmpty) continue;
           final pi = _indentOf(pl);
           if (pi > indent &&
@@ -315,7 +336,7 @@ SynxParseResult parse(String rawText) {
       var becameList = false;
       for (var peek = i + 1; peek < lineCount; peek++) {
         final pl = _lineBytes(bytes, lineStarts, peek);
-        final pt = utf8.decode(pl, allowMalformed: true).trim();
+        final pt = _trim(_decodeLine(pl));
         if (pt.isEmpty) continue;
         if (pt.startsWith('- ')) {
           _insertValue(rootObj, stack, parentIdx, parsed.key, synxArray());
@@ -432,13 +453,83 @@ List<int> _lineBytes(Uint8List bytes, List<int> starts, int i) {
   return bytes.sublist(s, e);
 }
 
+/// Leading whitespace of [line] in UTF-8 bytes, measured over Unicode
+/// whitespace (SYNX §4) so U+00A0 or U+3000 indent like a space does.
 int _indentOf(List<int> line) {
   var i = 0;
-  while (i < line.length && (line[i] == 0x20 || line[i] == 0x09)) {
-    i++;
+  while (i < line.length) {
+    final b = line[i];
+    if (b < 0x80) {
+      if (b != 0x20 && (b < 0x09 || b > 0x0D)) break;
+      i++;
+      continue;
+    }
+    var cp = 0;
+    var n = 1;
+    if (b >= 0xC2 && b <= 0xDF && i + 1 < line.length) {
+      cp = ((b & 0x1F) << 6) | (line[i + 1] & 0x3F);
+      n = 2;
+    } else if (b >= 0xE0 && b <= 0xEF && i + 2 < line.length) {
+      cp = ((b & 0x0F) << 12) | ((line[i + 1] & 0x3F) << 6) | (line[i + 2] & 0x3F);
+      n = 3;
+    } else {
+      break;
+    }
+    if (!_isUnicodeWs(cp)) break;
+    i += n;
   }
   return i;
 }
+
+/// Decodes one line as UTF-8. `utf8.decode` silently drops a leading BOM, but
+/// only the very start of the document may lose one (see [clampText]); a
+/// U+FEFF at the start of any other line is ordinary content.
+String _decodeLine(List<int> line) {
+  if (line.length >= 3 && line[0] == 0xEF && line[1] == 0xBB && line[2] == 0xBF) {
+    return '${String.fromCharCode(0xFEFF)}${utf8.decode(line.sublist(3), allowMalformed: true)}';
+  }
+  return utf8.decode(line, allowMalformed: true);
+}
+
+/// `String.trim` over White_Space only. Dart's own `trim` also strips U+FEFF,
+/// which Rust's `str::trim` does not, so a stray BOM mid-document would vanish
+/// here but survive in the reference.
+String _trim(String s) => _trimRight(_trimLeft(s));
+
+String _trimLeft(String s) {
+  var i = 0;
+  while (i < s.length && _isUnicodeWs(s.codeUnitAt(i))) {
+    i++;
+  }
+  return i == 0 ? s : s.substring(i);
+}
+
+String _trimRight(String s) {
+  var end = s.length;
+  while (end > 0 && _isUnicodeWs(s.codeUnitAt(end - 1))) {
+    end--;
+  }
+  return end == s.length ? s : s.substring(0, end);
+}
+
+/// Unicode White_Space (the set Rust's `char::is_whitespace` uses).
+bool _isUnicodeWs(int cp) {
+  if (cp < 0x80) return cp == 0x20 || (cp >= 0x09 && cp <= 0x0D);
+  return cp == 0x85 ||
+      cp == 0xA0 ||
+      cp == 0x1680 ||
+      (cp >= 0x2000 && cp <= 0x200A) ||
+      cp == 0x2028 ||
+      cp == 0x2029 ||
+      cp == 0x202F ||
+      cp == 0x205F ||
+      cp == 0x3000;
+}
+
+int _utf8Len(int cp) =>
+    cp < 0x80 ? 1 : (cp < 0x800 ? 2 : (cp < 0x10000 ? 3 : 4));
+
+bool _isHighSurrogate(int unit) => unit >= 0xD800 && unit <= 0xDBFF;
 
 int _firstWs(String s) {
   for (var i = 0; i < s.length; i++) {
@@ -562,7 +653,7 @@ _ParsedLine? _parseLine(String trimmed) {
     }
   }
   if (out.markers.contains('inherit') && out.value.isNotEmpty) {
-    out.markerArgs = [out.value.trim()];
+    out.markerArgs = [_trim(out.value)];
     out.value = '';
   }
   return out;
@@ -571,7 +662,7 @@ _ParsedLine? _parseLine(String trimmed) {
 SynxConstraints _parseConstraints(String raw) {
   final c = SynxConstraints();
   for (final rawPart in raw.split(',')) {
-    final part = rawPart.trim();
+    final part = _trim(rawPart);
     if (part.isEmpty) continue;
     if (part == 'required') {
       c.required = true;
@@ -583,8 +674,8 @@ SynxConstraints _parseConstraints(String raw) {
     }
     final colon = part.indexOf(':');
     if (colon < 0) continue;
-    final k = part.substring(0, colon).trim();
-    final v = part.substring(colon + 1).trim();
+    final k = _trim(part.substring(0, colon));
+    final v = _trim(part.substring(colon + 1));
     switch (k) {
       case 'min':
         final d = double.tryParse(v);
@@ -676,7 +767,7 @@ SynxValue _castTyped(String val, String hint) {
     case 'float':
       return synxFloat(double.tryParse(val) ?? 0);
     case 'bool':
-      return synxBool(val.trim() == 'true');
+      return synxBool(_trim(val) == 'true');
     case 'string':
       return synxString(val);
     case 'random':

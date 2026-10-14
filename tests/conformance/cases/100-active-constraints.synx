@@ -1,0 +1,22 @@
+!active
+title[required] Hello
+missing[required] null
+blank[required] ""
+age[type:int] 42
+age_bad[type:int] forty
+ratio[type:float] 3
+flag[type:bool] yes
+color[enum:red|green|blue] green
+color_bad[enum:red|green|blue] purple
+num_enum[enum:1|2|3] 2
+level[min:1, max:10] 5
+low[min:1, max:10] 0
+high[min:1, max:10] 11
+score[min:0.5] 0.25
+nick[min:3, max:8] ab
+long_nick[min:3, max:8] abcdefghij
+cyr[max:4] мир
+cyr_long[max:4] мирок
+emoji[max:2] 😀😀
+code[pattern:^[a-z]+$] abc
+code_bad[pattern:^[a-z]+$] ABC

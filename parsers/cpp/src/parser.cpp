@@ -1,6 +1,7 @@
 // SYNX parser — converts raw text into a value tree with metadata.
 // Mirrors crates/synx-core/src/parser.rs line-for-line where practical.
 #include "synx/parser.hpp"
+#include "unicode_ws.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -17,41 +18,50 @@ namespace synx {
 
 namespace {
 
+using detail::trim_end_view;
+using detail::trim_view;
+using detail::ws_len_at;
+using detail::ws_len_before;
+
 // ─── small utility helpers ───────────────────────────────────────────────────
 
 inline bool is_space(char c) noexcept { return c == ' ' || c == '\t'; }
-
-inline std::string_view trim_view(std::string_view s) noexcept {
-    size_t start = 0;
-    while (start < s.size() && (s[start] == ' ' || s[start] == '\t' || s[start] == '\r')) {
-        ++start;
-    }
-    size_t end = s.size();
-    while (end > start && (s[end - 1] == ' ' || s[end - 1] == '\t' || s[end - 1] == '\r')) {
-        --end;
-    }
-    return s.substr(start, end - start);
-}
-
-inline std::string_view trim_end_view(std::string_view s) noexcept {
-    size_t end = s.size();
-    while (end > 0 && (s[end - 1] == ' ' || s[end - 1] == '\t' || s[end - 1] == '\r')) {
-        --end;
-    }
-    return s.substr(0, end);
-}
 
 inline bool starts_with(std::string_view s, std::string_view prefix) noexcept {
     return s.size() >= prefix.size() && std::memcmp(s.data(), prefix.data(), prefix.size()) == 0;
 }
 
-// Same indent-count semantics as Rust `(raw.len() - raw.trim_start().len()) as i32`.
+// Same indent-count semantics as Rust `(raw.len() - raw.trim_start().len()) as i32`:
+// bytes of leading Unicode whitespace.
 inline int indent_of(std::string_view raw) noexcept {
     size_t pos = 0;
-    while (pos < raw.size() && (raw[pos] == ' ' || raw[pos] == '\t')) {
-        ++pos;
+    while (pos < raw.size()) {
+        size_t n = ws_len_at(raw, pos);
+        if (n == 0) break;
+        pos += n;
     }
     return static_cast<int>(pos);
+}
+
+// Byte offset of the first character at or past `strip` bytes of leading
+// whitespace; always a character boundary (a multi-byte indent character must
+// not be cut in half). Rust `strip_boundary`.
+inline size_t strip_boundary(std::string_view s, size_t strip) noexcept {
+    size_t off = 0;
+    while (off < strip && off < s.size()) {
+        size_t n = ws_len_at(s, off);
+        if (n == 0) break;
+        off += n;
+    }
+    return off;
+}
+
+// Longest prefix of `s` that fits in `limit` bytes without splitting a character.
+inline size_t utf8_prefix_len(std::string_view s, size_t limit) noexcept {
+    if (s.size() <= limit) return s.size();
+    size_t end = limit;
+    while (end > 0 && (static_cast<unsigned char>(s[end]) & 0xC0) == 0x80) --end;
+    return end;
 }
 
 // Strip trailing ` //` or ` #` inline comments. Same behaviour as parser.rs `strip_comment`.
@@ -551,6 +561,14 @@ inline std::string_view line_view(std::string_view text,
 // ─── public API ─────────────────────────────────────────────────────────────
 
 std::string_view clamp_synx_text(std::string_view text) noexcept {
+    // A single leading U+FEFF is dropped first (SYNX §2.1; §6 matches directives
+    // with a leading BOM ignored). It is not Unicode whitespace, so trimming
+    // alone would leave the BOM bytes + `!active` as a key and never enter Active mode.
+    if (text.size() >= 3 && static_cast<unsigned char>(text[0]) == 0xEF
+        && static_cast<unsigned char>(text[1]) == 0xBB
+        && static_cast<unsigned char>(text[2]) == 0xBF) {
+        text.remove_prefix(3);
+    }
     if (text.size() <= kMaxSynxInputBytes) {
         return text;
     }
@@ -615,6 +633,48 @@ ParseResult parse(std::string_view text) {
     while (i < line_count) {
         std::string_view raw = line_view(text, line_starts, i, total);
         std::string_view t = trim_view(raw);
+
+        // A blank line is never structural and never body (§8.4.1).
+        if (t.empty()) { ++i; continue; }
+
+        int indent = indent_of(raw);
+
+        // Continue multiline block. Runs before every line-class rule below on
+        // purpose: a `|` / `|+` body is raw text (§8.4.1), so `#`, `//`, `###`
+        // and `!…` are ordinary content there.
+        if (block.has_value()) {
+            if (indent > block->indent) {
+                if (block->content.size() < kMaxMultilineBlockBytes) {
+                    if (!block->content.empty()) {
+                        block->content.push_back('\n');
+                    }
+                    size_t room = kMaxMultilineBlockBytes - block->content.size();
+                    std::string_view slice;
+                    if (block->preserve_indent) {
+                        // `|+` (SYNX 3.7): lock the base indent to the first
+                        // non-empty continuation line, then strip exactly that
+                        // many leading whitespace bytes from each subsequent
+                        // line, never cutting inside a character. See spec §8.4.1.
+                        if (block->base_indent < 0) {
+                            block->base_indent = indent;
+                        }
+                        size_t strip = static_cast<size_t>(std::min(block->base_indent, indent));
+                        // Trim trailing whitespace but keep indentation beyond `strip`.
+                        std::string_view raw_trim = trim_end_view(raw);
+                        size_t cut = strip_boundary(raw_trim, strip);
+                        slice = cut < raw_trim.size() ? raw_trim.substr(cut) : std::string_view{};
+                    } else {
+                        slice = t;
+                    }
+                    size_t n = utf8_prefix_len(slice, room);
+                    block->content.append(slice.data(), n);
+                }
+                ++i; continue;
+            }
+            insert_value(root, stack, block->stack_idx, block->key,
+                         Value::make_string(std::move(block->content)));
+            block.reset();
+        }
 
         // Directives
         if (t == "!active") { result.mode = Mode::Active; ++i; continue; }
@@ -682,54 +742,7 @@ ParseResult parse(std::string_view text) {
         if (t == "###") { in_block_comment = !in_block_comment; ++i; continue; }
         if (in_block_comment) { ++i; continue; }
 
-        if (t.empty() || t[0] == '#' || starts_with(t, "//")) { ++i; continue; }
-
-        int indent = indent_of(raw);
-
-        // Continue multiline block
-        if (block.has_value()) {
-            if (indent > block->indent) {
-                if (block->content.size() < kMaxMultilineBlockBytes) {
-                    if (!block->content.empty()) {
-                        block->content.push_back('\n');
-                    }
-                    size_t room = kMaxMultilineBlockBytes - block->content.size();
-                    std::string_view slice;
-                    std::string strip_buf;
-                    if (block->preserve_indent) {
-                        // `|+` (SYNX 3.7): lock the base indent to the first
-                        // non-empty continuation line, then strip exactly that
-                        // many leading whitespace bytes from each subsequent
-                        // line. See spec §8.4.1.
-                        if (block->base_indent < 0) {
-                            block->base_indent = indent;
-                        }
-                        int strip = std::min(block->base_indent, indent);
-                        // `raw` is the original line; trim trailing whitespace
-                        // but keep leading indentation beyond `strip`.
-                        std::string_view raw_trim = raw;
-                        while (!raw_trim.empty()
-                               && (raw_trim.back() == ' '  || raw_trim.back() == '\t'
-                                || raw_trim.back() == '\r' || raw_trim.back() == '\n')) {
-                            raw_trim.remove_suffix(1);
-                        }
-                        if (static_cast<size_t>(strip) < raw_trim.size()) {
-                            slice = raw_trim.substr(strip);
-                        } else {
-                            slice = std::string_view{};
-                        }
-                    } else {
-                        slice = t;
-                    }
-                    size_t n = std::min(slice.size(), room);
-                    block->content.append(slice.data(), n);
-                }
-                ++i; continue;
-            }
-            insert_value(root, stack, block->stack_idx, block->key,
-                         Value::make_string(std::move(block->content)));
-            block.reset();
-        }
+        if (t[0] == '#' || starts_with(t, "//")) { ++i; continue; }
 
         // Continue list items
         if (starts_with(t, "- ")) {

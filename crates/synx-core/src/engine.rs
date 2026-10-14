@@ -427,7 +427,7 @@ fn apply_markers(
                 std::env::var(var_name).ok()
             };
 
-            let force_string = meta.type_hint.as_deref() == Some("string");
+            let force_string = wants_string(meta);
             let default_idx = markers.iter().position(|m| m == "default");
             if let Some(val) = env_val.filter(|v| !v.is_empty()) {
                 let resolved = if force_string {
@@ -879,7 +879,7 @@ fn apply_markers(
             let di = markers.iter().position(|m| m == "default").unwrap();
             if markers.len() > di + 1 {
                 let fallback = markers[di + 1..].join(":");
-                let resolved = if meta.type_hint.as_deref() == Some("string") {
+                let resolved = if wants_string(meta) {
                     Value::String(fallback)
                 } else {
                     cast_primitive(&fallback)
@@ -1249,7 +1249,8 @@ fn validate_constraints(map: &mut HashMap<String, Value>, key: &str, c: &Constra
             "int"    => matches!(val, Value::Int(_)),
             "float"  => matches!(val, Value::Float(_) | Value::Int(_)),
             "bool"   => matches!(val, Value::Bool(_)),
-            "string" => matches!(val, Value::String(_)),
+            // A `:secret` is a masked string: `[type:string]:secret:env` must accept it.
+            "string" => matches!(val, Value::String(_) | Value::Secret(_)),
             _        => true,
         };
         if !ok {
@@ -1277,11 +1278,14 @@ fn validate_constraints(map: &mut HashMap<String, Value>, key: &str, c: &Constra
         }
     }
 
-    // min / max  (numbers: value range; strings: length range)
+    // min / max  (numbers: value range; strings: length range).
+    // A string's length is its count of Unicode scalar values: until 3.7.4 it
+    // was UTF-8 bytes, so `[max:4]` rejected the three-letter `мир` (6 bytes)
+    // while TypeScript accepted it.
     let num = match &val {
         Value::Int(n)    => Some(*n as f64),
         Value::Float(f)  => Some(*f),
-        Value::String(s) if c.min.is_some() || c.max.is_some() => Some(s.len() as f64),
+        Value::String(s) if c.min.is_some() || c.max.is_some() => Some(s.chars().count() as f64),
         _                => None,
     };
     if let Some(n) = num {
@@ -1306,21 +1310,77 @@ fn validate_constraints(map: &mut HashMap<String, Value>, key: &str, c: &Constra
     // pattern (regex match — bounded length to avoid pathological compilation costs)
     if let Some(ref pat) = c.pattern {
         if pat.len() <= 256 {
+            // Invalid and backtracking-prone patterns are skipped silently, as in
+            // every other implementation.
             if let Value::String(ref s) = val {
-                match regex::Regex::new(pat) {
-                    Ok(re) if !re.is_match(s) => {
-                        map.insert(key.to_string(), Value::String(
-                            format!("CONSTRAINT_ERR: '{}' does not match pattern /{}/", key, pat),
-                        ));
-                        return;
+                if !has_nested_quantifier(pat) {
+                    if let Ok(re) = regex::Regex::new(pat) {
+                        if !re.is_match(s) {
+                            map.insert(key.to_string(), Value::String(
+                                format!("CONSTRAINT_ERR: '{}' does not match pattern /{}/", key, pat),
+                            ));
+                            return;
+                        }
                     }
-                    Ok(_) => {}
-                    // Invalid regex — skip silently, matching the JS engine.
-                    Err(_) => {}
                 }
             }
         }
     }
+}
+
+/// Does the pattern repeat something that already repeats — the `(a+)+`
+/// shape behind exponential backtracking?
+///
+/// The `regex` crate is linear and would run such a pattern safely, but every
+/// backtracking implementation (TypeScript, Java, .NET, Dart, Swift, C++)
+/// must refuse it, so the reference refuses it too: a `[pattern]` constraint
+/// with this shape is skipped everywhere, and the projection stays identical.
+/// Mirrors `hasNestedQuantifier` in `packages/synx-js/src/synxl.ts`.
+pub(crate) fn has_nested_quantifier(pattern: &str) -> bool {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut opens: Vec<usize> = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => i += 1,
+            '[' => {
+                // A character class is skipped wholesale; quantifiers in it are literal.
+                while i < chars.len() && chars[i] != ']' {
+                    if chars[i] == '\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+            }
+            '(' => opens.push(i),
+            ')' => {
+                if let Some(start) = opens.pop() {
+                    if matches!(chars.get(i + 1), Some('*' | '+' | '{')) {
+                        let mut body = String::new();
+                        let mut j = start + 1;
+                        while j < i {
+                            if chars[j] == '\\' {
+                                j += 2;
+                                continue;
+                            }
+                            body.push(chars[j]);
+                            j += 1;
+                        }
+                        let bytes = body.as_bytes();
+                        let quantified = bytes.iter().enumerate().any(|(k, &b)| {
+                            b == b'*' || b == b'+' || (b == b'{' && bytes.get(k + 1).is_some_and(u8::is_ascii_digit))
+                        });
+                        if quantified {
+                            return true;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
 }
 
 // ─── New-marker helpers ───────────────────────────────────
@@ -1596,6 +1656,21 @@ fn stringify_value(value: &Value, indent: usize) -> String {
         }
         _ => format!("{}{}\n", spaces, value_to_string(value)),
     }
+}
+
+/// Whether text taken from outside the document (`:env`, `:default`) must stay
+/// a string instead of going through [`cast_primitive`]. `(string)` always
+/// asked for that; since 3.7.4 so does `[type:string]` — before, the cast ran
+/// first and the constraint then rejected its own declared type, so a numeric
+/// id (`1550184245153112174`) or a zero-padded code (`007`) could not be read
+/// from the environment as text at all.
+fn wants_string(meta: &Meta) -> bool {
+    meta.type_hint.as_deref() == Some("string")
+        || meta
+            .constraints
+            .as_ref()
+            .and_then(|c| c.type_name.as_deref())
+            == Some("string")
 }
 
 pub(crate) fn cast_primitive(val: &str) -> Value {
@@ -2463,6 +2538,48 @@ mod tests {
         assert_eq!(steel["weight"], Value::Int(25));
         assert_eq!(steel["stackable"], Value::Bool(true));
         assert_eq!(steel["material"], Value::String("metal".into()));
+    }
+
+    fn resolve_env(text: &str) -> std::collections::HashMap<String, Value> {
+        let env: std::collections::HashMap<String, String> = [
+            ("SNOW", "1550184245153112174"),
+            ("ZIP", "007"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let mut r = parse(text);
+        resolve(&mut r, &Options { env: Some(env), ..Default::default() });
+        r.root.as_object().unwrap().clone()
+    }
+
+    // 3.7.4: `[type:string]` keeps env text a string. Before, the value was cast
+    // first and the constraint then rejected its own declared type.
+    #[test]
+    fn test_env_type_string_constraint_keeps_text() {
+        let map = resolve_env(
+            "!active\nid[type:string]:env SNOW\nzip[type:string]:env ZIP\nfallback[type:string]:env:default:0042 MISSING\nplain:env ZIP\n",
+        );
+        assert_eq!(map["id"], Value::String("1550184245153112174".into()));
+        assert_eq!(map["zip"], Value::String("007".into()));
+        assert_eq!(map["fallback"], Value::String("0042".into()));
+        assert_eq!(map["plain"], Value::Int(7));
+    }
+
+    #[test]
+    fn test_string_length_constraint_counts_characters() {
+        let map = resolve_env("!active\nshort[max:4] мир\nlong[max:4] мирок\n");
+        assert_eq!(map["short"], Value::String("мир".into()));
+        assert_eq!(
+            map["long"],
+            Value::String("CONSTRAINT_ERR: 'long' value 5 exceeds max 4".into())
+        );
+    }
+
+    #[test]
+    fn test_type_string_constraint_accepts_secret() {
+        let map = resolve_env("!active\ntoken[type:string]:secret:env SNOW\n");
+        assert_eq!(map["token"], Value::Secret("1550184245153112174".into()));
     }
 
     #[test]

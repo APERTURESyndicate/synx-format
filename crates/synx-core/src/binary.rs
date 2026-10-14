@@ -42,11 +42,13 @@ const FORMAT_VERSION: u8 = 1;
 /// 16 MiB `.synx` source (SYNX §3) produces while refusing the pathological case.
 const MAX_DECODED_BYTES: usize = 256 * 1024 * 1024;
 
-/// Depth limit for the recursive value decoder. Mirrors the parser's
-/// `MAX_PARSE_NESTING_DEPTH` headroom (a hostile `.synxb` can nest ARRAY/OBJECT
-/// tags arbitrarily even though `parse` caps text at 128) so decoding a crafted
-/// container cannot overflow the stack.
-const MAX_DECODE_DEPTH: usize = 1024;
+/// Depth limit for the recursive value decoder. A hostile `.synxb` can nest
+/// ARRAY/OBJECT tags arbitrarily even though `parse` caps text at 128, so the
+/// decoder refuses anything deeper than twice that. 3.7.3 set 1024, which is
+/// itself deep enough to overflow a 2 MiB test thread in a Windows debug build
+/// (and sits close to the 1 MiB main-thread stack there): the guard overflowed
+/// the stack it was written to protect.
+const MAX_DECODE_DEPTH: usize = 256;
 
 /// Bound a `Vec::with_capacity` request taken from untrusted input.
 ///
@@ -1073,6 +1075,26 @@ mod tests {
         let deflated = miniz_oxide::deflate::compress_to_vec(&payload, 9);
         let framed = wrap_synxb(payload.len() as u32, 0, &deflated);
         assert!(decompile(&framed).is_err());
+    }
+
+    #[test]
+    fn test_decompile_parser_depth_round_trips() {
+        // The deepest tree `parse` can produce must still decode.
+        fn put(depth: usize, out: &mut Vec<u8>) {
+            if depth == 0 {
+                out.push(TAG_NULL);
+                return;
+            }
+            out.push(TAG_ARRAY);
+            encode_varint(out, 1);
+            put(depth - 1, out);
+        }
+        let mut payload = Vec::new();
+        encode_varint(&mut payload, 0); // empty string table
+        put(128, &mut payload);
+        let deflated = miniz_oxide::deflate::compress_to_vec(&payload, 9);
+        let framed = wrap_synxb(payload.len() as u32, 0, &deflated);
+        assert!(decompile(&framed).is_ok());
     }
 
     #[test]

@@ -179,13 +179,23 @@ describe('Security — :calc Safety', () => {
 
 describe('Security — Type Casting', () => {
   test('(int) on a non-integer yields 0, as the reference engine does', () => {
-    const data = Synx.parse('value (int)42.99') as any;
+    const data = Synx.parse('value(int) 42.99') as any;
     expect(data.value).toBe(0);
   });
 
   test('(bool) on "false" string returns false', () => {
-    const data = Synx.parse('flag (bool)false') as any;
+    const data = Synx.parse('flag(bool) false') as any;
     expect(data.flag).toBe(false);
+  });
+
+  // 3.7.4: a hint only lives on the key line. A value that merely begins with
+  // `(word)` is text — it used to be taken for a cast (`(aa)` → "").
+  test('a value starting with (word) is plain text', () => {
+    const data = Synx.parse(['a (aa)', 'b (int)5', 'c (random:bool)', 'd(int)', '  child 1'].join('\n')) as any;
+    expect(data.a).toBe('(aa)');
+    expect(data.b).toBe('(int)5');
+    expect(data.c).toBe('(random:bool)');
+    expect(data.d).toEqual({ child: 1 });
   });
 
   // SYNX §8.3 automatic casting strips the surrounding quotes and stops: the

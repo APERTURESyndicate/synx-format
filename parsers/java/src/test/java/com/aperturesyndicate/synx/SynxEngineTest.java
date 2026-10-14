@@ -14,7 +14,7 @@ class SynxEngineTest {
         SynxParseResult r = SynxParser.parse("!active\nport:env:default:3000 APP_PORT\n");
         SynxEngine.resolve(r, opts);
         SynxObject o = ((SynxValue.Obj) r.root).map();
-        assertEquals(SynxValue.ofString("9090"), o.get("port"));
+        assertEquals(SynxValue.ofInt(9090), o.get("port"));
     }
 
     @Test
@@ -24,7 +24,7 @@ class SynxEngineTest {
         SynxParseResult r = SynxParser.parse("!active\nport:env:default:3000 NOT_SET\n");
         SynxEngine.resolve(r, opts);
         SynxObject o = ((SynxValue.Obj) r.root).map();
-        assertEquals(SynxValue.ofString("3000"), o.get("port"));
+        assertEquals(SynxValue.ofInt(3000), o.get("port"));
     }
 
     @Test

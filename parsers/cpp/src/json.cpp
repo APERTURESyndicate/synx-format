@@ -5,6 +5,8 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -39,24 +41,59 @@ void write_int(std::string& out, int64_t n) {
     out.append(buf);
 }
 
+// Shortest decimal digits that round-trip `f` (finite, non-zero, positive) and the
+// decimal exponent `kk` such that value = 0.<digits> * 10^kk.
+void shortest_digits(double f, std::string& digits, int& kk) {
+    char buf[40];
+    for (int prec = 1; prec <= 17; ++prec) {
+        std::snprintf(buf, sizeof(buf), "%.*e", prec - 1, f);
+        if (std::strtod(buf, nullptr) == f || prec == 17) break;
+    }
+    // buf is `d[.ddd]e[+-]XX`.
+    digits.clear();
+    const char* e = std::strchr(buf, 'e');
+    for (const char* c = buf; c != e; ++c) {
+        if (*c >= '0' && *c <= '9') digits.push_back(*c);
+    }
+    int exp10 = std::atoi(e + 1);
+    while (digits.size() > 1 && digits.back() == '0') digits.pop_back();
+    kk = exp10 + 1;
+}
+
+// Positional notation of `digits`/`kk`, always with a `.`.
+std::string plain_digits(const std::string& digits, int kk) {
+    int n = static_cast<int>(digits.size());
+    if (kk <= 0) return "0." + std::string(static_cast<size_t>(-kk), '0') + digits;
+    if (n <= kk) return digits + std::string(static_cast<size_t>(kk - n), '0') + ".0";
+    return digits.substr(0, static_cast<size_t>(kk)) + "." + digits.substr(static_cast<size_t>(kk));
+}
+
+// Layout of Rust's `ryu::Buffer::format`: plain notation for 1e-5 <= |x| < 1e16
+// (always with a `.`), else `d.ddde<exp>` with no `+` and no exponent padding.
 void write_float(std::string& out, double f) {
     if (std::isnan(f) || std::isinf(f)) {
         out.append("null"); // JSON does not allow NaN/Inf; emit null for safety
         return;
     }
-    char buf[64];
-    // 17 significant digits — round-trip safe for IEEE 754 doubles.
-    std::snprintf(buf, sizeof(buf), "%.17g", f);
-    out.append(buf);
-    // Round-trip parity with Rust ryu: ensure a decimal point so JSON parsers
-    // round-trip back to a Float, not an Int.
-    bool has_marker = false;
-    for (char c : std::string_view(buf)) {
-        if (c == '.' || c == 'e' || c == 'E') { has_marker = true; break; }
+    if (f == 0.0) {
+        out.append(std::signbit(f) ? "-0.0" : "0.0");
+        return;
     }
-    if (!has_marker) {
-        out.append(".0");
+    std::string digits;
+    int kk = 0;
+    shortest_digits(std::fabs(f), digits, kk);
+    if (f < 0) out.push_back('-');
+    if (kk > -5 && kk <= 16) {
+        out.append(plain_digits(digits, kk));
+        return;
     }
+    out.push_back(digits[0]);
+    if (digits.size() > 1) {
+        out.push_back('.');
+        out.append(digits, 1, std::string::npos);
+    }
+    out.push_back('e');
+    out.append(std::to_string(kk - 1));
 }
 
 void write_value(std::string& out, const Value& v, size_t depth) {
@@ -121,6 +158,15 @@ void write_value(std::string& out, const Value& v, size_t depth) {
 }
 
 } // namespace
+
+std::string float_to_display_string(double f) {
+    if (std::isnan(f) || std::isinf(f)) return "null";
+    if (f == 0.0) return std::signbit(f) ? "-0.0" : "0.0";
+    std::string digits;
+    int kk = 0;
+    shortest_digits(std::fabs(f), digits, kk);
+    return (f < 0 ? "-" : "") + plain_digits(digits, kk);
+}
 
 void write_json(std::string& out, const Value& val) {
     write_value(out, val, 0);

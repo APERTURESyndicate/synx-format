@@ -814,7 +814,8 @@ class Synx {
       return strings[idx];
     };
     let depth = 0;
-    const MAX_DEPTH = 1024;
+    // Twice the parser's 128-level cap; matches MAX_DECODE_DEPTH in synx-core.
+    const MAX_DEPTH = 256;
     // Value tree
     function readValue(): unknown {
       if (++depth > MAX_DEPTH) throw new SynxError('.synxb nesting too deep');
@@ -1471,17 +1472,22 @@ interface SynxSchema {
 
 export default Synx;
 export { Synx };
-module.exports = Synx;
-module.exports.default = Synx;
-module.exports.Synx = Synx;
-module.exports.SynxError = SynxError;
-// SYNXL: `module.exports` is the Synx class, so every SYNXL static above is
-// already reachable as a named CommonJS export. Only the helpers and limits
-// that have no static counterpart need re-attaching here.
-module.exports.splitRecordLine = synxlSplitRecordLine;
-module.exports.utf8Length = synxlUtf8Length;
-module.exports.MAX_SYNXL_RECORD_BYTES = MAX_SYNXL_RECORD_BYTES;
-module.exports.MAX_SYNXL_FIELDS = MAX_SYNXL_FIELDS;
-module.exports.MAX_SYNXL_FIELD_NAME_BYTES = MAX_SYNXL_FIELD_NAME_BYTES;
-module.exports.MAX_SYNXL_FIELD_LISTS = MAX_SYNXL_FIELD_LISTS;
-module.exports.MAX_SYNXL_RECORDS = MAX_SYNXL_RECORDS;
+// CommonJS consumers get the class itself as `module.exports`. When the source is
+// loaded as an ES module (Bun or a bundler reading src/) `module` does not exist,
+// and an unguarded assignment threw `ReferenceError` on import.
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = Synx;
+  module.exports.default = Synx;
+  module.exports.Synx = Synx;
+  module.exports.SynxError = SynxError;
+  // SYNXL: `module.exports` is the Synx class, so every SYNXL static above is
+  // already reachable as a named CommonJS export. Only the helpers and limits
+  // that have no static counterpart need re-attaching here.
+  module.exports.splitRecordLine = synxlSplitRecordLine;
+  module.exports.utf8Length = synxlUtf8Length;
+  module.exports.MAX_SYNXL_RECORD_BYTES = MAX_SYNXL_RECORD_BYTES;
+  module.exports.MAX_SYNXL_FIELDS = MAX_SYNXL_FIELDS;
+  module.exports.MAX_SYNXL_FIELD_NAME_BYTES = MAX_SYNXL_FIELD_NAME_BYTES;
+  module.exports.MAX_SYNXL_FIELD_LISTS = MAX_SYNXL_FIELD_LISTS;
+  module.exports.MAX_SYNXL_RECORDS = MAX_SYNXL_RECORDS;
+}

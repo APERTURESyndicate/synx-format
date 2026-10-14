@@ -1,0 +1,6 @@
+!active
+nested[pattern:^(a+)+$] aaaa!
+nested_counted[pattern:^(ab){2}$] abab!
+flat[pattern:^[a+]+$] a+a
+flat_bad[pattern:^[a+]+$] b
+escaped[pattern:^\(a+\)+$] (aa)

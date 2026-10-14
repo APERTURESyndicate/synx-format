@@ -5,9 +5,10 @@
  * in a parsed SYNX object tree. Only runs in !active mode.
  */
 
-import type { SynxObject, SynxValue, SynxMetaMap, SynxOptions, SynxInclude } from './types';
+import type { SynxObject, SynxValue, SynxConstraints, SynxMeta, SynxMetaMap, SynxOptions, SynxInclude } from './types';
 import { safeCalc } from './calc';
-import { parseData } from './parser';
+import { parseData, parseI64 } from './parser';
+import { matchesLinear } from './synxl';
 
 // Lazy-loaded Node.js modules (not available in browser)
 let fs: typeof import('fs') | undefined;
@@ -128,9 +129,11 @@ export function resolve(
 ): SynxObject {
   const isTop = !root;
   let typeRegistry: Map<string, string> | undefined;
+  let constraintRegistry: Map<string, SynxConstraints> | undefined;
   if (!root) {
     root = obj;
     typeRegistry = buildTypeRegistry(obj);
+    constraintRegistry = buildConstraintRegistry(obj);
     // ── :inherit pre-pass (only at root level) ──
     applyInheritance(obj);
     // Remove private blocks (keys starting with _)
@@ -258,7 +261,7 @@ export function resolve(
       const envVal = envSource[varName];
 
       const defaultIdx = markers.indexOf('default');
-      const forceString = metaMap[key]?.typeHint === 'string';
+      const forceString = wantsString(metaMap[key]);
       if (envVal !== undefined && envVal !== '') {
         obj[key] = forceString ? envVal : castPrimitive(envVal);
       } else if (defaultIdx !== -1 && markers.length > defaultIdx + 1) {
@@ -477,7 +480,7 @@ export function resolve(
         const defaultIdx = markers.indexOf('default');
         if (defaultIdx !== -1 && markers.length > defaultIdx + 1) {
           const fallback = markers.slice(defaultIdx + 1).join(':');
-          const forceStr = metaMap[key]?.typeHint === 'string';
+          const forceStr = wantsString(metaMap[key]);
           obj[key] = forceStr ? fallback : castPrimitive(fallback);
         }
       }
@@ -702,8 +705,13 @@ export function resolve(
     }
   }
 
-  // spec: reference engine runs a final global pass by field name after
-  // constraints — `(type)` hints are checked against the resolved value.
+  // spec: the reference engine then checks every field against the merged
+  // `[...]` constraints declared for its name anywhere in the document
+  // (`validate_field_constraints`), and finally `(type)` hints against the
+  // resolved value. The constraint pass was missing here until 3.7.4.
+  if (isTop && constraintRegistry && constraintRegistry.size > 0) {
+    validateFieldConstraints(obj, constraintRegistry);
+  }
   if (isTop && typeRegistry && typeRegistry.size > 0) validateFieldTypes(obj, typeRegistry);
 
   return obj;
@@ -872,14 +880,71 @@ function buildTypeRegistry(obj: SynxObject, registry = new Map<string, string>()
   return registry;
 }
 
+// ─── Global constraint validation (mirrors synx-core build_constraint_registry / validate_field_constraints) ───
+
+function buildConstraintRegistry(
+  obj: SynxObject,
+  registry = new Map<string, SynxConstraints>(),
+  depth = 0,
+): Map<string, SynxConstraints> {
+  if (depth > MAX_RESOLVE_DEPTH) return registry;
+  const metaMap: SynxMetaMap | undefined = (obj as any).__synx;
+  if (metaMap) {
+    for (const key of Object.keys(metaMap)) {
+      const c = metaMap[key]?.constraints;
+      if (!c) continue;
+      const existing = registry.get(key);
+      registry.set(key, existing ? mergeConstraints(existing, c) : { ...c });
+    }
+  }
+  for (const key of Object.keys(obj)) {
+    const v = obj[key];
+    if (Array.isArray(v)) {
+      for (const item of v) if (isPlainObject(item)) buildConstraintRegistry(item as SynxObject, registry, depth + 1);
+    } else if (isPlainObject(v)) buildConstraintRegistry(v as SynxObject, registry, depth + 1);
+  }
+  return registry;
+}
+
+/** The stricter of two declarations for one field name, as `merge_constraints` in synx-core. */
+function mergeConstraints(base: SynxConstraints, incoming: SynxConstraints): SynxConstraints {
+  const out: SynxConstraints = { ...base };
+  if (incoming.required) out.required = true;
+  if (incoming.readonly) out.readonly = true;
+  if (incoming.min !== undefined) out.min = base.min === undefined ? incoming.min : Math.max(base.min, incoming.min);
+  if (incoming.max !== undefined) out.max = base.max === undefined ? incoming.max : Math.min(base.max, incoming.max);
+  if (out.type === undefined) out.type = incoming.type;
+  if (out.pattern === undefined) out.pattern = incoming.pattern;
+  if (out.enum === undefined) out.enum = incoming.enum;
+  return out;
+}
+
+function validateFieldConstraints(obj: SynxObject, registry: Map<string, SynxConstraints>, depth = 0): void {
+  if (depth > MAX_RESOLVE_DEPTH) return;
+  for (const key of Object.keys(obj)) {
+    if (key === '__synx') continue;
+    const c = registry.get(key);
+    const current = obj[key];
+    // A value the per-key pass already replaced is not re-validated: the
+    // error string's own length would be checked against min/max.
+    const errored = typeof current === 'string'
+      && (current.startsWith('CONSTRAINT_ERR:') || current.startsWith('TYPE_ERR:'));
+    if (c && !errored) validateConstraints(obj, key, c);
+    const child = obj[key];
+    if (Array.isArray(child)) {
+      for (const item of child) if (isPlainObject(item)) validateFieldConstraints(item as SynxObject, registry, depth + 1);
+    } else if (isPlainObject(child)) validateFieldConstraints(child as SynxObject, registry, depth + 1);
+  }
+}
+
 function isPlainObject(v: unknown): boolean {
   return typeof v === 'object' && v !== null && !Array.isArray(v) && !(v instanceof SynxSecret);
 }
 
 function valueMatchesType(v: unknown, t: string): boolean {
   switch (t) {
-    case 'int':    return typeof v === 'number' && Number.isInteger(v);
-    case 'float':  return typeof v === 'number';
+    case 'int':    return (typeof v === 'number' && Number.isInteger(v)) || typeof v === 'bigint';
+    case 'float':  return typeof v === 'number' || typeof v === 'bigint';
     case 'bool':   return typeof v === 'boolean';
     case 'string': return typeof v === 'string' || v instanceof SynxSecret;
     case 'array':  return Array.isArray(v);
@@ -893,6 +958,7 @@ function valueTypeName(v: unknown): string {
   if (v instanceof SynxSecret) return 'secret';
   if (Array.isArray(v)) return 'array';
   if (typeof v === 'number') return Number.isInteger(v) ? 'int' : 'float';
+  if (typeof v === 'bigint') return 'int';
   if (typeof v === 'boolean') return 'bool';
   if (typeof v === 'string') return 'string';
   return 'object';
@@ -936,10 +1002,11 @@ function validateConstraints(obj: SynxObject, key: string, c: import('./types').
   if (c.type) {
     const ok = (() => {
       switch (c.type) {
-        case 'int':    return typeof val === 'number' && Number.isInteger(val);
-        case 'float':  return typeof val === 'number';
+        case 'int':    return (typeof val === 'number' && Number.isInteger(val)) || typeof val === 'bigint';
+        case 'float':  return typeof val === 'number' || typeof val === 'bigint';
         case 'bool':   return typeof val === 'boolean';
-        case 'string': return typeof val === 'string';
+        // A `:secret` is a masked string: `[type:string]:secret:env` must accept it.
+        case 'string': return typeof val === 'string' || val instanceof SynxSecret;
         default:       return true;
       }
     })();
@@ -958,10 +1025,12 @@ function validateConstraints(obj: SynxObject, key: string, c: import('./types').
     }
   }
 
-  // min / max  (numbers: value range; strings: length range)
+  // min / max  (numbers: value range; strings: length in Unicode scalar
+  // values, as synx-core — `val.length` counted UTF-16 units).
   const n = typeof val === 'number' ? val
+          : typeof val === 'bigint' ? Number(val)
           : typeof val === 'string' && (c.min !== undefined || c.max !== undefined)
-            ? val.length : null;
+            ? [...val].length : null;
   if (n !== null) {
     if (c.min !== undefined && n < c.min) {
       obj[key] = `CONSTRAINT_ERR: '${key}' value ${n} is below min ${c.min}`;
@@ -973,15 +1042,15 @@ function validateConstraints(obj: SynxObject, key: string, c: import('./types').
     }
   }
 
-  // pattern (regex match — reject pathological patterns to prevent ReDoS)
-  if (c.pattern && typeof val === 'string') {
-    if (c.pattern.length > 128) return;
-    try {
-      if (!new RegExp(c.pattern).test(val)) {
-        obj[key] = `CONSTRAINT_ERR: '${key}' does not match pattern /${c.pattern}/`;
-        return;
-      }
-    } catch { /* invalid regex — skip silently */ }
+  // pattern — length-capped like synx-core; a pattern that nests one
+  // quantifier inside another (`^(a+)+$`) is refused rather than run, as in
+  // SYNXL since 3.7.2: active mode had no such guard, so the same 88-byte
+  // document that 3.7.2 defused for SYNXL still hung the event loop here.
+  if (c.pattern && typeof val === 'string' && c.pattern.length <= 256) {
+    if (matchesLinear(c.pattern, val) === false) {
+      obj[key] = `CONSTRAINT_ERR: '${key}' does not match pattern /${c.pattern}/`;
+      return;
+    }
   }
 }
 
@@ -1123,12 +1192,43 @@ function stringifyValue(value: unknown, indent: number): string {
   return `${sp}${String(value)}\n`;
 }
 
+/**
+ * Whether text taken from outside the document (`:env`, `:default`) must stay
+ * a string instead of going through `castPrimitive`. `(string)` always asked for
+ * that; since 3.7.4 so does `[type:string]` — before, the cast ran first and the
+ * constraint then rejected its own declared type. Mirrors `wants_string` in
+ * synx-core.
+ */
+function wantsString(meta: SynxMeta | undefined): boolean {
+  return meta?.typeHint === 'string' || meta?.constraints?.type === 'string';
+}
+
+/**
+ * Casts text that came from outside the document (`:env`, `:default`, `:split`).
+ * Mirrors `cast_primitive` in synx-core: surrounding quotes keep the literal,
+ * an integer is an exact i64 (a `bigint` beyond 2^53 — `parseInt` turned a
+ * 19-digit id into a different id), and one that overflows i64 is tried as a
+ * float, like Rust's `parse::<i64>()` then `parse::<f64>()`.
+ */
 function castPrimitive(val: string): SynxValue {
+  if (val.length >= 2) {
+    const first = val[0];
+    const last = val[val.length - 1];
+    if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
+      return val.slice(1, -1);
+    }
+  }
   if (val === 'true') return true;
   if (val === 'false') return false;
   if (val === 'null') return null;
-  if (/^-?\d+$/.test(val)) return parseInt(val, 10);
-  if (/^-?\d+\.\d+$/.test(val)) return parseFloat(val);
+  if (/^[+-]?\d+$/.test(val)) {
+    const int = parseI64(val.startsWith('+') ? val.slice(1) : val);
+    if (int !== null) return int;
+  }
+  if (/^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/.test(val)) {
+    const f = Number(val);
+    if (Number.isFinite(f)) return f;
+  }
   return val;
 }
 

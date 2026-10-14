@@ -29,7 +29,6 @@ As of **April 2026**, **SYNX 3.6** is **frozen** as the canonical interoperabili
 - **[parsers/README.md](parsers/README.md)** — native parser implementations (Rust, TypeScript, C++, Dart, C# / .NET, Go, Java, Swift); FFI bindings are listed separately in [bindings/](bindings/)
 - **[integrations/README.md](integrations/README.md)** — VS Code, Visual Studio, Sublime, Neovim, Godot, MCP, LSP  
 - **[docs/anthropic/claude.md](docs/anthropic/claude.md)** — Claude Desktop (MCP), Anthropic prompt helpers, tokenizer notes  
-- **[docs/dev/plugins-roadmap.md](docs/dev/plugins-roadmap.md)** — planned registry / plugins (**stub only**; not shipped in the engine yet)  
 - **[docs/spec/SYNXL-1-NORMATIVE.md](docs/spec/SYNXL-1-NORMATIVE.md)** — normative spec for **SYNXL** (`.synxl`), the record-stream format; conformance cases in [`tests/conformance-synxl/cases/`](tests/conformance-synxl/cases/)
 
 ---
