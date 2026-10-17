@@ -183,13 +183,15 @@ SYNX_TEST(calc_failures_write_calc_err_into_the_value) {
     EXPECT_EQ(str_at(r.root, "m"), pre + "division by zero");
     EXPECT_EQ(str_at(r.root, "p1"), pre + "missing closing parenthesis");
     EXPECT_EQ(str_at(r.root, "p2"), pre + "unexpected token at position 3");
-    EXPECT_EQ(str_at(r.root, "star"), pre + "unexpected token: Op(42)");
-    EXPECT_EQ(str_at(r.root, "rp"), pre + "unexpected token: RParen");
+    // 3.8.0: the token as written, not Rust's `{:?}` of it.
+    EXPECT_EQ(str_at(r.root, "star"), pre + "unexpected token: '*'");
+    EXPECT_EQ(str_at(r.root, "rp"), pre + "unexpected token: ')'");
     EXPECT_EQ(str_at(r.root, "hole"), pre + "unexpected end of expression");
     EXPECT_EQ(str_at(r.root, "num"), pre + "invalid number: '1.2.3'");
     EXPECT_EQ(str_at(r.root, "op"), pre + "invalid number: '-'");
     EXPECT_EQ(str_at(r.root, "bad"), pre + "unexpected token at position 1");
-    EXPECT_EQ(str_at(r.root, "uni"), pre + "unexpected character: '\xC3\x83' in expression");
+    // 3.8.0: the whole character, not its first byte read as Latin-1.
+    EXPECT_EQ(str_at(r.root, "uni"), pre + "unexpected character: '\xD0\xBC' in expression");
 }
 
 SYNX_TEST(calc_too_long_expression) {

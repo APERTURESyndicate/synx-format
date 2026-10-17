@@ -1,7 +1,7 @@
 # SYNX UE5 plugin template
 
 Drop-in Unreal Engine 5 plugin that exposes the native SYNX parser to C++ and
-Blueprint, with full parity to Rust `synx-core` 3.6.x. **No third-party Rust
+Blueprint, with full parity to Rust `synx-core` 3.8.0. **No third-party Rust
 toolchain or cdylib required.**
 
 ## Layout

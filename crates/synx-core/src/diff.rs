@@ -1,14 +1,13 @@
 //! Structural diff between two SYNX values.
 
-use std::collections::HashMap;
-use crate::Value;
+use crate::{Map, Value};
 
 /// Result of a structural diff between two SYNX objects.
 #[derive(Debug, Clone)]
 pub struct DiffResult {
-    pub added: HashMap<String, Value>,
-    pub removed: HashMap<String, Value>,
-    pub changed: HashMap<String, DiffChange>,
+    pub added: Map,
+    pub removed: Map,
+    pub changed: Map<DiffChange>,
     pub unchanged: Vec<String>,
 }
 
@@ -25,10 +24,10 @@ pub struct DiffChange {
 /// Keys present only in `a` appear in `removed`.
 /// Keys present in both but with different values appear in `changed`.
 /// Keys present in both with equal values appear in `unchanged`.
-pub fn diff(a: &HashMap<String, Value>, b: &HashMap<String, Value>) -> DiffResult {
-    let mut added = HashMap::new();
-    let mut removed = HashMap::new();
-    let mut changed = HashMap::new();
+pub fn diff(a: &Map, b: &Map) -> DiffResult {
+    let mut added = Map::default();
+    let mut removed = Map::default();
+    let mut changed = Map::default();
     let mut unchanged = Vec::new();
 
     for (key, a_val) in a {
@@ -62,14 +61,14 @@ pub fn diff(a: &HashMap<String, Value>, b: &HashMap<String, Value>) -> DiffResul
 ///
 /// Shape: `{ "added": {...}, "removed": {...}, "changed": { key: { "from": ..., "to": ... } }, "unchanged": [...] }`
 pub fn diff_to_value(d: &DiffResult) -> Value {
-    let mut root = HashMap::new();
+    let mut root = Map::default();
 
     root.insert("added".into(), Value::Object(d.added.clone()));
     root.insert("removed".into(), Value::Object(d.removed.clone()));
 
-    let mut changed_map = HashMap::new();
+    let mut changed_map = Map::default();
     for (k, c) in &d.changed {
-        let mut entry = HashMap::new();
+        let mut entry = Map::default();
         entry.insert("from".into(), c.from.clone());
         entry.insert("to".into(), c.to.clone());
         changed_map.insert(k.clone(), Value::Object(entry));
@@ -104,7 +103,7 @@ fn deep_equal(a: &Value, b: &Value) -> bool {
 mod tests {
     use super::*;
 
-    fn obj(pairs: Vec<(&str, Value)>) -> HashMap<String, Value> {
+    fn obj(pairs: Vec<(&str, Value)>) -> Map {
         pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
     }
 

@@ -5,31 +5,65 @@ namespace Synx;
 
 public static partial class SynxEngine
 {
-    private static void ApplyMarkers(
-        Dictionary<string, SynxValue> map,
-        string key,
-        SynxMeta meta,
-        SynxValue rootPtr,
-        SynxOptions options,
-        string path,
-        Dictionary<string, Dictionary<string, SynxMeta>> metadata,
-        Dictionary<string, SynxValue> includes)
+    /// <summary>Bits for the built-in markers <see cref="ApplyMarkers"/> dispatches on.</summary>
+    [Flags]
+    private enum Mk
+    {
+        None = 0,
+        Alias = 1 << 0, Calc = 1 << 1, Clamp = 1 << 2, Default = 1 << 3, Env = 1 << 4,
+        Fallback = 1 << 5, Format = 1 << 6, Geo = 1 << 7, I18n = 1 << 8, Import = 1 << 9,
+        Include = 1 << 10, Join = 1 << 11, Map = 1 << 12, Once = 1 << 13, Prompt = 1 << 14,
+        Random = 1 << 15, Ref = 1 << 16, Replace = 1 << 17, Round = 1 << 18, Secret = 1 << 19,
+        Sort = 1 << 20, Spam = 1 << 21, Split = 1 << 22, Sum = 1 << 23, Unique = 1 << 24,
+        Version = 1 << 25, Watch = 1 << 26,
+    }
+
+    /// <summary>Classify a marker chain once (perf: one pass instead of a scan per marker).</summary>
+    private static Mk MarkerBits(List<string> markers)
+    {
+        var bits = Mk.None;
+        foreach (var m in markers)
+        {
+            bits |= m switch
+            {
+                "alias" => Mk.Alias, "calc" => Mk.Calc, "clamp" => Mk.Clamp, "default" => Mk.Default,
+                "env" => Mk.Env, "fallback" => Mk.Fallback, "format" => Mk.Format, "geo" => Mk.Geo,
+                "i18n" => Mk.I18n, "import" => Mk.Import, "include" => Mk.Include, "join" => Mk.Join,
+                "map" => Mk.Map, "once" => Mk.Once, "prompt" => Mk.Prompt, "random" => Mk.Random,
+                "ref" => Mk.Ref, "replace" => Mk.Replace, "round" => Mk.Round, "secret" => Mk.Secret,
+                "sort" => Mk.Sort, "spam" => Mk.Spam, "split" => Mk.Split, "sum" => Mk.Sum,
+                "unique" => Mk.Unique, "version" => Mk.Version, "watch" => Mk.Watch,
+                _ => Mk.None,
+            };
+        }
+        return bits;
+    }
+
+    private static string? Arg(List<string> markers, string name, int offset)
+    {
+        var i = markers.IndexOf(name) + offset;
+        return i < markers.Count ? markers[i] : null;
+    }
+
+    private static void ApplyMarkers(Ctx ctx, Dictionary<string, SynxValue> map, string key, SynxMeta meta, string path)
     {
         var markers = meta.Markers;
+        var options = ctx.Options;
+        var root = ctx.Root;
+        var mb = MarkerBits(markers);
 
-        if (markers.Contains("spam"))
+        // ── :spam ── key:spam:MAX_CALLS[:WINDOW_SEC] target
+        if ((mb & Mk.Spam) != 0)
         {
-            var spamIdx = markers.IndexOf("spam");
-            var maxCalls = spamIdx + 1 < markers.Count && int.TryParse(markers[spamIdx + 1], out var maxC) ? maxC : 0;
-            var windowSec = spamIdx + 2 < markers.Count && ulong.TryParse(markers[spamIdx + 2], out var ws) ? ws : 1UL;
+            var maxCalls = Arg(markers, "spam", 1) is { } ms && SynxNum.TryParseU64(ms, ulong.MaxValue, out var mc) ? mc : 0;
+            var windowSec = Arg(markers, "spam", 2) is { } ws && SynxNum.TryParseU64(ws, ulong.MaxValue, out var w) ? w : 1;
             if (maxCalls == 0)
             {
                 map[key] = new SynxValue.Str("SPAM_ERR: invalid limit, use :spam:MAX[:WINDOW_SEC]");
                 return;
             }
             var target = map.TryGetValue(key, out var tv) ? ValueToString(tv) : key;
-            var bucket = key + "::" + target;
-            if (!AllowSpam(bucket, maxCalls, windowSec))
+            if (!AllowSpam(key + "::" + target, maxCalls, windowSec))
             {
                 map[key] = new SynxValue.Str($"SPAM_ERR: '{target}' exceeded {maxCalls} calls per {windowSec}s");
                 return;
@@ -37,13 +71,14 @@ public static partial class SynxEngine
             if (map.TryGetValue(key, out var cur))
             {
                 var t = ValueToString(cur);
-                var resolved = DeepGet(rootPtr, t) ?? (map.TryGetValue(t, out var lm) ? lm : null);
+                var resolved = DeepGet(root, t) ?? (map.TryGetValue(t, out var lm) ? lm : null);
                 if (resolved != null)
                     map[key] = CloneValue(resolved);
             }
         }
 
-        if (markers.Contains("include") || markers.Contains("import"))
+        // ── :include / :import ──
+        if ((mb & (Mk.Include | Mk.Import)) != 0)
         {
             if (map.TryGetValue(key, out var incVal) && incVal is SynxValue.Str fp)
             {
@@ -53,12 +88,16 @@ public static partial class SynxEngine
                     map[key] = new SynxValue.Str($"INCLUDE_ERR: max include depth ({maxD}) exceeded");
                     return;
                 }
+                if (path.Length == 0 && ctx.Preresolved.TryGetValue(key, out var pre) && pre.Path == fp.Value)
+                {
+                    map[key] = pre.Root;
+                    return;
+                }
                 try
                 {
-                    var baseDir = options.BasePath ?? ".";
-                    var full = JailPath(baseDir, fp.Value);
+                    var full = JailPath(options.BasePath ?? ".", fp.Value);
                     CheckFileSize(full);
-                    var text = File.ReadAllText(full);
+                    var text = ReadText(full, fp.Value);
                     var parsed = SynxParserCore.Parse(text);
                     if (parsed.Mode == SynxMode.Active)
                     {
@@ -67,7 +106,7 @@ public static partial class SynxEngine
                         child.BasePath = Path.GetDirectoryName(full) ?? ".";
                         Resolve(parsed, child);
                     }
-                    map[key] = CloneValue(parsed.Root);
+                    map[key] = parsed.Root;
                 }
                 catch (Exception e)
                 {
@@ -77,23 +116,24 @@ public static partial class SynxEngine
             return;
         }
 
-        if (markers.Contains("env"))
+        // ── :env ──
+        if ((mb & Mk.Env) != 0)
         {
             if (map.TryGetValue(key, out var ev) && ev is SynxValue.Str varName)
             {
-                string? envVal = null;
-                if (options.Env != null && options.Env.TryGetValue(varName.Value, out var evm))
-                    envVal = evm;
+                // Options.Env, when given, is the whole environment.
+                string? envVal;
+                if (options.Env != null)
+                    envVal = options.Env.TryGetValue(varName.Value, out var evm) ? evm : null;
                 else
                     envVal = Environment.GetEnvironmentVariable(varName.Value);
                 var forceStr = WantsString(meta);
                 var di = markers.IndexOf("default");
                 if (!string.IsNullOrEmpty(envVal))
-                {
                     map[key] = forceStr ? new SynxValue.Str(envVal) : CastPrimitive(envVal);
-                }
                 else if (di >= 0 && markers.Count > di + 1)
                 {
+                    // All parts after `default`, joined back: IPs (0.0.0.0) and URLs survive.
                     var fallback = string.Join(":", markers.Skip(di + 1));
                     map[key] = forceStr ? new SynxValue.Str(fallback) : CastPrimitive(fallback);
                 }
@@ -102,7 +142,8 @@ public static partial class SynxEngine
             }
         }
 
-        if (markers.Contains("random"))
+        // ── :random ──
+        if ((mb & Mk.Random) != 0)
         {
             if (map.TryGetValue(key, out var rv) && rv is SynxValue.Arr arr)
             {
@@ -113,175 +154,142 @@ public static partial class SynxEngine
                 }
                 if (meta.Args.Count > 0)
                 {
-                    var weights = meta.Args.Select(a => double.TryParse(a, CultureInfo.InvariantCulture, out var w) ? w : 0.0).ToList();
-                    map[key] = WeightedPick(arr, weights);
+                    var weights = new List<double>();
+                    foreach (var a in meta.Args)
+                        if (SynxNum.TryParseF64(a, out var wt)) weights.Add(wt);
+                    map[key] = WeightedPick(arr.Items, weights);
                 }
                 else
                     map[key] = CloneValue(arr.Items[RandomInt(arr.Items.Count)]);
             }
         }
 
-        if (markers.Contains("ref"))
+        // ── :ref ── like :alias, but the value feeds the markers after it (:ref:calc:*2)
+        if ((mb & Mk.Ref) != 0)
         {
             if (map.TryGetValue(key, out var refVal) && refVal is SynxValue.Str tgt)
             {
-                var resolved = DeepGet(rootPtr, tgt.Value)
+                var resolved = DeepGet(root, tgt.Value)
                                ?? (map.TryGetValue(tgt.Value, out var local) ? local : null)
                                ?? new SynxValue.Null();
-                if (markers.Contains("calc") && ValueAsNumber(resolved) is { } n)
+                SynxValue result = CloneValue(resolved);
+                if ((mb & Mk.Calc) != 0 && ValueAsNumber(resolved) is { } n
+                    && Arg(markers, "calc", 1) is { Length: > 0 } calcExpr && "+-*/%".Contains(calcExpr[0]))
                 {
-                    var calcIdx = markers.IndexOf("calc");
-                    if (calcIdx + 1 < markers.Count)
-                    {
-                        var calcExpr = markers[calcIdx + 1];
-                        if (calcExpr.Length > 0 && "+-*/%".Contains(calcExpr[0]))
-                        {
-                            var expr = FormatNumber(n) + " " + calcExpr;
-                            if (SynxSafeCalc.TryEval(expr, out var result, out var err))
-                            {
-                                map[key] = result % 1 == 0 && Math.Abs(result) < long.MaxValue
-                                    ? new SynxValue.Int((long)result)
-                                    : new SynxValue.Float(result);
-                            }
-                            else
-                                map[key] = new SynxValue.Str("CALC_ERR: " + err);
-                        }
-                        else
-                            map[key] = CloneValue(resolved);
-                    }
-                    else
-                        map[key] = CloneValue(resolved);
+                    var expr = SynxNum.FormatNumber(n) + " " + calcExpr;
+                    result = SynxSafeCalc.TryEval(expr, out var r, out var err)
+                        ? NumberValue(r)
+                        : new SynxValue.Str("CALC_ERR: " + err);
                 }
-                else
-                    map[key] = CloneValue(resolved);
+                map[key] = result;
             }
         }
 
-        if (markers.Contains("i18n"))
+        // ── :i18n ── key:i18n[:COUNT_FIELD]
+        if ((mb & Mk.I18n) != 0)
         {
             if (map.TryGetValue(key, out var iv) && iv is SynxValue.Obj trans)
             {
                 var lang = options.Lang ?? "en";
-                SynxValue val = trans.Map.TryGetValue(lang, out var lv) ? lv
+                var val = trans.Map.TryGetValue(lang, out var lv) ? lv
                     : trans.Map.TryGetValue("en", out var en) ? en
-                    : trans.Map.Values.FirstOrDefault() ?? new SynxValue.Null();
+                    : trans.Map.Count > 0 ? trans.Map.Values.First() : new SynxValue.Null();
 
-                var i18nIdx = markers.IndexOf("i18n");
-                var countField = i18nIdx + 1 < markers.Count ? markers[i18nIdx + 1] : null;
-
-                if (countField != null && val is SynxValue.Obj pluralForms)
+                if (Arg(markers, "i18n", 1) is { } countField && val is SynxValue.Obj pluralForms)
                 {
-                    var countVal = (long)(map.TryGetValue(countField, out var cv) ? ValueAsNumber(cv) ?? 0 : ValueAsNumber(DeepGet(rootPtr, countField) ?? new SynxValue.Null()) ?? 0);
+                    double? countNum = map.TryGetValue(countField, out var cv) ? ValueAsNumber(cv) : null;
+                    if (countNum == null && DeepGet(root, countField) is { } rc) countNum = ValueAsNumber(rc);
+                    var countVal = SynxNum.SaturatingI64(countNum ?? 0);
                     var cat = PluralCategory(lang, countVal);
                     var chosen = pluralForms.Map.TryGetValue(cat, out var c1) ? c1
                         : pluralForms.Map.TryGetValue("other", out var c2) ? c2
-                        : pluralForms.Map.Values.FirstOrDefault() ?? new SynxValue.Null();
-                    if (chosen is SynxValue.Str ps)
-                        map[key] = new SynxValue.Str(ps.Value.Replace("{count}", countVal.ToString(CultureInfo.InvariantCulture)));
-                    else
-                        map[key] = CloneValue(chosen);
+                        : pluralForms.Map.Count > 0 ? pluralForms.Map.Values.First() : new SynxValue.Null();
+                    map[key] = chosen is SynxValue.Str ps
+                        ? new SynxValue.Str(ps.Value.Replace("{count}", countVal.ToString(CultureInfo.InvariantCulture)))
+                        : CloneValue(chosen);
                 }
                 else
                     map[key] = CloneValue(val);
             }
         }
 
-        if (markers.Contains("calc"))
+        // ── :calc ──
+        if ((mb & Mk.Calc) != 0)
         {
-            if (map.TryGetValue(key, out var cv) && cv is SynxValue.Str expr0)
+            if (map.TryGetValue(key, out var cv) && cv is SynxValue.Str exprVal)
             {
-                var expr = expr0.Value;
-                if (expr.Length > MaxCalcExprLen)
+                var expr = exprVal.Value;
+                var exprBytes = SynxNum.Utf8Len(expr);
+                if (exprBytes > MaxCalcExprLen)
                 {
-                    map[key] = new SynxValue.Str(
-                        $"CALC_ERR: expression too long ({expr.Length} chars, max {MaxCalcExprLen})");
+                    map[key] = new SynxValue.Str($"CALC_ERR: expression too long ({exprBytes} chars, max {MaxCalcExprLen})");
                     return;
                 }
-                var resolved = expr;
-                if (rootPtr is SynxValue.Obj rootObj)
+                var rootMap = (root as SynxValue.Obj)?.Map;
+                var resolved = SubstituteCalcVars(expr, map, key, rootMap, ctx.RootSpecial);
+                if (resolved != null)
+                    resolved = ResolveCalcDots(resolved, root);
+                if (resolved == null)
                 {
-                    foreach (var (rk, rv) in rootObj.Map)
-                    {
-                        if (ValueAsNumberString(rv) is { } ns)
-                        {
-                            resolved = ReplaceWord(resolved, rk, ns);
-                            if (resolved.Length > MaxCalcResolvedLen)
-                            {
-                                map[key] = new SynxValue.Str(
-                                    $"CALC_ERR: resolved expression too long (max {MaxCalcResolvedLen} bytes)");
-                                return;
-                            }
-                        }
-                    }
-                }
-                foreach (var (rk, rv) in map)
-                {
-                    if (rk == key) continue;
-                    if (ValueAsNumberString(rv) is { } ns2)
-                    {
-                        resolved = ReplaceWord(resolved, rk, ns2);
-                        if (resolved.Length > MaxCalcResolvedLen)
-                        {
-                            map[key] = new SynxValue.Str(
-                                $"CALC_ERR: resolved expression too long (max {MaxCalcResolvedLen} bytes)");
-                            return;
-                        }
-                    }
-                }
-
-                resolved = ResolveCalcDots(resolved, rootPtr);
-                if (resolved.Length > MaxCalcResolvedLen)
-                {
-                    map[key] = new SynxValue.Str(
-                        $"CALC_ERR: resolved expression too long (max {MaxCalcResolvedLen} bytes)");
+                    map[key] = new SynxValue.Str($"CALC_ERR: resolved expression too long (max {MaxCalcResolvedLen} bytes)");
                     return;
                 }
-
-                if (SynxSafeCalc.TryEval(resolved, out var cr, out var cerr))
-                    map[key] = cr % 1 == 0 && Math.Abs(cr) < long.MaxValue
-                        ? new SynxValue.Int((long)cr)
-                        : new SynxValue.Float(cr);
-                else
-                    map[key] = new SynxValue.Str("CALC_ERR: " + (cerr ?? "error"));
+                map[key] = SynxSafeCalc.TryEval(resolved, out var cr, out var cerr)
+                    ? NumberValue(cr)
+                    : new SynxValue.Str("CALC_ERR: " + cerr);
             }
         }
 
-        if (markers.Contains("alias"))
+        // ── :alias ──
+        if ((mb & Mk.Alias) != 0)
         {
             if (map.TryGetValue(key, out var av) && av is SynxValue.Str at)
             {
-                var currentPath = path.Length == 0 ? key : path + "." + key;
-                if (at.Value == key || at.Value == currentPath)
-                    map[key] = new SynxValue.Str($"ALIAS_ERR: self-referential alias: {currentPath} → {at.Value}");
+                var target = at.Value;
+                // A list item's `#<index>` segment is a metadata detail, not part of a path
+                // a document can name.
+                var sb = new StringBuilder(path.Length + key.Length + 1);
+                foreach (var seg in SynxParserCore.MetaPathSegments(path))
+                {
+                    if (seg.StartsWith('#')) continue;
+                    sb.Append(seg).Append('.');
+                }
+                sb.Append(key);
+                var currentPath = sb.ToString();
+                if (target == key || target == currentPath)
+                    map[key] = new SynxValue.Str($"ALIAS_ERR: self-referential alias: {currentPath} → {target}");
                 else
                 {
-                    var targetVal = DeepGet(rootPtr, at.Value);
-                    var dot = at.Value.LastIndexOf('.');
-                    var targetParent = dot >= 0 ? at.Value[..dot] : "";
-                    var targetKeyName = dot >= 0 ? at.Value[(dot + 1)..] : at.Value;
-                    var targetHasAlias = metadata.TryGetValue(targetParent, out var tmm)
+                    var targetVal = DeepGet(root, target);
+                    var dot = target.LastIndexOf('.');
+                    var targetParent = dot >= 0 ? target[..dot] : "";
+                    var targetKeyName = dot >= 0 ? target[(dot + 1)..] : target;
+                    var targetHasAlias = ctx.Metadata.TryGetValue(targetParent, out var tmm)
                                          && tmm.TryGetValue(targetKeyName, out var tm)
                                          && tm.Markers.Contains("alias");
                     var isCycle = targetHasAlias && targetVal is SynxValue.Str ts &&
                                   (ts.Value == key || ts.Value == currentPath);
                     if (isCycle)
-                        map[key] = new SynxValue.Str(
-                            $"ALIAS_ERR: circular alias detected: {currentPath} → {at.Value}");
+                    {
+                        // Order-independent message: participants sorted.
+                        var (a, b) = CompareCodePoints(currentPath, target) <= 0 ? (currentPath, target) : (target, currentPath);
+                        map[key] = new SynxValue.Str($"ALIAS_ERR: circular alias detected: {a} → {b}");
+                    }
                     else
-                        map[key] = CloneValue(targetVal ?? new SynxValue.Null());
+                        map[key] = targetVal != null ? CloneValue(targetVal) : new SynxValue.Null();
                 }
             }
         }
 
-        if (markers.Contains("secret"))
+        // ── :secret ── idempotent: the pre-pass may already have wrapped a literal.
+        if ((mb & Mk.Secret) != 0)
         {
-            // Idempotent: the pre-pass may already have wrapped a literal secret, and
-            // ValueToString masks a Secret, so re-wrapping would store the mask itself.
             if (map.TryGetValue(key, out var sv) && sv is not SynxValue.Secret)
                 map[key] = new SynxValue.Secret(ValueToString(sv));
         }
 
-        if (markers.Contains("unique"))
+        // ── :unique ──
+        if ((mb & Mk.Unique) != 0)
         {
             if (map.TryGetValue(key, out var uv) && uv is SynxValue.Arr ua)
             {
@@ -289,69 +297,71 @@ public static partial class SynxEngine
                 var uq = new List<SynxValue>();
                 foreach (var item in ua.Items)
                 {
-                    var s = ValueToString(item);
-                    if (seen.Add(s)) uq.Add(CloneValue(item));
+                    if (seen.Add(ValueToString(item))) uq.Add(CloneValue(item));
                 }
                 map[key] = new SynxValue.Arr(uq);
             }
         }
 
-        if (markers.Contains("geo"))
+        // ── :geo ──
+        if ((mb & Mk.Geo) != 0)
         {
             if (map.TryGetValue(key, out var gv) && gv is SynxValue.Arr ga)
             {
-                var region = options.Region ?? "US";
-                var prefix = region + " ";
-                SynxValue? found = null;
+                var prefix = (options.Region ?? "US") + " ";
+                SynxValue? result = null;
                 foreach (var item in ga.Items)
                 {
                     if (item is SynxValue.Str gs && gs.Value.StartsWith(prefix, StringComparison.Ordinal))
                     {
-                        found = new SynxValue.Str(gs.Value[prefix.Length..].Trim());
+                        result = new SynxValue.Str(gs.Value[prefix.Length..].Trim());
                         break;
                     }
                 }
-                if (found != null)
-                    map[key] = found;
-                else if (ga.Items.Count > 0 && ga.Items[0] is SynxValue.Str f0)
+                if (result == null)
                 {
-                    var sp = f0.Value.IndexOf(' ');
-                    map[key] = sp >= 0 ? new SynxValue.Str(f0.Value[(sp + 1)..].Trim()) : CloneValue(ga.Items[0]);
+                    if (ga.Items.Count == 0)
+                        result = new SynxValue.Null();
+                    else if (ga.Items[0] is SynxValue.Str f0 && f0.Value.IndexOf(' ') is var sp and >= 0)
+                        result = new SynxValue.Str(f0.Value[(sp + 1)..].Trim());
+                    else
+                        result = CloneValue(ga.Items[0]);
                 }
-                else
-                    map[key] = new SynxValue.Null();
+                map[key] = result;
             }
         }
 
-        if (markers.Contains("split"))
+        // ── :split ──
+        if ((mb & Mk.Split) != 0)
         {
             if (map.TryGetValue(key, out var spv) && spv is SynxValue.Str ss)
             {
-                var si = markers.IndexOf("split");
-                var sep = si + 1 < markers.Count ? DelimiterFromKeyword(markers[si + 1]) : ",";
-                var items = ss.Value.Split(sep, StringSplitOptions.None)
-                    .Select(x => x.Trim())
-                    .Where(x => x.Length > 0)
-                    .Select(CastPrimitive)
-                    .ToList();
+                var sep = Arg(markers, "split", 1) is { } sk ? DelimiterFromKeyword(sk) : ",";
+                var items = new List<SynxValue>();
+                foreach (var p in RustSplit(ss.Value, sep))
+                {
+                    var t = p.Trim();
+                    if (t.Length > 0) items.Add(CastPrimitive(t));
+                }
                 map[key] = new SynxValue.Arr(items);
             }
         }
 
-        if (markers.Contains("join"))
+        // ── :join ──
+        if ((mb & Mk.Join) != 0)
         {
             if (map.TryGetValue(key, out var jv) && jv is SynxValue.Arr ja)
             {
-                var ji = markers.IndexOf("join");
-                var sep = ji + 1 < markers.Count ? DelimiterFromKeyword(markers[ji + 1]) : ",";
+                var sep = Arg(markers, "join", 1) is { } jk ? DelimiterFromKeyword(jk) : ",";
                 map[key] = new SynxValue.Str(string.Join(sep, ja.Items.Select(ValueToString)));
             }
         }
 
-        if (markers.Contains("default") && !markers.Contains("env"))
+        // ── :default (standalone, without :env) ──
+        if ((mb & Mk.Default) != 0 && (mb & Mk.Env) == 0)
         {
             var isEmpty = !map.TryGetValue(key, out var dv) || dv is SynxValue.Null
-                          || dv is SynxValue.Str ds && ds.Value.Length == 0;
+                          || (dv is SynxValue.Str ds && ds.Value.Length == 0);
             if (isEmpty)
             {
                 var di = markers.IndexOf("default");
@@ -363,90 +373,152 @@ public static partial class SynxEngine
             }
         }
 
-        if (markers.Contains("clamp"))
+        // ── :clamp ── key:clamp:MIN:MAX value. A bound must be a finite number: `nan`,
+        // `inf`, `1e400` skip the marker (Rust's f64::clamp panicked on a NaN bound).
+        if ((mb & Mk.Clamp) != 0)
         {
-            var ci = markers.IndexOf("clamp");
-            var minS = ci + 1 < markers.Count ? markers[ci + 1] : "";
-            var maxS = ci + 2 < markers.Count ? markers[ci + 2] : "";
-            if (double.TryParse(minS, CultureInfo.InvariantCulture, out var lo) &&
-                double.TryParse(maxS, CultureInfo.InvariantCulture, out var hi))
+            if (SynxNum.TryParseF64(Arg(markers, "clamp", 1) ?? "", out var lo) && double.IsFinite(lo)
+                && SynxNum.TryParseF64(Arg(markers, "clamp", 2) ?? "", out var hi) && double.IsFinite(hi))
             {
                 if (lo > hi)
-                    map[key] = new SynxValue.Str($"CONSTRAINT_ERR: clamp min ({lo}) > max ({hi})");
+                    map[key] = new SynxValue.Str($"CONSTRAINT_ERR: clamp min ({SynxNum.Display(lo)}) > max ({SynxNum.Display(hi)})");
                 else if (map.TryGetValue(key, out var clv) && ValueAsNumber(clv) is { } cn)
-                {
-                    var cld = Math.Clamp(cn, lo, hi);
-                    map[key] = cld % 1 == 0 && Math.Abs(cld) < long.MaxValue
-                        ? new SynxValue.Int((long)cld)
-                        : new SynxValue.Float(cld);
-                }
+                    map[key] = NumberValue(cn < lo ? lo : cn > hi ? hi : cn);
             }
         }
 
-        if (markers.Contains("round"))
+        // ── :round ── key:round:N value (N decimal places, default 0)
+        if ((mb & Mk.Round) != 0)
         {
-            var ri = markers.IndexOf("round");
-            var dec = ri + 1 < markers.Count && int.TryParse(markers[ri + 1], out var dd) ? dd : 0;
+            var dec = Arg(markers, "round", 1) is { } rs && SynxNum.TryParseU64(rs, uint.MaxValue, out var d) ? (uint)d : 0u;
             if (map.TryGetValue(key, out var rv) && ValueAsNumber(rv) is { } rn)
             {
-                var factor = Math.Pow(10, dec);
-                var rounded = Math.Round(rn * factor) / factor;
-                map[key] = dec == 0 ? new SynxValue.Int((long)rounded) : new SynxValue.Float(rounded);
+                var factor = Math.Pow(10, unchecked((int)dec));
+                var rounded = Math.Round(rn * factor, MidpointRounding.AwayFromZero) / factor;
+                map[key] = dec == 0 ? new SynxValue.Int(SynxNum.SaturatingI64(rounded)) : new SynxValue.Float(rounded);
             }
         }
 
-        if (markers.Contains("map"))
+        // ── :map ── key:map:source_key + `- lookup result` items
+        if ((mb & Mk.Map) != 0)
         {
             if (map.TryGetValue(key, out var mv) && mv is SynxValue.Arr ma)
             {
-                var mi = markers.IndexOf("map");
-                var sourceKey = mi + 1 < markers.Count ? markers[mi + 1] : "";
-                string lookupVal;
+                var sourceKey = Arg(markers, "map", 1) ?? "";
+                var lookupVal = "";
                 if (sourceKey.Length > 0)
-                    lookupVal = ValueToString(DeepGet(rootPtr, sourceKey) ?? (map.TryGetValue(sourceKey, out var sm) ? sm : new SynxValue.Str("")));
-                else
-                    lookupVal = "";
-
+                {
+                    var src = DeepGet(root, sourceKey) ?? (map.TryGetValue(sourceKey, out var sm) ? sm : null);
+                    lookupVal = src != null ? ValueToString(src) : "";
+                }
                 SynxValue? pick = null;
                 foreach (var item in ma.Items)
                 {
-                    if (item is SynxValue.Str line)
+                    if (item is SynxValue.Str line && line.Value.IndexOf(' ') is var sp and >= 0
+                        && line.Value[..sp].Trim() == lookupVal)
                     {
-                        var sp = line.Value.IndexOf(' ');
-                        if (sp > 0 && line.Value[..sp].Trim() == lookupVal)
-                        {
-                            pick = CastPrimitive(line.Value[(sp + 1)..].Trim());
-                            break;
-                        }
+                        pick = CastPrimitive(line.Value[(sp + 1)..].Trim());
+                        break;
                     }
                 }
-                map[key] = CloneValue(pick ?? new SynxValue.Null());
+                map[key] = pick ?? new SynxValue.Null();
             }
         }
 
-        if (markers.Contains("format"))
+        // ── :format ── key:format:PATTERN value (printf-style: %.2f, %d, %05d, %e)
+        if ((mb & Mk.Format) != 0)
         {
-            var fi = markers.IndexOf("format");
-            var pat = fi + 1 < markers.Count ? markers[fi + 1] : "%s";
+            var pat = Arg(markers, "format", 1) ?? "%s";
             if (map.TryGetValue(key, out var fv))
                 map[key] = new SynxValue.Str(ApplyFormatPattern(pat, fv));
         }
 
-        if (markers.Contains("fallback"))
+        // ── :replace:FROM:TO ── literal substring replacement; TO defaults to deletion
+        if ((mb & Mk.Replace) != 0)
         {
-            var fbi = markers.IndexOf("fallback");
-            var defv = fbi + 1 < markers.Count ? markers[fbi + 1] : "";
-            var useFb = !map.TryGetValue(key, out var fbv) || fbv is SynxValue.Null
-                || fbv is SynxValue.Str fbs && fbs.Value.Length == 0
-                || fbv is SynxValue.Str pathStr && pathStr.Value.Length > 0 && !SafeFileExists(options.BasePath ?? ".", pathStr.Value);
+            if (map.TryGetValue(key, out var rpv) && rpv is SynxValue.Str rps)
+            {
+                var from = Arg(markers, "replace", 1) ?? "";
+                var to = Arg(markers, "replace", 2) ?? "";
+                if (from.Length > 0)
+                    map[key] = new SynxValue.Str(rps.Value.Replace(from, to, StringComparison.Ordinal));
+            }
+        }
+
+        // ── :sort / :sort:desc ── two numbers compare numerically, anything else as text by
+        // code point (never locale collation); stable.
+        if ((mb & Mk.Sort) != 0)
+        {
+            if (map.TryGetValue(key, out var sov) && sov is SynxValue.Arr soa)
+            {
+                var desc = Arg(markers, "sort", 1) == "desc";
+                var sorted = new List<SynxValue>(soa.Items.Count);
+                foreach (var item in soa.Items) sorted.Add(CloneValue(item));
+                var keyed = sorted.Select((v, i) => (v, i, text: ValueAsNumber(v) == null ? ValueToString(v) : null)).ToArray();
+                Array.Sort(keyed, (x, y) =>
+                {
+                    int c;
+                    if (ValueAsNumber(x.v) is { } xn && ValueAsNumber(y.v) is { } yn)
+                        c = double.IsNaN(xn) || double.IsNaN(yn) ? 0 : xn.CompareTo(yn);
+                    else
+                        c = CompareCodePoints(x.text ?? ValueToString(x.v), y.text ?? ValueToString(y.v));
+                    return c != 0 ? c : x.i.CompareTo(y.i);
+                });
+                sorted = keyed.Select(k => k.v).ToList();
+                if (desc) sorted.Reverse();
+                map[key] = new SynxValue.Arr(sorted);
+            }
+        }
+
+        // ── :sum ── numeric items (and numeric strings); int while every summand is whole
+        if ((mb & Mk.Sum) != 0)
+        {
+            if (map.TryGetValue(key, out var suv) && suv is SynxValue.Arr sua)
+            {
+                double total = 0;
+                var allInt = true;
+                foreach (var v in sua.Items)
+                {
+                    switch (v)
+                    {
+                        case SynxValue.Int n:
+                            total += n.Value;
+                            break;
+                        case SynxValue.Float f:
+                            total += f.Value;
+                            if (f.Value % 1 != 0) allInt = false;
+                            break;
+                        case SynxValue.Str s when SynxNum.TryParseF64(s.Value, out var sf):
+                            total += sf;
+                            if (sf % 1 != 0) allInt = false;
+                            break;
+                    }
+                }
+                map[key] = allInt && total % 1 == 0 && Math.Abs(total) < long.MaxValue
+                    ? new SynxValue.Int((long)total)
+                    : new SynxValue.Float(total);
+            }
+        }
+
+        // ── :fallback ── key:fallback:DEFAULT value — the default when the path is missing
+        if ((mb & Mk.Fallback) != 0)
+        {
+            var defv = Arg(markers, "fallback", 1) ?? "";
+            var useFb = !map.TryGetValue(key, out var fbv) || fbv switch
+            {
+                SynxValue.Null => true,
+                SynxValue.Str { Value.Length: 0 } => true,
+                SynxValue.Str fs => !SafePathExists(options.BasePath ?? ".", fs.Value),
+                _ => false,
+            };
             if (useFb && defv.Length > 0)
                 map[key] = new SynxValue.Str(defv);
         }
 
-        if (markers.Contains("once"))
+        // ── :once ── key:once[:uuid|random|timestamp], persisted in .synx.lock
+        if ((mb & Mk.Once) != 0)
         {
-            var oi = markers.IndexOf("once");
-            var gen = oi + 1 < markers.Count ? markers[oi + 1] : "uuid";
+            var gen = Arg(markers, "once", 1) ?? "uuid";
             var lockPath = Path.Combine(options.BasePath ?? ".", ".synx.lock");
             if (ReadLock(lockPath, key) is { } existing)
                 map[key] = new SynxValue.Str(existing);
@@ -455,7 +527,7 @@ public static partial class SynxEngine
                 var generated = gen switch
                 {
                     "timestamp" => DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString(CultureInfo.InvariantCulture),
-                    "random" => RandomInt(int.MaxValue).ToString(CultureInfo.InvariantCulture),
+                    "random" => (NextU64() % uint.MaxValue).ToString(CultureInfo.InvariantCulture),
                     _ => GenerateUuid(),
                 };
                 WriteLock(lockPath, key, generated);
@@ -463,18 +535,19 @@ public static partial class SynxEngine
             }
         }
 
-        if (markers.Contains("version"))
+        // ── :version ── key:version:OP:REQUIRED value → bool
+        if ((mb & Mk.Version) != 0)
         {
             if (map.TryGetValue(key, out var vv) && vv is SynxValue.Str curv)
             {
-                var vi = markers.IndexOf("version");
-                var op = vi + 1 < markers.Count ? markers[vi + 1] : ">=";
-                var req = vi + 2 < markers.Count ? markers[vi + 2] : "";
+                var op = Arg(markers, "version", 1) ?? ">=";
+                var req = Arg(markers, "version", 2) ?? "";
                 map[key] = new SynxValue.Bool(CompareVersions(curv.Value, op, req));
             }
         }
 
-        if (markers.Contains("watch"))
+        // ── :watch ── key:watch[:KEY_PATH] ./file
+        if ((mb & Mk.Watch) != 0)
         {
             if (map.TryGetValue(key, out var wv) && wv is SynxValue.Str wp)
             {
@@ -484,16 +557,24 @@ public static partial class SynxEngine
                     map[key] = new SynxValue.Str($"WATCH_ERR: max include depth ({maxD}) exceeded");
                     return;
                 }
+                string full;
                 try
                 {
-                    var full = JailPath(options.BasePath ?? ".", wp.Value);
+                    full = JailPath(options.BasePath ?? ".", wp.Value);
                     CheckFileSize(full);
-                    var wi = markers.IndexOf("watch");
-                    var kp = wi + 1 < markers.Count ? markers[wi + 1] : null;
-                    var content = File.ReadAllText(full);
+                }
+                catch (Exception e)
+                {
+                    map[key] = new SynxValue.Str("WATCH_ERR: " + e.Message);
+                    return;
+                }
+                var kp = Arg(markers, "watch", 1);
+                try
+                {
+                    var content = ReadText(full, wp.Value);
                     var ext = Path.GetExtension(full).TrimStart('.');
                     map[key] = kp != null
-                        ? CloneValue(ExtractFromContent(content, kp, ext) ?? new SynxValue.Null())
+                        ? ExtractFromContent(content, kp, ext) ?? new SynxValue.Null()
                         : new SynxValue.Str(content.Trim());
                 }
                 catch (Exception e)
@@ -503,15 +584,12 @@ public static partial class SynxEngine
             }
         }
 
-        if (markers.Contains("prompt"))
+        // ── :prompt ── key:prompt:LABEL subtree → fenced SYNX text
+        if ((mb & Mk.Prompt) != 0)
         {
-            var pi = markers.IndexOf("prompt");
-            var label = pi + 1 < markers.Count ? markers[pi + 1] : key;
+            var label = Arg(markers, "prompt", 1) ?? key;
             if (map.TryGetValue(key, out var pv))
-            {
-                var synx = StringifyValue(pv, 0);
-                map[key] = new SynxValue.Str(label + " (SYNX):\n```synx\n" + synx + "```");
-            }
+                map[key] = new SynxValue.Str(label + " (SYNX):\n```synx\n" + StringifyValue(pv, 0) + "```");
         }
 
         // ── WASM custom markers ──
@@ -527,8 +605,7 @@ public static partial class SynxEngine
                 var currentValue = map.TryGetValue(key, out var cv) ? cv : new SynxValue.Null();
                 try
                 {
-                    var result = wasmRt.ApplyMarker(marker, currentValue, args);
-                    map[key] = result;
+                    map[key] = wasmRt.ApplyMarker(marker, currentValue, args);
                 }
                 catch (Exception e)
                 {
@@ -538,48 +615,49 @@ public static partial class SynxEngine
             }
         }
 
+        // ── Constraint validation (always last, after all markers resolved) ──
         if (meta.Constraints is { } constr)
-            ValidateConstraintsOnMap(map, key, constr);
+            ValidateConstraints(map, key, constr);
     }
 
-    private static string ResolveCalcDots(string resolved, SynxValue rootPtr)
+    private static bool SafePathExists(string baseDir, string rel)
     {
-        var bytes = Encoding.UTF8.GetBytes(resolved);
-        var len = bytes.Length;
-        var dotResolved = new StringBuilder(resolved.Length);
-        var i = 0;
-        while (i < len)
+        try
         {
-            if (IsWordCharByte(bytes[i]))
-            {
-                var start = i;
-                var hasDot = false;
-                while (i < len && (IsWordCharByte(bytes[i]) || bytes[i] == (byte)'.'))
-                {
-                    if (bytes[i] == (byte)'.') hasDot = true;
-                    i++;
-                }
-                var token = resolved[start..i];
-                if (hasDot && token.Contains('.'))
-                {
-                    if (DeepGet(rootPtr, token) is { } dv && ValueAsNumber(dv) is { } n)
-                    {
-                        dotResolved.Append(FormatNumber(n));
-                        if (dotResolved.Length > MaxCalcResolvedLen)
-                            return resolved;
-                        continue;
-                    }
-                }
-                dotResolved.Append(token);
-            }
-            else
-            {
-                dotResolved.Append((char)bytes[i]);
-                i++;
-            }
-            if (dotResolved.Length > MaxCalcResolvedLen)
-                return resolved;
+            var full = JailPath(baseDir, rel);
+            return File.Exists(full) || Directory.Exists(full);
         }
-        return dotResolved.ToString();
+        catch
+        {
+            // A path that escapes the jail counts as missing.
+            return false;
+        }
+    }
+
+    /// <summary>Rust <c>str::split</c>: an empty separator splits around every character.</summary>
+    private static IEnumerable<string> RustSplit(string s, string sep)
+    {
+        if (sep.Length > 0)
+            return s.Split(sep, StringSplitOptions.None);
+        var parts = new List<string> { "" };
+        foreach (var r in s.EnumerateRunes()) parts.Add(r.ToString());
+        parts.Add("");
+        return parts;
+    }
+
+    /// <summary>Ordinal comparison by Unicode code point (UTF-16 order differs above the surrogates).</summary>
+    internal static int CompareCodePoints(string a, string b)
+    {
+        var n = Math.Min(a.Length, b.Length);
+        for (var i = 0; i < n; i++)
+        {
+            var x = a[i];
+            var y = b[i];
+            if (x == y) continue;
+            if (char.IsSurrogate(x) != char.IsSurrogate(y))
+                return char.IsSurrogate(x) ? 1 : -1;
+            return x.CompareTo(y);
+        }
+        return a.Length.CompareTo(b.Length);
     }
 }

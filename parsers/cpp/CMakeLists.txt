@@ -7,6 +7,7 @@
 #
 # Options:
 #   SYNX_BUILD_TESTS=ON|OFF   build unit + conformance tests (default OFF)
+#   SYNX_BUILD_BENCH=ON|OFF   build bench/synx_bench (default OFF)
 #   SYNX_USE_ZLIB=AUTO|ON|OFF use zlib for .synxb DEFLATE (AUTO: detect; OFF: disable compile/decompile)
 #   SYNX_NO_EXCEPTIONS=ON|OFF compile without exceptions / RTTI for UE5 (default ON)
 #
@@ -16,7 +17,7 @@
 
 cmake_minimum_required(VERSION 3.16)
 project(synx-cpp
-    VERSION 3.7.4
+    VERSION 3.8.0
     DESCRIPTION "SYNX (Active Data Format) — native C++17 parser"
     LANGUAGES CXX)
 
@@ -50,11 +51,16 @@ endif()
 # ─── library ────────────────────────────────────────────────────────────────
 set(SYNX_SOURCES
     src/value.cpp
+    src/unicode.cpp
+    src/numfmt.cpp
+    src/rng.cpp
     src/parser.cpp
     src/engine.cpp
     src/engine_markers.cpp
+    src/json_read.cpp
     src/calc.cpp
     src/json.cpp
+    src/synx_writer.cpp
     src/stringify.cpp
     src/formatter.cpp
     src/diff.cpp
@@ -89,10 +95,15 @@ else()
     target_compile_options(synx PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
-# ─── tests ──────────────────────────────────────────────────────────────────
+# ─── tests / bench ──────────────────────────────────────────────────────────
 if(SYNX_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
+endif()
+
+if(SYNX_BUILD_BENCH)
+    add_executable(synx_bench bench/bench.cpp)
+    target_link_libraries(synx_bench PRIVATE synx)
 endif()
 
 # ─── install ────────────────────────────────────────────────────────────────

@@ -36,12 +36,13 @@ public static class SynxFormat
     }
 
     /// <summary>
-    /// Tool call reshape: same as <c>Synx::parse_tool</c> when the document is not <c>!active</c>
-    /// (no marker resolution in this preview).
+    /// Tool call reshape (<c>Synx::parse_tool</c>): <c>{ tool, params }</c>, or <c>{ tools }</c> with
+    /// <c>!schema</c>. An <c>!active</c> document is resolved first.
     /// </summary>
-    public static Dictionary<string, SynxValue> ParseTool(string text)
+    public static Dictionary<string, SynxValue> ParseTool(string text, SynxOptions? options = null)
     {
         var r = SynxParserCore.Parse(text);
+        SynxEngine.Resolve(r, options ?? new SynxOptions());
         return SynxParserCore.ReshapeToolOutput(r.Root, r.Schema);
     }
 
@@ -86,12 +87,12 @@ public static class SynxFormat
     {
         var result = SynxBinary.Decompile(data);
         var sb = new System.Text.StringBuilder();
-        if (result.Tool) sb.AppendLine("!tool");
-        if (result.Schema) sb.AppendLine("!schema");
-        if (result.Llm) sb.AppendLine("!llm");
-        if (result.Mode == SynxMode.Active) sb.AppendLine("!active");
-        if (result.Locked) sb.AppendLine("!lock");
-        if (sb.Length > 0) sb.AppendLine();
+        if (result.Tool) sb.Append("!tool\n");
+        if (result.Schema) sb.Append("!schema\n");
+        if (result.Llm) sb.Append("!llm\n");
+        if (result.Mode == SynxMode.Active) sb.Append("!active\n");
+        if (result.Locked) sb.Append("!lock\n");
+        if (sb.Length > 0) sb.Append('\n');
         sb.Append(Stringify(result.Root));
         return sb.ToString();
     }

@@ -28,7 +28,7 @@
  * @packageDocumentation
  */
 
-import { parseData, castType, parseConstraints, parseI64 } from './parser';
+import { parseData, castType, parseConstraints, parseI64, rootKeyLines } from './parser';
 import { toCanonicalJSONString, compareUnicodeScalar } from './json';
 import type {
   SynxObject,
@@ -69,7 +69,6 @@ const NON_DETERMINISTIC_HINTS = new Set([
   'random:bool',
 ]);
 
-const UNSAFE_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 
 // ─── Hard errors (§11.1) ──────────────────────────────────
 
@@ -163,7 +162,8 @@ function truncateUtf8(s: string, maxBytes: number): string {
 
 /** Assign without triggering the `__proto__` setter (prototype pollution). */
 function setField(obj: SynxObject, key: string, value: SynxValue): void {
-  if (UNSAFE_KEYS.has(key)) {
+  // perf: three string compares beat a Set lookup on every cell.
+  if (key === '__proto__' || key === 'constructor' || key === 'prototype') {
     Object.defineProperty(obj, key, {
       value, enumerable: true, writable: true, configurable: true,
     });
@@ -217,12 +217,10 @@ function scanIndent(line: string): { indent: number; end: number } {
  * looking for it under an ASCII-only offset finds nothing and mis-attributes
  * the diagnostic to the record line (§11.2).
  */
-function synxIndentOf(line: string): number {
+/** UTF-16 offset just past the leading Unicode-whitespace run of `line`. */
+function scanIndentEnd(line: string): number {
   let i = 0;
-  while (i < line.length) {
-    if (!isUnicodeSpace(line.charCodeAt(i))) break;
-    i++;
-  }
+  while (i < line.length && isUnicodeSpace(line.charCodeAt(i))) i++;
   return i;
 }
 
@@ -268,44 +266,71 @@ interface SynxlPart {
  */
 export function splitRecordLine(line: string): SynxlPart[] {
   const parts: SynxlPart[] = [];
+  let pos = 0;
+  do {
+    pos = scanPart(line, pos);
+    parts.push({ value: line.substring(partStart, partEnd), quoted: partQuoted });
+  } while (pos !== -1);
+  return parts;
+}
+
+// The part found by the last `scanPart`: [partStart, partEnd) of the line.
+let partStart = 0;
+let partEnd = 0;
+let partQuoted = false;
+
+/**
+ * Scan the part that begins at offset `i` (§7.1): skip spaces and tabs, try a
+ * quoted run, fall back to an unquoted part trimmed of spaces and tabs.
+ * Returns the offset of the next part, or -1 when this was the last.
+ *
+ * perf: the record builder walks parts with this cursor instead of
+ * materialising an array of part objects per record.
+ */
+function scanPart(line: string, i: number): number {
   const n = line.length;
-  let i = 0;
 
-  for (;;) {
-    // 1. Skip spaces and horizontal tabs.
-    while (i < n) {
-      const ch = line.charCodeAt(i);
-      if (ch !== 32 && ch !== 9) break;
-      i++;
-    }
+  // 1. Skip spaces and horizontal tabs.
+  while (i < n) {
+    const ch = line.charCodeAt(i);
+    if (ch !== 32 && ch !== 9) break;
+    i++;
+  }
 
-    // 2. Quoted part?
-    const q = line.charCodeAt(i);
-    if (i < n && (q === 34 || q === 39)) {
-      const close = line.indexOf(line[i], i + 1);
-      if (close !== -1) {
-        let j = close + 1;
-        while (j < n) {
-          const ch = line.charCodeAt(j);
-          if (ch !== 32 && ch !== 9) break;
-          j++;
-        }
-        if (j >= n || line.charCodeAt(j) === 59) { // end of line or ';'
-          parts.push({ value: line.substring(i + 1, close), quoted: true });
-          if (j >= n) return parts;
-          i = j + 1;
-          continue;
-        }
+  // 2. Quoted part?
+  const q = line.charCodeAt(i);
+  if (i < n && (q === 34 || q === 39)) {
+    const close = line.indexOf(q === 34 ? '"' : "'", i + 1);
+    if (close !== -1) {
+      let j = close + 1;
+      while (j < n) {
+        const ch = line.charCodeAt(j);
+        if (ch !== 32 && ch !== 9) break;
+        j++;
+      }
+      if (j >= n || line.charCodeAt(j) === 59) { // end of line or ';'
+        partStart = i + 1;
+        partEnd = close;
+        partQuoted = true;
+        return j >= n ? -1 : j + 1;
       }
     }
-
-    // 3. Unquoted part — extends to the next `;` or to end of line.
-    const semi = line.indexOf(';', i);
-    const end = semi === -1 ? n : semi;
-    parts.push({ value: trimSpacesTabs(line.substring(i, end)), quoted: false });
-    if (semi === -1) return parts;
-    i = semi + 1;
   }
+
+  // 3. Unquoted part — extends to the next `;` or to end of line, trimmed of
+  //    spaces and tabs.
+  const semi = line.indexOf(';', i);
+  const end = semi === -1 ? n : semi;
+  let b = end;
+  while (b > i) {
+    const ch = line.charCodeAt(b - 1);
+    if (ch !== 32 && ch !== 9) break;
+    b--;
+  }
+  partStart = i;
+  partEnd = b;
+  partQuoted = false;
+  return semi === -1 ? -1 : semi + 1;
 }
 
 // ─── §8 Casting ───────────────────────────────────────────
@@ -327,36 +352,66 @@ const FLOAT_RE = /^[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?$/;
  * masquerade as data.
  */
 function castTyped(raw: string, type: string): CastResult {
+  const value = castTypedValue(raw, type);
+  return { ok: lastCastOk, value };
+}
+
+/** Whether the last `castTypedValue` succeeded. */
+let lastCastOk = true;
+
+/**
+ * `castTyped` without a result object per cell (perf): the value is returned
+ * and success is left in `lastCastOk`.
+ */
+function castTypedValue(raw: string, type: string): SynxValue {
+  const r = castTypedInner(raw, type);
+  lastCastOk = r !== CAST_FAILED;
+  return r === CAST_FAILED ? null : r as SynxValue;
+}
+
+const CAST_FAILED = Symbol('cast failed');
+
+function castTypedInner(raw: string, type: string): SynxValue | typeof CAST_FAILED {
   switch (type) {
     case 'int': {
-      const t = raw.trim();
-      if (!INT_RE.test(t)) return { ok: false, value: null };
+      // spec: §7.4 trims a part of spaces and tabs only; a U+00A0 left in it
+      // is data, so `5` followed by U+00A0 does not parse — as in synx-core. `trim()`
+      // removed it and let the cell pass.
+      const t = raw;
+      if (!INT_RE.test(t)) return CAST_FAILED;
       // §8.2 — typed casting *fails* when the part does not parse, and an
       // integer outside i64 does not. `parseInt` never fails, so without this
       // an overflowing id used to arrive as a rounded number with no
       // `CastFailed` to warn the consumer.
+      // perf: up to 15 digits is always a safe integer — no BigInt round trip.
+      // `-0` reads as 0, exactly as BigInt makes it.
+      const digits = t.charCodeAt(0) === 43 || t.charCodeAt(0) === 45 ? t.length - 1 : t.length;
+      if (digits <= 15) {
+        const v = +t;
+        return v === 0 ? 0 : v;
+      }
       const n = parseI64(t);
-      if (n === null) return { ok: false, value: null };
-      return { ok: true, value: n };
+      if (n === null) return CAST_FAILED;
+      return n;
     }
     case 'float': {
-      const t = raw.trim();
-      if (!FLOAT_RE.test(t)) return { ok: false, value: null };
+      const t = raw;
+      if (!FLOAT_RE.test(t)) return CAST_FAILED;
       const n = Number(t);
-      if (!Number.isFinite(n)) return { ok: false, value: null };
-      return { ok: true, value: n };
+      if (!Number.isFinite(n)) return CAST_FAILED;
+      return n;
     }
     case 'bool': {
-      const t = raw.trim();
-      if (t === 'true') return { ok: true, value: true };
-      if (t === 'false') return { ok: true, value: false };
-      return { ok: false, value: null };
+      const t = raw;
+      if (t === 'true') return true;
+      if (t === 'false') return false;
+      return CAST_FAILED;
     }
     case 'string':
-      return { ok: true, value: raw };
+      return raw;
     default:
       // Unknown hint → automatic cast, matching SYNX `cast_typed`'s fallback.
-      return { ok: true, value: castAuto(raw) };
+      return castAuto(raw);
   }
 }
 
@@ -405,7 +460,14 @@ function castAuto(raw: string): SynxValue {
       // §8.1 — literals, then integer, then decimal float, then string. An
       // integer that overflows i64 falls through to string, exactly as in the
       // reference implementation.
-      if (dotPos === -1) return parseI64(raw) ?? raw;
+      if (dotPos === -1) {
+        // perf: see castTyped — no BigInt for a safe-size integer.
+        if (len - firstDigit <= 15) {
+          const v = +raw;
+          return v === 0 ? 0 : v;
+        }
+        return parseI64(raw) ?? raw;
+      }
       if (dotPos > firstDigit && dotPos < len - 1) return parseFloat(raw);
     }
   }
@@ -576,14 +638,19 @@ function checkConstraints(name: string, value: SynxValue, c: SynxConstraints): s
   const n = typeof value === 'number'
     ? value
     : typeof value === 'string' && (c.min !== undefined || c.max !== undefined)
-      ? value.length
+      // Unicode scalar values, as the engine and synx-core count — `length`
+      // counted UTF-16 units and synx-core counted UTF-8 bytes, so `[max:2]`
+      // on an emoji disagreed between the two implementations.
+      ? scalarLength(value)
       : null;
   if (n !== null) {
     if (c.min !== undefined && n < c.min) return `'${name}' value ${n} is below min ${c.min}`;
     if (c.max !== undefined && n > c.max) return `'${name}' value ${n} exceeds max ${c.max}`;
   }
 
-  if (c.pattern && typeof value === 'string' && c.pattern.length <= 128) {
+  // Same 256-character cap as the engine and synx-core (this reader used 128,
+  // so a 129–256 character pattern was checked in Rust and skipped here).
+  if (c.pattern && typeof value === 'string' && c.pattern.length <= 256) {
     // Both the pattern and the value come out of the document, which §16 says
     // to treat as hostile. JavaScript's regex engine backtracks, so `^(a+)+$`
     // against 45 characters never returns — a 88-byte file that hangs the
@@ -609,12 +676,36 @@ function checkConstraints(name: string, value: SynxValue, c: SynxConstraints): s
  * not recoverable at all.
  */
 export function matchesLinear(pattern: string, value: string): boolean | null {
-  if (hasNestedQuantifier(pattern)) return null;
-  try {
-    return new RegExp(pattern).test(value);
-  } catch {
-    return null;
+  let re = PATTERN_CACHE.get(pattern);
+  if (re === undefined) {
+    re = null;
+    if (!hasNestedQuantifier(pattern)) {
+      try { re = new RegExp(pattern); } catch { re = null; }
+    }
+    // safety: bounded, so a document of distinct patterns cannot grow it forever.
+    if (PATTERN_CACHE.size >= 256) PATTERN_CACHE.clear();
+    PATTERN_CACHE.set(pattern, re);
   }
+  return re === null ? null : re.test(value);
+}
+
+/**
+ * Compiled `[pattern:…]` constraints; `null` marks a refused or invalid one.
+ * perf: a pattern was compiled for every cell it checked.
+ */
+const PATTERN_CACHE = new Map<string, RegExp | null>();
+
+/** Length in Unicode scalar values, without materialising `[...s]`. */
+export function scalarLength(s: string): number {
+  let n = s.length;
+  for (let i = 0; i < s.length - 1; i++) {
+    const c = s.charCodeAt(i);
+    if (c >= 0xd800 && c <= 0xdbff) {
+      const d = s.charCodeAt(i + 1);
+      if (d >= 0xdc00 && d <= 0xdfff) { n--; i++; }
+    }
+  }
+  return n;
 }
 
 /**
@@ -657,25 +748,16 @@ function hasNestedQuantifier(pattern: string): boolean {
 interface PendingRecord {
   line: number;
   recordLine: string;
-  blockLines: string[];
+  /** Block lines; `null` until the record has one (most records do not). */
+  blockLines: string[] | null;
   /** Source line number of each entry in `blockLines` (§11.2 line attribution). */
-  blockLineNos: number[];
+  blockLineNos: number[] | null;
   fields: SynxlFieldList;
+  /** Byte budget left for the block; -1 until the first block line needs it. */
   bytesLeft: number;
   truncated: boolean;
   /** Lazily built by `blockKeyIndex`; see the note there on why it is cached. */
   keyLines?: Map<string, number>;
-}
-
-/** Key token of a SYNX line: text up to whitespace, `(`, `[` or `:`. */
-function keyTokenOf(line: string, from: number): string {
-  let i = from;
-  while (i < line.length) {
-    const ch = line.charCodeAt(i);
-    if (ch === 32 || ch === 9 || ch === 40 || ch === 91 || ch === 58) break;
-    i++;
-  }
-  return line.substring(from, i);
 }
 
 /**
@@ -686,23 +768,21 @@ function keyTokenOf(line: string, from: number): string {
  * keys, and §13 lets a single record hold 16 MiB of them — enough to turn one
  * hostile row into hours of CPU while every limit reads as satisfied.
  *
- * A key reaches the embedded document's root when its indent is at or below
- * every indent before it: the first line opens the root level and SYNX §8.6
- * stack repair pulls later dedents back up to it.
+ * The SYNX parser itself records which line put each key at the root, so
+ * stack repair, list items and multiline bodies are decided exactly as in the
+ * parse.
+ *
+ * spec: until 3.8.0 a "running minimum indent" stood in for the parser, in
+ * UTF-16 units: a deeper line after a key with a value — which the parser
+ * lifts to the root — and keys after a U+3000 indent fell back to the record
+ * line, and differently from synx-core.
  */
 function blockKeyIndex(p: PendingRecord): Map<string, number> {
   if (p.keyLines) return p.keyLines;
   const map = new Map<string, number>();
-  let runningMin = Infinity;
-  for (let i = 0; i < p.blockLines.length; i++) {
-    const l = p.blockLines[i];
-    const ind = synxIndentOf(l);
-    if (ind === l.length) continue;
-    if (ind > runningMin) continue;
-    runningMin = ind;
-    const key = keyTokenOf(l, ind);
-    if (!map.has(key)) map.set(key, p.blockLineNos[i]);
-  }
+  const nos = p.blockLineNos ?? [];
+  const lines = rootKeyLines((p.blockLines ?? []).join('\n'), { directives: false, nondeterministicHints: false });
+  for (const [key, i] of lines) map.set(key, nos[i]);
   p.keyLines = map;
   return map;
 }
@@ -786,7 +866,10 @@ class SynxlReader {
     // §3.1 only allows to be ignored at the start of input, and keeps U+0085,
     // which §3.3's `ltrim` removes. Each difference decides whether a document
     // is accepted at all, so the classifier has to use the format's set.
-    const trimmed = trimUnicode(line);
+    // perf: classify by the first significant character; only a line that can
+    // be structural (`#`, `!`, `/`) pays for a trimmed copy.
+    const first = line.charCodeAt(scanIndentEnd(line));
+    const trimmed = first === 35 || first === 33 || first === 47 ? trimUnicode(line) : '';
 
     if (trimmed === '###') { // §4.3 block-comment toggle
       this.inBlockComment = !this.inBlockComment;
@@ -796,7 +879,7 @@ class SynxlReader {
 
     // §4.3 — `!synxl` / `!fields` are matched before the comment rules, and
     // both start with `!`, so plain prefix checks are unambiguous here.
-    if (trimmed.charCodeAt(0) === 33) {
+    if (first === 33) {
       if (trimmed === '!synxl' || trimmed.startsWith('!synxl ') || trimmed.startsWith('!synxl\t')) {
         this.handlePrologue(trimmed, lineNo);
         return done;
@@ -818,8 +901,8 @@ class SynxlReader {
       hardError('UnknownDirective', `unknown directive "${trimmed}" — a record starting with "!" must be quoted`, lineNo);
     }
 
-    if (trimmed.charCodeAt(0) === 35) return done;                       // # comment
-    if (trimmed.charCodeAt(0) === 47 && trimmed.charCodeAt(1) === 47) return done; // // comment
+    if (first === 35) return done;                       // # comment
+    if (first === 47 && trimmed.charCodeAt(1) === 47) return done; // // comment
 
     if (!this.prologueSeen) {
       hardError('MissingOrMalformedPrologue', 'missing prologue: the first significant line must be "!synxl 1"', lineNo);
@@ -831,20 +914,22 @@ class SynxlReader {
     // §6 — record line. The SYNX §7 first-character filter is NOT applied:
     // `-5`, `[unparsed]`, `/var/log/app` and `@handle` are ordinary values.
     const budget = this.maxRecordBytes;
-    const cost = utf8Length(line) + 1;
     let recordLine = line;
     let truncated = false;
-    if (cost > budget) {
+    // perf: a UTF-16 unit is at most 3 UTF-8 bytes, so most lines are known to
+    // fit without measuring; the exact count is taken only near the budget or
+    // when a block line needs what is left of it.
+    if (line.length * 3 + 1 > budget && utf8Length(line) + 1 > budget) {
       recordLine = truncateUtf8(line, budget);
       truncated = true;
     }
     this.pending = {
       line: lineNo,
       recordLine,
-      blockLines: [],
-      blockLineNos: [],
+      blockLines: null,
+      blockLineNos: null,
       fields: this.fields,
-      bytesLeft: truncated ? 0 : budget - cost,
+      bytesLeft: truncated ? 0 : -1,
       truncated,
     };
     return done;
@@ -858,18 +943,20 @@ class SynxlReader {
   private appendBlockLine(line: string, lineNo: number): void {
     const p = this.pending;
     if (!p) return;
+    if (p.bytesLeft < 0) p.bytesLeft = this.maxRecordBytes - (utf8Length(p.recordLine) + 1);
     if (p.bytesLeft <= 0) { p.truncated = true; return; }
+    if (!p.blockLines) { p.blockLines = []; p.blockLineNos = []; }
     const cost = utf8Length(line) + 1;
     if (cost > p.bytesLeft) {
       p.blockLines.push(truncateUtf8(line, p.bytesLeft));
-      p.blockLineNos.push(lineNo);
+      p.blockLineNos!.push(lineNo);
       p.bytesLeft = 0;
       p.truncated = true;
       return;
     }
     p.bytesLeft -= cost;
     p.blockLines.push(line);
-    p.blockLineNos.push(lineNo);
+    p.blockLineNos!.push(lineNo);
   }
 
   private handlePrologue(trimmed: string, lineNo: number): void {
@@ -915,17 +1002,18 @@ class SynxlReader {
     // precedes the record in the source), RecordTruncated, CastFailed in field
     // order, MissingFields/ExtraFields, block diagnostics in sorted key order,
     // ConstraintViolation in field order.
-    const orphanDiags = this.orphans;
-    this.orphans = [];
-    for (const d of orphanDiags) d.record = index;
-    const truncDiags: SynxlDiagnostic[] = [];
-    const castDiags: SynxlDiagnostic[] = [];
-    const arityDiags: SynxlDiagnostic[] = [];
-    const blockDiags: SynxlDiagnostic[] = [];
-    const constraintDiags: SynxlDiagnostic[] = [];
-
+    // perf: one array, filled in exactly the normative order — each kind is
+    // produced after the one before it, so per-kind arrays merged at the end
+    // (six arrays, a closure and a spread per record) gave the same sequence.
+    let diagnostics: SynxlDiagnostic[];
+    if (this.orphans.length > 0) {
+      diagnostics = this.orphans;
+      this.orphans = [];
+      for (const d of diagnostics) d.record = index;
+    } else {
+      diagnostics = [];
+    }
     const make = (
-      into: SynxlDiagnostic[],
       kind: SynxlDiagnosticKind,
       line: number,
       message: string,
@@ -933,14 +1021,14 @@ class SynxlReader {
     ): void => {
       const d: SynxlDiagnostic = { kind, record: index, line, message };
       if (field !== undefined) d.field = field;
-      into.push(d);
+      diagnostics.push(d);
     };
 
     if (p.truncated) {
-      make(truncDiags, 'RecordTruncated', p.line,
+      make('RecordTruncated', p.line,
         `record exceeds the ${this.maxRecordBytes}-byte budget and was truncated at a UTF-8 boundary`);
     } else if (this.unterminated) {
-      make(truncDiags, 'RecordTruncated', p.line,
+      make('RecordTruncated', p.line,
         'input ended without a newline — the final record may be incomplete');
     }
 
@@ -954,43 +1042,51 @@ class SynxlReader {
     if (trimSpacesTabs(p.recordLine) === ';') {
       for (const f of fields) setField(values, f.name, null);
     } else {
-      const parts = splitRecordLine(p.recordLine);
-
       // ── Inline fields (§7, §8) ──
-      let inlineIdx = 0;
+      // perf: parts are scanned in step with the fields — no part array.
+      const line = p.recordLine;
+      let pos = 0;
+      let partCount = 0;
       for (const f of fields) {
         if (f.block) { setField(values, f.name, null); continue; }
-        const part: SynxlPart | undefined = parts[inlineIdx++];
-        if (part === undefined) { setField(values, f.name, null); continue; }
-        if (part.quoted) {
+        if (pos === -1) { setField(values, f.name, null); continue; }
+        pos = scanPart(line, pos);
+        partCount++;
+        const value = line.substring(partStart, partEnd);
+        if (partQuoted) {
           // §7.4 — literal inner text: no escapes, no casting, no comment strip.
-          setField(values, f.name, part.value);
+          setField(values, f.name, value);
           continue;
         }
-        if (part.value === '') { setField(values, f.name, null); continue; } // §7.2
+        if (value === '') { setField(values, f.name, null); continue; } // §7.2
         if (f.type) {
-          const cast = castTyped(part.value, f.type);
-          if (!cast.ok) {
-            make(castDiags, 'CastFailed', p.line, `cannot cast "${part.value}" to ${f.type}`, f.name);
+          const cast = castTypedValue(value, f.type);
+          if (!lastCastOk) {
+            make('CastFailed', p.line, `cannot cast "${value}" to ${f.type}`, f.name);
           }
-          setField(values, f.name, cast.value);
+          setField(values, f.name, cast);
         } else {
-          setField(values, f.name, castAuto(part.value));
+          setField(values, f.name, castAuto(value));
         }
       }
+      // Surplus parts are counted, not kept (§7.3).
+      while (pos !== -1) {
+        pos = scanPart(line, pos);
+        partCount++;
+      }
 
-      if (parts.length < arity) {
-        make(arityDiags, 'MissingFields', p.line,
-          `record has ${parts.length} inline field(s), field list declares ${arity}; missing trailing fields are null`);
-      } else if (parts.length > arity) {
-        make(arityDiags, 'ExtraFields', p.line,
-          `record has ${parts.length} inline field(s), field list declares ${arity}; surplus discarded`);
+      if (partCount < arity) {
+        make('MissingFields', p.line,
+          `record has ${partCount} inline field(s), field list declares ${arity}; missing trailing fields are null`);
+      } else if (partCount > arity) {
+        make('ExtraFields', p.line,
+          `record has ${partCount} inline field(s), field list declares ${arity}; surplus discarded`);
       }
     }
 
     // ── Block fields (§9) ──
-    const blockText = p.blockLines.join('\n');
-    if (blockText.trim() !== '') {
+    const blockText = p.blockLines ? p.blockLines.join('\n') : '';
+    if (blockText !== '' && blockText.trim() !== '') {
       // §9.3 — delegate to the SYNX parser with the block's ORIGINAL
       // indentation; SYNX's stack repair attaches the shallowest keys to the
       // sub-document root, so no dedent pre-pass is needed.
@@ -1012,10 +1108,10 @@ class SynxlReader {
         if (f && f.block) {
           setField(values, key, root[key]);
         } else if (f) {
-          make(blockDiags, 'BlockFieldNotDeclared', blockKeyLine(p, key),
+          make('BlockFieldNotDeclared', blockKeyLine(p, key),
             `block key "${key}" is not declared [block]; the inline value is authoritative`, key);
         } else {
-          make(blockDiags, 'UnknownBlockKey', blockKeyLine(p, key),
+          make('UnknownBlockKey', blockKeyLine(p, key),
             `block key "${key}" matches no field in the field list`, key);
         }
       }
@@ -1028,18 +1124,10 @@ class SynxlReader {
         const msg = checkConstraints(f.name, values[f.name], f.constraints);
         // §11.2 — an inline field reports the record line, a block field the
         // line its key sits on.
-        if (msg) make(constraintDiags, 'ConstraintViolation', f.block ? blockKeyLine(p, f.name) : p.line, msg, f.name);
+        if (msg) make('ConstraintViolation', f.block ? blockKeyLine(p, f.name) : p.line, msg, f.name);
       }
     }
 
-    const diagnostics = [
-      ...orphanDiags,
-      ...truncDiags,
-      ...castDiags,
-      ...arityDiags,
-      ...blockDiags,
-      ...constraintDiags,
-    ];
     return { index, line: p.line, values, fields: p.fields, diagnostics };
   }
 }
@@ -1229,6 +1317,7 @@ export function synxlToNDJSON(source: string | SynxlDocument, options: SynxlOpti
 /** True for values that can sit on the first line of a `- ` list item. */
 function isInlineScalar(v: SynxValue): boolean {
   if (v === null) return true;
+  if (isSecretValue(v)) return true; // written as its `[SECRET]` mask
   if (typeof v === 'object') return false;
   return synxScalarText(v) !== null;
 }
@@ -1249,6 +1338,9 @@ function isInlineScalar(v: SynxValue): boolean {
  */
 function numberText(n: number): string | null {
   if (!Number.isFinite(n)) return null;
+  // `String(-0)` is "0": the sign — which the JSON projection keeps as `-0.0`
+  // — was lost on the way through the writer.
+  if (Object.is(n, -0)) return '-0.0';
   if (Number.isInteger(n) && !Number.isSafeInteger(n)) {
     return `${expandExponent(String(n))}.0`;
   }
@@ -1256,7 +1348,9 @@ function numberText(n: number): string | null {
 }
 
 /** Spell an exponent-form number out in full: SYNX §8.3 reads only `-?d.d`. */
-function expandExponent(s: string): string {
+export function expandExponent(s: string): string {
+  // perf: almost every number has no exponent; skip the regex for those.
+  if (s.indexOf('e') === -1 && s.indexOf('E') === -1) return s;
   const m = /^([+-]?)(\d+)(?:\.(\d+))?[eE]([+-]?\d+)$/.exec(s);
   if (!m) return s;
 
@@ -1298,7 +1392,9 @@ function synxScalarText(value: SynxValue): string | null {
   if (value.indexOf(' //') !== -1 || value.indexOf(' #') !== -1) return null;
 
   const needsQuote =
-    value !== trimUnicode(value) ||
+    // Edge whitespace, checked on the two edge characters — `trimUnicode`
+    // built a copy of every value to compare it.
+    isUnicodeSpace(value.charCodeAt(0)) || isUnicodeSpace(value.charCodeAt(value.length - 1)) ||
     value.indexOf('\r') !== -1 ||
     value === '|' || value === '|+' ||
     value.charCodeAt(0) === 34 || value.charCodeAt(0) === 39 ||
@@ -1380,8 +1476,15 @@ function inlineText(value: SynxValue, type?: string): string | null {
   return onlyLeadingQuote ? value : null;
 }
 
+/** A `:secret` value (branded by the engine; see SynxSecret). */
+function isSecretValue(v: unknown): boolean {
+  return v !== null && typeof v === 'object' && (v as Record<symbol, unknown>)[Symbol.for('synx.secret')] === true;
+}
+
 function emitListItem(item: SynxValue, indent: number, out: string[], step: number): void {
   const pad = ' '.repeat(indent);
+  // safety: a secret is written as its mask, never as its fields or plaintext.
+  if (isSecretValue(item)) { out.push(`${pad}- [SECRET]`); return; }
   if (item !== null && typeof item === 'object' && !Array.isArray(item)) {
     const entries = Object.entries(item as SynxObject).filter(([k]) => !k.startsWith('__synx'));
     if (entries.length === 0) { out.push(`${pad}- {}`); return; }
@@ -1389,12 +1492,17 @@ function emitListItem(item: SynxValue, indent: number, out: string[], step: numb
     // reorder so that one is available. Key order is not semantically
     // significant (the canonical projection sorts keys anyway).
     let first = entries.findIndex(([, v]) => isInlineScalar(v));
+    // §14.1 — an item is an object only when a deeper line follows its `- `
+    // line: a one-key item came back as a string, and an item with no inline
+    // value lost its head. Repeating the head in full below fixes both (a
+    // repeated key is legal; the last one wins). Mirrors synx-core.
+    const repeatHead = first < 0 || entries.length === 1;
     if (first < 0) first = 0;
     const [fk, fv] = entries[first];
-    const text = isInlineScalar(fv) ? synxScalarText(fv) : null;
+    const text = isSecretValue(fv) ? '[SECRET]' : isInlineScalar(fv) ? synxScalarText(fv) : null;
     out.push(text === null ? `${pad}- ${fk}` : `${pad}- ${fk} ${text}`);
     for (let i = 0; i < entries.length; i++) {
-      if (i === first) continue;
+      if (i === first && !repeatHead) continue;
       emitBlockEntry(entries[i][0], entries[i][1], indent + step, out, step);
     }
     return;
@@ -1412,8 +1520,11 @@ function emitListItem(item: SynxValue, indent: number, out: string[], step: numb
 
 function emitBlockEntry(key: string, value: SynxValue, indent: number, out: string[], step: number): void {
   const pad = ' '.repeat(indent);
+  if (isSecretValue(value)) { out.push(`${pad}${key} [SECRET]`); return; }
   if (Array.isArray(value)) {
-    out.push(`${pad}${key}`);
+    // A bare key reads back as an empty object; the `:join` list marker is
+    // the SYNX surface that yields an empty array, as synx-core writes it.
+    out.push(value.length === 0 ? `${pad}${key}:join` : `${pad}${key}`);
     for (const item of value) emitListItem(item, indent + step, out, step);
     return;
   }
@@ -1433,6 +1544,19 @@ function emitBlockEntry(key: string, value: SynxValue, indent: number, out: stri
   out.push(`${pad}${key} |+`);
   const body = String(value).split('\n');
   for (const bodyLine of body) out.push(`${pad}${' '.repeat(step)}${bodyLine}`);
+}
+
+/**
+ * Write an object as a SYNX document body that parses back to the same data
+ * — the block writer of §14.1. Used by `Synx.stringify` and `Synx.decompile`.
+ */
+export function writeSynxBody(obj: SynxObject, step = 2): string {
+  const out: string[] = [];
+  for (const [k, v] of Object.entries(obj)) {
+    if (k.startsWith('__synx')) continue;
+    emitBlockEntry(k, v, 0, out, step);
+  }
+  return out.length ? out.join('\n') + '\n' : '';
 }
 
 /** A group of records sharing one field list, as emitted by the writer. */
@@ -1459,11 +1583,20 @@ function emitGroup(group: WriteGroup, out: string[], step: number): void {
   // block field for the whole group; inline arity is a per-group constant.
   const blockNames = new Set<string>();
   for (const f of group.fields) if (f.block) blockNames.add(f.name);
+  // perf: each cell's inline text is computed once here and reused below —
+  // it was computed twice, once to decide promotion and once to write.
+  const types = group.fields.map(fieldType);
+  const texts: (string | null)[][] = [];
   for (const rec of group.records) {
-    for (const f of group.fields) {
-      if (blockNames.has(f.name)) continue;
-      if (inlineText(rec[f.name] ?? null, fieldType(f)) === null) blockNames.add(f.name);
+    const row: (string | null)[] = [];
+    for (let i = 0; i < group.fields.length; i++) {
+      const f = group.fields[i];
+      if (blockNames.has(f.name)) { row.push(null); continue; }
+      const t = inlineText(rec[f.name] ?? null, types[i]);
+      if (t === null) blockNames.add(f.name);
+      row.push(t);
     }
+    texts.push(row);
   }
 
   if (blockNames.size === group.fields.length) {
@@ -1484,11 +1617,16 @@ function emitGroup(group: WriteGroup, out: string[], step: number): void {
   });
   out.push(`!fields ${decls.join('; ')}`);
 
-  for (const rec of group.records) {
+  const inlineIdx: number[] = [];
+  for (let i = 0; i < group.fields.length; i++) if (!blockNames.has(group.fields[i].name)) inlineIdx.push(i);
+  for (let r = 0; r < group.records.length; r++) {
+    const rec = group.records[r];
+    const row = texts[r];
     const parts: string[] = [];
-    for (const f of group.fields) {
-      if (blockNames.has(f.name)) continue;
-      parts.push(inlineText(rec[f.name] ?? null, fieldType(f)) ?? '');
+    for (const i of inlineIdx) {
+      // A field promoted after this row was scanned has no cached text; it is
+      // block now, so it is not in `inlineIdx` either.
+      parts.push(row[i] ?? '');
     }
     // §7.2 — a record whose every inline field is null renders as the all-null
     // form, exactly `;`, which the reader recognizes at any arity without

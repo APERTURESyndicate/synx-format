@@ -38,23 +38,32 @@ export function compareUnicodeScalar(a: string, b: string): number {
   return a.length - b.length;
 }
 
+/** Characters that need escaping: `"`, `\`, and the C0 controls. */
+const NEEDS_ESCAPE = /["\\\u0000-\u001f]/;
+
 /** RFC 8259 string escaping, matching the reference implementation's choices. */
 function escapeString(s: string): string {
+  // perf: most strings need no escaping at all — one native test, one concat.
+  if (!NEEDS_ESCAPE.test(s)) return '"' + s + '"';
   let out = '"';
-  for (const ch of s) {
-    const c = ch.codePointAt(0) as number;
-    if (ch === '"') out += '\\"';
-    else if (ch === '\\') out += '\\\\';
-    else if (ch === '\n') out += '\\n';
-    else if (ch === '\r') out += '\\r';
-    else if (ch === '\t') out += '\\t';
+  let start = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    let esc: string;
+    if (c === 34) esc = '\\"';
+    else if (c === 92) esc = '\\\\';
+    else if (c === 10) esc = '\\n';
+    else if (c === 13) esc = '\\r';
+    else if (c === 9) esc = '\\t';
     // `\b` and `\f` have short forms in RFC 8259, but the reference
-    // implementation writes them as `` / ``, and §1.4.3 measures
+    // implementation writes them as `\u0008` / `\u000c`, and §1.4.3 measures
     // conformance on byte-identical output.
-    else if (c < 0x20) out += '\\u' + c.toString(16).padStart(4, '0');
-    else out += ch;
+    else if (c < 0x20) esc = '\\u' + c.toString(16).padStart(4, '0');
+    else continue;
+    out += s.substring(start, i) + esc;
+    start = i + 1;
   }
-  return out + '"';
+  return out + s.substring(start) + '"';
 }
 
 /**
@@ -107,8 +116,14 @@ function writeValue(v: unknown, hideMeta: boolean, indent: number, depth: number
     .sort(compareUnicodeScalar);
   if (keys.length === 0) return '{}';
   const entries = keys.map(k => {
-    const desc = Object.getOwnPropertyDescriptor(obj, k);
-    const value = desc && 'value' in desc ? desc.value : obj[k];
+    // perf: only `__proto__` needs the descriptor; every other key reads directly.
+    let value: unknown;
+    if (k === '__proto__') {
+      const desc = Object.getOwnPropertyDescriptor(obj, k);
+      value = desc && 'value' in desc ? desc.value : obj[k];
+    } else {
+      value = obj[k];
+    }
     return pad + escapeString(k) + sep + writeValue(value, hideMeta, indent, depth + 1);
   });
   return '{' + nl + entries.join(',' + nl) + nl + padEnd + '}';

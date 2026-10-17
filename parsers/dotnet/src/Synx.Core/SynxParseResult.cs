@@ -16,11 +16,17 @@ public sealed class SynxParseResult
     public bool Schema { get; set; }
     public bool Llm { get; set; }
 
-    /// <summary>Dot-path → key → meta (<c>""</c> is root), aligned with Rust <c>ParseResult::metadata</c>.</summary>
+    /// <summary>
+    /// Dot-path → key → meta (<c>""</c> is root), aligned with Rust <c>ParseResult::metadata</c>:
+    /// a list item is <c>list.#0</c>, and <c>.</c> / <c>\</c> inside a key are escaped (<c>a\.b</c>).
+    /// </summary>
     public Dictionary<string, Dictionary<string, SynxMeta>> Metadata { get; set; } = new(StringComparer.Ordinal);
 
     public List<SynxIncludeDirective> Includes { get; set; } = [];
 
     /// <summary><c>!use @scope/name [as alias]</c> directives.</summary>
     public List<SynxUseDirective> Uses { get; set; } = [];
+
+    /// <summary>Input was cut by a resource limit (16 MiB, 2 000 000 lines, a 1 MiB multiline body).</summary>
+    public bool Truncated { get; set; }
 }

@@ -3,7 +3,8 @@
 `parsers/cpp` is the **native** SYNX parser written in C++17 — no FFI to the
 Rust `synx-core` crate, no `synx-c` cdylib at runtime. It mirrors the
 canonical Rust engine 1:1 (parse / `!active` / `.synxb` / canonical JSON /
-diff / format / `!tool`).
+diff / format / `!tool`) at SYNX **3.8.0**: objects keep source order and
+`!active` documents resolve in one pass in document order.
 
 Targets:
 
@@ -67,10 +68,10 @@ if (bytes.ok()) {
 ```cpp
 synx::Options opts;
 opts.marker_fns["upper"] = [](const std::string& key,
-                              const std::vector<std::string>& args,
+                              const std::vector<std::string>& args,  // parts after `:upper`
                               const synx::Value& v) {
-    std::string s = synx::detail::value_to_string(v); // internal helper
-    for (auto& c : s) c = std::toupper(static_cast<unsigned char>(c));
+    std::string s = v.as_string() ? *v.as_string() : std::string();
+    for (auto& c : s) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
     return synx::Value::make_string(std::move(s));
 };
 auto r = synx::Synx::parse_active_root(
@@ -99,8 +100,10 @@ parsers/cpp/
 │   └── binary.hpp         # compile(), decompile()
 ├── src/
 │   ├── value.cpp parser.cpp engine.cpp engine_markers.cpp calc.cpp
-│   ├── json.cpp stringify.cpp formatter.cpp diff.cpp binary.cpp synx.cpp
-│   └── engine_internal.hpp  (private)
+│   ├── json.cpp json_read.cpp synx_writer.cpp stringify.cpp formatter.cpp
+│   ├── diff.cpp binary.cpp synx.cpp unicode.cpp numfmt.cpp rng.cpp
+│   └── *.hpp, unicode_tables.inc  (private)
+├── bench/bench.cpp         # best-of-N timings per document
 ├── tests/
 │   ├── CMakeLists.txt
 │   ├── test_helpers.hpp test_main.cpp
@@ -126,17 +129,23 @@ parsers/cpp/
 
 ## What's unsupported (versus Rust core)
 
-* **WASM custom markers** — replaced by `Options::marker_fns` (C++ `std::function`).
+* **WASM custom markers** — replaced by `Options::marker_fns` (C++ `std::function`),
+  dispatched where Rust dispatches WASM markers: after the built-ins, the first
+  registered non-built-in marker of a chain, with the parts after it as `args`.
+* **SYNXL** (`.synxl` datasets) — not ported.
+* **`.synxb` without zlib** — `compile` / `decompile` return an error; the
+  payload layer itself does not depend on zlib.
 * **`:signing`** — Ed25519 signature verification module not yet ported.
 * `:vision` / `:audio` are passthrough envelopes; consumers attach actual
   media bytes outside the parser. This matches the Rust core's surface.
 
 ## Wire compatibility
 
-* **JSON**: byte-for-byte identical to Rust ryu/itoa output for typical inputs.
-  Floats round-tripped through `%.17g` with mandatory `.0` suffix.
-* **`.synxb`**: identical magic / version / flags / string table / DEFLATE
-  payload as `crates/synx-core`. Files written here decompile under Rust /
-  C# / GDScript and vice-versa.
-* **Canonical text format**: same sort key and indentation rules as the
-  Rust `fmt_canonical`.
+* **JSON**: byte-for-byte identical to Rust (`ryu` float layout, shortest
+  round-trip digits).
+* **`.synxb`**: magic / version / flags / string table (ordered by use count) /
+  payload are byte-identical to `crates/synx-core`; the DEFLATE stream is zlib's
+  (Rust uses miniz_oxide), so the compressed bytes differ while both read each
+  other's files.
+* **Canonical text format** and **stringify**: byte-identical to Rust
+  `fmt_canonical` and `serialize` (the SYNXL §14.1 writer).

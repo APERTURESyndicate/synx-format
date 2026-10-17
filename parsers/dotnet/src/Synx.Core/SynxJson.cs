@@ -1,7 +1,5 @@
-using System.Buffers;
 using System.Globalization;
 using System.Text;
-using System.Text.Json;
 
 namespace Synx;
 
@@ -56,8 +54,10 @@ public static class SynxJson
                 break;
             case SynxValue.Obj obj:
                 o.Append('{');
-                var keys = obj.Map.Keys.OrderBy(k => k, StringComparer.Ordinal).ToList();
-                for (var i = 0; i < keys.Count; i++)
+                var keys = new string[obj.Map.Count];
+                obj.Map.Keys.CopyTo(keys, 0);
+                SynxSort.Keys(keys);
+                for (var i = 0; i < keys.Length; i++)
                 {
                     if (i > 0) o.Append(',');
                     WriteString(o, keys[i]);
@@ -74,25 +74,25 @@ public static class SynxJson
     internal static void WriteDouble(StringBuilder o, double f)
     {
         // JSON has no NaN / ±Infinity literals — emit null so output stays valid.
-        // Matches the Rust write_json fix in synx_core::write_json_depth.
         if (double.IsNaN(f) || double.IsInfinity(f))
         {
             o.Append("null");
             return;
         }
-        // Match ECMA/JavaScript shortest representation (same idea as Rust ryu in synx-core).
-        var buf = new ArrayBufferWriter<byte>();
-        using (var jw = new Utf8JsonWriter(buf))
-            jw.WriteNumberValue(f);
-        var span = buf.WrittenSpan;
-        o.Append(Encoding.UTF8.GetString(span));
+        // The ryu layout synx-core writes: 1.0, 0.25, 1e-7, 1.2345678901234569e23.
+        SynxNum.AppendRyu(o, f);
     }
 
     internal static void WriteString(StringBuilder o, string str)
     {
         o.Append('"');
-        foreach (var ch in str)
+        // perf: unescaped runs are copied whole.
+        var start = 0;
+        for (var i = 0; i < str.Length; i++)
         {
+            var ch = str[i];
+            if (ch >= 0x20 && ch != '"' && ch != '\\') continue;
+            o.Append(str, start, i - start);
             switch (ch)
             {
                 case '"': o.Append("\\\""); break;
@@ -101,13 +101,14 @@ public static class SynxJson
                 case '\r': o.Append("\\r"); break;
                 case '\t': o.Append("\\t"); break;
                 default:
-                    if (ch < 0x20)
-                        o.AppendFormat(CultureInfo.InvariantCulture, "\\u{0:x4}", (uint)ch);
-                    else
-                        o.Append(ch);
+                    o.Append("\\u00").Append(Hex[ch >> 4]).Append(Hex[ch & 0xF]);
                     break;
             }
+            start = i + 1;
         }
+        o.Append(str, start, str.Length - start);
         o.Append('"');
     }
+
+    private const string Hex = "0123456789abcdef";
 }

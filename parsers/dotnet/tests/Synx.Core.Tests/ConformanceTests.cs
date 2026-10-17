@@ -37,6 +37,7 @@ public class ConformanceTests
         // GetString keeps a leading BOM (ReadAllText would drop it): stripping it is the parser's job.
         var utf8 = new UTF8Encoding(false);
         var input = utf8.GetString(File.ReadAllBytes(synxPath));
+        // As the Rust and TypeScript runners: the expectation is trimmed, our output is not.
         var expected = utf8.GetString(File.ReadAllBytes(expectedPath)).Trim();
 
         var isTool = input.TrimStart().StartsWith("!tool", StringComparison.Ordinal);
@@ -60,6 +61,6 @@ public class ConformanceTests
     [Fact]
     public void Conformance_suite_is_not_empty()
     {
-        Assert.True(Cases().Count() >= 24, "expected at least 24 conformance cases (001-018, 100-105)");
+        Assert.True(Cases().Count() >= 34, "expected at least 34 conformance cases (001-019, 100-114)");
     }
 }

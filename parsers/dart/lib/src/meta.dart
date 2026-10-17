@@ -28,7 +28,7 @@ class SynxConstraints {
 class SynxMeta {
   List<String> markers = [];
 
-  /// One arg per marker (same length as `markers`).
+  /// Arguments carried in the value: `:random` weights, the parent of `:inherit name`.
   List<String> args = [];
   String? typeHint;
   SynxConstraints? constraints;
@@ -46,6 +46,8 @@ class SynxMeta {
   }
 }
 
+/// Metadata of one object, by key. Paths name a list item as `list.#0` and escape
+/// `.` / `\` inside a key (`a\.b`), as synx-core.
 typedef SynxMetaMap = Map<String, SynxMeta>;
 typedef SynxMetadataTree = Map<String, SynxMetaMap>;
 
@@ -71,6 +73,10 @@ class SynxParseResult {
   SynxMetadataTree metadata;
   List<SynxIncludeDirective> includes;
   List<SynxUseDirective> uses;
+
+  /// Input was cut by a resource limit (16 MiB, 2 000 000 lines, a 1 MiB multiline
+  /// body). A dropped leading BOM does not count.
+  bool truncated = false;
 
   SynxParseResult({
     SynxValue? root,

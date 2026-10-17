@@ -1,0 +1,10 @@
+!active
+s:format:%.2f "3.14159"
+n:format:%.2f 3.14159
+obj
+  k 1
+nothing null
+a See {obj}!
+b Value {nothing}.
+v1:version:>=:1.2.3 1.2.3-beta
+v2:version:>:1.2 "1.10"

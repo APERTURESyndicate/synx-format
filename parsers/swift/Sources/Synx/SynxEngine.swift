@@ -1,171 +1,188 @@
-// SYNX `!active` engine — resolves markers, includes, packages, interpolation,
-// constraints. Mirrors crates/synx-core/src/engine.rs.
+// SYNX `!active` engine — resolution order, pre-passes, registries, validation.
+// Port of crates/synx-core/src/engine.rs (control-flow half).
 import Foundation
 
 public enum SynxEngine {
 
     public static let maxResolveDepth = 512
 
-    /// Apply markers and constraints to `result` in-place. No-op if mode != .active.
+    /// Apply markers and constraints to `result` in place. No-op unless `.active`.
     public static func resolve(_ result: inout SynxParseResult, options: SynxOptions) {
         guard result.mode == .active else { return }
-        guard case .object = result.root else { return }
-        var r = Resolver(result: result, options: options)
-        r.run()
-        result = r.result
-    }
-}
-
-// MARK: - Resolver
-
-final class Resolver {
-    var result: SynxParseResult
-    var options: SynxOptions
-    var namespaces: [String: SynxObject] = [:]
-    var typeRegistry: [String: SynxConstraints] = [:]
-    var onceLoaded = false
-    var onceKeys: Set<String> = []
-    var onceNewKeys: Set<String> = []
-    /// Aliases of `!include`d files (not `!use` packages) — `{key:include}` scope.
-    var includeAliases: [String] = []
-    var rng: SystemRandomNumberGenerator
-
-    init(result: SynxParseResult, options: SynxOptions) {
-        self.result = result
-        self.options = options
-        self.rng = SystemRandomNumberGenerator()
+        guard case .object(let o) = result.root else { return }
+        let root = MObject(o)
+        resolveTree(root, &result, options: options)
+        result.root = .object(root.toObject())
     }
 
-    func run() {
-        loadPackages()
-        loadIncludes()
-        applyInheritPass()
-        stripUnderscoreKeys()
-        maskSecretLiterals()
-        walk(path: "", depth: 0)
-        validateFieldConstraints()
-        validateFieldTypes()
-        flushOnce()
-    }
+    /// Resolve the working tree of `result` (its `root` field is left alone).
+    static func resolveTree(_ root: MObject, _ result: inout SynxParseResult, options: SynxOptions) {
+        guard result.mode == .active else { return }
+        var metadata = result.metadata
+        result.metadata = [:]
+        let includeDirectives = result.includes
+        result.includes = []
+        let useDirectives = result.uses
+        result.uses = []
 
-    // MARK: - top-level passes
+        // `options.env["SYNX_SEED"]` makes `:random` and friends reproducible (Swift extension).
+        if let s = options.env?["SYNX_SEED"], let seed = RustNumber.parseU64(s) { SynxRng.seed(seed) }
 
-    private func loadPackages() {
-        guard !result.uses.isEmpty else { return }
-        let base = options.packagesPath ?? "./synx_packages"
-        for use in result.uses {
-            if use.package.contains("..") { continue }
-            let path = (base as NSString).appendingPathComponent(use.package + "/synx.synx")
-            guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { continue }
-            let sub = SynxParser.parse(text)
-            guard case .object(let obj) = sub.root else { continue }
-            namespaces[use.alias] = obj
-            // Expose under alias key in root so interpolation `{alias.key}` works.
-            if case .object(var root) = result.root {
-                root.set(use.alias, to: .object(obj))
-                result.root = .object(root)
+        let packages = Files.loadPackages(useDirectives, options)
+        var includes = Files.loadIncludes(includeDirectives, options)
+        // Root `:include` keys the pre-pass already resolved, as `[path, root]`;
+        // kept apart from `includes`, whose size `{key:include}` reads.
+        var preresolved = SynxIndexMap<MValue>()
+
+        // `:include` / `:import` root keys are include aliases too, so
+        // `{leaf:<key>}` interpolation works for `db:include ./common.synx`.
+        if let mm = metadata[""] {
+            let base = options.basePath ?? "."
+            for (i, key) in root.keys.enumerated() {
+                guard let meta = mm[key], meta.hasMarker("include") || meta.hasMarker("import") else { continue }
+                // safety: the included document's own pre-pass includes again;
+                // without the depth cap a file that includes itself never ends.
+                if options.includeDepth >= (options.maxIncludeDepth ?? Files.defaultMaxIncludeDepth) { continue }
+                guard let file = root.values[i].string else { continue }
+                guard case .ok(let path) = Files.jail(base, file), Files.sizeError(path) == nil,
+                      case .ok(let text) = Files.read(path, ctx: file) else { continue }
+                let included = Files.loadSynx(text, path, options)
+                // perf: the key's `:include` marker takes this result instead of
+                // resolving the file again (each level twice cost 2^depth).
+                preresolved[key] = .array(MArray([.string(file), included]))
+                if includes.position(of: key) == nil { includes[key] = included }
             }
         }
-    }
-
-    private func loadIncludes() {
-        guard !result.includes.isEmpty else { return }
-        let maxDepth = options.maxIncludeDepth ?? 16
-        if options.includeDepth >= maxDepth { return }
-
-        let base = options.basePath ?? "."
-        for inc in result.includes {
-            guard let safe = jailPath(base: base, rel: inc.path) else { continue }
-            guard let text = try? String(contentsOfFile: safe, encoding: .utf8) else { continue }
-            var sub = SynxParser.parse(text)
-            if sub.mode == .active {
-                var subOpts = options
-                subOpts.basePath = (safe as NSString).deletingLastPathComponent
-                subOpts.includeDepth = options.includeDepth + 1
-                SynxEngine.resolve(&sub, options: subOpts)
-            }
-            guard case .object(let obj) = sub.root else { continue }
-            namespaces[inc.alias] = obj
-            includeAliases.append(inc.alias)
-            if case .object(var root) = result.root {
-                root.set(inc.alias, to: .object(obj))
-                result.root = .object(root)
-            }
+        for (alias, value) in packages where root.find(alias) == nil {
+            root.keys.append(alias)
+            root.values.append(value.deepCopy())
         }
-    }
 
-    private func applyInheritPass() {
-        for (path, fields) in result.metadata {
-            for (key, meta) in fields where meta.hasMarker("inherit") && !meta.args.isEmpty {
-                inheritMerge(path: path, key: key, parentNames: meta.args)
-            }
+        var types = SynxIndexMap<String>()
+        var constraints = SynxIndexMap<SynxConstraints>()
+        collectRegistries(.object(root), metadata, "", &types, &constraints, 0)
+
+        applyInheritance(root, &metadata)
+        root.retain { !$0.utf8.starts(with: [0x5F]) }
+        maskSecretLiterals(.object(root), metadata, "")
+
+        // Resolution replaces values but never adds or removes keys: the root's
+        // key set is fixed from here on.
+        var special: [String] = []
+        for k in root.keys where Calc.isSpecialKey(k) { special.append(k) }
+        let r = Resolver(options: options, root: root, metadata: metadata, includes: includes,
+                         preresolved: preresolved, rootSpecial: special)
+        r.resolve(.object(root), "", 0)
+
+        if !constraints.isEmpty || !types.isEmpty {
+            validateFields(root, constraints, types, options)
         }
+        result.metadata = metadata
+        result.includes = includeDirectives
     }
 
-    private func inheritMerge(path: String, key: String, parentNames: [String]) {
-        guard case .object(var root) = result.root else { return }
-        let parentObj = getObjectAt(path: path, in: &root)
-        guard var parent = parentObj.value else { return }
-        guard case .object(var target) = (parent[key] ?? .null) else { return }
+    // MARK: - registries
 
-        for parentName in parentNames {
-            if let pv = parent[parentName], case .object(let src) = pv {
-                mergeMissing(into: &target, from: src)
-            }
-        }
-        parent.set(key, to: .object(target))
-        setObjectAt(path: path, in: &root, value: parent)
-        result.root = .object(root)
+    private static func mergeConstraints(_ base: inout SynxConstraints, _ inc: SynxConstraints) {
+        if inc.required { base.required = true }
+        if inc.readonly { base.readonly = true }
+        if let b = inc.min { base.min = base.min.map { Swift.max($0, b) } ?? b }
+        if let b = inc.max { base.max = base.max.map { Swift.min($0, b) } ?? b }
+        if base.typeName == nil { base.typeName = inc.typeName }
+        if base.pattern == nil { base.pattern = inc.pattern }
+        if base.enumValues == nil { base.enumValues = inc.enumValues }
     }
 
-    private func mergeMissing(into dst: inout SynxObject, from src: SynxObject) {
-        for entry in src.entries {
-            if let existing = dst[entry.key] {
-                if case .object(var existingObj) = existing,
-                   case .object(let srcObj) = entry.value {
-                    mergeMissing(into: &existingObj, from: srcObj)
-                    dst.set(entry.key, to: .object(existingObj))
-                }
-                // Child wins — don't overwrite.
-            } else {
-                dst.set(entry.key, to: entry.value)
-            }
-        }
-    }
-
-    private func stripUnderscoreKeys() {
-        guard case .object(var root) = result.root else { return }
-        let keys = root.keys
-        for k in keys where k.first == "_" {
-            _ = root.remove(k)
-        }
-        result.root = .object(root)
-    }
-
-    private func walk(path: String, depth: Int) {
-        guard depth <= SynxEngine.maxResolveDepth else { return }
-        // Children first, so a parent's markers and interpolation see resolved values.
-        if case .object(let root) = result.root,
-           case .object(let obj) = getValueAt(path: path, in: root) ?? .null {
-            for entry in obj.entries {
-                if case .object = entry.value {
-                    let sub = path.isEmpty ? entry.key : path + "." + entry.key
-                    walk(path: sub, depth: depth + 1)
-                } else if case .array(let arr) = entry.value {
-                    let sub = path.isEmpty ? entry.key : path + "." + entry.key
-                    for item in arr {
-                        if case .object = item { walk(path: sub, depth: depth + 1) }
+    /// Registries from the live tree: each object's own declarations first, then
+    /// its children in document order. The first type for a name wins.
+    private static func collectRegistries(_ value: MValue, _ metadata: SynxMetadataTree, _ path: String,
+                                          _ types: inout SynxIndexMap<String>,
+                                          _ constraints: inout SynxIndexMap<SynxConstraints>, _ depth: Int) {
+        if depth > SynxEngine.maxResolveDepth { return }
+        guard let map = value.object else { return }
+        if let mm = metadata[path] {
+            for (key, meta) in mm {
+                if let hint = meta.typeHint, types[key] == nil { types[key] = hint }
+                if let c = meta.constraints {
+                    if constraints[key] != nil {
+                        constraints.update(key, default: c) { mergeConstraints(&$0, c) }
+                    } else {
+                        constraints[key] = c
                     }
                 }
             }
         }
-        // For every metadata entry at this path level apply markers.
-        if let fields = result.metadata[path] {
-            for (key, meta) in fields {
-                applyMarkers(meta: meta, key: key, atPath: path)
+        for i in 0..<map.count {
+            let child = map.values[i]
+            guard child.isObjectOrArray else { continue }
+            let childPath = Resolver.childPath(path, map.keys[i])
+            if let arr = child.array {
+                for (idx, item) in arr.items.enumerated() where item.object != nil {
+                    collectRegistries(item, metadata, Resolver.itemPath(childPath, idx), &types, &constraints, depth + 1)
+                }
+            } else {
+                collectRegistries(child, metadata, childPath, &types, &constraints, depth + 1)
             }
         }
-        interpolateLevel(path: path)
+    }
+
+    // MARK: - :inherit
+
+    /// Several parents merged left to right, the child overrides; each field keeps
+    /// the declaration of the object its value came from; inherited nested
+    /// subtrees are copies carrying their own declarations.
+    private static func applyInheritance(_ root: MObject, _ metadata: inout SynxMetadataTree) {
+        guard let rootMeta = metadata[""] else { return }
+        var inherits: [(String, [String])] = []
+        for (key, meta) in rootMeta {
+            guard let idx = meta.markerIndex("inherit") else { continue }
+            var parents = Array(meta.markers[(idx + 1)...])
+            if parents.isEmpty && !meta.args.isEmpty { parents = meta.args }
+            if !parents.isEmpty { inherits.append((key, parents)) }
+        }
+        for (childKey, parents) in inherits {
+            // Only an object inherits; a list or a scalar is left as written.
+            guard let childObj = root.get(childKey)?.object else { continue }
+            let merged = MObject()
+            var source: [(key: String, from: String?)] = []
+            func note(_ k: String, _ from: String?) {
+                if let i = source.firstIndex(where: { $0.key.bytesEqual(k) }) { source[i].from = from } else { source.append((k, from)) }
+            }
+            for parentName in parents {
+                guard let p = root.get(parentName)?.object else { continue }
+                for i in 0..<p.count {
+                    merged.set(p.keys[i], p.values[i].deepCopy())
+                    note(p.keys[i], parentName)
+                }
+            }
+            for i in 0..<childObj.count {
+                merged.set(childObj.keys[i], childObj.values[i].deepCopy())
+                note(childObj.keys[i], nil)
+            }
+            var top = SynxMetaMap()
+            var nested: [(String, SynxMetaMap)] = []
+            for (k, src) in source {
+                let from = src ?? childKey
+                if let m = metadata[MetaPath.segment(from)]?[k] { top[k] = m }
+                if let parent = src {
+                    // The inherited subtree is a copy; its nested markers move with it.
+                    let prefix = MetaPath.segment(parent) + "." + MetaPath.segment(k)
+                    for (p, mm) in metadata {
+                        guard p.bytesHasPrefix(prefix) else { continue }
+                        let rest = String(decoding: Array(p.utf8).dropFirst(prefix.utf8.count), as: UTF8.self)
+                        if !rest.isEmpty && !rest.bytesHasPrefix(".") { continue }
+                        nested.append((MetaPath.segment(childKey) + "." + MetaPath.segment(k) + rest, mm))
+                    }
+                }
+            }
+            root.set(childKey, .object(merged))
+            if top.isEmpty {
+                metadata.removeValue(forKey: MetaPath.segment(childKey))
+            } else {
+                metadata[MetaPath.segment(childKey)] = top
+            }
+            for (p, mm) in nested { metadata[p] = mm }
+        }
     }
 
     // MARK: - :secret pre-pass
@@ -175,416 +192,391 @@ final class Resolver {
         "fallback", "once", "split", "join", "format", "replace",
     ]
 
-    /// Wrap every literal `:secret` value in `.secret` before any resolution so
-    /// an `{interpolation}` can never read the plaintext. A secret that itself
-    /// needs resolving (`:secret:env`) is masked by its own marker afterwards.
-    private func maskSecretLiterals() {
-        guard case .object(var root) = result.root else { return }
-        var changed = false
-        for (path, fields) in result.metadata {
-            for (key, meta) in fields where meta.hasMarker("secret")
-                && !meta.markers.contains(where: { Resolver.resolvingBeforeSecret.contains($0) }) {
-                guard var parent = getObjectAt(path: path, in: &root).value,
-                      let v = parent[key] else { continue }
-                switch v {
-                case .secret, .object, .array: continue
-                default: break
+    /// safety: literal `:secret` values are masked before any resolution, so no
+    /// `{interpolation}` can read the plaintext.
+    private static func maskSecretLiterals(_ value: MValue, _ metadata: SynxMetadataTree, _ path: String) {
+        guard let map = value.object else { return }
+        if let mm = metadata[path] {
+            for (key, meta) in mm where meta.hasMarker("secret") && !meta.markers.contains(where: { resolvingBeforeSecret.contains($0) }) {
+                guard let i = map.find(key) else { continue }
+                let v = map.values[i]
+                if !v.isSecret && !v.isObjectOrArray { map.values[i] = .secret(v.text) }
+            }
+        }
+        for i in 0..<map.count {
+            let child = map.values[i]
+            guard child.isObjectOrArray else { continue }
+            let childPath = Resolver.childPath(path, map.keys[i])
+            if let arr = child.array {
+                for (idx, item) in arr.items.enumerated() where item.object != nil {
+                    maskSecretLiterals(item, metadata, Resolver.itemPath(childPath, idx))
                 }
-                parent.set(key, to: .secret(valueToString(v)))
-                setObjectAt(path: path, in: &root, value: parent)
-                changed = true
+            } else {
+                maskSecretLiterals(child, metadata, childPath)
             }
-        }
-        if changed { result.root = .object(root) }
-    }
-
-    // MARK: - auto-{} interpolation
-
-    /// Resolve `{key}` / `{a.b}` / `{key:alias}` / `{key:include}` in every string
-    /// value of the object at `path`. Mirrors the Rust engine's third pass.
-    private func interpolateLevel(path: String) {
-        guard case .object(var root) = result.root else { return }
-        guard var parent = getObjectAt(path: path, in: &root).value else { return }
-        var changed = false
-        for entry in parent.entries {
-            guard case .string(let s) = entry.value, s.contains("{") else { continue }
-            let out = resolveInterpolation(s, root: root, local: parent)
-            if out != s {
-                parent.set(entry.key, to: .string(out))
-                changed = true
-            }
-        }
-        if changed {
-            setObjectAt(path: path, in: &root, value: parent)
-            result.root = .object(root)
         }
     }
 
-    private static let maxScratchBytes = 4 * 1024 * 1024
+    // MARK: - validation
 
-    private func isRefName(_ scalars: ArraySlice<Unicode.Scalar>) -> Bool {
-        scalars.allSatisfy { c in
-            c == "_" || c == "." || c.properties.isAlphabetic || c.properties.numericType != nil
+    private static func matchesType(_ v: MValue, _ t: String) -> Bool {
+        switch (t, v) {
+        case ("int", .int), ("float", .float), ("float", .int), ("bool", .bool),
+             ("string", .string), ("string", .secret), ("array", .array), ("object", .object):
+            return true
+        case ("int", _), ("float", _), ("bool", _), ("string", _), ("array", _), ("object", _):
+            return false
+        default:
+            return true  // unknown types are accepted
         }
     }
 
-    func resolveInterpolation(_ tpl: String, root: SynxObject, local: SynxObject) -> String {
-        let sc = Array(tpl.unicodeScalars)
-        var out = String.UnicodeScalarView()
-        var outBytes = 0
-        func push<S: Sequence>(_ seq: S) where S.Element == Unicode.Scalar {
-            for c in seq {
-                let w = UTF8.width(c)
-                if outBytes + w > Resolver.maxScratchBytes { return }
-                out.append(c)
-                outBytes += w
+    /// Constraints then type for every field. A value already holding a
+    /// CONSTRAINT_ERR / TYPE_ERR is not measured again against constraints.
+    private static func validateFields(_ map: MObject, _ constraints: SynxIndexMap<SynxConstraints>,
+                                       _ types: SynxIndexMap<String>, _ options: SynxOptions) {
+        for i in 0..<map.count {
+            let key = map.keys[i]
+            if let c = constraints[key] {
+                var already = false
+                if let s = map.values[i].string {
+                    already = s.bytesHasPrefix("CONSTRAINT_ERR:") || s.bytesHasPrefix("TYPE_ERR:")
+                }
+                if !already, let err = Constraints.violation(key, map.values[i], c) {
+                    report(options, err)
+                    map.values[i] = .string(err)
+                }
             }
+            if let expected = types[key], !matchesType(map.values[i], expected) {
+                let err = "TYPE_ERR: '\(key)' expected \(expected) but got \(map.values[i].typeName)"
+                report(options, err)
+                map.values[i] = .string(err)
+            }
+            switch map.values[i] {
+            case .object(let child): validateFields(child, constraints, types, options)
+            case .array(let arr):
+                for item in arr.items { if let o = item.object { validateFields(o, constraints, types, options) } }
+            default: break
+            }
+        }
+    }
+
+    static func report(_ options: SynxOptions, _ message: String) {
+        guard options.strict else { return }
+        FileHandle.standardError.write(Data("synx: \(message)\n".utf8))
+    }
+}
+
+// MARK: - lookups
+
+/// `root.key` directly, then a dotted path through objects (Rust `deep_get`).
+func deepGet(_ root: MValue, _ path: String) -> MValue? {
+    guard let map = root.object else { return nil }
+    if let v = map.get(path) { return v }
+    var current = root
+    for part in splitBytes(path, 0x2E) {
+        guard let o = current.object, let next = o.get(part) else { return nil }
+        current = next
+    }
+    return current
+}
+
+// MARK: - the resolver
+
+final class Resolver {
+    let options: SynxOptions
+    let root: MObject
+    let metadata: SynxMetadataTree
+    let includes: SynxIndexMap<MValue>
+    let preresolved: SynxIndexMap<MValue>
+    let rootSpecial: [String]
+
+    init(options: SynxOptions, root: MObject, metadata: SynxMetadataTree, includes: SynxIndexMap<MValue>,
+         preresolved: SynxIndexMap<MValue>, rootSpecial: [String]) {
+        self.options = options
+        self.root = root
+        self.metadata = metadata
+        self.includes = includes
+        self.preresolved = preresolved
+        self.rootSpecial = rootSpecial
+    }
+
+    /// One pass in document order: each key's subtree, then the key's own markers
+    /// — a marker sees every key before it resolved, at any depth — then `{…}`.
+    func resolve(_ value: MValue, _ path: String, _ depth: Int) {
+        guard let map = value.object else { return }
+        if depth >= SynxEngine.maxResolveDepth {
+            for i in 0..<map.count { map.values[i] = .string("NESTING_ERR: maximum object nesting depth exceeded") }
+            return
+        }
+        let mm = metadata[path]
+        let count = map.count
+        for i in 0..<count {
+            let child = map.values[i]
+            if child.isObjectOrArray {
+                let childPath = Resolver.childPath(path, map.keys[i])
+                if let arr = child.array {
+                    for (idx, item) in arr.items.enumerated() where item.object != nil {
+                        resolve(item, Resolver.itemPath(childPath, idx), depth + 1)
+                    }
+                } else {
+                    resolve(child, childPath, depth + 1)
+                }
+            }
+            guard let meta = mm?[map.keys[i]] else { continue }
+            applyMarkers(map, i, meta, path)
+        }
+        for i in 0..<count {
+            guard let s = map.values[i].string, s.utf8.contains(0x7B) else { continue }
+            let out = interpolate(s, map)
+            if !out.bytesEqual(s) { map.values[i] = .string(out) }
+        }
+    }
+
+    static func childPath(_ path: String, _ key: String) -> String {
+        var p = path
+        if !p.isEmpty { p.append(".") }
+        MetaPath.pushKey(&p, key)
+        return p
+    }
+
+    static func itemPath(_ listPath: String, _ idx: Int) -> String {
+        var p = listPath
+        MetaPath.pushItem(&p, idx)
+        return p
+    }
+
+    /// `{name}`, `{a.b}`, `{name:alias}`, `{name:include}`.
+    func interpolate(_ tpl: String, _ local: MObject) -> String {
+        let cap = Files.maxScratch
+        let t = Array(tpl.utf8)
+        var out: [UInt8] = []
+        out.reserveCapacity(min(t.count, cap))
+        func pushCapped(_ s: String) {
+            let u = Array(s.utf8)
+            let room = cap - min(out.count, cap)
+            if room > 0 { out.append(contentsOf: u.prefix(utf8Cut(u, room))) }
+        }
+        func pushLiteral(_ inner: ArraySlice<UInt8>) {
+            out.append(0x7B)
+            let rem = cap > out.count + 1 ? cap - (out.count + 1) : 0
+            if rem > 0 { let a = Array(inner); out.append(contentsOf: a.prefix(utf8Cut(a, rem))) }
+            if out.count < cap { out.append(0x7D) }
         }
         var i = 0
-        while i < sc.count {
-            if outBytes >= Resolver.maxScratchBytes { break }
-            if sc[i] == "{", let close = sc[(i + 1)...].firstIndex(of: "}") {
-                let inner = sc[(i + 1)..<close]
-                var refName = inner
-                var scope: String? = nil
-                if let colon = inner.firstIndex(of: ":") {
-                    refName = inner[inner.startIndex..<colon]
-                    var sv = String.UnicodeScalarView()
-                    sv.append(contentsOf: inner[(colon + 1)...])
-                    scope = String(sv)
-                }
-                if isRefName(refName) {
-                    var nameView = String.UnicodeScalarView()
-                    nameView.append(contentsOf: refName)
-                    let name = String(nameView)
-                    let resolved: SynxValue?
-                    if let scope = scope {
+        while i < t.count {
+            if out.count >= cap { break }
+            if t[i] == 0x7B, let close = t[(i + 1)...].firstIndex(of: 0x7D) {
+                let inner = t[(i + 1)..<close]
+                let colon = inner.firstIndex(of: 0x3A)
+                let ref = colon.map { t[(i + 1)..<$0] } ?? inner
+                if Resolver.isRefName(ref) {
+                    let name = String(decoding: ref, as: UTF8.self)
+                    var val: MValue? = nil
+                    if let c = colon {
+                        let scope = String(decoding: t[(c + 1)..<close], as: UTF8.self)
                         if scope == "include" {
-                            if includeAliases.count == 1, let ns = namespaces[includeAliases[0]] {
-                                resolved = deepGetValue(ns, name)
-                            } else {
-                                resolved = nil
-                            }
-                        } else {
-                            resolved = namespaces[scope].flatMap { deepGetValue($0, name) }
+                            if includes.count == 1 { val = deepGet(includes.entries[0].value, name) }
+                        } else if let inc = includes[scope] {
+                            val = deepGet(inc, name)
                         }
+                        if let v = val { pushCapped(v.text) } else { pushLiteral(inner) }
                     } else {
-                        resolved = deepGetValue(root, name) ?? local[name]
-                    }
-                    if let val = resolved {
-                        push(valueToString(val).unicodeScalars)
-                    } else {
-                        push(["{"]); push(inner); push(["}"])
+                        val = deepGet(.object(root), name) ?? local.get(name)
+                        if let v = val { pushCapped(v.text) } else { pushLiteral(ref) }
                     }
                     i = close + 1
                     continue
                 }
             }
-            push([sc[i]])
-            i += 1
+            let n = utf8Len(t[i])
+            if out.count < cap { out.append(contentsOf: t[i..<min(i + n, t.count)]) }
+            i += n
         }
-        return String(out)
+        return String(decoding: out, as: UTF8.self)
     }
 
-    /// Direct key first, then dot-path traversal through objects.
-    private func deepGetValue(_ root: SynxObject, _ path: String) -> SynxValue? {
-        if let direct = root[path] { return direct }
-        var current: SynxValue = .object(root)
-        for seg in path.split(separator: ".", omittingEmptySubsequences: false) {
-            guard case .object(let obj) = current, let next = obj[String(seg)] else { return nil }
-            current = next
+    /// Reference names: Unicode alphanumerics, `_` and `.`.
+    static func isRefName(_ s: ArraySlice<UInt8>) -> Bool {
+        for u in String(decoding: s, as: UTF8.self).unicodeScalars where !(isAlphanumeric(u) || u == "_" || u == ".") {
+            return false
         }
-        return current
+        return true
+    }
+}
+
+/// Longest prefix of `u` within `limit` bytes that does not split a character.
+func utf8Cut(_ u: [UInt8], _ limit: Int) -> Int {
+    if u.count <= limit { return u.count }
+    var n = limit
+    while n > 0 && (u[n] & 0xC0) == 0x80 { n -= 1 }
+    return n
+}
+
+// MARK: - files
+
+enum Files {
+    static let maxFileSize = 10 * 1024 * 1024
+    static let defaultMaxIncludeDepth = 16
+    static let maxScratch = 4 * 1024 * 1024
+
+    enum Outcome<T> {
+        case ok(T)
+        case err(String)
     }
 
-    private func applyMarkers(meta: SynxMeta, key: String, atPath path: String) {
-        guard case .object(var root) = result.root else { return }
-        let parentOpt = getObjectAt(path: path, in: &root)
-        guard var parent = parentOpt.value else { return }
-        var value = parent[key] ?? .null
-
-        // `:secret` masks the *resolved* value, so it runs after every other marker
-        // regardless of where it sits in the chain (`:secret:env`, `:env:secret`).
-        for marker in meta.markers where marker != "secret" {
-            switch marker {
-            case "env":      value = SynxMarkers.applyEnv(value, meta: meta, options: options)
-            case "default":  value = SynxMarkers.applyDefault(value, meta: meta)
-            case "calc":     value = SynxMarkers.applyCalc(value, key: key, root: root, local: parent)
-            case "ref":      value = SynxMarkers.applyRef(value, root: root, namespaces: namespaces)
-            case "alias":    value = SynxMarkers.applyRef(value, root: root, namespaces: namespaces)
-            case "random":   value = SynxMarkers.applyRandom(value, meta: meta, rng: &rng)
-            case "unique":   value = SynxMarkers.applyUnique(value)
-            case "geo":      value = SynxMarkers.applyGeo(value, meta: meta, options: options)
-            case "i18n":     value = SynxMarkers.applyI18n(value, meta: meta, options: options)
-            case "split":    value = SynxMarkers.applySplit(value, meta: meta)
-            case "join":     value = SynxMarkers.applyJoin(value, meta: meta)
-            case "clamp":    value = SynxMarkers.applyClamp(value, meta: meta)
-            case "round":    value = SynxMarkers.applyRound(value, meta: meta)
-            case "map":      value = SynxMarkers.applyMap(value, meta: meta)
-            case "format":   value = SynxMarkers.applyFormat(value, meta: meta,
-                                                              interpolate: { self.interpolate($0, root: root) })
-            case "replace":  value = SynxMarkers.applyReplace(value, meta: meta)
-            case "sort":     value = SynxMarkers.applySort(value, meta: meta)
-            case "sum":      value = SynxMarkers.applySum(value)
-            case "fallback": value = SynxMarkers.applyFallback(value, meta: meta)
-            case "once":     value = applyOnce(value, path: path, key: key)
-            case "version":  value = SynxMarkers.applyVersion(value)
-            case "watch":    value = SynxMarkers.applyWatch(value, basePath: options.basePath ?? ".")
-            case "prompt":   value = SynxMarkers.applyPrompt(value,
-                                                              interpolate: { self.interpolate($0, root: root) })
-            case "vision", "audio":
-                break // passthrough envelopes
-            case "spam":     value = SynxMarkers.applySpam(value, key: key)
-            case "inherit", "include", "import":
-                break // handled in pre-pass / directives
-            default:
-                if !SynxMarkers.isBuiltin(marker), let fn = options.markerFns[marker] {
-                    value = fn(key, meta.args, value)
-                }
-            }
+    /// Path sandbox (Rust `jail_path`).
+    static func jail(_ base: String, _ filePath: String) -> Outcome<URL> {
+        let quoted = "'\(filePath)'"
+        if filePath.utf8.first == 0x2F || filePath.utf8.first == 0x5C {
+            return .err("SECURITY: rooted paths are not allowed: \(quoted)")
         }
-
-        if meta.hasMarker("secret") { value = SynxMarkers.applySecret(value) }
-
-        // Apply runtime type cast for type hints (when no marker rewrote the value already).
-        if let th = meta.typeHint {
-            switch th {
-            case "int":
-                if case .int = value {} else if case .secret = value {} else {
-                    if case .string(let str) = value, let n = Int64(str) {
-                        value = .int(n)
-                    } else if let d = valueToNumber(value) {
-                        value = .int(Int64(d))
-                    }
-                }
-            case "float":
-                if case .float = value {} else {
-                    if let d = valueToNumber(value) { value = .float(d) }
-                }
-            case "string":
-                if case .string = value {} else if case .secret = value {} else {
-                    value = .string(valueToString(value))
-                }
-            case "bool":
-                if case .bool = value {} else {
-                    let s = valueToString(value)
-                    value = .bool(s == "true" || s == "1")
-                }
-            default: break
-            }
+        if isAbsolute(filePath) { return .err("SECURITY: absolute paths are not allowed: \(quoted)") }
+        let baseURL = URL(fileURLWithPath: base)
+        let canonicalBase = canonical(baseURL)
+        let baseCanonical = canonicalBase ?? baseURL
+        var full = baseCanonical.appendingPathComponent(filePath)
+        #if os(Windows)
+        // Rust's canonical base on Windows is verbatim (`\\?\C:\…`), and pushing
+        // onto it resolves `.` and `..` lexically.
+        if canonicalBase != nil { full = full.standardizedFileURL }
+        #endif
+        guard let fullCanonical = canonical(full) else {
+            if full.path.contains("..") { return .err("SECURITY: path traversal detected: \(quoted)") }
+            if !startsWith(full, baseCanonical) { return .err("SECURITY: path escapes base directory: \(quoted)") }
+            return .ok(full)
         }
-
-        // Constraint validation always runs last, after every marker has resolved.
-        if let c = meta.constraints,
-           let err = SynxValidate.constraintError(key: key, value: value, c: c) {
-            reportViolation(err)
-            value = .string(err)
-        }
-
-        parent.set(key, to: value)
-        setObjectAt(path: path, in: &root, value: parent)
-        result.root = .object(root)
+        if !startsWith(fullCanonical, baseCanonical) { return .err("SECURITY: path escapes base directory: \(quoted)") }
+        return .ok(fullCanonical)
     }
 
-    // MARK: - once persistence
-
-    private func applyOnce(_ v: SynxValue, path: String, key: String) -> SynxValue {
-        if !onceLoaded {
-            onceLoaded = true
-            let base = options.basePath ?? "."
-            let lockPath = (base as NSString).appendingPathComponent(".synx.lock")
-            if let text = try? String(contentsOfFile: lockPath, encoding: .utf8) {
-                for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
-                    let s = line.trimmingCharacters(in: .whitespaces)
-                    if !s.isEmpty { onceKeys.insert(s) }
-                }
-            }
+    private static func isAbsolute(_ p: String) -> Bool {
+        #if os(Windows)
+        let u = Array(p.utf8)
+        // `C:\x` / `C:/x` and UNC `\\server` (a leading separator is rooted, above).
+        if u.count >= 3 && ((u[0] | 0x20) >= 0x61 && (u[0] | 0x20) <= 0x7A) && u[1] == 0x3A && (u[2] == 0x5C || u[2] == 0x2F) {
+            return true
         }
-        let lockKey = path.isEmpty ? key : path + "." + key
-        if onceKeys.contains(lockKey) { return .null }
-        onceNewKeys.insert(lockKey)
-        return v
+        return false
+        #else
+        return p.hasPrefix("/")
+        #endif
     }
 
-    private func flushOnce() {
-        guard !onceNewKeys.isEmpty else { return }
+    /// The canonical path of an existing file or directory.
+    private static func canonical(_ url: URL) -> URL? {
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        return url.resolvingSymlinksInPath().standardizedFileURL
+    }
+
+    /// Rust `Path::starts_with`: whole components.
+    private static func startsWith(_ full: URL, _ base: URL) -> Bool {
+        let f = full.standardizedFileURL.pathComponents
+        let b = base.standardizedFileURL.pathComponents
+        if b.count > f.count { return false }
+        for (x, y) in zip(b, f) where !x.bytesEqual(y) {
+            #if os(Windows)
+            if x.lowercased() == y.lowercased() { continue }
+            #endif
+            return false
+        }
+        return true
+    }
+
+    /// `SECURITY: file too large …`, or nil.
+    static func sizeError(_ url: URL) -> String? {
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let size = (attrs[.size] as? NSNumber)?.intValue else { return nil }
+        if size > maxFileSize { return "SECURITY: file too large (\(size) bytes, max \(maxFileSize))" }
+        return nil
+    }
+
+    /// Read a UTF-8 text file; errors read as Rust normalises them.
+    static func read(_ url: URL, ctx: String) -> Outcome<String> {
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir) else {
+            return .err("file not found: \(ctx)")
+        }
+        if isDir.boolValue { return .err("permission denied: \(ctx)") }
+        guard let data = FileManager.default.contents(atPath: url.path) else { return .err("permission denied: \(ctx)") }
+        guard let text = String(data: data, encoding: .utf8), Array(text.utf8).count == data.count else {
+            return .err("stream did not contain valid UTF-8")
+        }
+        return .ok(text)
+    }
+
+    /// Parse, and resolve an `!active` file with the include depth bumped.
+    static func loadSynx(_ text: String, _ file: URL, _ options: SynxOptions) -> MValue {
+        let (root, parsed) = SynxParser.parseTree(text)
+        var result = parsed
+        if result.mode == .active {
+            var child = options
+            child.includeDepth += 1
+            child.basePath = file.deletingLastPathComponent().path
+            SynxEngine.resolveTree(root, &result, options: child)
+        }
+        return .object(root)
+    }
+
+    static func loadIncludes(_ directives: [SynxIncludeDirective], _ options: SynxOptions) -> SynxIndexMap<MValue> {
+        var map = SynxIndexMap<MValue>()
+        if options.includeDepth >= (options.maxIncludeDepth ?? defaultMaxIncludeDepth) { return map }
         let base = options.basePath ?? "."
-        let lockPath = (base as NSString).appendingPathComponent(".synx.lock")
-        let all = onceKeys.union(onceNewKeys)
-        let joined = all.sorted().joined(separator: "\n") + "\n"
-        try? joined.write(toFile: lockPath, atomically: true, encoding: .utf8)
+        for inc in directives {
+            guard case .ok(let path) = jail(base, inc.path), sizeError(path) == nil,
+                  case .ok(let text) = read(path, ctx: inc.path) else { continue }
+            map[inc.alias] = loadSynx(text, path, options)
+        }
+        return map
     }
 
-    // MARK: - path helpers
-
-    func getValueAt(path: String, in root: SynxObject) -> SynxValue? {
-        if path.isEmpty { return .object(root) }
-        var current: SynxValue = .object(root)
-        for seg in path.split(separator: ".") {
-            guard case .object(let obj) = current, let next = obj[String(seg)] else { return nil }
-            current = next
-        }
-        return current
+    /// Does `path` name something inside its base directory: relative, with no
+    /// root, drive or `..` segment? Judged by its text, so a package directory
+    /// that is itself a symlink keeps working (Rust `is_contained_relative`;
+    /// its `Path::is_absolute` adds nothing past the root and `:` checks).
+    /// safety: `!use @a/../../secret` and a manifest `main ../../x` read files
+    /// from anywhere — the escape `:include` refuses through `jail`.
+    static func isContainedRelative(_ path: String) -> Bool {
+        let b = Array(path.utf8)
+        guard let first = b.first, first != 0x2F, first != 0x5C, !b.contains(0x3A) else { return false }
+        return !b.split(omittingEmptySubsequences: false, whereSeparator: { $0 == 0x2F || $0 == 0x5C })
+            .contains { $0.elementsEqual([0x2E, 0x2E]) }
     }
 
-    func getObjectAt(path: String, in root: inout SynxObject) -> (value: SynxObject?, path: [String]) {
-        if path.isEmpty { return (root, []) }
-        let parts = path.split(separator: ".").map(String.init)
-        var current = root
-        for p in parts {
-            guard let v = current[p], case .object(let obj) = v else { return (nil, parts) }
-            current = obj
-        }
-        return (current, parts)
-    }
-
-    func setObjectAt(path: String, in root: inout SynxObject, value: SynxObject) {
-        if path.isEmpty { root = value; return }
-        let parts = path.split(separator: ".").map(String.init)
-        // Walk down rebuilding upward (immutable-style with COW).
-        func write(_ obj: inout SynxObject, _ idx: Int) {
-            if idx == parts.count {
-                obj = value
-                return
-            }
-            let key = parts[idx]
-            guard case .object(var child) = (obj[key] ?? .null) else { return }
-            write(&child, idx + 1)
-            obj.set(key, to: .object(child))
-        }
-        write(&root, 0)
-    }
-
-    // MARK: - jail / interpolate / helpers
-
-    func jailPath(base: String, rel: String) -> String? {
-        if rel.isEmpty { return nil }
-        if rel.first == "/" || rel.first == "\\" { return nil }
-        if rel.count >= 2 {
-            let second = rel[rel.index(after: rel.startIndex)]
-            if second == ":" { return nil } // Windows drive letter
-        }
-        if rel.hasPrefix("res://") || rel.hasPrefix("user://") { return nil }
-        let normalized = rel.replacingOccurrences(of: "\\", with: "/")
-        for seg in normalized.split(separator: "/", omittingEmptySubsequences: false) {
-            if seg == ".." || seg == "..." { return nil }
-        }
-        return (base as NSString).appendingPathComponent(normalized)
-    }
-
-    func interpolate(_ s: String, root: SynxObject) -> String {
-        var out = ""
-        out.reserveCapacity(s.count)
-        var i = s.startIndex
-        while i < s.endIndex {
-            let c = s[i]
-            if c == "{" {
-                if let end = s[s.index(after: i)...].firstIndex(of: "}") {
-                    let inner = String(s[s.index(after: i)..<end])
-                        .trimmingCharacters(in: .whitespaces)
-                    if let v = lookup(path: inner, in: root) {
-                        out.append(valueToString(v))
-                    } else {
-                        out.append("{")
-                        out.append(inner)
-                        out.append("}")
-                    }
-                    i = s.index(after: end)
-                    continue
-                } else {
-                    out.append("{")
-                    i = s.index(after: i)
-                    continue
-                }
-            }
-            out.append(c)
-            i = s.index(after: i)
-        }
-        return out
-    }
-
-    private func lookup(path: String, in root: SynxObject) -> SynxValue? {
-        // namespace.key.path form
-        if let dot = path.firstIndex(of: ".") {
-            let ns = String(path[..<dot])
-            let rest = String(path[path.index(after: dot)...])
-            if let nsRoot = namespaces[ns] {
-                if let v = deepGet(rest, in: nsRoot) { return v }
+    /// `main` / `entry` of `synx-pkg.synx`, if the manifest names a contained one.
+    private static func manifestMain(_ pkgDir: URL) -> URL? {
+        guard case .ok(let text) = read(pkgDir.appendingPathComponent("synx-pkg.synx"), ctx: "") else { return nil }
+        for line in splitBytes(text, 0x0A) {
+            let t = line.rustTrimmed
+            for prefix in ["main ", "entry "] where t.bytesHasPrefix(prefix) {
+                let entry = String(decoding: Array(t.utf8).dropFirst(prefix.utf8.count), as: UTF8.self).rustTrimmed
+                if isContainedRelative(entry) { return pkgDir.appendingPathComponent(entry) }
             }
         }
-        return deepGet(path, in: root)
+        return nil
     }
 
-    private func deepGet(_ path: String, in root: SynxObject) -> SynxValue? {
-        var current: SynxValue = .object(root)
-        for seg in path.split(separator: ".") {
-            guard case .object(let obj) = current, let next = obj[String(seg)] else { return nil }
-            current = next
+    /// `<base>/<packages_path>/@scope/name` → its manifest's entry or `src/main.synx`.
+    static func loadPackages(_ directives: [SynxUseDirective], _ options: SynxOptions) -> SynxIndexMap<MValue> {
+        var map = SynxIndexMap<MValue>()
+        let pkgRoot = URL(fileURLWithPath: options.basePath ?? ".")
+            .appendingPathComponent(options.packagesPath ?? "./synx_packages")
+        for ud in directives where isContainedRelative(ud.package) {
+            let pkgDir = pkgRoot.appendingPathComponent(ud.package)
+            let entry = manifestMain(pkgDir) ?? pkgDir.appendingPathComponent("src").appendingPathComponent("main.synx")
+            var isDir: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: entry.path, isDirectory: &isDir), !isDir.boolValue,
+                  sizeError(entry) == nil, case .ok(let text) = read(entry, ctx: "") else { continue }
+            let (root, parsed) = SynxParser.parseTree(text)
+            var result = parsed
+            if result.mode == .active {
+                var child = options
+                child.includeDepth += 1
+                child.basePath = entry.deletingLastPathComponent().path
+                SynxEngine.resolveTree(root, &result, options: child)
+            }
+            map[ud.alias] = .object(root)
         }
-        return current
+        return map
     }
-}
-
-// MARK: - top-level helpers
-
-func valueToString(_ v: SynxValue) -> String {
-    switch v {
-    case .null: return "null"
-    case .bool(let b): return b ? "true" : "false"
-    case .int(let n): return String(n)
-    case .float(let f):
-        return formatNumber(f)
-    case .string(let s): return s
-    case .secret: return "[SECRET]" // safety: plaintext must never reach a string sink
-    case .array(let a):
-        let parts = a.map { valueToString($0) }
-        return "[" + parts.joined(separator: ", ") + "]"
-    case .object: return "[Object]"
-    }
-}
-
-/// Rust `format_number`: whole numbers print without a fraction, others as shortest `Display`.
-func formatNumber(_ n: Double) -> String {
-    if n.isFinite && n.truncatingRemainder(dividingBy: 1) == 0 && abs(n) < 9.223372036854775807e18 {
-        return String(Int64(n))
-    }
-    return SynxJSON.displayNumber(n)
-}
-
-/// Does `meta` ask for the text to stay text (`(string)` or `[type:string]`)?
-func wantsString(_ meta: SynxMeta) -> Bool {
-    return meta.typeHint == "string" || meta.constraints?.typeName == "string"
-}
-
-/// Rust `cast_primitive`: quotes strip, `true`/`false`/`null`, exact `Int64`, then `Double`.
-func castPrimitive(_ val: String) -> SynxValue {
-    let scalars = Array(val.unicodeScalars)
-    if scalars.count >= 2, let f = scalars.first, let l = scalars.last,
-       (f == "\"" && l == "\"") || (f == "'" && l == "'") {
-        var inner = String.UnicodeScalarView()
-        inner.append(contentsOf: scalars[1..<(scalars.count - 1)])
-        return .string(String(inner))
-    }
-    switch val {
-    case "true":  return .bool(true)
-    case "false": return .bool(false)
-    case "null":  return .null
-    default: break
-    }
-    if let n = Int64(val) { return .int(n) }
-    // Hex floats (`0x1p3`) are not decimal numbers; Rust's parser rejects them.
-    if !val.contains(where: { $0 == "x" || $0 == "X" }), let d = Double(val) { return .float(d) }
-    return .string(val)
-}
-
-func valueToNumber(_ v: SynxValue) -> Double? {
-    return v.asDouble
-}
-
-func regexMatches(_ value: String, pattern: String) -> Bool {
-    guard let re = try? NSRegularExpression(pattern: pattern) else {
-        return true // Invalid pattern — do not reject.
-    }
-    let range = NSRange(value.startIndex..<value.endIndex, in: value)
-    return re.firstMatch(in: value, options: [], range: range) != nil
 }

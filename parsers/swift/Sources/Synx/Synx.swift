@@ -3,6 +3,9 @@ import Foundation
 
 public enum Synx {
 
+    /// The SYNX release this port implements.
+    public static let version = "3.8.0"
+
     /// Parse SYNX text and return its top-level object (static mode only).
     public static func parse(_ text: String) -> SynxObject {
         let r = SynxParser.parse(text)
@@ -12,12 +15,10 @@ public enum Synx {
 
     /// Parse and resolve `!active` markers. Returns top-level object.
     public static func parseActive(_ text: String, options: SynxOptions = SynxOptions()) -> SynxObject {
-        var r = SynxParser.parse(text)
-        if r.mode == .active {
-            SynxEngine.resolve(&r, options: options)
-        }
-        if case .object(let o) = r.root { return o }
-        return SynxObject()
+        let (root, parsed) = SynxParser.parseTree(text)
+        var r = parsed
+        if r.mode == .active { SynxEngine.resolveTree(root, &r, options: options) }
+        return root.toObject()
     }
 
     /// Parse and return the full ParseResult (mode, metadata, includes, …).
@@ -28,20 +29,17 @@ public enum Synx {
     /// Parse, resolve, and return the full ParseResult.
     public static func parseFullActive(_ text: String,
                                         options: SynxOptions = SynxOptions()) -> SynxParseResult {
-        var r = SynxParser.parse(text)
-        if r.mode == .active {
-            SynxEngine.resolve(&r, options: options)
-        }
+        let (root, parsed) = SynxParser.parseTree(text)
+        var r = parsed
+        if r.mode == .active { SynxEngine.resolveTree(root, &r, options: options) }
+        r.root = .object(root.toObject())
         return r
     }
 
     /// Parse a `!tool` envelope into `{ tool, params }` or `{ tools: [...] }`.
     public static func parseTool(_ text: String,
                                   options: SynxOptions = SynxOptions()) -> SynxObject {
-        var r = SynxParser.parse(text)
-        if r.mode == .active {
-            SynxEngine.resolve(&r, options: options)
-        }
+        let r = parseFullActive(text, options: options)
         let shaped = SynxParser.reshapeToolOutput(r.root, schema: r.schema)
         if case .object(let o) = shaped { return o }
         return SynxObject()

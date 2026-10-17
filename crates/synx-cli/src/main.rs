@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::process;
@@ -252,10 +251,10 @@ fn parse_file(text: &str, active: bool, base_path: Option<String>) -> Value {
     result.root
 }
 
-fn parse_to_map(text: &str, active: bool, base_path: Option<String>) -> HashMap<String, Value> {
+fn parse_to_map(text: &str, active: bool, base_path: Option<String>) -> synx_core::Map {
     match parse_file(text, active, base_path) {
         Value::Object(map) => map,
-        _ => HashMap::new(),
+        _ => synx_core::Map::default(),
     }
 }
 

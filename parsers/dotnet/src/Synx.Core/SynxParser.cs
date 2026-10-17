@@ -1,27 +1,77 @@
 using System.Globalization;
-using System.IO;
 using System.Text;
 
 namespace Synx;
 
 internal static class SynxParserCore
 {
-    // Matches Rust `MAX_PARSE_NESTING_DEPTH = 128`. Same input must accept/reject
-    // identically across implementations.
+    // Resource limits — the same caps as synx-core `parser.rs`, so the same input is
+    // accepted, truncated or rejected identically across implementations.
     internal const int MaxParseNestingDepth = 128;
-    private const int MaxListItems = 1 << 20;
+    internal const int MaxSynxInputBytes = 16 * 1024 * 1024;
+    private const int MaxLineStarts = 2_000_000;
+    private const int MaxMultilineBlockBytes = 1024 * 1024;
+    private const int MaxListItems = 1_048_576;
+    private const int MaxIncludeDirectives = 4096;
+    private const int MaxConstraintEnumParts = 4096;
+    private const int MaxMarkerChainSegments = 512;
+
+    /// <summary>
+    /// Drop a leading U+FEFF (SYNX §2.1) and cut the text to 16 MiB of UTF-8 without
+    /// splitting a character. <c>string.Trim</c> does not treat U+FEFF as whitespace,
+    /// so a BOM would otherwise stay glued to the first key or hide <c>!active</c>.
+    /// </summary>
+    internal static string ClampSynxText(string text, out bool truncated)
+    {
+        truncated = false;
+        // A dropped BOM is not truncation: synx-core measures the original length after it.
+        if (text.Length > 0 && text[0] == (char)0xFEFF)
+            text = text[1..];
+        if (text.Length <= MaxSynxInputBytes / 3 || SynxNum.Utf8Len(text) <= MaxSynxInputBytes)
+            return text;
+        truncated = true;
+        var bytes = 0;
+        var i = 0;
+        while (i < text.Length)
+        {
+            var n = char.IsHighSurrogate(text[i]) && i + 1 < text.Length && char.IsLowSurrogate(text[i + 1]) ? 2 : 1;
+            var b = n == 2 ? 4 : SynxNum.Utf8Len(text[i]);
+            if (bytes + b > MaxSynxInputBytes) break;
+            bytes += b;
+            i += n;
+        }
+        return text[..i];
+    }
+
+    /// <summary>SYNX whitespace: Unicode White_Space, the set Rust <c>char::is_whitespace</c> accepts.</summary>
+    internal static bool IsWs(char c) => c <= ' ' ? c == ' ' || (c >= '\t' && c <= '\r') : c >= '\u0085' && char.IsWhiteSpace(c);
+
+    private static bool IsReservedJsKey(string key) => key is "__proto__" or "constructor" or "prototype";
 
     internal static SynxParseResult Parse(string text)
     {
-        // A single leading U+FEFF is dropped before anything else (SYNX §2.1);
-        // `string.Trim` does not treat it as whitespace, so it would otherwise
-        // stay glued to the first key or hide a leading `!active`.
-        if (text.Length > 0 && text[0] == '﻿')
-            text = text[1..];
+        text = ClampSynxText(text, out var truncated);
+        // Keep at most MaxLineStarts lines: cut before the newline that would start one more.
+        {
+            var seen = 0;
+            var scan = 0;
+            while (true)
+            {
+                var nl = text.IndexOf('\n', scan);
+                if (nl < 0) break;
+                if (seen >= MaxLineStarts - 1)
+                {
+                    text = text[..nl];
+                    truncated = true;
+                    break;
+                }
+                seen++;
+                scan = nl + 1;
+            }
+        }
 
-        var lines = SplitLines(text);
         var root = new Dictionary<string, SynxValue>(StringComparer.Ordinal);
-        var stack = new List<(int Indent, StackEntry Entry)> { (-1, new StackEntry.Root()) };
+        var stack = new List<Frame>(16) { new(-1, FrameKind.Root, "", 0, 0, root) { Path = "" } };
         var metadata = new Dictionary<string, Dictionary<string, SynxMeta>>(StringComparer.Ordinal);
         var includes = new List<SynxIncludeDirective>();
         var uses = new List<SynxUseDirective>();
@@ -35,16 +85,28 @@ internal static class SynxParserCore
         ListState? list = null;
         var inBlockComment = false;
 
-        for (var i = 0; i < lines.Count; i++)
+        var len = text.Length;
+        var pos = 0;
+        while (pos <= len)
         {
-            var raw = lines[i];
-            var trimmed = raw.Trim();
+            // perf: lines are walked as offsets; a line is copied only where it is stored.
+            var start = pos;
+            var nlIdx = text.IndexOf('\n', start);
+            var nl = nlIdx < 0 ? len : nlIdx;
+            pos = nl + 1;
+            var end = nl > start && text[nl - 1] == '\r' ? nl - 1 : nl;
 
+            var ts = start;
+            while (ts < end && IsWs(text[ts])) ts++;
             // A blank line is never structural and never body (SYNX §8.4.1).
-            if (trimmed.Length == 0)
+            if (ts == end)
                 continue;
+            var te = end;
+            while (te > ts && IsWs(text[te - 1])) te--;
 
-            var indent = raw.Length - raw.TrimStart().Length;
+            // Indentation is the UTF-8 byte length of the leading whitespace (SYNX §4).
+            var indent = 0;
+            for (var k = start; k < ts; k++) indent += SynxNum.Utf8Len(text[k]);
 
             // Block continuation runs before every line-class rule below: a `|` / `|+`
             // body is raw text, so `#`, `//`, `###` and `!…` are ordinary content there.
@@ -52,35 +114,70 @@ internal static class SynxParserCore
             {
                 if (indent > blk.Indent)
                 {
-                    if (blk.Content.Length > 0)
-                        blk.Content.Append('\n');
-                    string slice;
-                    if (blk.PreserveIndent)
+                    if (blk.Bytes < MaxMultilineBlockBytes)
                     {
-                        // `|+` (SYNX 3.7): lock base indent to first non-empty
-                        // continuation line, then strip exactly that many leading
-                        // whitespace chars from each line. See spec §8.4.1.
-                        if (blk.BaseIndent < 0) blk.BaseIndent = indent;
-                        var strip = Math.Min(blk.BaseIndent, indent);
-                        var rawTrim = raw.TrimEnd();
-                        slice = strip < rawTrim.Length ? rawTrim.Substring(strip) : "";
+                        if (blk.Content.Length > 0)
+                        {
+                            blk.Content.Append('\n');
+                            blk.Bytes++;
+                        }
+                        var room = MaxMultilineBlockBytes - blk.Bytes;
+                        if (room > 0)
+                        {
+                            int sliceStart, sliceEnd;
+                            if (blk.PreserveIndent)
+                            {
+                                // `|+` (SYNX 3.7): lock the strip prefix to the indent of the first
+                                // continuation line and cut that many bytes of whitespace — by whole
+                                // characters — from each line. Spec §8.4.1.
+                                if (blk.BaseIndent < 0) blk.BaseIndent = indent;
+                                var strip = Math.Min(blk.BaseIndent, indent);
+                                var rawEnd = end;
+                                while (rawEnd > start && IsWs(text[rawEnd - 1])) rawEnd--;
+                                var cut = start;
+                                var off = 0;
+                                while (cut < rawEnd && off < strip && IsWs(text[cut]))
+                                {
+                                    off += SynxNum.Utf8Len(text[cut]);
+                                    cut++;
+                                }
+                                sliceStart = cut;
+                                sliceEnd = rawEnd;
+                            }
+                            else
+                            {
+                                sliceStart = ts;
+                                sliceEnd = te;
+                            }
+                            var take = sliceStart;
+                            var used = 0;
+                            while (take < sliceEnd)
+                            {
+                                var pair = char.IsHighSurrogate(text[take]) && take + 1 < sliceEnd && char.IsLowSurrogate(text[take + 1]);
+                                var b = pair ? 4 : SynxNum.Utf8Len(text[take]);
+                                if (used + b > room) break;
+                                used += b;
+                                take += pair ? 2 : 1;
+                            }
+                            blk.Content.Append(text, sliceStart, take - sliceStart);
+                            blk.Bytes += used;
+                            if (take < sliceEnd) truncated = true;
+                        }
                     }
                     else
                     {
-                        slice = trimmed;
+                        truncated = true;
                     }
-                    blk.Content.Append(slice);
                     continue;
                 }
 
-                var content = blk.Content.ToString();
-                var blkKey = blk.Key;
-                var blkStackIdx = blk.StackIdx;
                 block = null;
-                InsertValue(root, stack, blkStackIdx, blkKey, new SynxValue.Str(content));
+                Insert(stack, blk.StackIdx, blk.Key, new SynxValue.Str(blk.Content.ToString()));
             }
 
-            if (trimmed == "###")
+            var trimmed = text.AsSpan(ts, te - ts);
+
+            if (trimmed.SequenceEqual("###"))
             {
                 inBlockComment = !inBlockComment;
                 continue;
@@ -88,128 +185,113 @@ internal static class SynxParserCore
             if (inBlockComment)
                 continue;
 
-            if (trimmed == "!active")
+            // Directive lines (§6). Every form starts with `!` or `#!mode:`; unknown `!…`
+            // lines fall through to the generic line handling.
+            if (trimmed[0] == '!' || trimmed.StartsWith("#!mode:"))
             {
-                mode = SynxMode.Active;
-                continue;
-            }
-            if (trimmed == "!lock")
-            {
-                locked = true;
-                continue;
-            }
-            if (trimmed == "!tool")
-            {
-                tool = true;
-                continue;
-            }
-            if (trimmed == "!schema")
-            {
-                schema = true;
-                continue;
-            }
-            if (trimmed == "!llm")
-            {
-                llm = true;
-                continue;
-            }
-            if (trimmed.StartsWith("!include ", StringComparison.Ordinal))
-            {
-                var rest = trimmed["!include ".Length..].Trim();
-                var sp = rest.Split([' ', '\t'], 2, StringSplitOptions.RemoveEmptyEntries);
-                var incPath = sp[0];
-                var alias = sp.Length > 1
-                    ? sp[1].Trim()
-                    : DeriveIncludeAlias(incPath);
-                includes.Add(new SynxIncludeDirective { Path = incPath, Alias = alias });
-                continue;
-            }
-            if (trimmed.StartsWith("!use ", StringComparison.Ordinal))
-            {
-                var rest = trimmed["!use ".Length..].Trim();
-                if (rest.StartsWith('@'))
+                if (trimmed.SequenceEqual("!active")) { mode = SynxMode.Active; continue; }
+                if (trimmed.SequenceEqual("!lock")) { locked = true; continue; }
+                if (trimmed.SequenceEqual("!tool")) { tool = true; continue; }
+                if (trimmed.SequenceEqual("!schema")) { schema = true; continue; }
+                if (trimmed.SequenceEqual("!llm")) { llm = true; continue; }
+                if (trimmed.StartsWith("!include "))
                 {
-                    // Parse: !use @scope/name [as alias]
-                    var asParts = rest.Split([" as "], 2, StringSplitOptions.None);
-                    var package = asParts[0].Trim();
-                    var alias = asParts.Length > 1
-                        ? asParts[1].Trim()
-                        : package.Split('/').Last();
-                    if (package.Length > 0)
-                        uses.Add(new SynxUseDirective { Package = package, Alias = alias });
+                    if (includes.Count < MaxIncludeDirectives)
+                    {
+                        var rest = TrimWs(trimmed[9..]);
+                        var ws = 0;
+                        while (ws < rest.Length && !IsWs(rest[ws])) ws++;
+                        var incPath = rest[..ws].ToString();
+                        var alias = ws < rest.Length ? TrimWs(rest[(ws + 1)..]).ToString() : DeriveIncludeAlias(incPath);
+                        includes.Add(new SynxIncludeDirective { Path = incPath, Alias = alias });
+                    }
+                    continue;
                 }
-                continue;
-            }
-            if (trimmed.StartsWith("#!mode:", StringComparison.Ordinal))
-            {
-                var declared = trimmed.Split(':', 2)[1].Trim();
-                mode = declared == "active" ? SynxMode.Active : SynxMode.Static;
-                continue;
-            }
-
-            if (trimmed[0] == '#' || trimmed.StartsWith("//", StringComparison.Ordinal))
-                continue;
-
-            if (trimmed.StartsWith("- ", StringComparison.Ordinal))
-            {
-                if (list is { } lst0 && indent > lst0.Indent)
+                if (trimmed.StartsWith("!use "))
                 {
-                    // Frames of a previous list item at the same or deeper indent are done.
-                    while (stack.Count > 1 && stack[^1].Entry is StackEntry.ListItem && stack[^1].Indent >= indent)
+                    var rest = TrimWs(trimmed[5..]).ToString();
+                    if (rest.StartsWith('@'))
+                    {
+                        // Parse: !use @scope/name [as alias]
+                        var asIdx = rest.IndexOf(" as ", StringComparison.Ordinal);
+                        var package = (asIdx < 0 ? rest : rest[..asIdx]).Trim();
+                        var alias = asIdx >= 0 ? rest[(asIdx + 4)..].Trim() : package[(package.LastIndexOf('/') + 1)..];
+                        if (package.Length > 0)
+                            uses.Add(new SynxUseDirective { Package = package, Alias = alias });
+                    }
+                    continue;
+                }
+                if (trimmed.StartsWith("#!mode:"))
+                {
+                    var declared = TrimWs(trimmed[7..]);
+                    mode = declared.SequenceEqual("active") ? SynxMode.Active : SynxMode.Static;
+                    continue;
+                }
+            }
+
+            if (trimmed[0] == '#' || trimmed.StartsWith("//"))
+                continue;
+
+            if (trimmed.StartsWith("- "))
+            {
+                if (list is { } lst && indent > lst.Indent)
+                {
+                    // Pop every frame of the previous item — its own frame and any object
+                    // nested inside it; popping only item frames stopped at a nested object,
+                    // so the next item's keys were looked up through it and dropped.
+                    while (stack.Count > 1 && stack[^1].Indent >= indent)
                         stack.RemoveAt(stack.Count - 1);
 
-                    var valStr = StripComment(trimmed.AsSpan(2).Trim());
+                    var valStr = StripComment(TrimWs(trimmed[2..]));
 
-                    // Peek the next non-empty line: more deeply indented and not a `- `
-                    // continuation means this item is an object, not a scalar.
+                    // The item is an object when the next content line is deeper and not
+                    // another item or a comment.
                     var nested = false;
-                    for (var peek = i + 1; peek < lines.Count; peek++)
+                    if (NextContentLine(text, pos) is var (ps, pe) && ps >= 0)
                     {
-                        var pl = lines[peek];
-                        var pt = pl.Trim();
-                        if (pt.Length == 0) continue;
-                        var pi = pl.Length - pl.TrimStart().Length;
-                        if (pi > indent && !pt.StartsWith("- ", StringComparison.Ordinal)
-                            && pt[0] != '#' && !pt.StartsWith("//", StringComparison.Ordinal))
+                        var pts = ps;
+                        var pi = 0;
+                        while (pts < pe && IsWs(text[pts])) { pi += SynxNum.Utf8Len(text[pts]); pts++; }
+                        var pt = text.AsSpan(pts, pe - pts);
+                        if (pi > indent && !pt.StartsWith("- ") && pt[0] != '#' && !pt.StartsWith("//"))
                             nested = true;
-                        break;
                     }
 
-                    if (NavigateToParent(root, stack, lst0.StackIdx) is { } listParent)
+                    var listParent = stack[lst.StackIdx].Map;
+                    if (!listParent.TryGetValue(lst.Key, out var existing))
                     {
-                        if (!listParent.TryGetValue(lst0.Key, out var existing) || existing is not SynxValue.Arr items)
+                        existing = new SynxValue.Arr([]);
+                        listParent[lst.Key] = existing;
+                    }
+                    // A key re-declared under the open list as something else takes the items
+                    // no more: they are dropped, never written into a detached array.
+                    if (existing is SynxValue.Arr items && items.Items.Count < MaxListItems)
+                    {
+                        if (nested)
                         {
-                            items = new SynxValue.Arr([]);
-                            listParent[lst0.Key] = items;
-                        }
-                        if (items.Items.Count < MaxListItems)
-                        {
-                            if (nested)
+                            var itemObj = new Dictionary<string, SynxValue>(StringComparer.Ordinal);
+                            if (ParseLine(valStr, out var itemLine))
                             {
-                                var itemObj = new Dictionary<string, SynxValue>(StringComparer.Ordinal);
-                                if (ParseLine(valStr) is { } itemLine)
-                                {
-                                    SynxValue itemVal = itemLine.TypeHint is { } ih
-                                        ? CastTyped(itemLine.Value, ih)
-                                        : itemLine.Value.Length > 0
-                                            ? Cast(itemLine.Value)
-                                            : new SynxValue.Obj(new Dictionary<string, SynxValue>(StringComparer.Ordinal));
-                                    if (itemLine.Key is not ("__proto__" or "constructor" or "prototype"))
-                                        itemObj[itemLine.Key] = itemVal;
-                                }
-                                else
-                                {
-                                    itemObj["_value"] = Cast(valStr);
-                                }
-                                var itemIdx = items.Items.Count;
-                                items.Items.Add(new SynxValue.Obj(itemObj));
-                                if (stack.Count < MaxParseNestingDepth)
-                                    stack.Add((indent, new StackEntry.ListItem(lst0.Key, itemIdx)));
+                                SynxValue itemVal = itemLine.TypeHint is { } ih
+                                    ? CastTyped(itemLine.Value, ih)
+                                    : itemLine.Value.Length > 0
+                                        ? Cast(itemLine.Value)
+                                        : new SynxValue.Obj(new Dictionary<string, SynxValue>(StringComparer.Ordinal));
+                                if (!IsReservedJsKey(itemLine.Key))
+                                    itemObj[itemLine.Key] = itemVal;
                             }
                             else
                             {
-                                items.Items.Add(Cast(valStr));
+                                itemObj["_value"] = Cast(valStr);
                             }
+                            var itemIdx = items.Items.Count;
+                            items.Items.Add(new SynxValue.Obj(itemObj));
+                            if (stack.Count < MaxParseNestingDepth)
+                                stack.Add(new Frame(indent, FrameKind.ListItem, lst.Key, itemIdx, lst.StackIdx, itemObj));
+                        }
+                        else
+                        {
+                            items.Items.Add(Cast(valStr));
                         }
                     }
                     continue;
@@ -218,105 +300,114 @@ internal static class SynxParserCore
             else if (list is { } lst1 && indent <= lst1.Indent)
             {
                 list = null;
-                while (stack.Count > 1 && stack[^1].Entry is StackEntry.ListItem && stack[^1].Indent >= indent)
+                while (stack.Count > 1 && stack[^1].Kind == FrameKind.ListItem && stack[^1].Indent >= indent)
                     stack.RemoveAt(stack.Count - 1);
             }
 
-            var parsed = ParseLine(trimmed);
-            if (parsed is null)
+            if (!ParseLine(trimmed, out var parsed))
                 continue;
 
-            // Reject prototype-polluting keys so JSON consumers (notably JS)
-            // are never exposed to __proto__ / constructor / prototype injection.
-            // Matches `synx_core::parser::parse`.
-            if (parsed.Key is "__proto__" or "constructor" or "prototype")
+            // Reject prototype-polluting keys so JSON consumers (notably JS) are never
+            // exposed to __proto__ / constructor / prototype injection.
+            if (IsReservedJsKey(parsed.Key))
                 continue;
 
             while (stack.Count > 1 && stack[^1].Indent >= indent)
                 stack.RemoveAt(stack.Count - 1);
 
             var parentIdx = stack.Count - 1;
+            var parentMap = stack[parentIdx].Map;
 
-            if (mode == SynxMode.Active && (parsed.Markers.Count > 0 || parsed.Constraints != null ||
-                                            parsed.TypeHint != null))
+            if (mode == SynxMode.Active && metadata.Count > 0
+                && parentMap.TryGetValue(parsed.Key, out var replaced) && replaced is SynxValue.Obj or SynxValue.Arr)
             {
-                var pathPrefix = BuildPath(stack);
-                if (!metadata.TryGetValue(pathPrefix, out var mm))
+                // A key that replaces an object or a list replaces its declarations too:
+                // metadata is filed by path, so the old subtree's markers and constraints
+                // used to apply to whatever took its place.
+                var parentPath = PathOf(stack, parentIdx);
+                var sb = new StringBuilder(parentPath);
+                if (sb.Length > 0) sb.Append('.');
+                AppendKeySegment(sb, parsed.Key);
+                var prefix = sb.ToString();
+                List<string>? drop = null;
+                foreach (var p in metadata.Keys)
+                {
+                    if (p == prefix || (p.Length > prefix.Length && p[prefix.Length] == '.' && p.StartsWith(prefix, StringComparison.Ordinal)))
+                        (drop ??= []).Add(p);
+                }
+                if (drop != null)
+                    foreach (var p in drop) metadata.Remove(p);
+            }
+
+            if (mode == SynxMode.Active && (parsed.Markers.Count > 0 || parsed.Constraints != null || parsed.TypeHint != null))
+            {
+                var path = PathOf(stack, parentIdx);
+                if (!metadata.TryGetValue(path, out var mm))
                 {
                     mm = new Dictionary<string, SynxMeta>(StringComparer.Ordinal);
-                    metadata[pathPrefix] = mm;
+                    metadata[path] = mm;
                 }
                 mm[parsed.Key] = new SynxMeta
                 {
-                    Markers = [.. parsed.Markers],
-                    Args = [.. parsed.MarkerArgs],
+                    Markers = ReferenceEquals(parsed.Markers, s_noMarkers) ? [] : parsed.Markers,
+                    Args = ReferenceEquals(parsed.MarkerArgs, s_noMarkers) ? [] : parsed.MarkerArgs,
                     TypeHint = parsed.TypeHint,
-                    Constraints = CloneConstraints(parsed.Constraints),
+                    Constraints = parsed.Constraints,
                 };
             }
 
-            // `|` (3.6) trims each continuation line; `|+` (3.7) preserves
-            // indent relative to the first non-empty line. Spec §8.4.1.
-            var isBlock = parsed.Value == "|" || parsed.Value == "|+";
-            var preserveIndent = parsed.Value == "|+";
-            var isListMarker = parsed.Markers.Any(m =>
-                m is "random" or "unique" or "geo" or "join");
+            // `|` (3.6) trims each continuation line; `|+` (3.7) keeps the indent relative
+            // to the first one. Spec §8.4.1.
+            var isBlock = parsed.Value.SequenceEqual("|") || parsed.Value.SequenceEqual("|+");
+            var isListMarker = false;
+            foreach (var m in parsed.Markers)
+            {
+                if (m is "random" or "unique" or "geo" or "join") { isListMarker = true; break; }
+            }
 
             if (isBlock)
             {
-                InsertValue(root, stack, parentIdx, parsed.Key, new SynxValue.Str(""));
+                parentMap[parsed.Key] = new SynxValue.Str("");
                 block = new BlockState
                 {
                     Indent = indent,
                     Key = parsed.Key,
                     Content = new StringBuilder(),
                     StackIdx = parentIdx,
-                    PreserveIndent = preserveIndent,
+                    PreserveIndent = parsed.Value.SequenceEqual("|+"),
                 };
             }
             else if (isListMarker && parsed.Value.Length == 0)
             {
                 // Insert an empty array now so the key exists even if the list stays empty.
-                InsertValue(root, stack, parentIdx, parsed.Key, new SynxValue.Arr([]));
-                list = new ListState
-                {
-                    Indent = indent,
-                    Key = parsed.Key,
-                    StackIdx = parentIdx,
-                };
+                parentMap[parsed.Key] = new SynxValue.Arr([]);
+                list = new ListState { Indent = indent, Key = parsed.Key, StackIdx = parentIdx };
             }
             else if (parsed.Value.Length == 0)
             {
-                var peek = PeekNextNonEmptyTrimmed(lines, i + 1);
-                if (peek != null && peek.StartsWith("- ", StringComparison.Ordinal))
+                if (NextContentLine(text, pos) is var (ps, pe) && ps >= 0 && TrimWs(text.AsSpan(ps, pe - ps)).StartsWith("- "))
                 {
-                    InsertValue(root, stack, parentIdx, parsed.Key, new SynxValue.Arr([]));
-                    list = new ListState
-                    {
-                        Indent = indent,
-                        Key = parsed.Key,
-                        StackIdx = parentIdx,
-                    };
+                    parentMap[parsed.Key] = new SynxValue.Arr([]);
+                    list = new ListState { Indent = indent, Key = parsed.Key, StackIdx = parentIdx };
                     continue;
                 }
 
-                InsertValue(root, stack, parentIdx, parsed.Key, new SynxValue.Obj(new Dictionary<string, SynxValue>(StringComparer.Ordinal)));
+                var obj = new Dictionary<string, SynxValue>(StringComparer.Ordinal);
+                parentMap[parsed.Key] = new SynxValue.Obj(obj);
+                // Past the cap the object is still inserted, but nesting stops increasing.
                 if (stack.Count < MaxParseNestingDepth)
-                    stack.Add((indent, new StackEntry.Key(parsed.Key)));
+                    stack.Add(new Frame(indent, FrameKind.Key, parsed.Key, 0, parentIdx, obj));
             }
             else
             {
-                var value = parsed.TypeHint is { } hint
+                parentMap[parsed.Key] = parsed.TypeHint is { } hint
                     ? CastTyped(parsed.Value, hint)
                     : Cast(parsed.Value);
-                InsertValue(root, stack, parentIdx, parsed.Key, value);
             }
         }
 
         if (block is { } blkEnd)
-        {
-            InsertValue(root, stack, blkEnd.StackIdx, blkEnd.Key, new SynxValue.Str(blkEnd.Content.ToString()));
-        }
+            Insert(stack, blkEnd.StackIdx, blkEnd.Key, new SynxValue.Str(blkEnd.Content.ToString()));
 
         return new SynxParseResult
         {
@@ -329,79 +420,141 @@ internal static class SynxParserCore
             Metadata = metadata,
             Includes = includes,
             Uses = uses,
+            Truncated = truncated,
         };
+    }
+
+    private static void Insert(List<Frame> stack, int idx, string key, SynxValue value)
+    {
+        if (idx < stack.Count)
+            stack[idx].Map[key] = value;
+    }
+
+    /// <summary>The first non-blank line at or after <paramref name="from"/>, CR excluded; (-1, -1) when none.</summary>
+    private static (int Start, int End) NextContentLine(string text, int from)
+    {
+        var p = from;
+        while (p <= text.Length)
+        {
+            var nlIdx = p < text.Length ? text.IndexOf('\n', p) : -1;
+            var nl = nlIdx < 0 ? text.Length : nlIdx;
+            var end = nl > p && text[nl - 1] == '\r' ? nl - 1 : nl;
+            for (var k = p; k < end; k++)
+            {
+                if (!IsWs(text[k]))
+                    return (p, end);
+            }
+            p = nl + 1;
+        }
+        return (-1, -1);
+    }
+
+    internal static ReadOnlySpan<char> TrimWs(ReadOnlySpan<char> s)
+    {
+        var a = 0;
+        var b = s.Length;
+        while (a < b && IsWs(s[a])) a++;
+        while (b > a && IsWs(s[b - 1])) b--;
+        return s[a..b];
     }
 
     private static string DeriveIncludeAlias(string path)
     {
-        var name = path.Replace('\\', '/').Split('/')[^1];
-        return name.EndsWith(".synx", StringComparison.OrdinalIgnoreCase) ||
-               name.EndsWith(".SYNX", StringComparison.Ordinal)
-            ? name[..^5]
-            : name;
+        var name = path[(path.LastIndexOfAny(['/', '\\']) + 1)..];
+        if (name.EndsWith(".synx", StringComparison.Ordinal) || name.EndsWith(".SYNX", StringComparison.Ordinal))
+            return name[..^5];
+        return name;
     }
 
-    private static SynxConstraints? CloneConstraints(SynxConstraints? c)
+    // ── Metadata paths ──
+
+    /// <summary>
+    /// The metadata path of frame <paramref name="idx"/>: object keys, and for a list item
+    /// the list's key followed by <c>#&lt;index&gt;</c>. Follows the frame chain, so an
+    /// unrelated object opened between a list key and its item stays out of it.
+    /// </summary>
+    private static string PathOf(List<Frame> stack, int idx)
     {
-        if (c == null) return null;
-        return new SynxConstraints
-        {
-            Min = c.Min,
-            Max = c.Max,
-            TypeName = c.TypeName,
-            Required = c.Required,
-            Readonly = c.Readonly,
-            Pattern = c.Pattern,
-            EnumValues = c.EnumValues?.ToList(),
-        };
+        var f = stack[idx];
+        if (f.Path != null) return f.Path;
+        var parentPath = PathOf(stack, f.Kind == FrameKind.ListItem ? f.Parent : idx - 1);
+        var sb = new StringBuilder(parentPath.Length + f.Key.Length + 8);
+        sb.Append(parentPath);
+        if (sb.Length > 0) sb.Append('.');
+        AppendKeySegment(sb, f.Key);
+        if (f.Kind == FrameKind.ListItem)
+            sb.Append(".#").Append(f.ItemIdx.ToString(CultureInfo.InvariantCulture));
+        f.Path = sb.ToString();
+        return f.Path;
     }
 
-    private static string BuildPath(List<(int Indent, StackEntry Entry)> stack)
+    /// <summary>
+    /// Append <paramref name="key"/> as one path segment: <c>.</c> and <c>\</c> are escaped
+    /// with <c>\</c>, so the object <c>a.b</c> and <c>b</c> inside <c>a</c> never share a path.
+    /// </summary>
+    internal static void AppendKeySegment(StringBuilder sb, string key)
     {
-        var parts = new List<string>();
-        foreach (var (_, e) in stack.Skip(1))
+        if (key.AsSpan().IndexOfAny('.', '\\') < 0)
         {
-            if (e is StackEntry.Key k)
-                parts.Add(k.Name);
+            sb.Append(key);
+            return;
         }
-        return string.Join(".", parts);
+        foreach (var c in key)
+        {
+            if (c is '.' or '\\') sb.Append('\\');
+            sb.Append(c);
+        }
     }
 
-    private static List<string> SplitLines(string text)
+    internal static string KeySegment(string key)
     {
-        var lines = new List<string>();
-        var start = 0;
-        for (var i = 0; i <= text.Length; i++)
+        if (key.AsSpan().IndexOfAny('.', '\\') < 0) return key;
+        var sb = new StringBuilder(key.Length + 2);
+        AppendKeySegment(sb, key);
+        return sb.ToString();
+    }
+
+    /// <summary>The unescaped segments of a metadata path: <c>a\.b.c</c> is <c>["a.b", "c"]</c>.</summary>
+    internal static List<string> MetaPathSegments(string path)
+    {
+        var outList = new List<string>();
+        if (path.Length == 0) return outList;
+        var seg = new StringBuilder();
+        for (var i = 0; i < path.Length; i++)
         {
-            if (i == text.Length || text[i] == '\n')
+            var c = path[i];
+            if (c == '\\')
             {
-                var line = text[start..i];
-                if (line.Length > 0 && line[^1] == '\r')
-                    line = line[..^1];
-                lines.Add(line);
-                start = i + 1;
+                if (i + 1 < path.Length) seg.Append(path[++i]);
             }
+            else if (c == '.')
+            {
+                outList.Add(seg.ToString());
+                seg.Clear();
+            }
+            else seg.Append(c);
         }
-        return lines;
+        outList.Add(seg.ToString());
+        return outList;
     }
 
-    private static string? PeekNextNonEmptyTrimmed(List<string> lines, int from)
-    {
-        for (var j = from; j < lines.Count; j++)
-        {
-            var pt = lines[j].Trim();
-            if (pt.Length > 0)
-                return pt;
-        }
-        return null;
-    }
+    private enum FrameKind { Root, Key, ListItem }
 
-    private abstract record StackEntry
+    /// <summary>
+    /// One open object. <see cref="Map"/> is the object itself: a frame lives only while
+    /// its object is attached (anything that could replace it pops the frame first), so
+    /// holding it equals navigating to it from the root.
+    /// </summary>
+    private sealed class Frame(int indent, FrameKind kind, string key, int itemIdx, int parent, Dictionary<string, SynxValue> map)
     {
-        public sealed record Root : StackEntry;
-        public sealed record Key(string Name) : StackEntry;
-        /// <summary>The object of one `- key value` list item (a map inside <c>ListKey[ItemIdx]</c>).</summary>
-        public sealed record ListItem(string ListKey, int ItemIdx) : StackEntry;
+        public readonly int Indent = indent;
+        public readonly FrameKind Kind = kind;
+        public readonly string Key = key;
+        public readonly int ItemIdx = itemIdx;
+        /// <summary>For a list item, the frame holding the list (not necessarily the one below).</summary>
+        public readonly int Parent = parent;
+        public readonly Dictionary<string, SynxValue> Map = map;
+        public string? Path;
     }
 
     private sealed class BlockState
@@ -410,13 +563,12 @@ internal static class SynxParserCore
         public required string Key { get; init; }
         public required StringBuilder Content { get; init; }
         public required int StackIdx { get; init; }
-        /// <summary>
-        /// SYNX 3.7 <c>|+</c>: keep indent relative to the first non-empty
-        /// continuation line instead of fully trimming each line.
-        /// </summary>
+        /// <summary>SYNX 3.7 <c>|+</c>: keep indent relative to the first continuation line.</summary>
         public bool PreserveIndent { get; init; }
-        /// <summary>Locked on the first non-empty content line; -1 = unlocked.</summary>
+        /// <summary>Locked on the first content line; -1 = unlocked.</summary>
         public int BaseIndent { get; set; } = -1;
+        /// <summary>UTF-8 bytes in <see cref="Content"/> (the block cap is in bytes).</summary>
+        public int Bytes { get; set; }
     }
 
     private sealed class ListState
@@ -426,45 +578,43 @@ internal static class SynxParserCore
         public required int StackIdx { get; init; }
     }
 
-    private sealed class ParsedLine
+    /// <summary>One key line. perf: the value stays a slice of the line; it is copied only by the cast that stores it.</summary>
+    private ref struct ParsedLine
     {
-        public required string Key { get; init; }
-        public string? TypeHint { get; init; }
-        public required string Value { get; init; }
-        public required List<string> Markers { get; init; }
-        public required List<string> MarkerArgs { get; init; }
-        public SynxConstraints? Constraints { get; init; }
+        public string Key;
+        public string? TypeHint;
+        public ReadOnlySpan<char> Value;
+        public List<string> Markers;
+        public List<string> MarkerArgs;
+        public SynxConstraints? Constraints;
     }
 
-    private static ParsedLine? ParseLine(string trimmed)
+    private static readonly List<string> s_noMarkers = [];
+
+    private static bool ParseLine(ReadOnlySpan<char> trimmed, out ParsedLine parsed)
     {
-        if (trimmed.Length == 0
-            || trimmed[0] == '#'
-            || trimmed.StartsWith("//", StringComparison.Ordinal)
-            || trimmed.StartsWith("- ", StringComparison.Ordinal))
-            return null;
-
-        // Offsets are UTF-16 indexes into `trimmed`: every delimiter below is ASCII, so
-        // slicing at them can never split a character (or a surrogate pair).
-        var len = trimmed.Length;
+        parsed = default;
+        if (trimmed.IsEmpty) return false;
         var first = trimmed[0];
-        if (first == '[' || first == ':' || first == '-' ||
-            first == '#' || first == '/' || first == '(')
-            return null;
+        if (first is '[' or ':' or '-' or '#' or '/' or '(')
+            return false;
 
+        // Offsets are UTF-16 indexes: every delimiter is ASCII, so slicing at them never
+        // splits a character.
+        var len = trimmed.Length;
         var pos = 0;
-        while (pos < len && trimmed[pos] is not ' ' and not '\t' and not '[' and not ':' and not '(')
+        while (pos < len && trimmed[pos] is not (' ' or '\t' or '[' or ':' or '('))
             pos++;
-        var key = trimmed[..pos];
+        var key = trimmed[..pos].ToString();
 
         string? typeHint = null;
         if (pos < len && trimmed[pos] == '(')
         {
             var start = pos + 1;
-            var closeRel = trimmed.AsSpan(start).IndexOf(')');
+            var closeRel = trimmed[start..].IndexOf(')');
             if (closeRel >= 0)
             {
-                typeHint = trimmed.Substring(start, closeRel);
+                typeHint = trimmed.Slice(start, closeRel).ToString();
                 pos = start + closeRel + 1;
             }
             else
@@ -488,170 +638,206 @@ internal static class SynxParserCore
             }
             if (depth == 0)
             {
-                constraints = ParseConstraintInner(trimmed.Substring(cstart, scan - cstart));
+                constraints = ParseConstraints(trimmed[cstart..scan]);
                 pos = scan + 1;
             }
             else
             {
                 // Unbalanced: fall back to the first `]`, if any.
-                var rel = trimmed.IndexOf(']', cstart);
+                var rel = trimmed[cstart..].IndexOf(']');
                 if (rel >= 0)
                 {
-                    constraints = ParseConstraintInner(trimmed.Substring(cstart, rel - cstart));
-                    pos = rel + 1;
+                    constraints = ParseConstraints(trimmed.Slice(cstart, rel));
+                    pos = cstart + rel + 1;
                 }
                 else
                 {
-                    constraints = ParseConstraintInner(trimmed[cstart..]);
+                    constraints = ParseConstraints(trimmed[cstart..]);
                     pos = len;
                 }
             }
         }
 
-        var markers = new List<string>();
-        var markerArgs = new List<string>();
+        var markers = s_noMarkers;
         if (pos < len && trimmed[pos] == ':')
         {
             var markerStart = pos + 1;
             var markerEnd = markerStart;
             while (markerEnd < len && trimmed[markerEnd] is not (' ' or '\t'))
                 markerEnd++;
+            // Empty segments are kept (`a::b` is three), as in synx-core.
+            markers = [];
             var chain = trimmed[markerStart..markerEnd];
-            markers.AddRange(chain.Split(':', StringSplitOptions.RemoveEmptyEntries));
+            while (markers.Count < MaxMarkerChainSegments)
+            {
+                var c = chain.IndexOf(':');
+                if (c < 0)
+                {
+                    markers.Add(chain.ToString());
+                    break;
+                }
+                markers.Add(chain[..c].ToString());
+                chain = chain[(c + 1)..];
+            }
             pos = markerEnd;
         }
 
         while (pos < len && trimmed[pos] is ' ' or '\t')
             pos++;
 
-        var rawValue = pos < len ? StripComment(trimmed.AsSpan(pos)) : ReadOnlySpan<char>.Empty;
-        var rawValueStr = rawValue.ToString();
+        var rawValue = pos < len ? StripComment(trimmed[pos..]) : ReadOnlySpan<char>.Empty;
+        var args = s_noMarkers;
 
-        if (markers.Contains("random") && rawValueStr.Length > 0)
+        if (markers.Count > 0 && !rawValue.IsEmpty)
         {
-            var parts = rawValueStr.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
-            var nums = parts.Where(p => double.TryParse(p, CultureInfo.InvariantCulture, out _)).ToList();
-            if (nums.Count > 0)
+            // :random — weight percentages ride in the value.
+            if (markers.Contains("random"))
             {
-                markerArgs.AddRange(nums);
-                rawValueStr = "";
+                List<string>? nums = null;
+                var rest = rawValue;
+                while (true)
+                {
+                    rest = TrimWs(rest);
+                    if (rest.IsEmpty) break;
+                    var w = 0;
+                    while (w < rest.Length && !IsWs(rest[w])) w++;
+                    if (SynxNum.TryParseF64(rest[..w], out _))
+                        (nums ??= []).Add(rest[..w].ToString());
+                    rest = rest[w..];
+                }
+                if (nums != null)
+                {
+                    args = nums;
+                    rawValue = ReadOnlySpan<char>.Empty;
+                }
+            }
+            // :inherit — a value names the parent key; it opens a group, not a leaf.
+            if (!rawValue.IsEmpty && markers.Contains("inherit"))
+            {
+                args = [TrimWs(rawValue).ToString()];
+                rawValue = ReadOnlySpan<char>.Empty;
             }
         }
 
-        return new ParsedLine
+        parsed = new ParsedLine
         {
             Key = key,
             TypeHint = typeHint,
-            Value = rawValueStr,
+            Value = rawValue,
             Markers = markers,
-            MarkerArgs = markerArgs,
+            MarkerArgs = args,
             Constraints = constraints,
         };
+        return true;
     }
 
-    private static SynxConstraints? ParseConstraintInner(string raw)
+    /// <summary>The body of a <c>[…]</c> block; present even when nothing in it is recognised.</summary>
+    internal static SynxConstraints ParseConstraints(ReadOnlySpan<char> raw)
     {
         var c = new SynxConstraints();
-        var any = false;
-        foreach (var part in raw.Split(',').Select(s => s.Trim()).Where(s => s.Length > 0))
+        while (true)
         {
-            if (part == "required")
+            var comma = raw.IndexOf(',');
+            var part = TrimWs(comma < 0 ? raw : raw[..comma]);
+            raw = comma < 0 ? ReadOnlySpan<char>.Empty : raw[(comma + 1)..];
+            if (part.IsEmpty)
             {
+                if (comma < 0) break;
+                continue;
+            }
+            if (part.SequenceEqual("required"))
                 c.Required = true;
-                any = true;
-            }
-            else if (part == "readonly")
-            {
+            else if (part.SequenceEqual("readonly"))
                 c.Readonly = true;
-                any = true;
-            }
             else
             {
                 var colon = part.IndexOf(':');
                 if (colon < 0) continue;
-                var k = part[..colon].Trim();
-                var v = part[(colon + 1)..].Trim();
-                any = true;
+                var k = TrimWs(part[..colon]);
+                var v = TrimWs(part[(colon + 1)..]);
                 switch (k)
                 {
                     case "min":
-                        if (double.TryParse(v, CultureInfo.InvariantCulture, out var mn))
-                            c.Min = mn;
+                        c.Min = SynxNum.TryParseF64(v, out var mn) ? mn : null;
                         break;
                     case "max":
-                        if (double.TryParse(v, CultureInfo.InvariantCulture, out var mx))
-                            c.Max = mx;
+                        c.Max = SynxNum.TryParseF64(v, out var mx) ? mx : null;
                         break;
                     case "type":
-                        c.TypeName = v;
+                        c.TypeName = v.ToString();
                         break;
                     case "pattern":
-                        c.Pattern = v;
+                        c.Pattern = v.ToString();
                         break;
                     case "enum":
-                        c.EnumValues = v.Split('|').Select(s => s.Trim()).ToList();
+                        var vals = new List<string>();
+                        while (vals.Count < MaxConstraintEnumParts)
+                        {
+                            var bar = v.IndexOf('|');
+                            vals.Add((bar < 0 ? v : v[..bar]).ToString());
+                            if (bar < 0) break;
+                            v = v[(bar + 1)..];
+                        }
+                        c.EnumValues = vals;
                         break;
                 }
             }
+            if (comma < 0) break;
         }
-        return any ? c : null;
+        return c;
     }
 
-    private static string StripComment(ReadOnlySpan<char> val)
+    /// <summary>Cut an inline <c> //</c> or <c> #</c> comment and trailing whitespace off a value.</summary>
+    private static ReadOnlySpan<char> StripComment(ReadOnlySpan<char> val)
     {
-        var s = val.ToString();
-        var idx = s.IndexOf(" //", StringComparison.Ordinal);
-        if (idx >= 0)
-            s = s[..idx];
-        idx = s.IndexOf(" #", StringComparison.Ordinal);
-        if (idx >= 0)
-            s = s[..idx];
-        return s.TrimEnd();
+        if (val.IndexOf(' ') >= 0)
+        {
+            var idx = val.IndexOf(" //");
+            if (idx >= 0) val = val[..idx];
+            idx = val.IndexOf(" #");
+            if (idx >= 0) val = val[..idx];
+        }
+        var e = val.Length;
+        while (e > 0 && IsWs(val[e - 1])) e--;
+        return val[..e];
     }
 
-    private static SynxValue Cast(string val)
+    /// <summary>SYNX §8.3 automatic casting. perf: only a string result is copied.</summary>
+    internal static SynxValue Cast(ReadOnlySpan<char> val)
     {
         if (val.Length >= 2)
         {
             var a = val[0];
             var b = val[^1];
             if ((a == '"' && b == '"') || (a == '\'' && b == '\''))
-                return new SynxValue.Str(val[1..^1]);
+                return new SynxValue.Str(val[1..^1].ToString());
         }
 
-        if (val == "true") return new SynxValue.Bool(true);
-        if (val == "false") return new SynxValue.Bool(false);
-        if (val == "null") return new SynxValue.Null();
+        if (val.IsEmpty) return new SynxValue.Str("");
+        if (val.SequenceEqual("true")) return new SynxValue.Bool(true);
+        if (val.SequenceEqual("false")) return new SynxValue.Bool(false);
+        if (val.SequenceEqual("null")) return new SynxValue.Null();
 
-        if (val.Length == 0)
-            return new SynxValue.Str("");
-
-        var bytes = Encoding.UTF8.GetBytes(val);
-        var blen = bytes.Length;
         var start = 0;
-        if (bytes[0] == (byte)'-')
+        if (val[0] == '-')
         {
-            if (blen == 1)
-                return new SynxValue.Str(val);
+            if (val.Length == 1) return new SynxValue.Str("-");
             start = 1;
         }
 
-        if (bytes[start] >= (byte)'0' && bytes[start] <= (byte)'9')
+        if (char.IsAsciiDigit(val[start]))
         {
-            int? dotPos = null;
+            var dotPos = -1;
             var allNumeric = true;
-            for (var j = start; j < blen; j++)
+            for (var j = start; j < val.Length; j++)
             {
-                if (bytes[j] == (byte)'.')
+                var ch = val[j];
+                if (ch == '.')
                 {
-                    if (dotPos.HasValue)
-                    {
-                        allNumeric = false;
-                        break;
-                    }
+                    if (dotPos >= 0) { allNumeric = false; break; }
                     dotPos = j;
                 }
-                else if (bytes[j] < (byte)'0' || bytes[j] > (byte)'9')
+                else if (!char.IsAsciiDigit(ch))
                 {
                     allNumeric = false;
                     break;
@@ -660,78 +846,34 @@ internal static class SynxParserCore
 
             if (allNumeric)
             {
-                if (dotPos is { } dp)
+                if (dotPos >= 0)
                 {
-                    if (dp > start && dp < blen - 1 && double.TryParse(val, CultureInfo.InvariantCulture, out var f))
-                        return new SynxValue.Float(f);
+                    if (dotPos > start && dotPos < val.Length - 1)
+                        return new SynxValue.Float(double.Parse(val, NumberStyles.Float, CultureInfo.InvariantCulture));
                 }
-                else if (long.TryParse(val, CultureInfo.InvariantCulture, out var n))
+                else if (SynxNum.TryParseI64(val, out var n))
                     return new SynxValue.Int(n);
             }
         }
 
-        return new SynxValue.Str(val);
+        return new SynxValue.Str(val.ToString());
     }
 
     private static readonly Random s_rng = new(42);
 
-    private static SynxValue CastTyped(string val, string hint)
+    /// <summary>SYNX §8.3 typed casting.</summary>
+    private static SynxValue CastTyped(ReadOnlySpan<char> val, string hint) => hint switch
     {
-        return hint switch
-        {
-            "int" => new SynxValue.Int(long.TryParse(val, CultureInfo.InvariantCulture, out var i) ? i : 0),
-            "float" => new SynxValue.Float(double.TryParse(val, CultureInfo.InvariantCulture, out var f) ? f : 0),
-            "bool" => new SynxValue.Bool(val.Trim() == "true"),
-            "string" => new SynxValue.Str(val),
-            // Match Rust `rng::random_i64()` — full signed 64-bit range including
-            // negatives. `Random.NextInt64()` (no args) only covers [0, Int64.MaxValue).
-            "random" or "random:int" => new SynxValue.Int(s_rng.NextInt64(long.MinValue, long.MaxValue)),
-            "random:float" => new SynxValue.Float(s_rng.NextDouble()),
-            "random:bool" => new SynxValue.Bool(s_rng.Next(2) == 1),
-            _ => Cast(val),
-        };
-    }
-
-    private static void InsertValue(
-        Dictionary<string, SynxValue> root,
-        List<(int Indent, StackEntry Entry)> stack,
-        int parentIdx,
-        string key,
-        SynxValue value)
-    {
-        if (NavigateToParent(root, stack, parentIdx) is not { } target)
-            return;
-        target[key] = value;
-    }
-
-    private static Dictionary<string, SynxValue>? NavigateToParent(
-        Dictionary<string, SynxValue> root,
-        List<(int Indent, StackEntry Entry)> stack,
-        int targetIdx)
-    {
-        if (targetIdx == 0)
-            return root;
-
-        var cur = root;
-        foreach (var (_, entry) in stack.Skip(1).Take(targetIdx))
-        {
-            switch (entry)
-            {
-                case StackEntry.Key k:
-                    if (!cur.TryGetValue(k.Name, out var child) || child is not SynxValue.Obj o)
-                        return null;
-                    cur = o.Map;
-                    break;
-                case StackEntry.ListItem li:
-                    if (!cur.TryGetValue(li.ListKey, out var lv) || lv is not SynxValue.Arr arr
-                        || li.ItemIdx >= arr.Items.Count || arr.Items[li.ItemIdx] is not SynxValue.Obj io)
-                        return null;
-                    cur = io.Map;
-                    break;
-            }
-        }
-        return cur;
-    }
+        "int" => new SynxValue.Int(SynxNum.TryParseI64(val, out var i) ? i : 0),
+        "float" => new SynxValue.Float(SynxNum.TryParseF64(val, out var f) ? f : 0),
+        "bool" => new SynxValue.Bool(TrimWs(val).SequenceEqual("true")),
+        "string" => new SynxValue.Str(val.ToString()),
+        // Full signed 64-bit range, as Rust `rng::random_i64()`.
+        "random" or "random:int" => new SynxValue.Int(s_rng.NextInt64(long.MinValue, long.MaxValue)),
+        "random:float" => new SynxValue.Float(s_rng.NextDouble()),
+        "random:bool" => new SynxValue.Bool(s_rng.Next(2) == 1),
+        _ => Cast(val),
+    };
 
     internal static Dictionary<string, SynxValue> ReshapeToolOutput(SynxValue root, bool schema)
     {
@@ -739,24 +881,23 @@ internal static class SynxParserCore
             return new Dictionary<string, SynxValue>(StringComparer.Ordinal);
 
         var map = mapObj.Map;
+        var keys = map.Keys.ToList();
+        keys.Sort(CodePointComparer.Instance);
         if (schema)
         {
             var tools = new List<SynxValue>();
-            foreach (var key in map.Keys.OrderBy(k => k, StringComparer.Ordinal))
+            foreach (var key in keys)
             {
-                var val = map[key];
-                var def = new Dictionary<string, SynxValue>(StringComparer.Ordinal)
+                tools.Add(new SynxValue.Obj(new Dictionary<string, SynxValue>(StringComparer.Ordinal)
                 {
                     ["name"] = new SynxValue.Str(key),
-                    ["params"] = val,
-                };
-                tools.Add(new SynxValue.Obj(def));
+                    ["params"] = map[key],
+                }));
             }
-            var outer = new Dictionary<string, SynxValue>(StringComparer.Ordinal)
+            return new Dictionary<string, SynxValue>(StringComparer.Ordinal)
             {
                 ["tools"] = new SynxValue.Arr(tools),
             };
-            return outer;
         }
 
         if (map.Count == 0)
@@ -768,9 +909,8 @@ internal static class SynxParserCore
             };
         }
 
-        var toolKey = map.Keys.OrderBy(k => k, StringComparer.Ordinal).First();
-        var toolValue = map[toolKey];
-        var parameters = toolValue switch
+        var toolKey = keys[0];
+        var parameters = map[toolKey] switch
         {
             SynxValue.Obj o => new SynxValue.Obj(new Dictionary<string, SynxValue>(o.Map, StringComparer.Ordinal)),
             _ => new SynxValue.Obj(new Dictionary<string, SynxValue>(StringComparer.Ordinal)),

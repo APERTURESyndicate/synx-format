@@ -1,0 +1,5 @@
+!synxl 1
+!fields n(int) ; f(float) ; b(bool)
+
+5  ; 1.5  ; true 
+7 ; 2.5 ; false

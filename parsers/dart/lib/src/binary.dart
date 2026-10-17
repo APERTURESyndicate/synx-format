@@ -8,6 +8,7 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'meta.dart';
+import 'num.dart';
 import 'value.dart';
 
 const List<int> _magic = [0x53, 0x59, 0x4E, 0x58, 0x42]; // "SYNXB"
@@ -70,6 +71,7 @@ SynxCompileResult compile(SynxParseResult r, bool resolved) {
     _collectMetadataStrings(r.metadata, st);
     _collectIncludeStrings(r.includes, st);
   }
+  st.orderByUse();
 
   final payload = BytesBuilder();
   st.encode(payload);
@@ -126,6 +128,9 @@ SynxDecompileResult decompile(List<int> data) {
       (data[8] << 8) |
       (data[9] << 16) |
       (data[10] << 24);
+  if (uncomp > _maxDecodedBytes) {
+    return SynxDecompileResult.failure('declared size $uncomp exceeds limit $_maxDecodedBytes');
+  }
 
   late Uint8List payload;
   try {
@@ -228,16 +233,41 @@ class _Cursor {
 // ─── String table ───────────────────────────────────────────────────────────
 
 class _StringTable {
-  final List<String> strings = [];
+  List<String> strings = [];
   final Map<String, int> index = {};
+
+  /// How many times each string is referenced, by first-seen index.
+  final List<int> uses = [];
 
   int intern(String s) {
     final existing = index[s];
-    if (existing != null) return existing;
+    if (existing != null) {
+      uses[existing]++;
+      return existing;
+    }
     final idx = strings.length;
     strings.add(s);
     index[s] = idx;
+    uses.add(1);
     return idx;
+  }
+
+  /// Renumber by descending use count (ties keep first-seen order): frequent
+  /// strings get one-byte indexes, and the same document always compiles to the
+  /// same bytes (Rust `StringTable::order_by_use`).
+  void orderByUse() {
+    final order = List<int>.generate(strings.length, (i) => i);
+    order.sort((a, b) {
+      final c = uses[b] - uses[a];
+      return c != 0 ? c : a - b;
+    });
+    final reordered = <String>[];
+    for (var newIdx = 0; newIdx < order.length; newIdx++) {
+      final str = strings[order[newIdx]];
+      index[str] = newIdx;
+      reordered.add(str);
+    }
+    strings = reordered;
   }
 
   int indexOf(String s) => index[s] ?? 0;
@@ -294,7 +324,7 @@ void _collectStrings(SynxValue v, _StringTable t) {
       }
       return;
     case SynxObj(map: var map):
-      for (final e in map.entries) {
+      for (final e in map.entryView) {
         t.intern(e.key);
         _collectStrings(e.value, t);
       }
@@ -370,7 +400,7 @@ void _encodeValue(BytesBuilder out, SynxValue v, _StringTable t) {
       return;
     case SynxObj(map: var map):
       out.addByte(_tagObject);
-      final keys = map.sortedKeys;
+      final keys = sortCodePoints(map.keys);
       _varint(out, keys.length);
       for (final k in keys) {
         _varint(out, t.indexOf(k));
@@ -380,7 +410,26 @@ void _encodeValue(BytesBuilder out, SynxValue v, _StringTable t) {
   }
 }
 
-SynxValue _decodeValue(_Cursor cur, _StringTableReader t) {
+/// Depth limit for the recursive value decoder (twice the parser's nesting cap).
+const int _maxDecodeDepth = 256;
+
+/// safety: the decoded payload is bounded — a small deflate stream can expand
+/// into gigabytes.
+const int _maxDecodedBytes = 256 * 1024 * 1024;
+
+/// A count from the file, bounded by the bytes left (every element costs at least one).
+int _readCount(_Cursor cur) {
+  final n = _readVarint(cur);
+  if (n < 0 || n > cur.data.length - cur.pos) {
+    throw const SynxBinaryError('unexpected end of data');
+  }
+  return n;
+}
+
+SynxValue _decodeValue(_Cursor cur, _StringTableReader t, [int depth = 0]) {
+  if (depth > _maxDecodeDepth) {
+    throw const SynxBinaryError('nesting exceeds $_maxDecodeDepth — refusing to decode');
+  }
   if (cur.pos >= cur.data.length) {
     throw const SynxBinaryError('unexpected end of data');
   }
@@ -401,18 +450,18 @@ SynxValue _decodeValue(_Cursor cur, _StringTableReader t) {
     case _tagSecret:
       return synxSecret(t.get(_readVarint(cur)));
     case _tagArray:
-      final count = _readVarint(cur);
+      final count = _readCount(cur);
       final arr = <SynxValue>[];
       for (var i = 0; i < count; i++) {
-        arr.add(_decodeValue(cur, t));
+        arr.add(_decodeValue(cur, t, depth + 1));
       }
       return synxArray(arr);
     case _tagObject:
-      final count = _readVarint(cur);
+      final count = _readCount(cur);
       final obj = SynxObject();
       for (var i = 0; i < count; i++) {
         final ki = _readVarint(cur);
-        obj.set(t.get(ki), _decodeValue(cur, t));
+        obj.set(t.get(ki), _decodeValue(cur, t, depth + 1));
       }
       return synxObject(obj);
   }
@@ -467,12 +516,12 @@ SynxConstraints _decodeConstraints(_Cursor cur, _StringTableReader t) {
 }
 
 void _encodeMetadata(BytesBuilder out, SynxMetadataTree tree, _StringTable t) {
-  final outerKeys = tree.keys.toList()..sort();
+  final outerKeys = sortCodePoints(tree.keys.toList());
   _varint(out, outerKeys.length);
   for (final path in outerKeys) {
     _varint(out, t.indexOf(path));
     final m = tree[path]!;
-    final innerKeys = m.keys.toList()..sort();
+    final innerKeys = sortCodePoints(m.keys.toList());
     _varint(out, innerKeys.length);
     for (final fk in innerKeys) {
       final meta = m[fk]!;
@@ -561,5 +610,10 @@ List<SynxIncludeDirective> _decodeIncludes(
 
 Uint8List _encodeUtf8(String s) => Uint8List.fromList(utf8.encode(s));
 
-String _decodeUtf8(List<int> bytes) =>
-    utf8.decode(bytes, allowMalformed: true);
+String _decodeUtf8(List<int> bytes) {
+  try {
+    return utf8.decode(bytes);
+  } on FormatException catch (e) {
+    throw SynxBinaryError("invalid UTF-8 in string table: ${e.message}");
+  }
+}

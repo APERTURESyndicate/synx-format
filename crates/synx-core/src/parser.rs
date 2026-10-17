@@ -1,7 +1,6 @@
 //! SYNX Parser — converts raw .synx text into a structured value tree
 //! with metadata for engine resolution.
 
-use std::collections::HashMap;
 use memchr::memchr;
 use crate::value::*;
 use crate::rng;
@@ -12,7 +11,7 @@ use crate::rng;
 /// Maximum UTF-8 bytes accepted per `parse()` (truncate with valid UTF-8 boundary).
 pub(crate) const MAX_SYNX_INPUT_BYTES: usize = 16 * 1024 * 1024;
 
-/// Maximum indexed line starts (1 + number of `\n` before truncate). Bounds `line_starts` RAM (~8× on 64-bit).
+/// Maximum lines considered (1 + number of newlines before truncate).
 const MAX_LINE_STARTS: usize = 2_000_000;
 
 /// Indentation-tree depth for nested objects (stack size). Iterative parser — prevents giant parent chains.
@@ -154,7 +153,29 @@ pub fn parse(text: &str) -> ParseResult {
 ///
 /// `parse(text)` is `parse_with(text, ParserOptions::default())`.
 pub fn parse_with(text: &str, opts: ParserOptions) -> ParseResult {
-    let original_len = text.len();
+    parse_impl(text, opts, None)
+}
+
+/// The 0-based line of `text` that declares each key landing at the root of
+/// the parsed document; the first declaration of a key wins.
+///
+/// SYNXL §11.2 reports a block diagnostic on the line inside the block, and
+/// which keys reach the root is the parser's own decision (stack repair, list
+/// items, multiline bodies) — re-deriving it from indentation got it wrong.
+pub(crate) fn root_key_lines(text: &str, opts: ParserOptions) -> std::collections::HashMap<String, usize> {
+    let mut lines = std::collections::HashMap::new();
+    parse_impl(text, opts, Some(&mut lines));
+    lines
+}
+
+fn parse_impl(
+    text: &str,
+    opts: ParserOptions,
+    mut root_lines: Option<&mut std::collections::HashMap<String, usize>>,
+) -> ParseResult {
+    // spec: a leading U+FEFF is dropped (§2.1) and is not lost content; it
+    // used to make every document with a BOM report `truncated`.
+    let original_len = text.strip_prefix('\u{feff}').unwrap_or(text).len();
     let text = clamp_synx_text(text);
     let parse_end = find_parse_end_bytes(text.as_bytes());
     let text = &text[..parse_end];
@@ -162,30 +183,16 @@ pub fn parse_with(text: &str, opts: ParserOptions) -> ParseResult {
     // Either cap having bitten means input was dropped before parsing began.
     let mut truncated_multiline = text.len() < original_len;
 
-    let mut line_starts: Vec<usize> = Vec::new();
-    line_starts.push(0);
-    let mut scan = 0usize;
-    while scan < bytes.len() {
-        if let Some(rel) = memchr(b'\n', &bytes[scan..]) {
-            let pos = scan + rel;
-            line_starts.push(pos + 1);
-            scan = pos + 1;
-        } else {
-            break;
-        }
-    }
-    let line_count = line_starts.len();
-
-    let mut root = HashMap::new();
+    let mut root = Map::default();
     let mut stack: Vec<(i32, StackEntry)> = vec![(-1, StackEntry::Root)];
     // Parent-navigation cache; cleared on every stack mutation (see NavCache).
-    let mut nav_cache: NavCache = None;
+    let mut nav_cache = NavCache::default();
     let mut mode = Mode::Static;
     let mut locked = false;
     let mut tool = false;
     let mut schema = false;
     let mut llm = false;
-    let mut metadata: HashMap<String, MetaMap> = HashMap::new();
+    let mut metadata: Map<MetaMap> = Map::default();
     let mut includes: Vec<IncludeDirective> = Vec::new();
     let mut uses: Vec<UseDirective> = Vec::new();
 
@@ -193,25 +200,32 @@ pub fn parse_with(text: &str, opts: ParserOptions) -> ParseResult {
     let mut list: Option<ListState> = None;
     let mut in_block_comment = false;
 
-    let mut i = 0;
-    while i < line_count {
+    // perf: lines are found on the fly. An index of every line start was built
+    // up front before — one more pass and a vector grown to the line count,
+    // paid again for every SYNXL block. `find_parse_end_bytes` has already
+    // applied the line cap, so walking to the end is walking the capped text.
+    let mut pos = 0usize;
+    let mut line_no = 0usize;
+    while pos <= bytes.len() {
+        let this_line = line_no;
+        line_no += 1;
         // Extract line without allocating
-        let start = line_starts[i];
-        let end = if i + 1 < line_count { line_starts[i + 1] - 1 } else { bytes.len() };
+        let start = pos;
+        let nl = memchr(b'\n', &bytes[start..]).map_or(bytes.len(), |rel| start + rel);
+        pos = nl + 1;
         // Handle \r\n
-        let end = if end > start && end > 0 && bytes.get(end - 1) == Some(&b'\r') { end - 1 } else { end };
+        let end = if nl > start && bytes[nl - 1] == b'\r' { nl - 1 } else { nl };
         let raw = &text[start..end];
 
-        let trimmed = raw.trim();
+        let trimmed = trim_ws(raw);
 
         // A blank line is never structural and never body: SYNX §8.4.1 does not
         // preserve blank lines inside a multiline body.
         if trimmed.is_empty() {
-            i += 1;
             continue;
         }
 
-        let indent = (raw.len() - raw.trim_start().len()) as i32;
+        let indent = indent_len(raw) as i32;
 
         // Continue multiline block.
         //
@@ -258,25 +272,22 @@ pub fn parse_with(text: &str, opts: ParserOptions) -> ParseResult {
                 } else {
                     truncated_multiline = true;
                 }
-                i += 1;
                 continue;
             } else {
                 let content = std::mem::take(&mut blk.content);
-                let blk_key = blk.key.clone();
+                let blk_key = blk.key;
                 let blk_stack_idx = blk.stack_idx;
                 block = None;
-                insert_value(&mut root, &stack, blk_stack_idx, &blk_key, Value::String(content), &mut nav_cache);
+                insert_value(&mut root, &stack, blk_stack_idx, blk_key, Value::String(content), &mut nav_cache);
             }
         }
 
         // Block comment toggle: ###
         if trimmed == "###" {
             in_block_comment = !in_block_comment;
-            i += 1;
             continue;
         }
         if in_block_comment {
-            i += 1;
             continue;
         }
 
@@ -289,27 +300,22 @@ pub fn parse_with(text: &str, opts: ParserOptions) -> ParseResult {
             // Mode declaration
             if trimmed == "!active" {
                 mode = Mode::Active;
-                i += 1;
                 continue;
             }
             if trimmed == "!lock" {
                 locked = true;
-                i += 1;
                 continue;
             }
             if trimmed == "!tool" {
                 tool = true;
-                i += 1;
                 continue;
             }
             if trimmed == "!schema" {
                 schema = true;
-                i += 1;
                 continue;
             }
             if trimmed == "!llm" {
                 llm = true;
-                i += 1;
                 continue;
             }
             if trimmed.starts_with("!include ") {
@@ -324,7 +330,6 @@ pub fn parse_with(text: &str, opts: ParserOptions) -> ParseResult {
                     });
                     includes.push(IncludeDirective { path, alias });
                 }
-                i += 1;
                 continue;
             }
             if trimmed.starts_with("!use ") {
@@ -341,13 +346,11 @@ pub fn parse_with(text: &str, opts: ParserOptions) -> ParseResult {
                         uses.push(UseDirective { package, alias });
                     }
                 }
-                i += 1;
                 continue;
             }
             if trimmed.starts_with("#!mode:") {
                 let declared = trimmed.splitn(2, ':').nth(1).unwrap_or("static").trim();
                 mode = if declared == "active" { Mode::Active } else { Mode::Static };
-                i += 1;
                 continue;
             }
         }
@@ -357,14 +360,12 @@ pub fn parse_with(text: &str, opts: ParserOptions) -> ParseResult {
         // consumed and preserved those) and MUST be discarded exactly like a
         // comment line: it must neither set a mode flag nor become a key.
         if !opts.directives && trimmed.starts_with('!') {
-            i += 1;
             continue;
         }
 
         // Skip comments. Checked after the directive block above so that the
         // `#!mode:` pragma is still recognised.
         if trimmed.starts_with('#') || trimmed.starts_with("//") {
-            i += 1;
             continue;
         }
 
@@ -372,33 +373,24 @@ pub fn parse_with(text: &str, opts: ParserOptions) -> ParseResult {
         if trimmed.starts_with("- ") {
             if let Some(ref lst) = list {
                 if indent > lst.indent {
-                    // Pop any stack frames belonging to a previous list item
-                    // at the same or deeper indent so items don't accumulate.
-                    while stack.len() > 1 {
-                        match stack.last() {
-                            Some((d, StackEntry::ListItem { .. })) if *d >= indent => { pop_frame(&mut stack, &mut nav_cache); }
-                            _ => break,
-                        }
+                    // Pop every frame of the previous item — its own frame and
+                    // any object nested inside it. Popping only `ListItem`
+                    // frames stopped at a nested `sub` object, so the next
+                    // item's keys were looked up through `sub` and dropped.
+                    while stack.len() > 1 && stack.last().map_or(false, |(d, _)| *d >= indent) {
+                        pop_frame(&mut stack, &mut nav_cache);
                     }
 
-                    let val_str = strip_comment(trimmed[2..].trim());
+                    let val_str = strip_comment(trim_ws(&trimmed[2..]));
 
                     // Peek next non-empty line — if it is more deeply
                     // indented and not a `- ` continuation, this item is an
                     // object, not a scalar.
-                    let mut peek = i + 1;
                     let mut nested = false;
-                    while peek < line_count {
-                        let ps = line_starts[peek];
-                        let pe = if peek + 1 < line_count { line_starts[peek + 1] - 1 } else { bytes.len() };
-                        let pe = if pe > ps && bytes.get(pe - 1) == Some(&b'\r') { pe - 1 } else { pe };
+                    if let Some((ps, pe)) = next_content_line(text, pos) {
                         let pl = &text[ps..pe];
-                        let pt = pl.trim();
-                        if pt.is_empty() {
-                            peek += 1;
-                            continue;
-                        }
-                        let pi = (pl.len() - pl.trim_start().len()) as i32;
+                        let pt = trim_ws(pl);
+                        let pi = indent_len(pl) as i32;
                         if pi > indent
                             && !pt.starts_with("- ")
                             && !pt.starts_with('#')
@@ -406,53 +398,50 @@ pub fn parse_with(text: &str, opts: ParserOptions) -> ParseResult {
                         {
                             nested = true;
                         }
-                        break;
                     }
 
-                    let list_key = lst.key.clone();
+                    let list_key = lst.key;
                     let list_stack_idx = lst.stack_idx;
 
                     // Locate the items array, creating it lazily in the parent map.
                     if let Some(parent_map) = navigate_cached(&mut root, &stack, list_stack_idx, &mut nav_cache) {
                         let arr_entry = parent_map
-                            .entry(list_key.clone())
+                            .entry(list_key.to_string())
                             .or_insert_with(|| Value::Array(Vec::new()));
                         if let Value::Array(arr) = arr_entry {
                             if arr.len() >= MAX_LIST_ITEMS {
-                                i += 1;
                                 continue;
                             }
                             if nested {
-                                let mut item_obj: HashMap<String, Value> = HashMap::new();
-                                if let Some(parsed) = parse_line(&val_str) {
-                                    let val = if let Some(ref hint) = parsed.type_hint {
-                                        cast_typed_with(&parsed.value, hint, opts.nondeterministic_hints)
+                                let mut item_obj: Map = Map::default();
+                                if let Some(parsed) = parse_line(val_str) {
+                                    let val = if let Some(hint) = parsed.type_hint {
+                                        cast_typed_with(parsed.value, hint, opts.nondeterministic_hints)
                                     } else if !parsed.value.is_empty() {
-                                        cast(&parsed.value)
+                                        cast(parsed.value)
                                     } else {
-                                        Value::Object(HashMap::new())
+                                        Value::Object(Map::default())
                                     };
                                     // Same prototype-pollution guard as the key-line
                                     // branch below: a list item is just as capable of
                                     // carrying `__proto__` into the JSON projection.
-                                    if !is_reserved_js_key(&parsed.key) {
-                                        item_obj.insert(parsed.key, val);
+                                    if !is_reserved_js_key(parsed.key) {
+                                        item_obj.insert(parsed.key.to_string(), val);
                                     }
                                 } else {
-                                    item_obj.insert("_value".to_string(), cast(&val_str));
+                                    item_obj.insert("_value".to_string(), cast(val_str));
                                 }
                                 let item_idx = arr.len();
                                 arr.push(Value::Object(item_obj));
                                 if stack.len() < MAX_PARSE_NESTING_DEPTH {
-                                    push_frame(&mut stack, &mut nav_cache, (indent, StackEntry::ListItem { list_key, item_idx }));
+                                    push_frame(&mut stack, &mut nav_cache, (indent, StackEntry::ListItem { list_key, item_idx, parent: list_stack_idx }));
                                 }
                             } else {
-                                arr.push(cast(&val_str));
+                                arr.push(cast(val_str));
                             }
                         }
                     }
 
-                    i += 1;
                     continue;
                 }
             }
@@ -472,12 +461,11 @@ pub fn parse_with(text: &str, opts: ParserOptions) -> ParseResult {
         }
 
         // Parse key line
-        if let Some(parsed) = parse_line(trimmed) {
+        if let Some(mut parsed) = parse_line(trimmed) {
             // Reject prototype-polluting keys so downstream consumers (esp. JS
             // applications consuming the JSON output) are not exposed to
             // `__proto__` / `constructor` / `prototype` injection.
-            if is_reserved_js_key(&parsed.key) {
-                i += 1;
+            if is_reserved_js_key(parsed.key) {
                 continue;
             }
 
@@ -487,6 +475,36 @@ pub fn parse_with(text: &str, opts: ParserOptions) -> ParseResult {
             }
 
             let parent_idx = stack.len() - 1;
+            if parent_idx == 0 {
+                if let Some(lines) = root_lines.as_deref_mut() {
+                    lines.entry(parsed.key.to_string()).or_insert(this_line);
+                }
+            }
+
+            // spec: a key that replaces an object or list replaces its
+            // declarations too. Metadata is filed by path, so the old
+            // subtree's markers and constraints used to apply to whatever
+            // took its place (`port` / `  port[enum:a]` / `port` left the
+            // second, empty `port` failing the first one's enum).
+            if mode == Mode::Active && !metadata.is_empty() {
+                let replaces_tree = navigate_cached(&mut root, &stack, parent_idx, &mut nav_cache)
+                    .and_then(|m| m.get(parsed.key))
+                    .map_or(false, |v| matches!(v, Value::Object(_) | Value::Array(_)));
+                if replaces_tree {
+                    if !nav_cache.meta_path_valid {
+                        fill_path(&stack, &mut nav_cache.meta_path);
+                        nav_cache.meta_path_valid = true;
+                    }
+                    let mut prefix = nav_cache.meta_path.clone();
+                    if !prefix.is_empty() {
+                        prefix.push('.');
+                    }
+                    crate::engine::push_key_segment(&mut prefix, parsed.key);
+                    metadata.retain(|p, _| {
+                        !(p == &prefix || (p.starts_with(prefix.as_str()) && p.as_bytes().get(prefix.len()) == Some(&b'.')))
+                    });
+                }
+            }
 
             // Save metadata if in active mode
             if mode == Mode::Active
@@ -494,15 +512,24 @@ pub fn parse_with(text: &str, opts: ParserOptions) -> ParseResult {
                     || parsed.constraints.is_some()
                     || parsed.type_hint.is_some())
             {
-                let path = build_path(&stack);
-                let meta_map = metadata.entry(path).or_default();
+                // perf: the metadata path changes only with the stack, so it is
+                // rebuilt after a push/pop instead of once per marked key.
+                if !nav_cache.meta_path_valid {
+                    fill_path(&stack, &mut nav_cache.meta_path);
+                    nav_cache.meta_path_valid = true;
+                }
+                let path = nav_cache.meta_path.as_str();
+                if !metadata.contains_key(path) {
+                    metadata.insert(path.to_string(), MetaMap::default());
+                }
+                let meta_map = metadata.get_mut(path).expect("inserted above");
                 meta_map.insert(
-                    parsed.key.clone(),
+                    parsed.key.to_string(),
                     Meta {
-                        markers: parsed.markers.clone(),
-                        args: parsed.marker_args.clone(),
-                        type_hint: parsed.type_hint.clone(),
-                        constraints: parsed.constraints.clone(),
+                        markers: parsed.markers.iter().map(|m| m.to_string()).collect(),
+                        args: std::mem::take(&mut parsed.marker_args),
+                        type_hint: parsed.type_hint.map(str::to_string),
+                        constraints: parsed.constraints.take(),
                     },
                 );
             }
@@ -514,9 +541,10 @@ pub fn parse_with(text: &str, opts: ParserOptions) -> ParseResult {
             // change meaning under 3.7; the bump is documented in CHANGELOG.
             let is_block = parsed.value == "|" || parsed.value == "|+";
             let preserve_indent = parsed.value == "|+";
-            let is_list_marker = parsed.markers.iter().any(|m| {
-                matches!(m.as_str(), "random" | "unique" | "geo" | "join")
-            });
+            let is_list_marker = parsed
+                .markers
+                .iter()
+                .any(|m| matches!(*m, "random" | "unique" | "geo" | "join"));
 
             if is_block {
                 insert_value(
@@ -553,31 +581,8 @@ pub fn parse_with(text: &str, opts: ParserOptions) -> ParseResult {
                 });
             } else if parsed.value.is_empty() {
                 // Peek ahead for list
-                let mut peek = i + 1;
-                while peek < line_count {
-                    let ps = line_starts[peek];
-                    let pe = if peek + 1 < line_count {
-                        line_starts[peek + 1] - 1
-                    } else {
-                        bytes.len()
-                    };
-                    let pe = if pe > ps && bytes.get(pe - 1) == Some(&b'\r') { pe - 1 } else { pe };
-                    let pt = text[ps..pe].trim();
-                    if !pt.is_empty() {
-                        break;
-                    }
-                    peek += 1;
-                }
-
-                if peek < line_count {
-                    let ps = line_starts[peek];
-                    let pe = if peek + 1 < line_count {
-                        line_starts[peek + 1] - 1
-                    } else {
-                        bytes.len()
-                    };
-                    let pe = if pe > ps && bytes.get(pe - 1) == Some(&b'\r') { pe - 1 } else { pe };
-                    let pt = text[ps..pe].trim();
+                if let Some((ps, pe)) = next_content_line(text, pos) {
+                    let pt = trim_ws(&text[ps..pe]);
                     if pt.starts_with("- ") {
                         insert_value(
                             &mut root,
@@ -592,7 +597,6 @@ pub fn parse_with(text: &str, opts: ParserOptions) -> ParseResult {
                             key: parsed.key,
                             stack_idx: parent_idx,
                         });
-                        i += 1;
                         continue;
                     }
                 }
@@ -602,7 +606,7 @@ pub fn parse_with(text: &str, opts: ParserOptions) -> ParseResult {
                     &stack,
                     parent_idx,
                     &parsed.key,
-                    Value::Object(HashMap::new()),
+                    Value::Object(Map::default()),
                     &mut nav_cache,
                 );
                 // Guard against pathological inputs that create extremely deep nesting,
@@ -612,16 +616,14 @@ pub fn parse_with(text: &str, opts: ParserOptions) -> ParseResult {
                     push_frame(&mut stack, &mut nav_cache, (indent, StackEntry::Key(parsed.key)));
                 }
             } else {
-                let value = if let Some(ref hint) = parsed.type_hint {
-                    cast_typed_with(&parsed.value, hint, opts.nondeterministic_hints)
+                let value = if let Some(hint) = parsed.type_hint {
+                    cast_typed_with(parsed.value, hint, opts.nondeterministic_hints)
                 } else {
-                    cast(&parsed.value)
+                    cast(parsed.value)
                 };
-                insert_value(&mut root, &stack, parent_idx, &parsed.key, value, &mut nav_cache);
+                insert_value(&mut root, &stack, parent_idx, parsed.key, value, &mut nav_cache);
             }
         }
-
-        i += 1;
     }
 
     // Flush pending block
@@ -630,7 +632,7 @@ pub fn parse_with(text: &str, opts: ParserOptions) -> ParseResult {
             &mut root,
             &stack,
             blk.stack_idx,
-            &blk.key,
+            blk.key,
             Value::String(blk.content),
             &mut nav_cache,
         );
@@ -659,6 +661,22 @@ pub fn parse_with(text: &str, opts: ParserOptions) -> ParseResult {
     }
 }
 
+/// The first line at or after byte `from` that is not blank, as
+/// `(start, end)` with a trailing `CR` excluded.
+fn next_content_line(text: &str, from: usize) -> Option<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let mut p = from;
+    while p <= bytes.len() {
+        let nl = memchr(b'\n', &bytes[p..]).map_or(bytes.len(), |rel| p + rel);
+        let end = if nl > p && bytes[nl - 1] == b'\r' { nl - 1 } else { nl };
+        if !trim_ws(&text[p..end]).is_empty() {
+            return Some((p, end));
+        }
+        p = nl + 1;
+    }
+    None
+}
+
 // ─── !tool output reshaping ──────────────────────────────
 
 /// Reshape parsed tree for `!tool` mode.
@@ -684,20 +702,20 @@ pub fn reshape_tool_output(root: &Value, schema: bool) -> Value {
         keys.sort();
         for key in keys {
             let val = &map[key];
-            let mut def = HashMap::new();
+            let mut def = Map::default();
             def.insert("name".to_string(), Value::String(key.clone()));
             def.insert("params".to_string(), val.clone());
             tools.push(Value::Object(def));
         }
-        let mut out = HashMap::new();
+        let mut out = Map::default();
         out.insert("tools".to_string(), Value::Array(tools));
         Value::Object(out)
     } else {
         // Call mode: first key = tool name, children = params
         if map.is_empty() {
-            let mut out = HashMap::new();
+            let mut out = Map::default();
             out.insert("tool".to_string(), Value::Null);
-            out.insert("params".to_string(), Value::Object(HashMap::new()));
+            out.insert("params".to_string(), Value::Object(Map::default()));
             return Value::Object(out);
         }
 
@@ -711,10 +729,10 @@ pub fn reshape_tool_output(root: &Value, schema: bool) -> Value {
         let params = match tool_value {
             Value::Object(m) => Value::Object(m.clone()),
             // If tool has a single value (no nested params), wrap it
-            _ => Value::Object(HashMap::new()),
+            _ => Value::Object(Map::default()),
         };
 
-        let mut out = HashMap::new();
+        let mut out = Map::default();
         out.insert("tool".to_string(), Value::String(tool_key.clone()));
         out.insert("params".to_string(), params);
         Value::Object(out)
@@ -724,19 +742,19 @@ pub fn reshape_tool_output(root: &Value, schema: bool) -> Value {
 // ─── Internal types ──────────────────────────────────────
 
 #[derive(Debug)]
-enum StackEntry {
+enum StackEntry<'a> {
     Root,
-    Key(String),
+    Key(&'a str),
     /// We are inside a list item that turned out to be an object
     /// (a `- key value` line followed by deeper-indented sub-keys).
     /// `list_key` is the list's key in its parent map; `item_idx` is
     /// the position in the list's `Array`.
-    ListItem { list_key: String, item_idx: usize },
+    ListItem { list_key: &'a str, item_idx: usize, parent: usize },
 }
 
-struct BlockState {
+struct BlockState<'a> {
     indent: i32,
-    key: String,
+    key: &'a str,
     content: String,
     stack_idx: usize,
     /// SYNX 3.7 `|+`: keep indent relative to the first continuation line.
@@ -747,24 +765,74 @@ struct BlockState {
     base_indent: i32,
 }
 
-struct ListState {
+struct ListState<'a> {
     indent: i32,
-    key: String,
+    key: &'a str,
     stack_idx: usize,
 }
 
-struct ParsedLine {
-    key: String,
-    type_hint: Option<String>,
-    value: String,
-    markers: Vec<String>,
+/// One key line, borrowed from the source text.
+///
+/// perf: every field is a slice of the line; owned strings are made only for
+/// what is actually stored (the map key, the cast value, active metadata).
+struct ParsedLine<'a> {
+    key: &'a str,
+    type_hint: Option<&'a str>,
+    value: &'a str,
+    markers: Vec<&'a str>,
     marker_args: Vec<String>,
     constraints: Option<Constraints>,
 }
 
+/// SYNX whitespace inside the ASCII range — exactly what `char::is_whitespace`
+/// accepts below U+0080 (U+0009..U+000D and U+0020).
+#[inline(always)]
+fn is_ascii_ws(b: u8) -> bool {
+    matches!(b, b'\t' | b'\n' | 0x0B | 0x0C | b'\r' | b' ')
+}
+
+/// `str::trim` with an ASCII fast path.
+///
+/// perf: `str::trim` decodes every edge character; config lines almost always
+/// begin and end in ASCII, so bytes are checked first and the Unicode-aware
+/// trim runs only when a non-ASCII byte sits at an edge.
+#[inline]
+fn trim_ws(s: &str) -> &str {
+    let b = s.as_bytes();
+    let mut start = 0;
+    while start < b.len() && is_ascii_ws(b[start]) {
+        start += 1;
+    }
+    if start < b.len() && b[start] >= 0x80 {
+        return s[start..].trim();
+    }
+    let mut end = b.len();
+    while end > start && is_ascii_ws(b[end - 1]) {
+        end -= 1;
+    }
+    if end > start && b[end - 1] >= 0x80 {
+        return s[start..end].trim_end();
+    }
+    &s[start..end]
+}
+
+/// Byte length of the leading whitespace of `s` (Unicode-aware, ASCII fast path).
+#[inline]
+fn indent_len(s: &str) -> usize {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() && is_ascii_ws(b[i]) {
+        i += 1;
+    }
+    if i < b.len() && b[i] >= 0x80 {
+        return s.len() - s.trim_start().len();
+    }
+    i
+}
+
 // ─── Line parser ─────────────────────────────────────────
 
-fn parse_line(trimmed: &str) -> Option<ParsedLine> {
+fn parse_line(trimmed: &str) -> Option<ParsedLine<'_>> {
     if trimmed.is_empty()
         || trimmed.starts_with('#')
         || trimmed.starts_with("//")
@@ -790,14 +858,14 @@ fn parse_line(trimmed: &str) -> Option<ParsedLine> {
         }
         pos += 1;
     }
-    let key = trimmed[..pos].to_string();
+    let key = &trimmed[..pos];
 
     // Optional (type)
     let mut type_hint = None;
     if pos < len && bytes[pos] == b'(' {
         let start = pos + 1;
-        if let Some(c) = trimmed[start..].find(')') {
-            type_hint = Some(trimmed[start..start + c].to_string());
+        if let Some(c) = memchr(b')', &bytes[start..]) {
+            type_hint = Some(&trimmed[start..start + c]);
             pos = start + c + 1;
         } else {
             pos += 1;
@@ -851,11 +919,7 @@ fn parse_line(trimmed: &str) -> Option<ParsedLine> {
             marker_end += 1;
         }
         let chain = &trimmed[marker_start..marker_end];
-        markers = chain
-            .split(':')
-            .take(MAX_MARKER_CHAIN_SEGMENTS)
-            .map(|s| s.to_string())
-            .collect();
+        markers = chain.split(':').take(MAX_MARKER_CHAIN_SEGMENTS).collect();
         pos = marker_end;
     }
 
@@ -865,31 +929,28 @@ fn parse_line(trimmed: &str) -> Option<ParsedLine> {
     }
 
     // Value
-    let mut raw_value = if pos < len {
-        strip_comment(&trimmed[pos..])
-    } else {
-        String::new()
-    };
+    let mut raw_value = if pos < len { strip_comment(&trimmed[pos..]) } else { "" };
 
-    // For :random — parse weight percentages from value
-    if markers.contains(&"random".to_string()) && !raw_value.is_empty() {
-        let parts: Vec<&str> = raw_value.split_whitespace().collect();
-        let nums: Vec<String> = parts
-            .iter()
-            .filter(|s| s.parse::<f64>().is_ok())
-            .map(|s| s.to_string())
-            .collect();
-        if !nums.is_empty() {
-            marker_args = nums;
-            raw_value.clear();
+    if !markers.is_empty() && !raw_value.is_empty() {
+        // For :random — parse weight percentages from value
+        if markers.iter().any(|m| *m == "random") {
+            let nums: Vec<String> = raw_value
+                .split_whitespace()
+                .filter(|s| s.parse::<f64>().is_ok())
+                .map(|s| s.to_string())
+                .collect();
+            if !nums.is_empty() {
+                marker_args = nums;
+                raw_value = "";
+            }
         }
-    }
 
-    // For :inherit — a non-empty value names the parent key, not a scalar.
-    // Promote it into marker_args so the line opens a group instead of a leaf.
-    if markers.contains(&"inherit".to_string()) && !raw_value.is_empty() {
-        marker_args = vec![raw_value.trim().to_string()];
-        raw_value.clear();
+        // For :inherit — a non-empty value names the parent key, not a scalar.
+        // Promote it into marker_args so the line opens a group instead of a leaf.
+        if !raw_value.is_empty() && markers.iter().any(|m| *m == "inherit") {
+            marker_args = vec![raw_value.trim().to_string()];
+            raw_value = "";
+        }
     }
 
     Some(ParsedLine {
@@ -1023,30 +1084,60 @@ pub(crate) fn cast_typed_with(val: &str, hint: &str, nondeterministic: bool) -> 
     }
 }
 
-fn strip_comment(val: &str) -> String {
-    let mut result = val.to_string();
-    if let Some(idx) = result.find(" //") {
-        result.truncate(idx);
+/// Cut an inline ` //` or ` #` comment and trailing whitespace off a value.
+///
+/// perf: a slice of `val`, never an allocation — the value is copied once,
+/// by the cast that stores it.
+fn strip_comment(val: &str) -> &str {
+    let mut result = val;
+    // perf: without a space there is no ` //` / ` #` to find.
+    if memchr(b' ', result.as_bytes()).is_some() {
+        if let Some(idx) = memchr::memmem::find(result.as_bytes(), b" //") {
+            result = &result[..idx];
+        }
+        if let Some(idx) = memchr::memmem::find(result.as_bytes(), b" #") {
+            result = &result[..idx];
+        }
     }
-    if let Some(idx) = result.find(" #") {
-        result.truncate(idx);
-    }
-    result.trim_end().to_string()
+    result.trim_end()
 }
 
 // ─── Tree helpers ────────────────────────────────────────
 
-fn build_path(stack: &[(i32, StackEntry)]) -> String {
-    // Metadata paths follow object keys only; list-item indices are not
-    // part of the dot-path. This matches the JS engine and the README
-    // contract that metadata is keyed by ancestor object keys.
-    let mut parts = Vec::new();
-    for (_, entry) in stack.iter().skip(1) {
-        if let StackEntry::Key(ref k) = entry {
-            parts.push(k.as_str());
+fn fill_path(stack: &[(i32, StackEntry<'_>)], out: &mut String) {
+    // Metadata is keyed by the dot-path the engine walks: object keys, and for
+    // a list item the list's key followed by `#<index>` (a key never starts
+    // with `#`, that is a comment). Following the frame chain rather than the
+    // whole stack keeps an unrelated open object out of it.
+    // spec: until 3.7.5 a list item contributed nothing, so its keys were
+    // filed under the list's parent and every marker inside a list item was
+    // skipped; an index-free path then made all items share one declaration
+    // per key, so `port[max:9]` in the third server rewrote the first's
+    // `port:env:default:7001`.
+    out.clear();
+    if stack.len() <= 1 {
+        return;
+    }
+    let mut chain = [0usize; MAX_PARSE_NESTING_DEPTH + 1];
+    let n = frame_chain(stack, stack.len() - 1, &mut chain);
+    for &idx in &chain[..n] {
+        match &stack[idx].1 {
+            StackEntry::Key(k) => {
+                if !out.is_empty() {
+                    out.push('.');
+                }
+                crate::engine::push_key_segment(out, k);
+            }
+            StackEntry::ListItem { list_key, item_idx, .. } => {
+                if !out.is_empty() {
+                    out.push('.');
+                }
+                crate::engine::push_key_segment(out, list_key);
+                crate::engine::push_item_segment(out, *item_idx);
+            }
+            StackEntry::Root => {}
         }
     }
-    parts.join(".")
 }
 
 /// Cache of the last resolved parent map: `(stack index of the parent, pointer)`.
@@ -1056,7 +1147,21 @@ fn build_path(stack: &[(i32, StackEntry)]) -> String {
 /// documented DoS: an 8 MiB file (well under the 16 MiB cap) took tens of
 /// seconds. The cache reuses the parent pointer across consecutive inserts to
 /// the same parent, making it linear again.
-type NavCache = Option<(usize, *mut HashMap<String, Value>)>;
+#[derive(Default)]
+struct NavCache {
+    parent: Option<(usize, *mut Map)>,
+    /// Dot-path of the current stack for metadata, valid until the next push/pop.
+    meta_path: String,
+    meta_path_valid: bool,
+}
+
+impl NavCache {
+    #[inline]
+    fn invalidate(&mut self) {
+        self.parent = None;
+        self.meta_path_valid = false;
+    }
+}
 
 /// Push a stack frame and invalidate the navigation cache.
 ///
@@ -1067,28 +1172,28 @@ type NavCache = Option<(usize, *mut HashMap<String, Value>)>;
 /// pointer, and inserting into the cached map itself relocates only its own
 /// buckets, not the `HashMap` struct the pointer refers to.
 #[inline]
-fn push_frame(stack: &mut Vec<(i32, StackEntry)>, cache: &mut NavCache, frame: (i32, StackEntry)) {
+fn push_frame<'a>(stack: &mut Vec<(i32, StackEntry<'a>)>, cache: &mut NavCache, frame: (i32, StackEntry<'a>)) {
     stack.push(frame);
-    *cache = None;
+    cache.invalidate();
 }
 
 /// Pop a stack frame and invalidate the navigation cache (see [`push_frame`]).
 #[inline]
-fn pop_frame(stack: &mut Vec<(i32, StackEntry)>, cache: &mut NavCache) -> Option<(i32, StackEntry)> {
+fn pop_frame<'a>(stack: &mut Vec<(i32, StackEntry<'a>)>, cache: &mut NavCache) -> Option<(i32, StackEntry<'a>)> {
     let popped = stack.pop();
-    *cache = None;
+    cache.invalidate();
     popped
 }
 
 /// Resolve the parent map for `parent_idx`, reusing the cached pointer when the
 /// stack has not changed since it was cached (see [`NavCache`]).
 fn navigate_cached<'a>(
-    root: &'a mut HashMap<String, Value>,
-    stack: &[(i32, StackEntry)],
+    root: &'a mut Map,
+    stack: &[(i32, StackEntry<'_>)],
     parent_idx: usize,
     cache: &mut NavCache,
-) -> Option<&'a mut HashMap<String, Value>> {
-    if let Some((idx, ptr)) = *cache {
+) -> Option<&'a mut Map> {
+    if let Some((idx, ptr)) = cache.parent {
         if idx == parent_idx {
             // SAFETY: `cache` is cleared by push_frame/pop_frame on every stack
             // mutation, so a non-None entry means the stack is unchanged since
@@ -1097,16 +1202,16 @@ fn navigate_cached<'a>(
             return Some(unsafe { &mut *ptr });
         }
     }
-    let ptr = navigate_to_parent(root, stack, parent_idx)? as *mut HashMap<String, Value>;
-    *cache = Some((parent_idx, ptr));
+    let ptr = navigate_to_parent(root, stack, parent_idx)? as *mut Map;
+    cache.parent = Some((parent_idx, ptr));
     // SAFETY: as above — `ptr` was just derived from the exclusive borrow of
     // `root` and no other reference to the same map is live.
     Some(unsafe { &mut *ptr })
 }
 
 fn insert_value(
-    root: &mut HashMap<String, Value>,
-    stack: &[(i32, StackEntry)],
+    root: &mut Map,
+    stack: &[(i32, StackEntry<'_>)],
     parent_idx: usize,
     key: &str,
     value: Value,
@@ -1120,43 +1225,69 @@ fn insert_value(
     // rather than inserting it at the wrong nesting level.
 }
 
+/// The frames from the root to `target`, root excluded, in descending order,
+/// written into `chain`; returns how many there are.
+///
+/// A `Key` frame's parent is the frame below it. A `ListItem` frame's parent
+/// is the frame that holds the list, which need not be the one below: an
+/// object opened between the list key and its first item (`x_1` in
+/// `items:join` / `x_1` / `- k v`) sits in between without being an ancestor.
+/// Walking the stack in order went through it, so the item was looked up in
+/// the wrong object and its keys were dropped.
+fn frame_chain(stack: &[(i32, StackEntry<'_>)], target: usize, chain: &mut [usize; MAX_PARSE_NESTING_DEPTH + 1]) -> usize {
+    let mut n = 0;
+    let mut idx = target;
+    while idx > 0 && n < chain.len() {
+        chain[n] = idx;
+        n += 1;
+        idx = match stack[idx].1 {
+            StackEntry::ListItem { parent, .. } => parent,
+            _ => idx - 1,
+        };
+    }
+    chain[..n].reverse();
+    n
+}
+
 fn navigate_to_parent<'a>(
-    root: &'a mut HashMap<String, Value>,
-    stack: &[(i32, StackEntry)],
+    root: &'a mut Map,
+    stack: &[(i32, StackEntry<'_>)],
     target_idx: usize,
-) -> Option<&'a mut HashMap<String, Value>> {
+) -> Option<&'a mut Map> {
     if target_idx == 0 {
         return Some(root);
     }
+    let mut chain = [0usize; MAX_PARSE_NESTING_DEPTH + 1];
+    let n = frame_chain(stack, target_idx, &mut chain);
 
-    // SAFETY: We navigate a tree of nested HashMaps / Arrays using a raw
-    // pointer to work around the borrow-checker's inability to track that
-    // successive `get_mut` calls target disjoint subtrees.  The invariants
-    // that make this sound:
+    // SAFETY: We navigate a tree of nested maps / arrays using a raw pointer
+    // to work around the borrow-checker's inability to track that successive
+    // `get_mut` calls target disjoint subtrees. The invariants that make this
+    // sound:
     //   1. `root` is a valid, exclusively-owned mutable reference for 'a.
-    //   2. We descend strictly downward and never alias: at each step we
-    //      replace `current` with a pointer to a child map, discarding the
-    //      parent pointer.
+    //   2. We descend strictly downward along one ancestor chain and never
+    //      alias: at each step `current` is replaced by a pointer to a child
+    //      map, discarding the parent pointer.
     //   3. The returned reference re-borrows from `root`'s lifetime 'a and
     //      is the only mutable reference handed out by this function.
-    let mut current = root as *mut HashMap<String, Value>;
-    for (_indent, entry) in stack.iter().skip(1).take(target_idx) {
-        match entry {
+    let mut current = root as *mut Map;
+    for &idx in &chain[..n] {
+        match &stack[idx].1 {
             StackEntry::Root => unreachable!("Root only appears at index 0"),
             StackEntry::Key(k) => {
-                let child = unsafe { (*current).get_mut(k) };
+                let child = unsafe { (*current).get_mut(*k) };
                 match child {
-                    Some(Value::Object(map)) => current = map as *mut HashMap<String, Value>,
+                    Some(Value::Object(map)) => current = map as *mut Map,
                     _ => return None, // Path segment missing or not an Object
                 }
             }
-            StackEntry::ListItem { list_key, item_idx } => {
-                let arr_val = unsafe { (*current).get_mut(list_key) };
+            StackEntry::ListItem { list_key, item_idx, .. } => {
+                let arr_val = unsafe { (*current).get_mut(*list_key) };
                 match arr_val {
                     Some(Value::Array(arr)) => {
                         if *item_idx >= arr.len() { return None; }
                         match &mut arr[*item_idx] {
-                            Value::Object(map) => current = map as *mut HashMap<String, Value>,
+                            Value::Object(map) => current = map as *mut Map,
                             _ => return None,
                         }
                     }
@@ -1170,6 +1301,13 @@ fn navigate_to_parent<'a>(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn bom_is_not_truncation() {
+        let r = parse("\u{feff}a 1\n");
+        assert!(!r.truncated, "a BOM is dropped, not lost content");
+        assert_eq!(r.root.as_object().unwrap()["a"], Value::Int(1));
+    }
     use super::*;
 
     #[test]
@@ -1498,6 +1636,42 @@ mod tests {
         assert_eq!(c["z"], Value::Int(4));
         assert_eq!(c.len(), 2);
         assert_eq!(root["a"].as_object().unwrap().len(), 1);
+    }
+
+    // A nested object inside one list item must not swallow the next item.
+    #[test]
+    fn test_list_item_after_nested_object_keeps_its_keys() {
+        let data = parse("items
+  - name a
+    sub
+      k 1
+  - name b
+    v 2
+    w 3
+after 1
+");
+        let root = data.root.as_object().unwrap();
+        let items = root["items"].as_array().unwrap();
+        let b = items[1].as_object().unwrap();
+        assert_eq!(b["name"], Value::String("b".into()));
+        assert_eq!(b["v"], Value::Int(2));
+        assert_eq!(b["w"], Value::Int(3));
+        assert_eq!(root["after"], Value::Int(1));
+    }
+
+    #[test]
+    fn test_objects_keep_document_order() {
+        let data = parse("zeta 1
+alpha 2
+mid
+  y 1
+  b 2
+");
+        let root = data.root.as_object().unwrap();
+        let keys: Vec<&str> = root.keys().map(|k| k.as_str()).collect();
+        assert_eq!(keys, ["zeta", "alpha", "mid"]);
+        let mid: Vec<&str> = root["mid"].as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        assert_eq!(mid, ["y", "b"]);
     }
 
     #[test]

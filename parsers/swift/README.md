@@ -3,7 +3,10 @@
 `parsers/swift` is the **native** SYNX parser, written in pure Swift 5.9 — no
 FFI to the Rust `synx-core` crate, no `synx-c` cdylib at runtime. It mirrors
 the canonical Rust engine 1:1 (parse / `!active` / `.synxb` / canonical JSON /
-diff / format / `!tool`).
+diff / format / `!tool`) at SYNX **3.8.0** (`Synx.version`): objects keep
+source order and `!active` documents resolve in one pass in document order.
+Keys and strings compare as UTF-8 bytes, as in Rust — not by Swift's canonical
+equivalence (`"é" == "e\u{301}"` is true for `String`, but they are two keys).
 
 Targets:
 
@@ -82,9 +85,13 @@ parsers/swift/
 │   ├── Synx.swift           # top-level facade
 │   ├── SynxValue.swift      # enum, SynxObject, SynxMeta, SynxConstraints, SynxParseResult
 │   ├── SynxOptions.swift    # options + MarkerFn closure type
-│   ├── SynxParser.swift     # text → tree
-│   ├── SynxEngine.swift     # !active resolver + Resolver class
-│   ├── SynxMarkers.swift    # all 27 markers as pure functions
+│   ├── SynxParser.swift     # text → tree (over UTF-8 bytes)
+│   ├── SynxTree.swift       # mutable working tree for the parser and engine
+│   ├── SynxEngine.swift     # !active resolution, pre-passes, files
+│   ├── SynxMarkers.swift    # the markers, in synx-core's order
+│   ├── SynxValidate.swift   # [constraints], [pattern], JSON for :watch
+│   ├── SynxText.swift       # Unicode whitespace / case, key index
+│   ├── SynxNumber.swift     # numbers as Rust parses and prints them
 │   ├── SynxCalc.swift       # safe arithmetic
 │   ├── SynxJSON.swift       # canonical JSON
 │   ├── SynxStringify.swift  # value → SYNX text
@@ -111,8 +118,13 @@ parsers/swift/
 
 ## What's unsupported (versus Rust core)
 
-* **WASM custom markers** — replaced by `SynxOptions.markerFns` (`(key, args, value) -> SynxValue`).
-  Builtin markers always win over custom ones with the same name.
+* **WASM custom markers** — replaced by `SynxOptions.markerFns` (`(key, args, value) -> SynxValue`),
+  run where synx-core runs WASM markers: after the built-ins, the first registered
+  non-built-in marker of a chain, with the parts after it as `args`.
+* **SYNXL** (`.synxl` datasets) — not ported.
+* **`[pattern]`** runs on `NSRegularExpression` (ICU). Patterns synx-core's `regex`
+  refuses (look-around, back-references, atomic groups, possessive quantifiers)
+  and nested quantifiers (`(a+)+`) are skipped, as there.
 * **`:signing`** — Ed25519 signature verification module not ported (same as
   C# / GDScript / C++ ports).
 * `:vision` / `:audio` are passthrough envelopes; consumers attach actual
@@ -120,11 +132,11 @@ parsers/swift/
 
 ## Wire compatibility
 
-* **JSON**: byte-for-byte identical to Rust ryu/itoa output for typical inputs.
-  Floats use `%.17g` with a mandatory `.0` suffix so round-trip preserves the
-  Float vs Int distinction.
-* **`.synxb`**: identical magic / version / flags / string table / DEFLATE
-  payload as `crates/synx-core`. Files written here decompile under Rust /
-  C# / GDScript / C++ and vice-versa.
-* **Canonical text format**: same sort key and indentation rules as the
-  Rust `fmt_canonical`.
+* **JSON**: byte-for-byte identical to Rust (`ryu` float layout, shortest
+  round-trip digits).
+* **`.synxb`**: magic / version / flags / string table (ordered by use count) /
+  payload are byte-identical to `crates/synx-core`; the DEFLATE stream comes
+  from the `Compression` framework, so compressed bytes may differ while both
+  read each other's files.
+* **Canonical text format** and **stringify**: byte-identical to Rust
+  `fmt_canonical` and `serialize` (the SYNXL §14.1 writer).

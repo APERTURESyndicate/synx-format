@@ -70,6 +70,26 @@ fn jail_path(base: &str, file_path: &str) -> Result<std::path::PathBuf, String> 
     Ok(full_canonical)
 }
 
+/// Whether `path` names something inside its base directory: relative, with
+/// no root, drive or `..` segment. Judged by its text, so a package directory
+/// that is itself a symlink (a linked local package) keeps working.
+///
+/// safety: `!use` joined the package name and the manifest's `main` / `wasm`
+/// onto the packages directory as written, so `!use @a/../../secret` read
+/// `<anywhere>/src/main.synx` into the document — the escape `!include`
+/// already refused through `jail_path`.
+fn is_contained_relative(path: &str) -> bool {
+    if path.is_empty()
+        || path.starts_with('/')
+        || path.starts_with('\\')
+        || path.contains(':')
+        || std::path::Path::new(path).is_absolute()
+    {
+        return false;
+    }
+    path.split(|c| c == '/' || c == '\\').all(|seg| seg != "..")
+}
+
 /// Check file size before reading.
 fn check_file_size(path: &std::path::Path) -> Result<(), String> {
     match std::fs::metadata(path) {
@@ -93,13 +113,22 @@ fn fmt_io_err(e: &std::io::Error, ctx: &str) -> String {
     }
 }
 
+/// Whether a marker chain contains `name`.
+///
+/// perf: replaces `markers.contains(&"name".to_string())`, which allocated
+/// two strings per check — about seventy per marked key.
+#[inline]
+fn has_marker(markers: &[String], name: &str) -> bool {
+    markers.iter().any(|m| m == name)
+}
+
 /// Resolve all active-mode markers in a ParseResult.
 /// Returns the resolved root Value.
 pub fn resolve(result: &mut ParseResult, options: &Options) {
     if result.mode != Mode::Active {
         return;
     }
-    let metadata = std::mem::take(&mut result.metadata);
+    let mut metadata = std::mem::take(&mut result.metadata);
     let includes_directives = std::mem::take(&mut result.includes);
     let use_directives = std::mem::take(&mut result.uses);
 
@@ -129,6 +158,10 @@ pub fn resolve(result: &mut ParseResult, options: &Options) {
 
     // ── Load !include files ──
     let mut includes_map = load_includes(&includes_directives, options);
+    // Root `:include` keys the pre-pass below already resolved, as
+    // `[path, root]`; kept apart from `includes_map`, whose size and first
+    // value `{key:include}` reads.
+    let mut preresolved: Map = Map::default();
 
     // ── Pre-pass: also register `:include`/`:import` marker keys as aliases ──
     // This makes `{leaf:<key>}` interpolation work for the README pattern:
@@ -145,6 +178,13 @@ pub fn resolve(result: &mut ParseResult, options: &Options) {
             };
             let is_inc = meta.markers.iter().any(|m| m == "include" || m == "import");
             if !is_inc { continue; }
+            // safety: the pre-pass resolves the included document, whose own
+            // pre-pass includes again; without the depth cap every other
+            // include path has, a file that includes itself overflowed the
+            // stack and took the process down.
+            if options._include_depth >= options.max_include_depth.unwrap_or(DEFAULT_MAX_INCLUDE_DEPTH) {
+                continue;
+            }
             // The current value is the path string from the parser.
             let path = match root_map.get(key) {
                 Some(Value::String(s)) => s.clone(),
@@ -169,6 +209,13 @@ pub fn resolve(result: &mut ParseResult, options: &Options) {
                 }
                 resolve(&mut included, &child_opts);
             }
+            // perf: the `:include` marker of this key takes this result instead
+            // of reading and resolving the file again. Each level resolved it
+            // twice, so a chain of includes cost 2^depth resolutions.
+            preresolved.insert(
+                key.clone(),
+                Value::Array(vec![Value::String(path.clone()), included.root.clone()]),
+            );
             includes_map.entry(key.clone()).or_insert(included.root);
         }
     }
@@ -180,8 +227,18 @@ pub fn resolve(result: &mut ParseResult, options: &Options) {
         }
     }
 
+    // ── Type and constraint registries ──
+    // spec: built from the document as it stands, before inheritance, walking
+    // each object's own declarations and then its children — the order the
+    // TypeScript engine uses, which decides the winner when one field name is
+    // declared with different types. A declaration whose object was later
+    // overwritten (`a` / `  x(int) 1` / `a 5`) no longer counts.
+    let mut type_registry: Map<String> = Map::default();
+    let mut constraint_registry: Map<Constraints> = Map::default();
+    collect_registries(&result.root, &metadata, &mut String::new(), &mut type_registry, &mut constraint_registry, 0);
+
     // ── :inherit pre-pass ──
-    apply_inheritance(&mut result.root, &metadata);
+    apply_inheritance(&mut result.root, &mut metadata);
     // Remove private blocks (keys starting with _)
     if let Value::Object(ref mut root_map) = result.root {
         root_map.retain(|k, _| !k.starts_with('_'));
@@ -194,12 +251,8 @@ pub fn resolve(result: &mut ParseResult, options: &Options) {
     // referencing a root-level secret would otherwise read it unmasked. Only
     // plain values are pre-masked here; a secret that itself needs resolving
     // (`:env:secret`, etc.) is left for its own marker to mask in place.
-    mask_secret_literals(&mut result.root, &metadata, "");
+    mask_secret_literals(&mut result.root, &metadata, &mut String::new());
 
-    // ── Build type registry ──
-    let type_registry = build_type_registry(&metadata);
-    // ── Build constraint registry ──
-    let constraint_registry = build_constraint_registry(&metadata);
 
     // SAFETY: `root_ptr` is a raw pointer to `result.root` used exclusively
     // for *immutable* read access inside marker handlers (:calc, :alias,
@@ -211,25 +264,89 @@ pub fn resolve(result: &mut ParseResult, options: &Options) {
     //      always a distinct subtree from what we read via `root_ptr`.
     //   3. The pointer is valid for the entire duration of `resolve_value`.
     let root_ptr = &mut result.root as *mut Value;
-    resolve_value(&mut result.root, root_ptr, options, &metadata, "", &includes_map, 0);
+    let calc_scope = CalcScope::of(&result.root);
+    let mut path = String::new();
+    resolve_value(&mut result.root, root_ptr, options, &metadata, &mut path, &includes_map, &preresolved, &calc_scope, 0);
 
-    // ── Validate field constraints (global, by field name) ──
-    validate_field_constraints(&mut result.root, &constraint_registry);
-    
-    // ── Validate field types ──
-    validate_field_types(&mut result.root, &type_registry, "");
+    // ── Validate field constraints, then types (global, by field name) ──
+    // perf: one walk for both; per field the order is the same as two walks.
+    validate_fields(&mut result.root, &constraint_registry, &type_registry);
     
     result.metadata = metadata;
     result.includes = includes_directives;
+}
+
+/// Append `key` to a metadata path as one segment.
+///
+/// spec: a key may itself contain a dot (`a.b`). Written as is, the object
+/// `a.b` and the object `b` inside `a` had one path, so the markers of one
+/// applied to the other. `.` and `\` in a key are escaped with `\`; a key
+/// without them — nearly every key — is copied as it is.
+pub(crate) fn push_key_segment(path: &mut String, key: &str) {
+    if memchr::memchr2(b'.', b'\\', key.as_bytes()).is_none() {
+        path.push_str(key);
+        return;
+    }
+    for c in key.chars() {
+        if c == '.' || c == '\\' {
+            path.push('\\');
+        }
+        path.push(c);
+    }
+}
+
+/// `key` as one metadata-path segment (see [`push_key_segment`]).
+pub(crate) fn key_segment(key: &str) -> std::borrow::Cow<'_, str> {
+    if memchr::memchr2(b'.', b'\\', key.as_bytes()).is_none() {
+        return std::borrow::Cow::Borrowed(key);
+    }
+    let mut out = String::with_capacity(key.len() + 2);
+    push_key_segment(&mut out, key);
+    std::borrow::Cow::Owned(out)
+}
+
+/// The segments of a metadata path, unescaped: `a\.b.c` is `["a.b", "c"]`.
+pub fn meta_path_segments(path: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if path.is_empty() {
+        return out;
+    }
+    let mut seg = String::new();
+    let mut chars = path.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                if let Some(n) = chars.next() {
+                    seg.push(n);
+                }
+            }
+            '.' => out.push(std::mem::take(&mut seg)),
+            _ => seg.push(c),
+        }
+    }
+    out.push(seg);
+    out
+}
+
+/// Append the metadata-path segment of list item `idx`: `.#<idx>`.
+///
+/// A key never starts with `#` (that line is a comment), so the segment
+/// cannot collide with an object key.
+pub(crate) fn push_item_segment(path: &mut String, idx: usize) {
+    use std::fmt::Write as _;
+    path.push_str(".#");
+    let _ = write!(path, "{}", idx);
 }
 
 fn resolve_value(
     value: &mut Value,
     root_ptr: *mut Value,
     options: &Options,
-    metadata: &HashMap<String, MetaMap>,
-    path: &str,
-    includes: &HashMap<String, Value>,
+    metadata: &Map<MetaMap>,
+    path: &mut String,
+    includes: &Map,
+    preresolved: &Map,
+    calc_scope: &CalcScope,
     depth: usize,
 ) {
     // Guard: prevent stack overflow from deeply nested objects
@@ -246,81 +363,161 @@ fn resolve_value(
         return;
     }
 
-    let meta_map = metadata.get(path).cloned();
+    let Value::Object(ref mut map) = value else { return };
 
-    if let Value::Object(ref mut map) = value {
-        let keys: Vec<String> = map.keys().cloned().collect();
-
-        // First pass: recurse into nested objects/arrays
-        for key in &keys {
-            let child_path = if path.is_empty() {
-                key.clone()
-            } else {
-                format!("{}.{}", path, key)
-            };
-
-            if let Some(child) = map.get_mut(key) {
+    // One pass in document order: each key's subtree, then the key's own
+    // markers, then the next key — so a marker sees every key before it fully
+    // resolved, at any depth.
+    //
+    // spec: until 3.7.5 every nested object was resolved before any marker of
+    // its parent, so `a:calc …` followed by `b` / `  x {a}` gave `x` the
+    // unresolved expression in Rust and the result in TypeScript.
+    // perf: one path buffer for the whole walk instead of a `format!` per
+    // child; metadata is borrowed, not cloned per object.
+    let mm = metadata.get(path.as_str());
+    let base_len = path.len();
+    for i in 0..map.len() {
+        if let Some((key, child)) = map.get_index_mut(i) {
+            if matches!(child, Value::Object(_) | Value::Array(_)) {
+                if base_len > 0 {
+                    path.push('.');
+                }
+                push_key_segment(path, key);
                 match child {
                     Value::Object(_) => {
-                        resolve_value(child, root_ptr, options, metadata, &child_path, includes, depth + 1);
+                        resolve_value(child, root_ptr, options, metadata, path, includes, preresolved, calc_scope, depth + 1);
                     }
                     Value::Array(arr) => {
-                        for item in arr.iter_mut() {
+                        let list_len = path.len();
+                        for (idx, item) in arr.iter_mut().enumerate() {
                             if let Value::Object(_) = item {
-                                resolve_value(item, root_ptr, options, metadata, &child_path, includes, depth + 1);
+                                push_item_segment(path, idx);
+                                resolve_value(item, root_ptr, options, metadata, path, includes, preresolved, calc_scope, depth + 1);
+                                path.truncate(list_len);
                             }
                         }
                     }
                     _ => {}
                 }
+                path.truncate(base_len);
             }
         }
+        let Some(mm) = mm else { continue };
+        let Some((k, _)) = map.get_index(i) else { break };
+        let Some(meta) = mm.get(k.as_str()) else { continue };
+        let key = k.clone();
+        apply_markers(map, &key, meta, root_ptr, options, path, metadata, preresolved, calc_scope);
+    }
 
-        // Second pass: apply markers
-        if let Some(ref mm) = meta_map {
-            for key in &keys {
-                let meta = match mm.get(key) {
-                    Some(m) => m.clone(),
-                    None => continue,
-                };
-
-                apply_markers(map, key, &meta, root_ptr, options, path, metadata, includes);
+    // Third pass: auto-{} interpolation on all string values
+    for i in 0..map.len() {
+        let replaced = match map.get_index(i) {
+            Some((_, Value::String(s))) if memchr::memchr(b'{', s.as_bytes()).is_some() => {
+                let root_ref = unsafe { &*root_ptr };
+                let result = resolve_interpolation(s, root_ref, map, includes);
+                if result != *s { Some(result) } else { None }
             }
-        }
-
-        // Third pass: auto-{} interpolation on all string values
-        let keys2: Vec<String> = map.keys().cloned().collect();
-        for key in &keys2 {
-            if let Some(Value::String(s)) = map.get(key) {
-                if s.contains('{') {
-                    let root_ref = unsafe { &*root_ptr };
-                    let result = resolve_interpolation(s, root_ref, map, includes);
-                    if result != *s {
-                        map.insert(key.to_string(), Value::String(result));
-                    }
-                }
+            _ => None,
+        };
+        if let Some(result) = replaced {
+            if let Some((_, v)) = map.get_index_mut(i) {
+                *v = Value::String(result);
             }
         }
     }
 }
 
+/// Bits for the built-in markers `apply_markers` dispatches on.
+mod mk {
+    pub const ALIAS: u32 = 1 << 0;
+    pub const CALC: u32 = 1 << 1;
+    pub const CLAMP: u32 = 1 << 2;
+    pub const DEFAULT: u32 = 1 << 3;
+    pub const ENV: u32 = 1 << 4;
+    pub const FALLBACK: u32 = 1 << 5;
+    pub const FORMAT: u32 = 1 << 6;
+    pub const GEO: u32 = 1 << 7;
+    pub const I18N: u32 = 1 << 8;
+    pub const IMPORT: u32 = 1 << 9;
+    pub const INCLUDE: u32 = 1 << 10;
+    pub const JOIN: u32 = 1 << 11;
+    pub const MAP: u32 = 1 << 12;
+    pub const ONCE: u32 = 1 << 13;
+    pub const PROMPT: u32 = 1 << 14;
+    pub const RANDOM: u32 = 1 << 15;
+    pub const REF: u32 = 1 << 16;
+    pub const REPLACE: u32 = 1 << 17;
+    pub const ROUND: u32 = 1 << 18;
+    pub const SECRET: u32 = 1 << 19;
+    pub const SORT: u32 = 1 << 20;
+    pub const SPAM: u32 = 1 << 21;
+    pub const SPLIT: u32 = 1 << 22;
+    pub const SUM: u32 = 1 << 23;
+    pub const UNIQUE: u32 = 1 << 24;
+    pub const VERSION: u32 = 1 << 25;
+    pub const WATCH: u32 = 1 << 26;
+}
+
+/// Classify a marker chain into [`mk`] bits. Arguments (`3000` in
+/// `:default:3000`) and unknown names contribute nothing.
+fn marker_bits(markers: &[String]) -> u32 {
+    let mut bits = 0;
+    for m in markers {
+        bits |= match m.as_str() {
+            "alias" => mk::ALIAS,
+            "calc" => mk::CALC,
+            "clamp" => mk::CLAMP,
+            "default" => mk::DEFAULT,
+            "env" => mk::ENV,
+            "fallback" => mk::FALLBACK,
+            "format" => mk::FORMAT,
+            "geo" => mk::GEO,
+            "i18n" => mk::I18N,
+            "import" => mk::IMPORT,
+            "include" => mk::INCLUDE,
+            "join" => mk::JOIN,
+            "map" => mk::MAP,
+            "once" => mk::ONCE,
+            "prompt" => mk::PROMPT,
+            "random" => mk::RANDOM,
+            "ref" => mk::REF,
+            "replace" => mk::REPLACE,
+            "round" => mk::ROUND,
+            "secret" => mk::SECRET,
+            "sort" => mk::SORT,
+            "spam" => mk::SPAM,
+            "split" => mk::SPLIT,
+            "sum" => mk::SUM,
+            "unique" => mk::UNIQUE,
+            "version" => mk::VERSION,
+            "watch" => mk::WATCH,
+            _ => 0,
+        };
+    }
+    bits
+}
+
 fn apply_markers(
-    map: &mut HashMap<String, Value>,
+    map: &mut Map,
     key: &str,
     meta: &Meta,
     root_ptr: *mut Value,
     options: &Options,
     path: &str,
-    metadata: &HashMap<String, MetaMap>,
-    _includes: &HashMap<String, Value>,
+    metadata: &Map<MetaMap>,
+    preresolved: &Map,
+    calc_scope: &CalcScope,
 ) {
     let markers = &meta.markers;
+    // perf: one pass classifies the chain; every marker test below is a bit
+    // test instead of a scan with string compares (~35 scans per key before).
+    let mb = marker_bits(markers);
 
     // ── :spam ──
     // Syntax: key:spam:MAX_CALLS:WINDOW_SEC target
     // WINDOW_SEC defaults to 1 when omitted.
     // If target is a key path, resolves its value after passing the limit check.
-    if markers.contains(&"spam".to_string()) {
+    if mb & mk::SPAM != 0 {
         let spam_idx = markers.iter().position(|m| m == "spam").unwrap();
         let max_calls = markers
             .get(spam_idx + 1)
@@ -369,7 +566,7 @@ fn apply_markers(
     }
 
     // ── :include / :import ──
-    if markers.contains(&"include".to_string()) || markers.contains(&"import".to_string()) {
+    if (mb & mk::INCLUDE != 0) || (mb & mk::IMPORT != 0) {
         if let Some(Value::String(file_path)) = map.get(key) {
             let max_depth = options.max_include_depth.unwrap_or(DEFAULT_MAX_INCLUDE_DEPTH);
             if options._include_depth >= max_depth {
@@ -378,6 +575,17 @@ fn apply_markers(
                     Value::String(format!("INCLUDE_ERR: max include depth ({}) exceeded", max_depth)),
                 );
                 return;
+            }
+            if path.is_empty() {
+                if let Some(Value::Array(pre)) = preresolved.get(key) {
+                    if let [Value::String(pre_path), root] = pre.as_slice() {
+                        if pre_path == file_path {
+                            let root = root.clone();
+                            map.insert(key.to_string(), root);
+                            return;
+                        }
+                    }
+                }
             }
             let base = options
                 .base_path
@@ -419,7 +627,7 @@ fn apply_markers(
     }
 
     // ── :env ──
-    if markers.contains(&"env".to_string()) {
+    if mb & mk::ENV != 0 {
         if let Some(Value::String(var_name)) = map.get(key) {
             let env_val = if let Some(ref env_map) = options.env {
                 env_map.get(var_name.as_str()).cloned()
@@ -457,7 +665,7 @@ fn apply_markers(
     }
 
     // ── :random ──
-    if markers.contains(&"random".to_string()) {
+    if mb & mk::RANDOM != 0 {
         if let Some(Value::Array(arr)) = map.get(key) {
             if arr.is_empty() {
                 map.insert(key.to_string(), Value::Null);
@@ -476,7 +684,7 @@ fn apply_markers(
     // ── :ref ──
     // Like :alias but feeds the resolved value into subsequent markers.
     // Supports :ref:calc shorthand: key:ref:calc:*2 base_rate → resolves base_rate, then applies "VALUE * 2".
-    if markers.contains(&"ref".to_string()) {
+    if mb & mk::REF != 0 {
         if let Some(Value::String(target)) = map.get(key) {
             let root_ref = unsafe { &*root_ptr };
             let resolved = deep_get(root_ref, target)
@@ -484,7 +692,7 @@ fn apply_markers(
                 .unwrap_or(Value::Null);
 
             // If :calc follows with a shorthand expression
-            if markers.contains(&"calc".to_string()) {
+            if mb & mk::CALC != 0 {
                 if let Some(n) = value_as_number(&resolved) {
                     let calc_idx = markers.iter().position(|m| m == "calc").unwrap();
                     if let Some(calc_expr) = markers.get(calc_idx + 1) {
@@ -532,7 +740,7 @@ fn apply_markers(
     //       few {count} предмета
     //       many {count} предметов
     //       other {count} предметов
-    if markers.contains(&"i18n".to_string()) {
+    if mb & mk::I18N != 0 {
         if let Some(Value::Object(translations)) = map.get(key) {
             let lang = options.lang.as_deref().unwrap_or("en");
             let val = translations.get(lang)
@@ -576,7 +784,7 @@ fn apply_markers(
     }
 
     // ── :calc ──
-    if markers.contains(&"calc".to_string()) {
+    if mb & mk::CALC != 0 {
         if let Some(Value::String(expr)) = map.get(key) {
             if expr.len() > MAX_CALC_EXPR_LEN {
                 map.insert(
@@ -585,46 +793,24 @@ fn apply_markers(
                 );
                 return;
             }
-            let mut resolved = expr.clone();
-
-            // Substitute variables from root (flat keys)
             let root_ref = unsafe { &*root_ptr };
-            if let Value::Object(ref root_map) = root_ref {
-                for (rk, rv) in root_map {
-                    if let Some(n) = value_as_number(rv) {
-                        resolved = replace_word(&resolved, rk, &format_number(n));
-                        if resolved.len() > MAX_CALC_RESOLVED_LEN {
-                            map.insert(
-                                key.to_string(),
-                                Value::String(format!(
-                                    "CALC_ERR: resolved expression too long (max {} bytes)",
-                                    MAX_CALC_RESOLVED_LEN
-                                )),
-                            );
-                            return;
-                        }
-                    }
+            let root_map = match root_ref {
+                Value::Object(m) => Some(m),
+                _ => None,
+            };
+            let mut resolved = match substitute_calc_vars(expr, map, key, root_map, calc_scope) {
+                Some(r) => r,
+                None => {
+                    map.insert(
+                        key.to_string(),
+                        Value::String(format!(
+                            "CALC_ERR: resolved expression too long (max {} bytes)",
+                            MAX_CALC_RESOLVED_LEN
+                        )),
+                    );
+                    return;
                 }
-            }
-
-            // Substitute from current object (flat keys)
-            for (rk, rv) in map.iter() {
-                if rk != key {
-                    if let Some(n) = value_as_number(rv) {
-                        resolved = replace_word(&resolved, rk, &format_number(n));
-                        if resolved.len() > MAX_CALC_RESOLVED_LEN {
-                            map.insert(
-                                key.to_string(),
-                                Value::String(format!(
-                                    "CALC_ERR: resolved expression too long (max {} bytes)",
-                                    MAX_CALC_RESOLVED_LEN
-                                )),
-                            );
-                            return;
-                        }
-                    }
-                }
-            }
+            };
 
             // Substitute dot-path references (e.g., base.hp, server.port)
             let root_ref2 = unsafe { &*root_ptr };
@@ -671,8 +857,11 @@ fn apply_markers(
                         return;
                     }
                 } else {
-                    dot_resolved.push(bytes[i] as char);
-                    i += 1;
+                    // A whole character: `bytes[i] as char` read each UTF-8
+                    // byte as Latin-1, so `цена` came out as mojibake.
+                    let ch = resolved[i..].chars().next().unwrap_or('\u{fffd}');
+                    dot_resolved.push(ch);
+                    i += ch.len_utf8();
                     if dot_resolved.len() > MAX_CALC_RESOLVED_LEN {
                         map.insert(
                             key.to_string(),
@@ -707,15 +896,18 @@ fn apply_markers(
     }
 
     // ── :alias ──
-    if markers.contains(&"alias".to_string()) {
+    if mb & mk::ALIAS != 0 {
         if let Some(Value::String(target)) = map.get(key) {
             let target = target.clone();
-            // Build the full dot-path of the current key
-            let current_path = if path.is_empty() {
-                key.to_string()
-            } else {
-                format!("{}.{}", path, key)
-            };
+            // Build the full dot-path of the current key. A list item's
+            // `#<index>` segment is a metadata detail, not part of the path a
+            // document can name, so it is left out (as in TypeScript).
+            let mut current_path = String::with_capacity(path.len() + key.len() + 1);
+            for seg in meta_path_segments(path).iter().filter(|seg| !seg.starts_with('#')) {
+                current_path.push_str(seg);
+                current_path.push('.');
+            }
+            current_path.push_str(key);
             // Detect direct self-reference: key:alias key
             if target == key || target == current_path {
                 map.insert(
@@ -738,7 +930,7 @@ fn apply_markers(
                 let target_has_alias = metadata
                     .get(&target_parent)
                     .and_then(|mm| mm.get(&target_key_name))
-                    .map(|m| m.markers.contains(&"alias".to_string()))
+                    .map(|m| has_marker(&m.markers, "alias"))
                     .unwrap_or(false);
                 let is_cycle = target_has_alias && match &target_val {
                     Some(Value::String(s)) => s == key || s == &current_path,
@@ -766,7 +958,7 @@ fn apply_markers(
     }
 
     // ── :secret ──
-    if markers.contains(&"secret".to_string()) {
+    if mb & mk::SECRET != 0 {
         // Idempotent: the :secret pre-pass may already have wrapped a literal
         // secret. `value_to_string` masks a Secret to "[SECRET]", so re-wrapping
         // would replace the stored value with the mask itself.
@@ -781,7 +973,7 @@ fn apply_markers(
     }
 
     // ── :unique ──
-    if markers.contains(&"unique".to_string()) {
+    if mb & mk::UNIQUE != 0 {
         if let Some(Value::Array(arr)) = map.get(key) {
             // A HashSet membership test keeps this linear; the previous
             // `Vec::contains` made de-duping an N-item list O(N²).
@@ -798,7 +990,7 @@ fn apply_markers(
     }
 
     // ── :geo ──
-    if markers.contains(&"geo".to_string()) {
+    if mb & mk::GEO != 0 {
         if let Some(Value::Array(arr)) = map.get(key) {
             let region = options.region.as_deref().unwrap_or("US");
             let prefix = format!("{} ", region);
@@ -832,7 +1024,7 @@ fn apply_markers(
     // ── :template (legacy — handled by auto-{} in resolve_value) ──
 
     // ── :split ──
-    if markers.contains(&"split".to_string()) {
+    if mb & mk::SPLIT != 0 {
         if let Some(Value::String(s)) = map.get(key) {
             let split_idx = markers.iter().position(|m| m == "split").unwrap();
             let sep = if split_idx + 1 < markers.len() {
@@ -851,7 +1043,7 @@ fn apply_markers(
     }
 
     // ── :join ──
-    if markers.contains(&"join".to_string()) {
+    if mb & mk::JOIN != 0 {
         if let Some(Value::Array(arr)) = map.get(key) {
             let join_idx = markers.iter().position(|m| m == "join").unwrap();
             let sep = if join_idx + 1 < markers.len() {
@@ -869,7 +1061,7 @@ fn apply_markers(
     }
 
     // ── :default (standalone, without :env) ──
-    if markers.contains(&"default".to_string()) && !markers.contains(&"env".to_string()) {
+    if (mb & mk::DEFAULT != 0) && !(mb & mk::ENV != 0) {
         let is_empty = match map.get(key) {
             Some(Value::Null) | None => true,
             Some(Value::String(s)) if s.is_empty() => true,
@@ -892,11 +1084,15 @@ fn apply_markers(
     // ── :clamp ──
     // Syntax: key:clamp:MIN:MAX value
     // Clamps a numeric value to [MIN, MAX].
-    if markers.contains(&"clamp".to_string()) {
+    if mb & mk::CLAMP != 0 {
         let clamp_idx = markers.iter().position(|m| m == "clamp").unwrap();
         let min_s = markers.get(clamp_idx + 1).cloned().unwrap_or_default();
         let max_s = markers.get(clamp_idx + 2).cloned().unwrap_or_default();
-        if let (Ok(lo), Ok(hi)) = (min_s.parse::<f64>(), max_s.parse::<f64>()) {
+        // safety: a bound must be a finite number. `f64::clamp` panics on a
+        // NaN bound, so `:clamp:nan:5` crashed the process; `inf` and `nan`
+        // are not SYNX numbers, and TypeScript skipped them.
+        let bound = |s: &str| s.parse::<f64>().ok().filter(|v| v.is_finite());
+        if let (Some(lo), Some(hi)) = (bound(&min_s), bound(&max_s)) {
             if lo > hi {
                 map.insert(key.to_string(), Value::String(
                     format!("CONSTRAINT_ERR: clamp min ({}) > max ({})", lo, hi),
@@ -916,7 +1112,7 @@ fn apply_markers(
     // ── :round ──
     // Syntax: key:round:N value  (N = decimal places, default 0)
     // Works standalone or after :calc: key:calc:round:2 expr
-    if markers.contains(&"round".to_string()) {
+    if mb & mk::ROUND != 0 {
         let round_idx = markers.iter().position(|m| m == "round").unwrap();
         let decimals: u32 = markers.get(round_idx + 1)
             .and_then(|s| s.parse().ok())
@@ -936,7 +1132,7 @@ fn apply_markers(
     // ── :map ──
     // Syntax: key:map:source_key\n  - lookup_val result
     // Looks up `source_key` in root, finds matching "lookup_val result" entry in the array.
-    if markers.contains(&"map".to_string()) {
+    if mb & mk::MAP != 0 {
         if let Some(Value::Array(arr)) = map.get(key) {
             let map_idx = markers.iter().position(|m| m == "map").unwrap();
             let source_key = markers.get(map_idx + 1).cloned().unwrap_or_default();
@@ -973,7 +1169,7 @@ fn apply_markers(
     // ── :format ──
     // Syntax: key:format:PATTERN value  (printf-style: %.2f, %d, %05d, %e)
     // Converts numeric or string value to a formatted string.
-    if markers.contains(&"format".to_string()) {
+    if mb & mk::FORMAT != 0 {
         let fmt_idx = markers.iter().position(|m| m == "format").unwrap();
         let pattern = markers.get(fmt_idx + 1).cloned().unwrap_or_else(|| "%s".to_string());
         if let Some(current) = map.get(key) {
@@ -986,7 +1182,7 @@ fn apply_markers(
     // Literal substring replacement on a string value. `TO` defaults to "" (deletion).
     // `FROM`/`TO` cannot contain ':' because the marker chain is colon-delimited;
     // for those cases use `{interpolation}` instead.
-    if markers.contains(&"replace".to_string()) {
+    if mb & mk::REPLACE != 0 {
         if let Some(Value::String(s)) = map.get(key) {
             let idx = markers.iter().position(|m| m == "replace").unwrap();
             let from = markers.get(idx + 1).cloned().unwrap_or_default();
@@ -1000,7 +1196,7 @@ fn apply_markers(
 
     // ── :sort  /  :sort:desc ──    (since 3.6.2)
     // Sort an array. Numeric items compare numerically; otherwise lexicographic.
-    if markers.contains(&"sort".to_string()) {
+    if mb & mk::SORT != 0 {
         if let Some(Value::Array(arr)) = map.get(key) {
             let idx = markers.iter().position(|m| m == "sort").unwrap();
             let desc = matches!(markers.get(idx + 1).map(|s| s.as_str()), Some("desc"));
@@ -1021,7 +1217,7 @@ fn apply_markers(
     // ── :sum ──    (since 3.6.2)
     // Sum the numeric items of an array. Non-numeric items are ignored.
     // Returns Int when all summands are integers, Float otherwise.
-    if markers.contains(&"sum".to_string()) {
+    if mb & mk::SUM != 0 {
         if let Some(Value::Array(arr)) = map.get(key) {
             let mut total: f64 = 0.0;
             let mut all_int = true;
@@ -1054,7 +1250,7 @@ fn apply_markers(
     // Syntax: key:fallback:DEFAULT_PATH value
     // If the value (treated as a file path) doesn't exist on disk, use the fallback.
     // Falls back to default if value is also null/empty.
-    if markers.contains(&"fallback".to_string()) {
+    if mb & mk::FALLBACK != 0 {
         let fb_idx = markers.iter().position(|m| m == "fallback").unwrap();
         let default_val = markers.get(fb_idx + 1).cloned().unwrap_or_default();
         let use_fallback = match map.get(key) {
@@ -1077,7 +1273,7 @@ fn apply_markers(
     // ── :once ──
     // Syntax: key:once  or  key:once:uuid  or  key:once:random  or  key:once:timestamp
     // Generates a value once and persists it in a .synx.lock sidecar file.
-    if markers.contains(&"once".to_string()) {
+    if mb & mk::ONCE != 0 {
         let once_idx = markers.iter().position(|m| m == "once").unwrap();
         let gen_type = markers.get(once_idx + 1).map(|s| s.as_str()).unwrap_or("uuid");
         let lock_path = options.base_path.as_deref()
@@ -1108,7 +1304,7 @@ fn apply_markers(
     // Syntax: key:version:OP:REQUIRED value
     // Compares the value (current version) against REQUIRED using OP (>=, <=, >, <, ==, !=).
     // Returns a bool.
-    if markers.contains(&"version".to_string()) {
+    if mb & mk::VERSION != 0 {
         if let Some(Value::String(current_ver)) = map.get(key) {
             let ver_idx = markers.iter().position(|m| m == "version").unwrap();
             let op = markers.get(ver_idx + 1).map(|s| s.as_str()).unwrap_or(">=");
@@ -1121,7 +1317,7 @@ fn apply_markers(
     // ── :watch ──
     // Syntax: key:watch:KEY_PATH ./file.json  (or ./file.synx)
     // Reads the referenced file at parse time. Optionally extracts a key path (JSON/SYNX).
-    if markers.contains(&"watch".to_string()) {
+    if mb & mk::WATCH != 0 {
         if let Some(Value::String(file_path)) = map.get(key) {
             let max_depth = options.max_include_depth.unwrap_or(DEFAULT_MAX_INCLUDE_DEPTH);
             if options._include_depth >= max_depth {
@@ -1166,7 +1362,7 @@ fn apply_markers(
     // Syntax: key:prompt:LABEL subtree
     // Converts the resolved subtree (object) into a SYNX-formatted string
     // wrapped in a labeled code fence, ready for LLM prompt embedding.
-    if markers.contains(&"prompt".to_string()) {
+    if mb & mk::PROMPT != 0 {
         let prompt_idx = markers.iter().position(|m| m == "prompt").unwrap();
         let label = markers.get(prompt_idx + 1).cloned().unwrap_or_else(|| key.to_string());
         if let Some(val) = map.get(key) {
@@ -1218,29 +1414,47 @@ fn apply_markers(
 
 // ─── Constraint enforcement ───────────────────────────────
 
-fn validate_constraints(map: &mut HashMap<String, Value>, key: &str, c: &Constraints) {
-    let val = match map.get(key) {
-        Some(v) => v.clone(),
+fn validate_constraints(map: &mut Map, key: &str, c: &Constraints) {
+    match map.get_mut(key) {
+        Some(v) => {
+            if let Some(err) = constraint_violation(key, v, c) {
+                *v = Value::String(err);
+            }
+        }
         None => {
             if c.required {
                 map.insert(key.to_string(), Value::String(
                     format!("CONSTRAINT_ERR: '{}' is required", key),
                 ));
             }
-            return;
         }
-    };
+    }
+}
 
+/// The error a value earns against its constraints, or `None` when it passes.
+///
+/// perf: reads the value in place — the previous version cloned it first.
+fn constraint_violation(key: &str, val: &Value, c: &Constraints) -> Option<String> {
     // required
     if c.required {
         let empty = matches!(val, Value::Null)
-            || matches!(&val, Value::String(s) if s.is_empty());
+            || matches!(val, Value::String(s) if s.is_empty());
         if empty {
-            map.insert(key.to_string(), Value::String(
-                format!("CONSTRAINT_ERR: '{}' is required", key),
-            ));
-            return;
+            return Some(format!("CONSTRAINT_ERR: '{}' is required", key));
         }
+    }
+
+    // spec: an absent value (null) is checked against `enum` only, read as an
+    // empty string; type, range and pattern apply to values that exist. An
+    // optional `port[type:int]:env PORT` with PORT unset is null, not an error
+    // — the behaviour the TypeScript engine documents and implements.
+    if matches!(val, Value::Null) {
+        if let Some(ref enum_vals) = c.enum_values {
+            if !enum_vals.iter().any(|e| e.is_empty()) {
+                return Some(format!("CONSTRAINT_ERR: '{}' must be one of [{}]", key, enum_vals.join("|")));
+            }
+        }
+        return None;
     }
 
     // type check
@@ -1254,27 +1468,22 @@ fn validate_constraints(map: &mut HashMap<String, Value>, key: &str, c: &Constra
             _        => true,
         };
         if !ok {
-            map.insert(key.to_string(), Value::String(
-                format!("CONSTRAINT_ERR: '{}' expected type '{}'", key, type_name),
-            ));
-            return;
+            return Some(format!("CONSTRAINT_ERR: '{}' expected type '{}'", key, type_name));
         }
     }
 
     // enum check
     if let Some(ref enum_vals) = c.enum_values {
-        let val_str = match &val {
-            Value::String(s) => s.clone(),
-            Value::Int(n)    => n.to_string(),
-            Value::Float(f)  => f.to_string(),
-            Value::Bool(b)   => b.to_string(),
-            _                => String::new(),
+        let owned;
+        let val_str: &str = match val {
+            Value::String(s) => s,
+            Value::Int(n)    => { owned = n.to_string(); &owned }
+            Value::Float(f)  => { owned = f.to_string(); &owned }
+            Value::Bool(b)   => if *b { "true" } else { "false" },
+            _                => "",
         };
-        if !enum_vals.contains(&val_str) {
-            map.insert(key.to_string(), Value::String(
-                format!("CONSTRAINT_ERR: '{}' must be one of [{}]", key, enum_vals.join("|")),
-            ));
-            return;
+        if !enum_vals.iter().any(|e| e == val_str) {
+            return Some(format!("CONSTRAINT_ERR: '{}' must be one of [{}]", key, enum_vals.join("|")));
         }
     }
 
@@ -1282,7 +1491,7 @@ fn validate_constraints(map: &mut HashMap<String, Value>, key: &str, c: &Constra
     // A string's length is its count of Unicode scalar values: until 3.7.4 it
     // was UTF-8 bytes, so `[max:4]` rejected the three-letter `мир` (6 bytes)
     // while TypeScript accepted it.
-    let num = match &val {
+    let num = match val {
         Value::Int(n)    => Some(*n as f64),
         Value::Float(f)  => Some(*f),
         Value::String(s) if c.min.is_some() || c.max.is_some() => Some(s.chars().count() as f64),
@@ -1291,18 +1500,12 @@ fn validate_constraints(map: &mut HashMap<String, Value>, key: &str, c: &Constra
     if let Some(n) = num {
         if let Some(min) = c.min {
             if n < min {
-                map.insert(key.to_string(), Value::String(
-                    format!("CONSTRAINT_ERR: '{}' value {} is below min {}", key, n, min),
-                ));
-                return;
+                return Some(format!("CONSTRAINT_ERR: '{}' value {} is below min {}", key, n, min));
             }
         }
         if let Some(max) = c.max {
             if n > max {
-                map.insert(key.to_string(), Value::String(
-                    format!("CONSTRAINT_ERR: '{}' value {} exceeds max {}", key, n, max),
-                ));
-                return;
+                return Some(format!("CONSTRAINT_ERR: '{}' value {} exceeds max {}", key, n, max));
             }
         }
     }
@@ -1312,20 +1515,42 @@ fn validate_constraints(map: &mut HashMap<String, Value>, key: &str, c: &Constra
         if pat.len() <= 256 {
             // Invalid and backtracking-prone patterns are skipped silently, as in
             // every other implementation.
-            if let Value::String(ref s) = val {
-                if !has_nested_quantifier(pat) {
-                    if let Ok(re) = regex::Regex::new(pat) {
-                        if !re.is_match(s) {
-                            map.insert(key.to_string(), Value::String(
-                                format!("CONSTRAINT_ERR: '{}' does not match pattern /{}/", key, pat),
-                            ));
-                            return;
-                        }
-                    }
+            if let Value::String(s) = val {
+                if pattern_rejects(pat, s) {
+                    return Some(format!("CONSTRAINT_ERR: '{}' does not match pattern /{}/", key, pat));
                 }
             }
         }
     }
+    None
+}
+
+/// Whether `s` fails `[pattern:…]`. Invalid and backtracking-prone patterns
+/// never reject.
+///
+/// perf: compiled patterns are cached per thread — a pattern declared on a
+/// field name was recompiled for every value checked against it.
+pub(crate) fn pattern_rejects(pat: &str, s: &str) -> bool {
+    use std::cell::RefCell;
+    thread_local! {
+        static PATTERNS: RefCell<HashMap<String, Option<regex::Regex>>> = RefCell::new(HashMap::new());
+    }
+    // safety: bounded — a document full of distinct patterns cannot grow it forever.
+    const MAX_CACHED_PATTERNS: usize = 256;
+    PATTERNS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if !cache.contains_key(pat) {
+            if cache.len() >= MAX_CACHED_PATTERNS {
+                cache.clear();
+            }
+            let compiled = if has_nested_quantifier(pat) { None } else { regex::Regex::new(pat).ok() };
+            cache.insert(pat.to_string(), compiled);
+        }
+        match cache.get(pat) {
+            Some(Some(re)) => !re.is_match(s),
+            _ => false,
+        }
+    })
 }
 
 /// Does the pattern repeat something that already repeats — the `(a+)+`
@@ -1400,6 +1625,13 @@ fn apply_format_pattern(pattern: &str, value: &Value) -> String {
         Value::Float(f) => {
             if pattern.contains('f') || pattern.contains('e') {
                 format_float_pattern(pattern, *f)
+            } else if (pattern.contains('d') || pattern.contains('i'))
+                && f.fract() == 0.0
+                && f.abs() < 9.0e15
+            {
+                // spec: a whole float takes an integer pattern — `12.0` under
+                // `%05d` is `00012`, as in TypeScript, where it is one number.
+                format_int_pattern(pattern, *f as i64)
             } else {
                 format_number(*f)
             }
@@ -1513,11 +1745,29 @@ fn write_lock_value(lock_path: &std::path::Path, key: &str, value: &str) {
     let _ = std::fs::write(lock_path, lines.join("\n") + "\n");
 }
 
+/// The integer at the start of `s` (after whitespace, with an optional sign),
+/// or 0 — JavaScript's `parseInt(s, 10) || 0`.
+fn leading_int(s: &str) -> i64 {
+    let t = s.trim_start();
+    let (neg, digits) = match t.as_bytes().first() {
+        Some(b'-') => (true, &t[1..]),
+        Some(b'+') => (false, &t[1..]),
+        _ => (false, t),
+    };
+    let mut n: i64 = 0;
+    for b in digits.bytes().take_while(u8::is_ascii_digit) {
+        n = n.saturating_mul(10).saturating_add((b - b'0') as i64);
+    }
+    if neg { -n } else { n }
+}
+
 /// Compare two version strings using a comparison operator.
 fn compare_versions(current: &str, op: &str, required: &str) -> bool {
-    let parse_ver = |s: &str| -> Vec<u64> {
-        s.split('.').filter_map(|p| p.parse().ok()).collect()
-    };
+    // spec: each dot-separated part is read for its leading integer, a part
+    // with none counting as 0 — positions never shift. Dropping unparsable
+    // parts made `1.2.3-beta` compare as `1.2` and `1.x.3` as `1.3`, and
+    // disagreed with the TypeScript engine.
+    let parse_ver = |s: &str| -> Vec<i64> { s.split('.').map(leading_int).collect() };
     let cv = parse_ver(current);
     let rv = parse_ver(required);
     let len = cv.len().max(rv.len());
@@ -1615,7 +1865,7 @@ fn json_value_to_synx(v: &serde_json::Value) -> Value {
             Value::Array(arr.iter().map(json_value_to_synx).collect())
         }
         serde_json::Value::Object(map) => {
-            let mut out = HashMap::new();
+            let mut out = Map::default();
             for (k, v) in map {
                 out.insert(k.clone(), json_value_to_synx(v));
             }
@@ -1651,6 +1901,15 @@ fn stringify_value(value: &Value, indent: usize) -> String {
                         out.push_str(&format!("{}{} {}\n", spaces, key, value_to_string(val)));
                     }
                 }
+            }
+            out
+        }
+        // A list prompts as its items, as a list inside an object does. It
+        // rendered as one empty line, while TypeScript listed the items.
+        Value::Array(arr) => {
+            let mut out = String::new();
+            for item in arr {
+                out.push_str(&format!("{}  - {}\n", spaces, value_to_string(item)));
             }
             out
         }
@@ -1745,6 +2004,119 @@ fn format_number(n: f64) -> String {
     }
 }
 
+/// What `:calc` needs to know about the root once per resolution.
+struct CalcScope {
+    /// Root keys a single-pass token lookup cannot find (see [`is_calc_special_key`]).
+    root_special: Vec<String>,
+}
+
+impl CalcScope {
+    fn of(root: &Value) -> Self {
+        // spec: computed after the pre-passes; resolution replaces values but
+        // never adds or removes keys, so the root key set is fixed from here.
+        let root_special = match root {
+            Value::Object(m) => m.keys().filter(|k| is_calc_special_key(k)).cloned().collect(),
+            _ => Vec::new(),
+        };
+        CalcScope { root_special }
+    }
+}
+
+/// A key that whole-word substitution can reach in ways a token lookup cannot:
+/// one containing a non-word byte (`max-hp`, `a.b`, `цена`), or one that a
+/// substituted number can itself spell (`2`, `NaN`, `inf`).
+fn is_calc_special_key(k: &str) -> bool {
+    !k.bytes().all(is_word_char)
+        || k.bytes().all(|b| b.is_ascii_digit())
+        || k == "NaN"
+        || k == "inf"
+}
+
+/// Substitute numeric variables into a `:calc` expression: a key of the
+/// current object first (it shadows the root), then a root key. `None` when
+/// the result exceeds `MAX_CALC_RESOLVED_LEN`.
+///
+/// perf: one pass over the expression's words with a map lookup each. The
+/// previous version ran `replace_word` — a full copy of the expression — for
+/// every numeric key of the root and of the object, so N calcs over a root of
+/// N keys was quadratic. The sequential form survives only for documents that
+/// have a special key with a numeric value, where it is the exact semantics.
+///
+/// spec: until 3.7.5 the root was substituted first, so a root key beat a
+/// same-named key of the object — the opposite of the TypeScript engine.
+fn substitute_calc_vars(
+    expr: &str,
+    local: &Map,
+    self_key: &str,
+    root: Option<&Map>,
+    scope: &CalcScope,
+) -> Option<String> {
+    let local_is_root = root.map_or(false, |r| std::ptr::eq(r, local));
+    let numeric = |m: &Map, k: &str| m.get(k).and_then(value_as_number);
+    let lookup = |name: &str| -> Option<f64> {
+        if name != self_key {
+            if let Some(n) = numeric(local, name) {
+                return Some(n);
+            }
+        }
+        root.and_then(|r| numeric(r, name))
+    };
+
+    let special_in_play = scope
+        .root_special
+        .iter()
+        .any(|k| root.map_or(false, |r| numeric(r, k).is_some()))
+        || (!local_is_root
+            && local
+                .iter()
+                .any(|(k, v)| k != self_key && value_as_number(v).is_some() && is_calc_special_key(k)));
+
+    if special_in_play {
+        // Exact sequential whole-word replacement, object before root.
+        let mut resolved = expr.to_string();
+        let maps = [Some(local), if local_is_root { None } else { root }];
+        for m in maps.into_iter().flatten() {
+            for (rk, rv) in m {
+                if std::ptr::eq(m, local) && rk == self_key {
+                    continue;
+                }
+                if let Some(n) = value_as_number(rv) {
+                    resolved = replace_word(&resolved, rk, &format_number(n));
+                    if resolved.len() > MAX_CALC_RESOLVED_LEN {
+                        return None;
+                    }
+                }
+            }
+        }
+        return Some(resolved);
+    }
+
+    let bytes = expr.as_bytes();
+    let mut out = String::with_capacity(expr.len() + 16);
+    let mut i = 0;
+    while i < bytes.len() {
+        if is_word_char(bytes[i]) {
+            let start = i;
+            while i < bytes.len() && is_word_char(bytes[i]) {
+                i += 1;
+            }
+            let token = &expr[start..i];
+            match lookup(token) {
+                Some(n) => out.push_str(&format_number(n)),
+                None => out.push_str(token),
+            }
+        } else {
+            let ch = expr[i..].chars().next().unwrap_or('\u{fffd}');
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+        if out.len() > MAX_CALC_RESOLVED_LEN {
+            return None;
+        }
+    }
+    Some(out)
+}
+
 /// Replace whole-word occurrences of `word` with `replacement`.
 fn replace_word(haystack: &str, word: &str, replacement: &str) -> String {
     let word_bytes = word.as_bytes();
@@ -1777,14 +2149,19 @@ fn replace_word(haystack: &str, word: &str, replacement: &str) -> String {
                 continue;
             }
         }
+        // A whole character: `hay_bytes[i] as char` read each UTF-8 byte as
+        // Latin-1. A match of a UTF-8 word starts on a boundary, so `i` stays
+        // on one.
+        let ch = haystack[i..].chars().next().unwrap_or('\u{fffd}');
         if result.len() < MAX_ENGINE_SCRATCH_STRING {
-            result.push(hay_bytes[i] as char);
+            result.push(ch);
         }
-        i += 1;
+        i += ch.len_utf8();
     }
-    while i < hay_len && result.len() < MAX_ENGINE_SCRATCH_STRING {
-        result.push(hay_bytes[i] as char);
-        i += 1;
+    if i < hay_len {
+        let room = MAX_ENGINE_SCRATCH_STRING.saturating_sub(result.len());
+        let end = i + haystack[i..].floor_char_boundary(room.min(hay_len - i));
+        result.push_str(&haystack[i..end]);
     }
     result
 }
@@ -1840,56 +2217,53 @@ fn needs_resolution_before_secret(markers: &[String]) -> bool {
 
 /// Convert every literal `:secret`-marked value to `Value::Secret` before
 /// resolution, so no later interpolation can read the plaintext.
-fn mask_secret_literals(value: &mut Value, metadata: &HashMap<String, MetaMap>, path: &str) {
+fn mask_secret_literals(value: &mut Value, metadata: &Map<MetaMap>, path: &mut String) {
     let map = match value {
         Value::Object(m) => m,
         _ => return,
     };
-    if let Some(mm) = metadata.get(path) {
-        let secret_keys: Vec<String> = mm
-            .iter()
-            .filter(|(_, meta)| {
-                meta.markers.iter().any(|m| m == "secret")
-                    && !needs_resolution_before_secret(&meta.markers)
-            })
-            .map(|(key, _)| key.clone())
-            .collect();
-        for key in secret_keys {
-            if let Some(v) = map.get(key.as_str()) {
-                if !matches!(v, Value::Secret(_) | Value::Object(_) | Value::Array(_)) {
-                    let raw = value_to_string(v);
-                    map.insert(key, Value::Secret(raw));
+    if let Some(mm) = metadata.get(path.as_str()) {
+        for (key, meta) in mm {
+            if has_marker(&meta.markers, "secret") && !needs_resolution_before_secret(&meta.markers) {
+                if let Some(v) = map.get_mut(key.as_str()) {
+                    if !matches!(v, Value::Secret(_) | Value::Object(_) | Value::Array(_)) {
+                        let raw = value_to_string(v);
+                        *v = Value::Secret(raw);
+                    }
                 }
             }
         }
     }
-    let keys: Vec<String> = map.keys().cloned().collect();
-    for key in keys {
-        let child_path = if path.is_empty() { key.clone() } else { format!("{}.{}", path, key) };
-        if let Some(child) = map.get_mut(&key) {
-            match child {
-                Value::Object(_) => mask_secret_literals(child, metadata, &child_path),
-                Value::Array(arr) => {
-                    for item in arr.iter_mut() {
-                        if let Value::Object(_) = item {
-                            mask_secret_literals(item, metadata, &child_path);
-                        }
+    let base_len = path.len();
+    for (key, child) in map.iter_mut() {
+        if !matches!(child, Value::Object(_) | Value::Array(_)) {
+            continue;
+        }
+        if base_len > 0 {
+            path.push('.');
+        }
+        push_key_segment(path, key);
+        match child {
+            Value::Object(_) => mask_secret_literals(child, metadata, path),
+            Value::Array(arr) => {
+                let list_len = path.len();
+                for (idx, item) in arr.iter_mut().enumerate() {
+                    if let Value::Object(_) = item {
+                        push_item_segment(path, idx);
+                        mask_secret_literals(item, metadata, path);
+                        path.truncate(list_len);
                     }
                 }
-                _ => {}
             }
+            _ => {}
         }
+        path.truncate(base_len);
     }
 }
 
-fn apply_inheritance(root: &mut Value, metadata: &HashMap<String, MetaMap>) {
+fn apply_inheritance(root: &mut Value, metadata: &mut Map<MetaMap>) {
     let root_meta = match metadata.get("") {
-        Some(m) => m.clone(),
-        None => return,
-    };
-
-    let root_map = match root.as_object_mut() {
-        Some(m) => m as *mut HashMap<String, Value>,
+        Some(m) => m,
         None => return,
     };
 
@@ -1899,8 +2273,8 @@ fn apply_inheritance(root: &mut Value, metadata: &HashMap<String, MetaMap>) {
     //   production:inherit:base   → parents come from markers[idx+1..]
     //   production:inherit base   → parser promotes "base" into meta.args
     let mut inherits: Vec<(String, Vec<String>)> = Vec::new();
-    for (key, meta) in &root_meta {
-        if meta.markers.contains(&"inherit".to_string()) {
+    for (key, meta) in root_meta {
+        if has_marker(&meta.markers, "inherit") {
             let idx = meta.markers.iter().position(|m| m == "inherit").unwrap();
             let mut parents: Vec<String> = meta.markers[idx + 1..].to_vec();
             // Fall back / extend with marker args promoted from a positional value.
@@ -1913,24 +2287,65 @@ fn apply_inheritance(root: &mut Value, metadata: &HashMap<String, MetaMap>) {
         }
     }
 
-    let map = unsafe { &mut *root_map };
+    let Value::Object(map) = root else { return };
     for (child_key, parents) in &inherits {
-        // Merge parents left-to-right: first parent is base, each subsequent overrides
-        let mut merged: HashMap<String, Value> = HashMap::new();
+        // spec: only an object inherits. A list or a scalar under `:inherit`
+        // is left as written — it used to be replaced by an empty object.
+        if !matches!(map.get(child_key.as_str()), Some(Value::Object(_))) {
+            continue;
+        }
+        // Merge parents left-to-right: first parent is base, each subsequent
+        // overrides, and the child overrides all. `source` remembers which
+        // object each field came from (`None` = the child itself).
+        let mut merged: Map = Map::default();
+        let mut source: Map<Option<&str>> = Map::default();
         for parent_name in parents {
-            if let Some(Value::Object(p)) = map.get(parent_name) {
+            if let Some(Value::Object(p)) = map.get(parent_name.as_str()) {
                 for (k, v) in p {
                     merged.insert(k.clone(), v.clone());
+                    source.insert(k.clone(), Some(parent_name.as_str()));
                 }
             }
         }
-        // Child fields override all parents
-        if let Some(Value::Object(c)) = map.get(child_key) {
+        if let Some(Value::Object(c)) = map.get(child_key.as_str()) {
             for (k, v) in c {
                 merged.insert(k.clone(), v.clone());
+                source.insert(k.clone(), None);
+            }
+        }
+
+        // spec: a field keeps the markers of the object its value came from.
+        // Inherited fields had none here, so `port:env:default:5 NAME` on the
+        // parent reached the child as the literal env-var name. A field the
+        // child redefines keeps only the child's own markers.
+        let mut top = MetaMap::default();
+        let mut nested: Vec<(String, MetaMap)> = Vec::new();
+        for (k, src) in &source {
+            let from = src.unwrap_or(child_key.as_str());
+            if let Some(m) = metadata.get(key_segment(from).as_ref()).and_then(|mm| mm.get(k.as_str())) {
+                top.insert(k.clone(), m.clone());
+            }
+            if let Some(parent) = src {
+                // The inherited subtree is a copy; its nested markers move with it.
+                let prefix = format!("{}.{}", key_segment(parent), key_segment(k));
+                for (path, mm) in metadata.iter() {
+                    let rest = match path.strip_prefix(prefix.as_str()) {
+                        Some(r) if r.is_empty() || r.starts_with('.') => r,
+                        _ => continue,
+                    };
+                    nested.push((format!("{}.{}{}", key_segment(child_key), key_segment(k), rest), mm.clone()));
+                }
             }
         }
         map.insert(child_key.clone(), Value::Object(merged));
+        if top.is_empty() {
+            metadata.shift_remove(key_segment(child_key).as_ref());
+        } else {
+            metadata.insert(key_segment(child_key).into_owned(), top);
+        }
+        for (path, mm) in nested {
+            metadata.insert(path, mm);
+        }
     }
 }
 
@@ -1961,8 +2376,8 @@ fn deep_get(root: &Value, path: &str) -> Option<Value> {
 fn resolve_interpolation(
     tpl: &str,
     root: &Value,
-    local_map: &HashMap<String, Value>,
-    includes: &HashMap<String, Value>,
+    local_map: &Map,
+    includes: &Map,
 ) -> String {
     let bytes = tpl.as_bytes();
     let len = bytes.len();
@@ -2064,8 +2479,8 @@ fn resolve_interpolation(
 fn load_includes(
     directives: &[IncludeDirective],
     options: &Options,
-) -> HashMap<String, Value> {
-    let mut map = HashMap::new();
+) -> Map {
+    let mut map = Map::default();
     let base = options.base_path.as_deref().unwrap_or(".");
     let max_depth = options.max_include_depth.unwrap_or(DEFAULT_MAX_INCLUDE_DEPTH);
     if options._include_depth >= max_depth {
@@ -2103,8 +2518,8 @@ fn load_packages(
     directives: &[UseDirective],
     options: &Options,
     #[cfg(feature = "wasm")] wasm_runtime: &mut crate::wasm::WasmMarkerRuntime,
-) -> HashMap<String, Value> {
-    let mut map = HashMap::new();
+) -> Map {
+    let mut map = Map::default();
     let pkg_base = options
         .packages_path
         .as_deref()
@@ -2114,6 +2529,9 @@ fn load_packages(
 
     for ud in directives {
         // @scope/name  → package dir is <pkg_root>/@scope/name
+        if !is_contained_relative(&ud.package) {
+            continue;
+        }
         let pkg_dir = pkg_root.join(&ud.package);
 
         // Check if this is a WASM marker package (type markers in manifest)
@@ -2176,14 +2594,14 @@ fn read_manifest_main(pkg_dir: &std::path::Path) -> Option<std::path::PathBuf> {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("main ") {
             let entry_path = rest.trim();
-            if !entry_path.is_empty() {
+            if is_contained_relative(entry_path) {
                 return Some(pkg_dir.join(entry_path));
             }
         }
         // Legacy field name support
         if let Some(rest) = trimmed.strip_prefix("entry ") {
             let entry_path = rest.trim();
-            if !entry_path.is_empty() {
+            if is_contained_relative(entry_path) {
                 return Some(pkg_dir.join(entry_path));
             }
         }
@@ -2221,14 +2639,14 @@ fn read_manifest_wasm(pkg_dir: &std::path::Path) -> Option<std::path::PathBuf> {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("wasm ") {
             let wasm_path = rest.trim();
-            if !wasm_path.is_empty() {
+            if is_contained_relative(wasm_path) {
                 return Some(pkg_dir.join(wasm_path));
             }
         }
         // Also check `main` if it points to a .wasm file
         if let Some(rest) = trimmed.strip_prefix("main ") {
             let path = rest.trim();
-            if path.ends_with(".wasm") {
+            if path.ends_with(".wasm") && is_contained_relative(path) {
                 return Some(pkg_dir.join(path));
             }
         }
@@ -2255,47 +2673,62 @@ fn read_manifest_capabilities(pkg_dir: &std::path::Path) -> crate::wasm::WasmCap
 
 // ─── Type validation ──────────────────────────────────────
 
-/// Build a global type registry from all metadata.
-/// Maps field name → expected type (e.g., "hp" → "int").
-fn build_type_registry(metadata: &HashMap<String, MetaMap>) -> HashMap<String, String> {
-    let mut registry: HashMap<String, String> = HashMap::new();
-
-    for meta_map in metadata.values() {
-        for (key, meta) in meta_map {
-            if let Some(ref type_hint) = meta.type_hint {
-                // If type already registered, check for conflict
-                if let Some(existing) = registry.get(key) {
-                    if existing != type_hint {
-                        // Type conflict: same field defined with different types
-                        // For now, first definition wins; could also log error
+/// Fill the type and constraint registries from one object and its subtree:
+/// the object's own declarations first, then each child in document order.
+fn collect_registries(
+    value: &Value,
+    metadata: &Map<MetaMap>,
+    path: &mut String,
+    types: &mut Map<String>,
+    constraints: &mut Map<Constraints>,
+    depth: usize,
+) {
+    if depth > MAX_RESOLVE_DEPTH {
+        return;
+    }
+    let Value::Object(map) = value else { return };
+    if let Some(mm) = metadata.get(path.as_str()) {
+        for (key, meta) in mm {
+            if let Some(ref hint) = meta.type_hint {
+                if !types.contains_key(key.as_str()) {
+                    types.insert(key.clone(), hint.clone());
+                }
+            }
+            if let Some(ref c) = meta.constraints {
+                match constraints.get_mut(key.as_str()) {
+                    Some(existing) => merge_constraints(existing, c),
+                    None => {
+                        constraints.insert(key.clone(), c.clone());
                     }
-                } else {
-                    registry.insert(key.clone(), type_hint.clone());
                 }
             }
         }
     }
-
-    registry
-}
-
-/// Build a global constraint registry from all metadata.
-/// Maps field name → merged constraints from [] declarations.
-fn build_constraint_registry(metadata: &HashMap<String, MetaMap>) -> HashMap<String, Constraints> {
-    let mut registry: HashMap<String, Constraints> = HashMap::new();
-
-    for meta_map in metadata.values() {
-        for (key, meta) in meta_map {
-            if let Some(ref constraints) = meta.constraints {
-                registry
-                    .entry(key.clone())
-                    .and_modify(|existing| merge_constraints(existing, constraints))
-                    .or_insert_with(|| constraints.clone());
-            }
+    let base_len = path.len();
+    for (key, child) in map {
+        if !matches!(child, Value::Object(_) | Value::Array(_)) {
+            continue;
         }
+        if base_len > 0 {
+            path.push('.');
+        }
+        push_key_segment(path, key);
+        match child {
+            Value::Object(_) => collect_registries(child, metadata, path, types, constraints, depth + 1),
+            Value::Array(items) => {
+                let list_len = path.len();
+                for (idx, item) in items.iter().enumerate() {
+                    if let Value::Object(_) = item {
+                        push_item_segment(path, idx);
+                        collect_registries(item, metadata, path, types, constraints, depth + 1);
+                        path.truncate(list_len);
+                    }
+                }
+            }
+            _ => {}
+        }
+        path.truncate(base_len);
     }
-
-    registry
 }
 
 /// Merge constraints when the same field is declared multiple times.
@@ -2332,87 +2765,49 @@ fn merge_constraints(base: &mut Constraints, incoming: &Constraints) {
     }
 }
 
-/// Validate [] constraints recursively for all object fields that have
-/// a registered constraint rule.
+/// Constraints then type for every field of the tree, in one walk.
 ///
-/// Skips values that already hold a CONSTRAINT_ERR string from the per-key
-/// validation pass in `apply_markers` — otherwise we'd re-validate the error
-/// message itself and report bogus numbers (the length of the error string)
-/// instead of the original value.
-fn validate_field_constraints(value: &mut Value, registry: &HashMap<String, Constraints>) {
+/// A value that already holds a CONSTRAINT_ERR / TYPE_ERR string from the
+/// per-key pass in `apply_markers` is not re-validated against constraints —
+/// otherwise the error message itself would be measured (its length checked
+/// against min/max) instead of the original value.
+fn validate_fields(value: &mut Value, constraints: &Map<Constraints>, types: &Map<String>) {
+    if constraints.is_empty() && types.is_empty() {
+        return;
+    }
     if let Value::Object(ref mut map) = value {
-        let keys: Vec<String> = map.keys().cloned().collect();
-        for key in &keys {
-            if let Some(constraints) = registry.get(key) {
+        for (key, val) in map.iter_mut() {
+            if let Some(c) = constraints.get(key.as_str()) {
                 let already_errored = matches!(
-                    map.get(key),
-                    Some(Value::String(s)) if s.starts_with("CONSTRAINT_ERR:")
-                        || s.starts_with("TYPE_ERR:")
+                    val,
+                    Value::String(s) if s.starts_with("CONSTRAINT_ERR:") || s.starts_with("TYPE_ERR:")
                 );
                 if !already_errored {
-                    validate_constraints(map, key, constraints);
+                    if let Some(err) = constraint_violation(key, val, c) {
+                        *val = Value::String(err);
+                    }
                 }
             }
-
-            if let Some(child) = map.get_mut(key) {
-                match child {
-                    Value::Object(_) => validate_field_constraints(child, registry),
-                    Value::Array(arr) => {
-                        for item in arr.iter_mut() {
-                            if let Value::Object(_) = item {
-                                validate_field_constraints(item, registry);
-                            }
-                        }
-                    }
-                    _ => {}
+            if let Some(expected) = types.get(key.as_str()) {
+                if !value_matches_type(val, expected) {
+                    *val = Value::String(format!(
+                        "TYPE_ERR: '{}' expected {} but got {}",
+                        key, expected, value_type_name(val)
+                    ));
                 }
             }
-        }
-    }
-}
-
-/// Validate that all values in the tree match their registered types.
-fn validate_field_types(value: &mut Value, registry: &HashMap<String, String>, path: &str) {
-    match value {
-        Value::Object(ref mut map) => {
-            let keys: Vec<String> = map.keys().cloned().collect();
-            for key in &keys {
-                if let Some(expected_type) = registry.get(key) {
-                    if let Some(val) = map.get(key) {
-                        if !value_matches_type(val, expected_type) {
-                            // Type mismatch: replace with error string
-                            let current_type = value_type_name(val);
-                            map.insert(key.clone(), Value::String(
-                                format!("TYPE_ERR: '{}' expected {} but got {}", key, expected_type, current_type)
-                            ));
+            match val {
+                Value::Object(_) => validate_fields(val, constraints, types),
+                Value::Array(arr) => {
+                    for item in arr.iter_mut() {
+                        if let Value::Object(_) = item {
+                            validate_fields(item, constraints, types);
                         }
                     }
                 }
-                
-                // Recurse into nested objects and arrays
-                if let Some(child) = map.get_mut(key) {
-                    match child {
-                        Value::Object(_) => {
-                            let child_path = if path.is_empty() {
-                                key.clone()
-                            } else {
-                                format!("{}.{}", path, key)
-                            };
-                            validate_field_types(child, registry, &child_path);
-                        }
-                        Value::Array(ref mut arr) => {
-                            for item in arr.iter_mut() {
-                                if let Value::Object(_) = item {
-                                    validate_field_types(item, registry, path);
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
+                _ => {}
             }
         }
-        _ => {}
     }
 }
 
@@ -2430,16 +2825,16 @@ fn value_matches_type(value: &Value, expected_type: &str) -> bool {
 }
 
 /// Get the human-readable name of a value's type.
-fn value_type_name(value: &Value) -> String {
+fn value_type_name(value: &Value) -> &'static str {
     match value {
-        Value::Int(_) => "int".to_string(),
-        Value::Float(_) => "float".to_string(),
-        Value::Bool(_) => "bool".to_string(),
-        Value::String(_) => "string".to_string(),
-        Value::Secret(_) => "secret".to_string(),
-        Value::Array(_) => "array".to_string(),
-        Value::Object(_) => "object".to_string(),
-        Value::Null => "null".to_string(),
+        Value::Int(_) => "int",
+        Value::Float(_) => "float",
+        Value::Bool(_) => "bool",
+        Value::String(_) => "string",
+        Value::Secret(_) => "secret",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+        Value::Null => "null",
     }
 }
 
@@ -2503,6 +2898,48 @@ fn plural_category(lang: &str, n: i64) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn test_single_include_key_still_feeds_interpolation() {
+        // `{key:include}` reads the only include when there is exactly one; the
+        // pre-pass results for the marker must not count as a second one.
+        let tmp = std::env::temp_dir().join("synx-include-single");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("common.synx"), "site_name Demo\n").unwrap();
+        let mut r = parse("!active\ndb:include common.synx\ngreet {site_name:include}\n");
+        let opts = Options { base_path: Some(tmp.to_string_lossy().into_owned()), ..Default::default() };
+        resolve(&mut r, &opts);
+        assert_eq!(r.root.as_object().unwrap()["greet"], Value::String("Demo".into()));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_clamp_bound_must_be_finite() {
+        // `f64::clamp` panics on a NaN bound; a non-finite bound skips the marker.
+        let mut r = parse("!active\nv:clamp:nan:5 3\nx:clamp:1:inf 7\ny:clamp:2:9 12");
+        resolve(&mut r, &Options::default());
+        let map = r.root.as_object().unwrap();
+        assert_eq!(map["v"], Value::Int(3));
+        assert_eq!(map["x"], Value::Int(7));
+        assert_eq!(map["y"], Value::Int(9));
+    }
+
+    #[test]
+    fn test_include_of_itself_stops_at_the_depth_cap() {
+        // The `:include` pre-pass recursed without the depth cap and overflowed the stack.
+        let tmp = std::env::temp_dir().join("synx-include-self");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("self.synx"), "!active\nme:include self.synx\n").unwrap();
+        let text = std::fs::read_to_string(tmp.join("self.synx")).unwrap();
+        let mut r = parse(&text);
+        let opts = Options { base_path: Some(tmp.to_string_lossy().into_owned()), ..Default::default() };
+        resolve(&mut r, &opts);
+        let json = crate::to_json(&r.root);
+        assert!(json.contains("INCLUDE_ERR: max include depth"), "{}", json);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
     use crate::{parse, Options, Value};
     use super::{resolve, read_manifest_main};
     use std::sync::Mutex;
@@ -2511,6 +2948,76 @@ mod tests {
     // them — so two spam tests running on different threads can clear each other's
     // bucket mid-test. Every spam test takes this lock for its whole body.
     static SPAM_TESTS: Mutex<()> = Mutex::new(());
+
+    // The spec's own example: `total` reads `tax`, which is itself a :calc.
+    // Resolution follows document order, so this holds on every run — with a
+    // HashMap it failed with CALC_ERR about half the time.
+    #[test]
+    fn test_calc_chain_follows_document_order() {
+        for _ in 0..50 {
+            let mut r = parse("!active
+price 100
+tax:calc price * 0.2
+total:calc price + tax
+");
+            resolve(&mut r, &Options::default());
+            let map = r.root.as_object().unwrap();
+            assert_eq!(map["tax"], Value::Int(20));
+            assert_eq!(map["total"], Value::Int(120));
+        }
+    }
+
+    // A key of the current object shadows a same-named root key, as in the
+    // TypeScript engine.
+    #[test]
+    fn test_calc_local_key_shadows_root() {
+        let mut r = parse("!active
+limit 5
+svc
+  limit 100
+  price:calc limit * 2
+  base:calc limit * 1
+");
+        resolve(&mut r, &Options::default());
+        let svc = r.root.as_object().unwrap()["svc"].as_object().unwrap().clone();
+        assert_eq!(svc["price"], Value::Int(200));
+    }
+
+    // Keys a word-token lookup cannot see still substitute exactly.
+    #[test]
+    fn test_calc_special_keys() {
+        let mut r = parse("!active
+max-hp 10
+hp 3
+left:calc max-hp - hp
+n.m 4
+both:calc n.m * hp
+");
+        resolve(&mut r, &Options::default());
+        let map = r.root.as_object().unwrap();
+        assert_eq!(map["left"], Value::Int(7));
+        assert_eq!(map["both"], Value::Int(12));
+    }
+
+    // :alias to a key resolved by :env elsewhere sees the resolved value no
+    // matter how many siblings precede it.
+    #[test]
+    fn test_alias_resolution_is_deterministic() {
+        let mut src = String::from("!active
+");
+        for i in 0..40 {
+            src.push_str(&format!("s{i}
+  port:env:default:{} P{i}
+", 7000 + i));
+        }
+        src.push_str("pick:alias s39.port
+");
+        for _ in 0..20 {
+            let mut r = parse(&src);
+            resolve(&mut r, &Options::default());
+            assert_eq!(r.root.as_object().unwrap()["pick"], Value::Int(7039));
+        }
+    }
 
     #[test]
     fn test_ref_simple() {
@@ -2540,7 +3047,7 @@ mod tests {
         assert_eq!(steel["material"], Value::String("metal".into()));
     }
 
-    fn resolve_env(text: &str) -> std::collections::HashMap<String, Value> {
+    fn resolve_env(text: &str) -> crate::Map {
         let env: std::collections::HashMap<String, String> = [
             ("SNOW", "1550184245153112174"),
             ("ZIP", "007"),
@@ -3065,6 +3572,32 @@ mod tests {
         assert!(!map.contains_key("config"), "should use alias, not auto name");
         let pkg = map["defaults"].as_object().unwrap();
         assert_eq!(pkg["identity"], Value::String("APERTURESyndicate".into()));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_use_cannot_leave_the_packages_directory() {
+        let tmp = std::env::temp_dir().join("synx-use-test-escape");
+        let _ = std::fs::remove_dir_all(&tmp);
+        // A SYNX file outside synx_packages that a document must not reach.
+        std::fs::create_dir_all(tmp.join("secret/src")).unwrap();
+        std::fs::write(tmp.join("secret/src/main.synx"), "token hunter2\n").unwrap();
+        // A package whose manifest points its entry outside itself.
+        let pkg_dir = tmp.join("synx_packages/@evil/pkg");
+        std::fs::create_dir_all(pkg_dir.join("src")).unwrap();
+        std::fs::write(pkg_dir.join("synx-pkg.synx"), "name @evil/pkg\nmain ../../../secret/src/main.synx\n").unwrap();
+        std::fs::write(pkg_dir.join("src/main.synx"), "own yes\n").unwrap();
+
+        let opts = Options { base_path: Some(tmp.to_string_lossy().into_owned()), ..Default::default() };
+        let mut r = parse("!active\n!use @a/../../secret as leak\napp x");
+        resolve(&mut r, &opts);
+        assert!(!r.root.as_object().unwrap().contains_key("leak"), "package name escaped synx_packages");
+
+        let mut r = parse("!active\n!use @evil/pkg as evil\napp x");
+        resolve(&mut r, &opts);
+        let evil = r.root.as_object().unwrap()["evil"].as_object().unwrap();
+        assert!(!evil.contains_key("token"), "manifest main escaped the package");
+        assert_eq!(evil["own"], Value::String("yes".into()));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

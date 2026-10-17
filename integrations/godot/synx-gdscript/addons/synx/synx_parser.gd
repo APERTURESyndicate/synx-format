@@ -2,11 +2,21 @@
 class_name SynxParser
 extends RefCounted
 
-# Static parser for SYNX text → SynxParseResult.
-# Behaviour parity targets `synx-core::parser::parse` and `synx-js::parseData`.
+# SYNX text → SynxParseResult, following synx-core `parser::parse_impl` line
+# for line (SYNX 3.8.0).
 #
-# This module is intentionally written as a single class with file-static
-# helpers so it can be used without instantiating an autoload.
+# • Indentation is the UTF-8 byte length of the leading Unicode whitespace
+#   (SYNX §4: U+00A0 counts 2, U+3000 counts 3); lines are trimmed of Unicode
+#   whitespace at both ends, and a line of only whitespace is blank.
+# • A `|` / `|+` body is read before any other line rule, so `#`, `###` and
+#   `!` lines inside it are content; `|+` keeps indentation relative to its
+#   first line, cut by whole characters.
+# • A `- ` item closes every frame at or deeper than its indent; a list is
+#   not a frame; an object opened between a list key and its first item is
+#   not the item's parent.
+# • Declarations are stored on the object that holds the key (SynxMeta).
+#
+# Lines are walked as offsets into the text; only keys and values are copied.
 
 const MAX_SYNX_INPUT_BYTES: int = 16 * 1024 * 1024
 const MAX_LINE_STARTS: int = 2_000_000
@@ -17,339 +27,642 @@ const MAX_INCLUDE_DIRECTIVES: int = 4096
 const MAX_CONSTRAINT_ENUM_PARTS: int = 4096
 const MAX_MARKER_CHAIN_SEGMENTS: int = 512
 
-# Stack-entry kinds — mirrors Rust StackEntry enum.
-const STACK_ROOT := 0
-const STACK_KEY := 1
-const STACK_LIST_ITEM := 2
+# The last key line `_parse_line` read (perf: fields instead of an Array
+# per line). `_pl_hint` and `_pl_constraints` are null when absent.
+static var _pl_key: String = ""
+static var _pl_hint: Variant = null
+static var _pl_value: String = ""
+static var _pl_markers: PackedStringArray = PackedStringArray()
+static var _pl_args: PackedStringArray = PackedStringArray()
+static var _pl_constraints: Variant = null
+# Shared empty chain — never mutated.
+static var _no_markers: PackedStringArray = PackedStringArray()
+
+# Set by the last `_peek` call: indent and first non-blank offset of the
+# next content line, and that line's trimmed end.
+static var _peek_indent: int = 0
+static var _peek_first: int = -1
+static var _peek_end: int = 0
 
 
 static func parse(text: String) -> SynxParseResult:
-	if text.length() > MAX_SYNX_INPUT_BYTES:
-		text = text.substr(0, MAX_SYNX_INPUT_BYTES)
+	return parse_with(text, true, true)
 
-	var lines: PackedStringArray = text.split("\n", true)
-	if lines.size() > MAX_LINE_STARTS:
-		lines.resize(MAX_LINE_STARTS)
+
+# `directives` = false and `nondeterministic_hints` = false give the embedded
+# parse SYNXL block delegation uses (synx-core `ParserOptions`).
+static func parse_with(text: String, directives: bool = true, nondeterministic_hints: bool = true) -> SynxParseResult:
+	text = clamp_text(text)
+	var n := text.length()
 
 	var result := SynxParseResult.new()
-	var root: Dictionary = {}
-	result.root = SynxValue.make_object(root)
-
-	# Stack frame layout: { "indent": int, "kind": int, "key": String, "list_key": String, "item_idx": int }
-	var stack: Array = [_stack_entry(-1, STACK_ROOT, "", "", 0)]
+	var root := SynxValue.make_object({})
 	var mode: int = SynxParseResult.Mode.STATIC
-	var locked := false
-	var tool_dir := false
-	var schema := false
-	var llm := false
-	var metadata: Dictionary = {}
 	var includes: Array = []
 	var uses: Array = []
 
-	# Block / list state.
-	var block_active := false
-	var block_indent := 0
-	var block_key := ""
-	var block_stack_idx := 0
-	var block_content := ""
+	# Frames: indent, object, and whether the frame is a list item.
+	var st_ind := PackedInt64Array([-1])
+	var st_obj: Array = [root]
+	var st_item := PackedByteArray([0])
 
-	var list_active := false
-	var list_indent := 0
-	var list_key := ""
-	var list_stack_idx := 0
+	var blk_active := false
+	var blk_indent := 0
+	var blk_key := ""
+	var blk_obj: SynxValue = null
+	var blk_preserve := false
+	var blk_base := -1
+	var blk_parts := PackedStringArray()
+	var blk_chars := 0
+	var blk_exact := false
+	var blk_bytes := 0
+
+	var lst_active := false
+	var lst_indent := 0
+	var lst_key := ""
+	var lst_parent: SynxValue = null
 
 	var in_block_comment := false
-	var line_count := lines.size()
-	var i := 0
 
-	while i < line_count:
-		var raw: String = lines[i]
-		# strip trailing \r (Windows CRLF)
-		if raw.length() > 0 and raw[raw.length() - 1] == "\r":
-			raw = raw.substr(0, raw.length() - 1)
+	var pos := 0
+	while pos <= n:
+		var start := pos
+		var nl := text.find("\n", pos)
+		if nl < 0:
+			nl = n
+		pos = nl + 1
+		var end := nl
+		if end > start and text.unicode_at(end - 1) == 13:
+			end -= 1
 
-		var trimmed: String = raw.strip_edges()
+		# Indent (UTF-8 bytes of leading Unicode whitespace) and first content.
+		var a := start
+		var indent := 0
+		while a < end:
+			var c := text.unicode_at(a)
+			if c == 32 or c == 9 or (c >= 10 and c <= 13):
+				indent += 1
+			elif c >= 0x85 and SynxText.is_ws(c):
+				indent += SynxText.utf8_width(c)
+			else:
+				break
+			a += 1
+		if a == end:
+			continue
+		var te := end
+		var lc := text.unicode_at(te - 1)
+		if lc <= 32 or lc >= 0x85:
+			while SynxText.is_ws(text.unicode_at(te - 1)):
+				te -= 1
 
-		# ── Directives ──
-		if trimmed == "!active":
-			mode = SynxParseResult.Mode.ACTIVE
-			i += 1
-			continue
-		if trimmed == "!lock":
-			locked = true
-			i += 1
-			continue
-		if trimmed == "!tool":
-			tool_dir = true
-			i += 1
-			continue
-		if trimmed == "!schema":
-			schema = true
-			i += 1
-			continue
-		if trimmed == "!llm":
-			llm = true
-			i += 1
-			continue
-		if trimmed.begins_with("!include "):
-			if includes.size() < MAX_INCLUDE_DIRECTIVES:
-				var rest := trimmed.substr(9).strip_edges()
-				var path_part := ""
-				var alias_part := ""
-				var ws := _index_of_ws(rest, 0)
-				if ws == -1:
-					path_part = rest
+		# ── Multiline body: before every other line rule ──
+		if blk_active:
+			if indent > blk_indent:
+				var slice: String
+				if blk_preserve:
+					if blk_base < 0:
+						blk_base = indent
+					var strip := mini(blk_base, indent)
+					var cut := start
+					var off := 0
+					while cut < te and off < strip:
+						var cc := text.unicode_at(cut)
+						if not SynxText.is_ws(cc):
+							break
+						off += SynxText.utf8_width(cc)
+						cut += 1
+					slice = text.substr(cut, te - cut)
 				else:
-					path_part = rest.substr(0, ws)
-					alias_part = rest.substr(ws).strip_edges()
-				if alias_part == "":
-					alias_part = _derive_alias(path_part)
-				includes.append(SynxParseResult.IncludeDirective.new(path_part, alias_part))
-			i += 1
-			continue
-		if trimmed.begins_with("!use "):
-			var rest_u := trimmed.substr(5).strip_edges()
-			if rest_u.begins_with("@"):
-				var pkg := ""
-				var alias_u := ""
-				var as_idx := rest_u.find(" as ")
-				if as_idx == -1:
-					pkg = rest_u.strip_edges()
-					var slash := pkg.rfind("/")
-					alias_u = pkg.substr(slash + 1) if slash >= 0 else pkg
-				else:
-					pkg = rest_u.substr(0, as_idx).strip_edges()
-					alias_u = rest_u.substr(as_idx + 4).strip_edges()
-				if pkg != "":
-					uses.append(SynxParseResult.UseDirective.new(pkg, alias_u))
-			i += 1
-			continue
-		if trimmed.begins_with("#!mode:"):
-			var declared := trimmed.substr(7).strip_edges()
-			mode = SynxParseResult.Mode.ACTIVE if declared == "active" else SynxParseResult.Mode.STATIC
-			i += 1
-			continue
+					slice = text.substr(a, te - a)
+				if not blk_exact:
+					var sep := 1 if blk_parts.size() > 0 else 0
+					if (blk_chars + sep + slice.length()) * 4 < MAX_MULTILINE_BLOCK_BYTES:
+						blk_parts.append(slice)
+						blk_chars += sep + slice.length()
+						continue
+					blk_exact = true
+					blk_bytes = SynxText.utf8_len("\n".join(blk_parts))
+				if blk_bytes < MAX_MULTILINE_BLOCK_BYTES:
+					if blk_parts.size() > 0:
+						blk_bytes += 1
+					var room := MAX_MULTILINE_BLOCK_BYTES - blk_bytes
+					var taken := SynxText.utf8_prefix(slice, room) if room > 0 else ""
+					blk_parts.append(taken)
+					blk_bytes += SynxText.utf8_len(taken)
+				continue
+			blk_obj.data[blk_key] = SynxValue.make_string("\n".join(blk_parts))
+			blk_active = false
+			blk_obj = null
 
-		# ── Block comments: ### … ### ──
-		if trimmed == "###":
+		var fc := text.unicode_at(a)
+
+		# ── Block comment toggle ──
+		if fc == 35 and te - a == 3 and text.unicode_at(a + 1) == 35 and text.unicode_at(a + 2) == 35:
 			in_block_comment = not in_block_comment
-			i += 1
 			continue
 		if in_block_comment:
-			i += 1
 			continue
 
-		# ── Skip empty / comments ──
-		if trimmed.is_empty() or trimmed.begins_with("#") or trimmed.begins_with("//"):
-			i += 1
-			continue
-
-		var indent: int = raw.length() - raw.lstrip(" \t").length()
-
-		# ── Continue multiline block ──
-		if block_active:
-			if indent > block_indent:
-				if block_content.length() < MAX_MULTILINE_BLOCK_BYTES:
-					if not block_content.is_empty():
-						block_content += "\n"
-					var room := MAX_MULTILINE_BLOCK_BYTES - block_content.length()
-					if room > 0:
-						block_content += trimmed.substr(0, min(trimmed.length(), room))
-				i += 1
-				continue
-			else:
-				_insert_at(root, stack, block_stack_idx, block_key, SynxValue.make_string(block_content))
-				block_active = false
-				block_content = ""
-
-		# ── Continue list items ──
-		if trimmed.begins_with("- "):
-			if list_active and indent > list_indent:
-				# Pop list-item frames at same or deeper indent so successive items don't accumulate.
-				while stack.size() > 1:
-					var top: Dictionary = stack[stack.size() - 1]
-					if int(top["kind"]) == STACK_LIST_ITEM and int(top["indent"]) >= indent:
-						stack.pop_back()
-					else:
-						break
-
-				var val_str := _strip_comment(trimmed.substr(2).strip_edges())
-
-				# Peek next non-empty line — nested?
-				var peek := i + 1
-				var nested := false
-				while peek < line_count:
-					var pl: String = lines[peek]
-					if pl.length() > 0 and pl[pl.length() - 1] == "\r":
-						pl = pl.substr(0, pl.length() - 1)
-					var pt := pl.strip_edges()
-					if pt.is_empty():
-						peek += 1
+		# ── Directives ──
+		if fc == 33 or (fc == 35 and te - a >= 7 and text.unicode_at(a + 1) == 33):
+			if directives:
+				var tr := text.substr(a, te - a)
+				if fc == 33:
+					if tr == "!active":
+						mode = SynxParseResult.Mode.ACTIVE
 						continue
-					var pi: int = pl.length() - pl.lstrip(" \t").length()
-					if pi > indent and not pt.begins_with("- ") and not pt.begins_with("#") and not pt.begins_with("//"):
-						nested = true
-					break
-
-				var parent_map := _navigate_to_parent(root, stack, list_stack_idx)
-				if parent_map != null:
-					if not parent_map.has(list_key):
-						parent_map[list_key] = SynxValue.make_array([])
-					var arr_val: SynxValue = parent_map[list_key]
-					if arr_val.kind == SynxValue.Kind.ARRAY:
-						var arr: Array = arr_val.data
-						if arr.size() < MAX_LIST_ITEMS:
-							if nested:
-								var item_obj: Dictionary = {}
-								var parsed := _parse_line(val_str)
-								if parsed != null:
-									var val: SynxValue
-									if not parsed["type_hint"].is_empty():
-										val = _cast_typed(parsed["value"], parsed["type_hint"])
-									elif not parsed["value"].is_empty():
-										val = _cast(parsed["value"])
-									else:
-										val = SynxValue.make_object({})
-									item_obj[parsed["key"]] = val
-								else:
-									item_obj["_value"] = _cast(val_str)
-								var item_idx := arr.size()
-								arr.append(SynxValue.make_object(item_obj))
-								if stack.size() < MAX_PARSE_NESTING_DEPTH:
-									stack.append(_stack_entry(indent, STACK_LIST_ITEM, "", list_key, item_idx))
-							else:
-								arr.append(_cast(val_str))
-				i += 1
-				continue
-		else:
-			# Close list if non-item line at-or-below list indent.
-			if list_active and indent <= list_indent:
-				list_active = false
-				while stack.size() > 1:
-					var top2: Dictionary = stack[stack.size() - 1]
-					if int(top2["kind"]) == STACK_LIST_ITEM and int(top2["indent"]) >= indent:
-						stack.pop_back()
-					else:
-						break
-
-		# ── Parse key line ──
-		var parsed_line := _parse_line(trimmed)
-		if parsed_line == null:
-			i += 1
-			continue
-
-		# Reject prototype-polluting keys (parity with Rust / JS).
-		if parsed_line["key"] == "__proto__" or parsed_line["key"] == "constructor" or parsed_line["key"] == "prototype":
-			i += 1
-			continue
-
-		# Pop stack to correct parent.
-		while stack.size() > 1 and int(stack[stack.size() - 1]["indent"]) >= indent:
-			stack.pop_back()
-		var parent_idx := stack.size() - 1
-
-		# Capture metadata in active mode.
-		if mode == SynxParseResult.Mode.ACTIVE:
-			var has_meta_payload := (parsed_line["markers"] as Array).size() > 0 \
-				or parsed_line["has_constraints"] \
-				or not String(parsed_line["type_hint"]).is_empty()
-			if has_meta_payload:
-				var path_key := _build_path(stack)
-				if not metadata.has(path_key):
-					metadata[path_key] = {}
-				var meta_map: Dictionary = metadata[path_key]
-				var meta := SynxMeta.new()
-				for m in parsed_line["markers"]:
-					meta.markers.append(String(m))
-				for a in parsed_line["marker_args"]:
-					meta.args.append(String(a))
-				meta.type_hint = parsed_line["type_hint"]
-				meta.has_constraints = parsed_line["has_constraints"]
-				if meta.has_constraints:
-					meta.c_min = parsed_line["c_min"]
-					meta.c_max = parsed_line["c_max"]
-					meta.c_type_name = parsed_line["c_type_name"]
-					meta.c_required = parsed_line["c_required"]
-					meta.c_readonly = parsed_line["c_readonly"]
-					meta.c_pattern = parsed_line["c_pattern"]
-					meta.c_enum = parsed_line["c_enum"]
-					meta.c_has_enum = parsed_line["c_has_enum"]
-				meta_map[parsed_line["key"]] = meta
-
-		var is_block := String(parsed_line["value"]) == "|"
-		var is_list_marker := false
-		for m2 in parsed_line["markers"]:
-			var s := String(m2)
-			if s == "random" or s == "unique" or s == "geo" or s == "join":
-				is_list_marker = true
-				break
-
-		if is_block:
-			_insert_at(root, stack, parent_idx, parsed_line["key"], SynxValue.make_string(""))
-			block_active = true
-			block_indent = indent
-			block_key = parsed_line["key"]
-			block_stack_idx = parent_idx
-			block_content = ""
-		elif is_list_marker and String(parsed_line["value"]).is_empty():
-			_insert_at(root, stack, parent_idx, parsed_line["key"], SynxValue.make_array([]))
-			list_active = true
-			list_indent = indent
-			list_key = parsed_line["key"]
-			list_stack_idx = parent_idx
-		elif String(parsed_line["value"]).is_empty():
-			# Peek for a list under this key.
-			var peek_idx := i + 1
-			while peek_idx < line_count:
-				var pl2: String = lines[peek_idx]
-				if pl2.length() > 0 and pl2[pl2.length() - 1] == "\r":
-					pl2 = pl2.substr(0, pl2.length() - 1)
-				var pt2 := pl2.strip_edges()
-				if not pt2.is_empty():
-					break
-				peek_idx += 1
-
-			if peek_idx < line_count:
-				var pl3: String = lines[peek_idx]
-				if pl3.length() > 0 and pl3[pl3.length() - 1] == "\r":
-					pl3 = pl3.substr(0, pl3.length() - 1)
-				var pt3 := pl3.strip_edges()
-				if pt3.begins_with("- "):
-					_insert_at(root, stack, parent_idx, parsed_line["key"], SynxValue.make_array([]))
-					list_active = true
-					list_indent = indent
-					list_key = parsed_line["key"]
-					list_stack_idx = parent_idx
-					i += 1
+					if tr == "!lock":
+						result.locked = true
+						continue
+					if tr == "!tool":
+						result.tool_directive = true
+						continue
+					if tr == "!schema":
+						result.schema = true
+						continue
+					if tr == "!llm":
+						result.llm = true
+						continue
+					if tr.begins_with("!include "):
+						if includes.size() < MAX_INCLUDE_DIRECTIVES:
+							includes.append(_include_directive(tr))
+						continue
+					if tr.begins_with("!use "):
+						var ud := _use_directive(tr)
+						if ud != null:
+							uses.append(ud)
+						continue
+				elif tr.begins_with("#!mode:"):
+					var declared := SynxText.trim(tr.substr(7))
+					mode = SynxParseResult.Mode.ACTIVE if declared == "active" else SynxParseResult.Mode.STATIC
 					continue
+			elif fc == 33:
+				continue
 
-			_insert_at(root, stack, parent_idx, parsed_line["key"], SynxValue.make_object({}))
-			if stack.size() < MAX_PARSE_NESTING_DEPTH:
-				stack.append(_stack_entry(indent, STACK_KEY, parsed_line["key"], "", 0))
+		# ── Comments ──
+		if fc == 35:
+			continue
+		if fc == 47 and a + 1 < te and text.unicode_at(a + 1) == 47:
+			continue
+
+		# ── List items ──
+		if fc == 45 and a + 1 < te and text.unicode_at(a + 1) == 32:
+			if lst_active and indent > lst_indent:
+				# Every frame of the previous item ends here, its own and any
+				# object nested inside it.
+				while st_ind.size() > 1 and st_ind[st_ind.size() - 1] >= indent:
+					_pop(st_ind, st_obj, st_item)
+				var live: SynxValue = lst_parent.data.get(lst_key)
+				if live == null or live.kind != SynxValue.Kind.ARRAY:
+					continue
+				var arr: Array = live.data
+				if arr.size() >= MAX_LIST_ITEMS:
+					continue
+				var val_str := _strip_comment(SynxText.trim(text.substr(a + 2, te - a - 2)))
+				var nested := false
+				if _peek(text, pos):
+					var pf := _peek_first
+					var pc := text.unicode_at(pf)
+					if _peek_indent > indent and pc != 35 \
+							and not (pc == 45 and pf + 1 < _peek_end and text.unicode_at(pf + 1) == 32) \
+							and not (pc == 47 and pf + 1 < _peek_end and text.unicode_at(pf + 1) == 47):
+						nested = true
+				if nested:
+					var item := SynxValue.make_object({})
+					if _parse_line(val_str, 0, val_str.length()):
+						var iv := _pl_value
+						var ival: SynxValue
+						if _pl_hint != null:
+							ival = cast_typed(iv, _pl_hint, nondeterministic_hints)
+						elif not iv.is_empty():
+							ival = cast(iv)
+						else:
+							ival = SynxValue.make_object({})
+						if not _is_reserved(_pl_key):
+							item.data[_pl_key] = ival
+					else:
+						item.data["_value"] = cast(val_str)
+					arr.append(item)
+					if st_ind.size() < MAX_PARSE_NESTING_DEPTH:
+						st_ind.append(indent)
+						st_obj.append(item)
+						st_item.append(1)
+				else:
+					arr.append(cast(val_str))
+			continue
+
+		# A non-item line at or above the list's indent closes it.
+		if lst_active and indent <= lst_indent:
+			lst_active = false
+			lst_parent = null
+			while st_ind.size() > 1 and st_item[st_item.size() - 1] == 1 and st_ind[st_ind.size() - 1] >= indent:
+				_pop(st_ind, st_obj, st_item)
+
+		# ── Key line ──
+		if not _parse_line(text, a, te):
+			continue
+		var key := _pl_key
+		if _is_reserved(key):
+			continue
+		while st_ind.size() > 1 and st_ind[st_ind.size() - 1] >= indent:
+			_pop(st_ind, st_obj, st_item)
+		var parent: SynxValue = st_obj[st_obj.size() - 1]
+		var markers := _pl_markers
+		var hint: Variant = _pl_hint
+
+		if mode == SynxParseResult.Mode.ACTIVE and (not markers.is_empty() or _pl_constraints != null or hint != null):
+			var meta := SynxMeta.new()
+			meta.set_markers(markers.duplicate())
+			meta.args = _pl_args.duplicate()
+			meta.type_hint = hint
+			if _pl_constraints != null:
+				meta.parse_constraints(_pl_constraints)
+			if parent.meta == null:
+				parent.meta = {}
+			parent.meta[key] = meta
+
+		var value := _pl_value
+		if value == "|" or value == "|+":
+			parent.data[key] = SynxValue.make_string("")
+			blk_active = true
+			blk_indent = indent
+			blk_key = key
+			blk_obj = parent
+			blk_preserve = value == "|+"
+			blk_base = -1
+			blk_parts = PackedStringArray()
+			blk_chars = 0
+			blk_exact = false
+			blk_bytes = 0
+		elif value.is_empty() and _has_list_marker(markers):
+			parent.data[key] = SynxValue.make_array([])
+			lst_active = true
+			lst_indent = indent
+			lst_key = key
+			lst_parent = parent
+		elif value.is_empty():
+			if _peek(text, pos):
+				var qf := _peek_first
+				if text.unicode_at(qf) == 45 and qf + 1 < _peek_end and text.unicode_at(qf + 1) == 32:
+					parent.data[key] = SynxValue.make_array([])
+					lst_active = true
+					lst_indent = indent
+					lst_key = key
+					lst_parent = parent
+					continue
+			var obj := SynxValue.make_object({})
+			parent.data[key] = obj
+			if st_ind.size() < MAX_PARSE_NESTING_DEPTH:
+				st_ind.append(indent)
+				st_obj.append(obj)
+				st_item.append(0)
+		elif hint != null:
+			parent.data[key] = cast_typed(value, hint, nondeterministic_hints)
 		else:
-			var v: SynxValue
-			if not String(parsed_line["type_hint"]).is_empty():
-				v = _cast_typed(parsed_line["value"], parsed_line["type_hint"])
-			else:
-				v = _cast(parsed_line["value"])
-			_insert_at(root, stack, parent_idx, parsed_line["key"], v)
+			parent.data[key] = cast(value)
 
-		i += 1
+	if blk_active:
+		blk_obj.data[blk_key] = SynxValue.make_string("\n".join(blk_parts))
 
-	# Flush pending block.
-	if block_active:
-		_insert_at(root, stack, block_stack_idx, block_key, SynxValue.make_string(block_content))
-
-	result.root = SynxValue.make_object(root)
+	result.root = root
 	result.mode = mode
-	result.locked = locked
-	result.tool_directive = tool_dir
-	result.schema = schema
-	result.llm = llm
-	result.metadata = metadata
 	result.includes = includes
 	result.uses = uses
 	return result
+
+
+# ─── Input caps ──
+
+# Drop a leading U+FEFF, cut at 16 MiB of UTF-8 (on a character boundary) and
+# at 2 000 000 lines.
+static func clamp_text(text: String) -> String:
+	if not text.is_empty() and text.unicode_at(0) == 0xFEFF:
+		text = text.substr(1)
+	if text.length() * 4 > MAX_SYNX_INPUT_BYTES:
+		if SynxText.utf8_len(text) > MAX_SYNX_INPUT_BYTES:
+			text = SynxText.utf8_prefix(text, MAX_SYNX_INPUT_BYTES)
+	if text.length() >= MAX_LINE_STARTS - 1:
+		var seen := 0
+		var p := 0
+		while true:
+			var nl := text.find("\n", p)
+			if nl < 0:
+				break
+			if seen >= MAX_LINE_STARTS - 1:
+				text = text.substr(0, nl)
+				break
+			seen += 1
+			p = nl + 1
+	return text
+
+
+# ─── Helpers ──
+
+static func _pop(st_ind: PackedInt64Array, st_obj: Array, st_item: PackedByteArray) -> void:
+	var top := st_ind.size() - 1
+	st_ind.resize(top)
+	st_obj.resize(top)
+	st_item.resize(top)
+
+
+static func _is_reserved(key: String) -> bool:
+	return key == "__proto__" or key == "constructor" or key == "prototype"
+
+
+static func _has_list_marker(markers: PackedStringArray) -> bool:
+	for m in markers:
+		if m == "random" or m == "unique" or m == "geo" or m == "join":
+			return true
+	return false
+
+
+# Find the next line at or after `from` that is not blank; sets `_peek_*`.
+static func _peek(text: String, from: int) -> bool:
+	var n := text.length()
+	var p := from
+	while p <= n:
+		var nl := text.find("\n", p)
+		if nl < 0:
+			nl = n
+		var e := nl
+		if e > p and text.unicode_at(e - 1) == 13:
+			e -= 1
+		var q := p
+		var w := 0
+		while q < e:
+			var c := text.unicode_at(q)
+			if c == 32 or c == 9 or (c >= 10 and c <= 13):
+				w += 1
+			elif c >= 0x85 and SynxText.is_ws(c):
+				w += SynxText.utf8_width(c)
+			else:
+				break
+			q += 1
+		if q < e:
+			var te := e
+			while SynxText.is_ws(text.unicode_at(te - 1)):
+				te -= 1
+			_peek_indent = w
+			_peek_first = q
+			_peek_end = te
+			return true
+		p = nl + 1
+	return false
+
+
+static func _include_directive(tr: String) -> SynxParseResult.IncludeDirective:
+	var rest := SynxText.trim(tr.substr(9))
+	var ws := -1
+	for i in rest.length():
+		if SynxText.is_ws(rest.unicode_at(i)):
+			ws = i
+			break
+	var path := rest if ws < 0 else rest.substr(0, ws)
+	var alias := ""
+	if ws >= 0:
+		alias = SynxText.trim(rest.substr(ws + 1))
+	else:
+		var slash := maxi(path.rfind("/"), path.rfind("\\"))
+		alias = path.substr(slash + 1) if slash >= 0 else path
+		if alias.ends_with(".synx") or alias.ends_with(".SYNX"):
+			alias = alias.substr(0, alias.length() - 5)
+	return SynxParseResult.IncludeDirective.new(path, alias)
+
+
+static func _use_directive(tr: String) -> SynxParseResult.UseDirective:
+	var rest := SynxText.trim(tr.substr(5))
+	if not rest.begins_with("@"):
+		return null
+	var package := ""
+	var alias := ""
+	var as_idx := rest.find(" as ")
+	if as_idx < 0:
+		package = SynxText.trim(rest)
+		var slash := package.rfind("/")
+		alias = package.substr(slash + 1) if slash >= 0 else package
+	else:
+		package = SynxText.trim(rest.substr(0, as_idx))
+		alias = SynxText.trim(rest.substr(as_idx + 4))
+	if package.is_empty():
+		return null
+	return SynxParseResult.UseDirective.new(package, alias)
+
+
+# ─── Key line ──
+
+# synx-core `parse_line` over s[a, te) (already trimmed) into the `_pl_*`
+# fields. False when the line is not a key line.
+static func _parse_line(s: String, a: int, te: int) -> bool:
+	if a >= te:
+		return false
+	var first := s.unicode_at(a)
+	if first == 91 or first == 58 or first == 45 or first == 35 or first == 47 or first == 40:
+		return false
+	var pos := a
+	while pos < te:
+		var ch := s.unicode_at(pos)
+		if ch == 32 or ch == 9 or ch == 91 or ch == 58 or ch == 40:
+			break
+		pos += 1
+	var key := s.substr(a, pos - a)
+
+	# `s` may be the whole document: searches stop at the line end, or a line
+	# without `)` would scan the rest of the text.
+	var hint: Variant = null
+	if pos < te and s.unicode_at(pos) == 40:
+		var close := pos + 1
+		while close < te and s.unicode_at(close) != 41:
+			close += 1
+		if close < te:
+			hint = s.substr(pos + 1, close - pos - 1)
+			pos = close + 1
+		else:
+			pos += 1
+
+	var constraints: Variant = null
+	if pos < te and s.unicode_at(pos) == 91:
+		var cstart := pos + 1
+		var depth := 1
+		var scan := cstart
+		while scan < te:
+			var ch2 := s.unicode_at(scan)
+			if ch2 == 91:
+				depth += 1
+			elif ch2 == 93:
+				depth -= 1
+				if depth == 0:
+					break
+			scan += 1
+		if depth == 0:
+			constraints = s.substr(cstart, scan - cstart)
+			pos = scan + 1
+		else:
+			var fb := cstart
+			while fb < te and s.unicode_at(fb) != 93:
+				fb += 1
+			if fb < te:
+				constraints = s.substr(cstart, fb - cstart)
+				pos = fb + 1
+			else:
+				constraints = s.substr(cstart, te - cstart)
+				pos = te
+
+	var markers := _no_markers
+	var args := _no_markers
+	if pos < te and s.unicode_at(pos) == 58:
+		var mstart := pos + 1
+		var mend := mstart
+		while mend < te:
+			var ch3 := s.unicode_at(mend)
+			if ch3 == 32 or ch3 == 9:
+				break
+			mend += 1
+		markers = s.substr(mstart, mend - mstart).split(":")
+		if markers.size() > MAX_MARKER_CHAIN_SEGMENTS:
+			markers.resize(MAX_MARKER_CHAIN_SEGMENTS)
+		pos = mend
+
+	while pos < te:
+		var ch4 := s.unicode_at(pos)
+		if ch4 != 32 and ch4 != 9:
+			break
+		pos += 1
+
+	var value := _strip_comment(s.substr(pos, te - pos)) if pos < te else ""
+
+	if not markers.is_empty() and not value.is_empty():
+		if markers.has("random"):
+			var nums := PackedStringArray()
+			for tok in _split_ws(value):
+				if SynxNum.is_f64_text(tok):
+					nums.append(tok)
+			if not nums.is_empty():
+				args = nums
+				value = ""
+		if not value.is_empty() and markers.has("inherit"):
+			args = PackedStringArray([SynxText.trim(value)])
+			value = ""
+
+	_pl_key = key
+	_pl_hint = hint
+	_pl_value = value
+	_pl_markers = markers
+	_pl_args = args
+	_pl_constraints = constraints
+	return true
+
+
+# Rust `str::split_whitespace`.
+static func _split_ws(s: String) -> PackedStringArray:
+	var out := PackedStringArray()
+	var n := s.length()
+	var i := 0
+	while i < n:
+		while i < n and SynxText.is_ws(s.unicode_at(i)):
+			i += 1
+		if i >= n:
+			break
+		var j := i
+		while j < n and not SynxText.is_ws(s.unicode_at(j)):
+			j += 1
+		out.append(s.substr(i, j - i))
+		i = j
+	return out
+
+
+# Cut an inline ` //` or ` #` comment, then trailing whitespace.
+# perf: the value is a suffix of a trimmed line, so without a cut there is
+# no trailing whitespace to remove.
+static func _strip_comment(val: String) -> String:
+	var cut := val.find(" #")
+	var sl := val.find(" //")
+	if sl >= 0 and (cut < 0 or sl < cut):
+		cut = sl
+	if cut < 0:
+		return val
+	return SynxText.trim_end(val.substr(0, cut))
+
+
+# ─── Casting ──
+
+# SYNX §8.3 automatic casting (synx-core `cast`).
+static func cast(val: String) -> SynxValue:
+	var n := val.length()
+	if n == 0:
+		return SynxValue.make_string("")
+	var c := val.unicode_at(0)
+	if n >= 2:
+		var cn := val.unicode_at(n - 1)
+		if (c == 34 and cn == 34) or (c == 39 and cn == 39):
+			return SynxValue.make_string(val.substr(1, n - 2))
+	if c == 116 and val == "true":
+		return SynxValue.make_bool(true)
+	if c == 102 and val == "false":
+		return SynxValue.make_bool(false)
+	if c == 110 and val == "null":
+		return SynxValue.make_null()
+	var start := 0
+	if c == 45:
+		if n == 1:
+			return SynxValue.make_string(val)
+		start = 1
+		c = val.unicode_at(1)
+	if c >= 48 and c <= 57:
+		var dot := val.find(".")
+		if dot < 0:
+			if val.is_valid_int():
+				# perf: up to 18 digits cannot overflow i64.
+				if n <= 18:
+					return SynxValue.make_int(val.to_int())
+				var iv: Variant = SynxNum.parse_i64(val)
+				if iv != null:
+					return SynxValue.make_int(iv)
+		elif dot > start and dot < n - 1:
+			var fc := val.unicode_at(dot + 1)
+			var ip := val.substr(start, dot - start)
+			var fp := val.substr(dot + 1)
+			if fc >= 48 and fc <= 57 and ip.is_valid_int() and fp.is_valid_int():
+				# perf: Clinger's fast path — at most 15 significant digits
+				# and 22 fraction digits are one exact division.
+				if n - start <= 16 and fp.length() <= 22:
+					var f := float((ip + fp).to_int()) / SynxNum._pow10f()[fp.length()]
+					return SynxValue.make_float(-f if start == 1 else f)
+				return SynxValue.make_float(SynxNum.parse_f64_valid(val))
+	return SynxValue.make_string(val)
+
+
+# SYNX §8.3 typed casting (synx-core `cast_typed_with`).
+static func cast_typed(val: String, hint: String, nondeterministic: bool = true) -> SynxValue:
+	match hint:
+		"int":
+			var iv: Variant = SynxNum.parse_i64(val)
+			return SynxValue.make_int(iv if iv != null else 0)
+		"float":
+			var fv: Variant = SynxNum.parse_f64(val)
+			return SynxValue.make_float(fv if fv != null else 0.0)
+		"bool":
+			return SynxValue.make_bool(SynxText.trim(val) == "true")
+		"string":
+			return SynxValue.make_string(val)
+		"random", "random:int":
+			if nondeterministic:
+				return SynxValue.make_int(SynxRng.random_i64())
+		"random:float":
+			if nondeterministic:
+				return SynxValue.make_float(SynxRng.random_f64_01())
+		"random:bool":
+			if nondeterministic:
+				return SynxValue.make_bool(SynxRng.random_bool())
+	return cast(val)
+
+
+# Kept for callers of the 3.7 API.
+static func _cast(val: String) -> SynxValue:
+	return cast(val)
+
+
+static func _cast_typed(val: String, hint: String) -> SynxValue:
+	return cast_typed(val, hint, true)
 
 
 # ─── Tool reshape (deferred from parse, matches reshape_tool_output) ──
@@ -358,11 +671,11 @@ static func reshape_tool_output(root: SynxValue, schema_mode: bool) -> SynxValue
 	if root.kind != SynxValue.Kind.OBJECT:
 		return root.clone()
 	var map: Dictionary = root.data
+	var keys: Array = map.keys()
+	keys.sort()
 
 	if schema_mode:
 		var tools_arr: Array = []
-		var keys: Array = map.keys()
-		keys.sort()
 		for key in keys:
 			var v: SynxValue = map[key]
 			var def: Dictionary = {}
@@ -373,16 +686,13 @@ static func reshape_tool_output(root: SynxValue, schema_mode: bool) -> SynxValue
 		out["tools"] = SynxValue.make_array(tools_arr)
 		return SynxValue.make_object(out)
 
-	# Call mode.
 	if map.is_empty():
 		var out_e: Dictionary = {}
 		out_e["tool"] = SynxValue.make_null()
 		out_e["params"] = SynxValue.make_object({})
 		return SynxValue.make_object(out_e)
 
-	var keys_c: Array = map.keys()
-	keys_c.sort()
-	var tool_key: String = String(keys_c[0])
+	var tool_key: String = String(keys[0])
 	var tool_val: SynxValue = map[tool_key]
 	var params: SynxValue
 	if tool_val.kind == SynxValue.Kind.OBJECT:
@@ -393,345 +703,3 @@ static func reshape_tool_output(root: SynxValue, schema_mode: bool) -> SynxValue
 	out_c["tool"] = SynxValue.make_string(tool_key)
 	out_c["params"] = params
 	return SynxValue.make_object(out_c)
-
-
-# ─── Stack helpers ──
-
-static func _stack_entry(indent: int, kind: int, key: String, list_key: String, item_idx: int) -> Dictionary:
-	return {
-		"indent": indent,
-		"kind": kind,
-		"key": key,
-		"list_key": list_key,
-		"item_idx": item_idx,
-	}
-
-
-static func _build_path(stack: Array) -> String:
-	var parts: Array[String] = []
-	for i in range(1, stack.size()):
-		var e: Dictionary = stack[i]
-		if int(e["kind"]) == STACK_KEY:
-			parts.append(String(e["key"]))
-	return ".".join(parts)
-
-
-static func _navigate_to_parent(root: Dictionary, stack: Array, target_idx: int) -> Variant:
-	if target_idx == 0:
-		return root
-	var current: Dictionary = root
-	for i in range(1, target_idx + 1):
-		var e: Dictionary = stack[i]
-		var kind: int = int(e["kind"])
-		if kind == STACK_KEY:
-			var k: String = String(e["key"])
-			if not current.has(k):
-				return null
-			var child: SynxValue = current[k]
-			if child.kind != SynxValue.Kind.OBJECT:
-				return null
-			current = child.data
-		elif kind == STACK_LIST_ITEM:
-			var lk: String = String(e["list_key"])
-			var idx: int = int(e["item_idx"])
-			if not current.has(lk):
-				return null
-			var arr_v: SynxValue = current[lk]
-			if arr_v.kind != SynxValue.Kind.ARRAY:
-				return null
-			var arr: Array = arr_v.data
-			if idx >= arr.size():
-				return null
-			var item: SynxValue = arr[idx]
-			if item.kind != SynxValue.Kind.OBJECT:
-				return null
-			current = item.data
-		else:
-			return null
-	return current
-
-
-static func _insert_at(root: Dictionary, stack: Array, parent_idx: int, key: String, value: SynxValue) -> void:
-	var target := _navigate_to_parent(root, stack, parent_idx)
-	if target != null:
-		target[key] = value
-
-
-# ─── Line parser ──
-
-static func _parse_line(trimmed: String) -> Variant:
-	if trimmed.is_empty() or trimmed.begins_with("#") or trimmed.begins_with("//") or trimmed.begins_with("- "):
-		return null
-
-	var first := trimmed.unicode_at(0)
-	# Reject lines starting with: [ : - # / (   (parity with Rust)
-	if first == 91 or first == 58 or first == 45 or first == 35 or first == 47 or first == 40:
-		return null
-
-	var len_t := trimmed.length()
-	var pos := 0
-	# Extract key.
-	while pos < len_t:
-		var ch := trimmed.unicode_at(pos)
-		if ch == 32 or ch == 9 or ch == 91 or ch == 58 or ch == 40:
-			break
-		pos += 1
-	if pos == 0:
-		return null
-	var key := trimmed.substr(0, pos)
-
-	var type_hint := ""
-	# Optional (type).
-	if pos < len_t and trimmed.unicode_at(pos) == 40:
-		var start := pos + 1
-		var close_rel := trimmed.substr(start).find(")")
-		if close_rel >= 0:
-			type_hint = trimmed.substr(start, close_rel)
-			pos = start + close_rel + 1
-		else:
-			pos += 1
-
-	# Optional [constraints] with balanced-bracket scan.
-	var has_constraints := false
-	var c_min := NAN
-	var c_max := NAN
-	var c_type_name := ""
-	var c_required := false
-	var c_readonly := false
-	var c_pattern := ""
-	var c_enum: PackedStringArray = PackedStringArray()
-	var c_has_enum := false
-
-	if pos < len_t and trimmed.unicode_at(pos) == 91:
-		var cstart := pos + 1
-		var depth := 1
-		var scan := cstart
-		while scan < len_t and depth > 0:
-			var ch2 := trimmed.unicode_at(scan)
-			if ch2 == 91:
-				depth += 1
-			elif ch2 == 93:
-				depth -= 1
-				if depth == 0:
-					break
-			scan += 1
-		var constraint_str := ""
-		if depth == 0:
-			constraint_str = trimmed.substr(cstart, scan - cstart)
-			pos = scan + 1
-		else:
-			var fb := trimmed.substr(cstart).find("]")
-			if fb >= 0:
-				constraint_str = trimmed.substr(cstart, fb)
-				pos = cstart + fb + 1
-			else:
-				constraint_str = trimmed.substr(cstart)
-				pos = len_t
-
-		# Parse constraints.
-		has_constraints = true
-		var parts := constraint_str.split(",", false)
-		for raw_p in parts:
-			var p := String(raw_p).strip_edges()
-			if p.is_empty():
-				continue
-			if p == "required":
-				c_required = true
-			elif p == "readonly":
-				c_readonly = true
-			else:
-				var colon := p.find(":")
-				if colon != -1:
-					var ckey := p.substr(0, colon).strip_edges()
-					var cval := p.substr(colon + 1).strip_edges()
-					match ckey:
-						"min":
-							if cval.is_valid_float():
-								c_min = cval.to_float()
-						"max":
-							if cval.is_valid_float():
-								c_max = cval.to_float()
-						"type":
-							c_type_name = cval
-						"pattern":
-							c_pattern = cval
-						"enum":
-							var ev := cval.split("|", false)
-							var lim := min(ev.size(), MAX_CONSTRAINT_ENUM_PARTS)
-							for j in lim:
-								c_enum.append(String(ev[j]))
-							c_has_enum = true
-
-	# Optional :markers.
-	var markers: Array = []
-	var marker_args: Array = []
-	if pos < len_t and trimmed.unicode_at(pos) == 58:
-		var marker_start := pos + 1
-		var marker_end := marker_start
-		while marker_end < len_t:
-			var ch3 := trimmed.unicode_at(marker_end)
-			if ch3 == 32 or ch3 == 9:
-				break
-			marker_end += 1
-		var chain := trimmed.substr(marker_start, marker_end - marker_start)
-		var split_chain := chain.split(":", true)
-		var lim2 := min(split_chain.size(), MAX_MARKER_CHAIN_SEGMENTS)
-		for j in lim2:
-			markers.append(String(split_chain[j]))
-		pos = marker_end
-
-	# Skip whitespace.
-	while pos < len_t:
-		var ch4 := trimmed.unicode_at(pos)
-		if ch4 != 32 and ch4 != 9:
-			break
-		pos += 1
-
-	var raw_value := ""
-	if pos < len_t:
-		raw_value = _strip_comment(trimmed.substr(pos))
-
-	# :random with weights — promote numeric tokens into marker_args.
-	if _contains_marker(markers, "random") and not raw_value.is_empty():
-		var nums: Array = []
-		for tok in raw_value.split(" ", false):
-			var s := String(tok).strip_edges()
-			if s.is_valid_float():
-				nums.append(s)
-		if nums.size() > 0:
-			marker_args = nums
-			raw_value = ""
-
-	# :inherit — promote parent name into marker_args.
-	if _contains_marker(markers, "inherit") and not raw_value.is_empty():
-		marker_args = [raw_value.strip_edges()]
-		raw_value = ""
-
-	return {
-		"key": key,
-		"type_hint": type_hint,
-		"value": raw_value,
-		"markers": markers,
-		"marker_args": marker_args,
-		"has_constraints": has_constraints,
-		"c_min": c_min,
-		"c_max": c_max,
-		"c_type_name": c_type_name,
-		"c_required": c_required,
-		"c_readonly": c_readonly,
-		"c_pattern": c_pattern,
-		"c_enum": c_enum,
-		"c_has_enum": c_has_enum,
-	}
-
-
-static func _contains_marker(markers: Array, name: String) -> bool:
-	for m in markers:
-		if String(m) == name:
-			return true
-	return false
-
-
-# ─── Value casting ──
-
-static func _cast(val: String) -> SynxValue:
-	# Quoted strings preserve literal value (bypass auto-casting).
-	if val.length() >= 2:
-		var c0 := val.unicode_at(0)
-		var cN := val.unicode_at(val.length() - 1)
-		if (c0 == 34 and cN == 34) or (c0 == 39 and cN == 39):
-			return SynxValue.make_string(val.substr(1, val.length() - 2))
-
-	if val == "true":
-		return SynxValue.make_bool(true)
-	if val == "false":
-		return SynxValue.make_bool(false)
-	if val == "null":
-		return SynxValue.make_null()
-
-	var len_v := val.length()
-	if len_v == 0:
-		return SynxValue.make_string("")
-
-	var start := 0
-	if val.unicode_at(0) == 45: # '-'
-		if len_v == 1:
-			return SynxValue.make_string(val)
-		start = 1
-
-	var c_first := val.unicode_at(start)
-	if c_first >= 48 and c_first <= 57: # '0'-'9'
-		var dot_pos := -1
-		var all_num := true
-		for j in range(start, len_v):
-			var ch := val.unicode_at(j)
-			if ch == 46:
-				if dot_pos != -1:
-					all_num = false
-					break
-				dot_pos = j
-			elif ch < 48 or ch > 57:
-				all_num = false
-				break
-		if all_num:
-			if dot_pos == -1:
-				if val.is_valid_int():
-					return SynxValue.make_int(val.to_int())
-			elif dot_pos > start and dot_pos < len_v - 1:
-				if val.is_valid_float():
-					return SynxValue.make_float(val.to_float())
-
-	return SynxValue.make_string(val)
-
-
-static func _cast_typed(val: String, hint: String) -> SynxValue:
-	match hint:
-		"int":
-			return SynxValue.make_int(val.to_int() if val.is_valid_int() else 0)
-		"float":
-			return SynxValue.make_float(val.to_float() if val.is_valid_float() else 0.0)
-		"bool":
-			return SynxValue.make_bool(val.strip_edges() == "true")
-		"string":
-			return SynxValue.make_string(val)
-		"random", "random:int":
-			return SynxValue.make_int(SynxRng.random_i64())
-		"random:float":
-			return SynxValue.make_float(SynxRng.random_f64_01())
-		"random:bool":
-			return SynxValue.make_bool(SynxRng.random_bool())
-		_:
-			return _cast(val)
-
-
-# ─── String helpers ──
-
-static func _strip_comment(val: String) -> String:
-	var result := val
-	var sl := result.find(" //")
-	if sl >= 0:
-		result = result.substr(0, sl)
-	var hp := result.find(" #")
-	if hp >= 0:
-		result = result.substr(0, hp)
-	return result.rstrip(" \t")
-
-
-static func _index_of_ws(s: String, start: int) -> int:
-	var n := s.length()
-	for i in range(start, n):
-		var ch := s.unicode_at(i)
-		if ch == 32 or ch == 9:
-			return i
-	return -1
-
-
-static func _derive_alias(path: String) -> String:
-	var slash := max(path.rfind("/"), path.rfind("\\"))
-	var name := path.substr(slash + 1) if slash >= 0 else path
-	var dot := name.rfind(".")
-	if dot >= 0:
-		var ext := name.substr(dot).to_lower()
-		if ext == ".synx":
-			name = name.substr(0, dot)
-	return name

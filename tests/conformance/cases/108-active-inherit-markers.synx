@@ -1,0 +1,13 @@
+!active
+_base
+  port:env:default:5 SYNX_CONFORMANCE_UNSET_VAR
+  weight 1
+steel:inherit:_base
+  weight 2
+plain:inherit:_base
+  port 9000
+multi:inherit:_base:extra
+  z 1
+extra
+  weight 3
+  q 4

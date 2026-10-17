@@ -1,6 +1,6 @@
 [package]
 name = "synx-node"
-version = "3.7.4"
+version = "3.8.0"
 edition = "2021"
 authors = ["APERTURESyndicate <support@aperturesyndicate.com>"]
 description = "SYNX Node.js native addon via napi-rs"
@@ -13,6 +13,9 @@ crate-type = ["cdylib"]
 synx-core = { path = "../../crates/synx-core", features = ["wasm"] }
 napi = { version = "2", features = ["napi6"] }
 napi-derive = "2"
+# perf: the addon allocates every node of the tree; mimalloc is ~1.7x faster
+# than the system allocator on Windows for this pattern (measured in synx-core).
+mimalloc = { version = "0.1", default-features = false }
 
 [build-dependencies]
 napi-build = "2"

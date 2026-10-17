@@ -8,7 +8,8 @@
 import type { SynxObject, SynxValue, SynxConstraints, SynxMeta, SynxMetaMap, SynxOptions, SynxInclude } from './types';
 import { safeCalc } from './calc';
 import { parseData, parseI64 } from './parser';
-import { matchesLinear } from './synxl';
+import { matchesLinear, scalarLength, expandExponent } from './synxl';
+import { compareUnicodeScalar } from './json';
 
 // Lazy-loaded Node.js modules (not available in browser)
 let fs: typeof import('fs') | undefined;
@@ -119,6 +120,73 @@ function fmtIoErr(err: any, ctx: string): string {
 
 // ─── Engine ───────────────────────────────────────────────
 
+// ─── Marker classification ────────────────────────────────
+
+const MK_ALIAS = 1 << 0;
+const MK_CALC = 1 << 1;
+const MK_CLAMP = 1 << 2;
+const MK_DEFAULT = 1 << 3;
+const MK_ENV = 1 << 4;
+const MK_FALLBACK = 1 << 5;
+const MK_FORMAT = 1 << 6;
+const MK_GEO = 1 << 7;
+const MK_I18N = 1 << 8;
+const MK_IMPORT = 1 << 9;
+const MK_INCLUDE = 1 << 10;
+const MK_JOIN = 1 << 11;
+const MK_MAP = 1 << 12;
+const MK_ONCE = 1 << 13;
+const MK_PROMPT = 1 << 14;
+const MK_RANDOM = 1 << 15;
+const MK_REF = 1 << 16;
+const MK_REPLACE = 1 << 17;
+const MK_ROUND = 1 << 18;
+const MK_SECRET = 1 << 19;
+const MK_SORT = 1 << 20;
+const MK_SPAM = 1 << 21;
+const MK_SPLIT = 1 << 22;
+const MK_SUM = 1 << 23;
+const MK_UNIQUE = 1 << 24;
+const MK_VERSION = 1 << 25;
+const MK_WATCH = 1 << 26;
+
+/** Classify a marker chain into `MK_*` bits; arguments and unknown names add nothing. */
+function markerBits(markers: string[]): number {
+  let bits = 0;
+  for (let i = 0; i < markers.length; i++) {
+    switch (markers[i]) {
+      case 'alias': bits |= MK_ALIAS; break;
+      case 'calc': bits |= MK_CALC; break;
+      case 'clamp': bits |= MK_CLAMP; break;
+      case 'default': bits |= MK_DEFAULT; break;
+      case 'env': bits |= MK_ENV; break;
+      case 'fallback': bits |= MK_FALLBACK; break;
+      case 'format': bits |= MK_FORMAT; break;
+      case 'geo': bits |= MK_GEO; break;
+      case 'i18n': bits |= MK_I18N; break;
+      case 'import': bits |= MK_IMPORT; break;
+      case 'include': bits |= MK_INCLUDE; break;
+      case 'join': bits |= MK_JOIN; break;
+      case 'map': bits |= MK_MAP; break;
+      case 'once': bits |= MK_ONCE; break;
+      case 'prompt': bits |= MK_PROMPT; break;
+      case 'random': bits |= MK_RANDOM; break;
+      case 'ref': bits |= MK_REF; break;
+      case 'replace': bits |= MK_REPLACE; break;
+      case 'round': bits |= MK_ROUND; break;
+      case 'secret': bits |= MK_SECRET; break;
+      case 'sort': bits |= MK_SORT; break;
+      case 'spam': bits |= MK_SPAM; break;
+      case 'split': bits |= MK_SPLIT; break;
+      case 'sum': bits |= MK_SUM; break;
+      case 'unique': bits |= MK_UNIQUE; break;
+      case 'version': bits |= MK_VERSION; break;
+      case 'watch': bits |= MK_WATCH; break;
+    }
+  }
+  return bits;
+}
+
 export function resolve(
   obj: SynxObject,
   options: SynxOptions = {},
@@ -132,8 +200,11 @@ export function resolve(
   let constraintRegistry: Map<string, SynxConstraints> | undefined;
   if (!root) {
     root = obj;
-    typeRegistry = buildTypeRegistry(obj);
-    constraintRegistry = buildConstraintRegistry(obj);
+    ROOT_CALC_SPECIAL.delete(obj);
+    // perf: one walk fills both registries (it was a walk each).
+    typeRegistry = new Map<string, string>();
+    constraintRegistry = new Map<string, SynxConstraints>();
+    collectRegistries(obj, typeRegistry, constraintRegistry);
     // ── :inherit pre-pass (only at root level) ──
     applyInheritance(obj);
     // Remove private blocks (keys starting with _)
@@ -189,11 +260,14 @@ export function resolve(
     // Apply markers
     if (!metaMap || !metaMap[key]) continue;
     const { markers, args } = metaMap[key];
+    // perf: one pass classifies the chain; each marker test below is a bit
+    // test instead of a linear `includes` (about 30 of them per key before).
+    const mb = markerBits(markers);
 
     // ── :spam ──
     // Syntax: key:spam:MAX_CALLS:WINDOW_SEC target
     // WINDOW_SEC defaults to 1 when omitted.
-    if (markers.includes('spam')) {
+    if ((mb & MK_SPAM) !== 0) {
       const idx = markers.indexOf('spam');
       const maxCalls = parseInt(markers[idx + 1] ?? '0', 10);
       const windowSec = Math.max(1, parseInt(markers[idx + 2] ?? '1', 10) || 1);
@@ -203,7 +277,7 @@ export function resolve(
         continue;
       }
 
-      const target = String(obj[key] ?? key);
+      const target = obj[key] === undefined ? key : valueToString(obj[key]);
       const bucketKey = `${key}::${target}`;
       if (!allowSpamAccess(bucketKey, maxCalls, windowSec)) {
         obj[key] = `SPAM_ERR: '${target}' exceeded ${maxCalls} calls per ${windowSec}s`;
@@ -217,7 +291,7 @@ export function resolve(
     }
 
     // ── :include / :import ──
-    if ((markers.includes('include') || markers.includes('import')) && typeof obj[key] === 'string') {
+    if (((mb & MK_INCLUDE) !== 0 || (mb & MK_IMPORT) !== 0) && typeof obj[key] === 'string') {
       if (!fs || !pathModule) {
         obj[key] = 'INCLUDE_ERR: :include/:import is not supported in browser';
         continue;
@@ -255,7 +329,7 @@ export function resolve(
     // Rust engine's `if let Some(Value::String(var_name)) = map.get(key)` guard
     // so that `key:env:default:foo` with no value (which is parsed as a group)
     // keeps its `{}` shape instead of accidentally applying the default.
-    if (markers.includes('env') && typeof value === 'string') {
+    if ((mb & MK_ENV) !== 0 && typeof value === 'string') {
       const varName = value;
       const envSource = options.env || (typeof process !== 'undefined' ? process.env : {});
       const envVal = envSource[varName];
@@ -275,7 +349,7 @@ export function resolve(
     }
 
     // ── :random ──
-    if (markers.includes('random') && Array.isArray(obj[key])) {
+    if ((mb & MK_RANDOM) !== 0 && Array.isArray(obj[key])) {
       const arr = obj[key] as SynxValue[];
       if (arr.length === 0) {
         obj[key] = null;
@@ -295,16 +369,16 @@ export function resolve(
     // ── :ref ──
     // Like :alias but feeds the resolved value into subsequent markers.
     // Supports :ref:calc shorthand: key:ref:calc:*2 base_rate → resolves base_rate, then applies "VALUE * 2".
-    if (markers.includes('ref') && typeof obj[key] === 'string') {
+    if ((mb & MK_REF) !== 0 && typeof obj[key] === 'string') {
       const target = obj[key] as string;
       const resolved = deepGet(root, target) ?? deepGet(obj, target);
       if (resolved !== undefined) {
         obj[key] = resolved;
         // If :calc follows, prepend the resolved value to the calc expression
-        if (markers.includes('calc')) {
+        if ((mb & MK_CALC) !== 0) {
           const calcIdx = markers.indexOf('calc');
           const calcExpr = markers[calcIdx + 1] ?? '';
-          if (calcExpr && typeof resolved === 'number') {
+          if (calcExpr && isNum(resolved)) {
             // Shorthand: :ref:calc:*2 → VALUE * 2, :ref:calc:+10 → VALUE + 10
             const first = calcExpr.charAt(0);
             if ('+-*/%'.includes(first)) {
@@ -326,7 +400,7 @@ export function resolve(
     // Selects a localized value from a nested object based on options.lang.
     // Plain syntax:        name:i18n\n  en Plains\n  ru Равнины
     // Plural syntax:       title:i18n:item_count\n  en\n    one {count} item\n    other {count} items\n  ru\n    one ...\n    few ...\n    many ...\n    other ...
-    if (markers.includes('i18n') && obj[key] && typeof obj[key] === 'object' && !Array.isArray(obj[key])) {
+    if ((mb & MK_I18N) !== 0 && obj[key] && typeof obj[key] === 'object' && !Array.isArray(obj[key])) {
       const translations = obj[key] as SynxObject;
       const lang = options.lang || 'en';
       let val: SynxValue = translations[lang] ?? translations['en'] ?? Object.values(translations)[0] ?? null;
@@ -354,25 +428,16 @@ export function resolve(
     }
 
     // ── :calc ──
-    if (markers.includes('calc') && typeof obj[key] === 'string') {
+    if ((mb & MK_CALC) !== 0 && typeof obj[key] === 'string') {
       let expr = obj[key] as string;
       if (expr.length > MAX_CALC_EXPR_LEN) {
         obj[key] = `CALC_ERR: expression too long (${expr.length} chars, max ${MAX_CALC_EXPR_LEN})`;
         continue;
       }
-      // Collect already-resolved numeric variables from root + local scope.
-      // Keys that appear later in iteration order and still hold a marker
-      // value (e.g. an unresolved :env string) are not yet numbers and will
-      // be absent from vars — place :calc keys after their dependencies.
-      const vars = new Map<string, string>();
-      for (const rKey of Object.keys(root)) {
-        if (typeof root[rKey] === 'number') vars.set(rKey, String(root[rKey]));
-      }
-      for (const rKey of Object.keys(obj)) {
-        if (rKey !== key && typeof obj[rKey] === 'number') vars.set(rKey, String(obj[rKey]));
-      }
-      // Substitute whole-word occurrences without building RegExp objects
-      if (vars.size > 0) expr = replaceVars(expr, vars);
+      // Already-resolved numeric variables: a key of this object shadows a
+      // root key. Keys later in document order that still hold a marker value
+      // (an unresolved :env string) are not numbers yet and stay as written.
+      expr = substituteCalcVars(expr, obj, key, root);
       // Substitute dot-path references (e.g. base.hp, server.port) before evaluating.
       expr = replaceDotPaths(expr, root);
       try {
@@ -383,7 +448,7 @@ export function resolve(
     }
 
     // ── :alias ──
-    if (markers.includes('alias') && typeof obj[key] === 'string') {
+    if ((mb & MK_ALIAS) !== 0 && typeof obj[key] === 'string') {
       const target = obj[key] as string;
       // Detect direct self-reference (bare key or full dot-path)
       const currentKeyPath = _currentPath ? `${_currentPath}.${key}` : key;
@@ -423,15 +488,15 @@ export function resolve(
     // ── :secret ──
     // Idempotent: the pre-pass (maskSecretLiterals) may already have wrapped a
     // literal secret. Re-wrapping would mask the mask and destroy reveal().
-    if (markers.includes('secret') && !(obj[key] instanceof SynxSecret)) {
+    if ((mb & MK_SECRET) !== 0 && !(obj[key] instanceof SynxSecret)) {
       obj[key] = new SynxSecret(String(obj[key])) as any;
     }
 
     // ── :unique ──
-    if (markers.includes('unique') && Array.isArray(obj[key])) {
+    if ((mb & MK_UNIQUE) !== 0 && Array.isArray(obj[key])) {
       const seen = new Set<string>();
       obj[key] = (obj[key] as SynxValue[]).filter((item) => {
-        const s = String(item);
+        const s = valueToString(item);
         if (seen.has(s)) return false;
         seen.add(s);
         return true;
@@ -439,10 +504,10 @@ export function resolve(
     }
 
     // ── :geo ──
-    if (markers.includes('geo') && Array.isArray(obj[key])) {
+    if ((mb & MK_GEO) !== 0 && Array.isArray(obj[key])) {
       const region = options.region || 'US';
       const arr = obj[key] as string[];
-      const found = arr.find((item) => String(item).startsWith(region + ' '));
+      const found = arr.find((item) => typeof item === 'string' && item.startsWith(region + ' '));
       if (found) {
         obj[key] = found.substring(region.length + 1).trim();
       } else {
@@ -459,7 +524,7 @@ export function resolve(
     // ── :template (legacy — handled by auto-{} below) ──
 
     // ── :split ──
-    if (markers.includes('split') && typeof obj[key] === 'string') {
+    if ((mb & MK_SPLIT) !== 0 && typeof obj[key] === 'string') {
       const splitIdx = markers.indexOf('split');
       const delimArg = (splitIdx + 1 < markers.length) ? markers[splitIdx + 1] : ',';
       const sep = delimiterFromKeyword(delimArg);
@@ -467,15 +532,15 @@ export function resolve(
     }
 
     // ── :join ──
-    if (markers.includes('join') && Array.isArray(obj[key])) {
+    if ((mb & MK_JOIN) !== 0 && Array.isArray(obj[key])) {
       const joinIdx = markers.indexOf('join');
       const delimArg = (joinIdx + 1 < markers.length) ? markers[joinIdx + 1] : ',';
       const sep = delimiterFromKeyword(delimArg);
-      obj[key] = (obj[key] as SynxValue[]).map(v => String(v)).join(sep);
+      obj[key] = (obj[key] as SynxValue[]).map(valueToString).join(sep);
     }
 
     // ── :default (standalone, not combined with :env) ──
-    if (markers.includes('default') && !markers.includes('env')) {
+    if ((mb & MK_DEFAULT) !== 0 && (mb & MK_ENV) === 0) {
       if (obj[key] === null || obj[key] === undefined || obj[key] === '') {
         const defaultIdx = markers.indexOf('default');
         if (defaultIdx !== -1 && markers.length > defaultIdx + 1) {
@@ -488,39 +553,42 @@ export function resolve(
 
     // ── :clamp ──
     // Syntax: key:clamp:MIN:MAX value
-    if (markers.includes('clamp')) {
+    if ((mb & MK_CLAMP) !== 0) {
       const idx = markers.indexOf('clamp');
-      const lo = parseFloat(markers[idx + 1] ?? '');
-      const hi = parseFloat(markers[idx + 2] ?? '');
+      // A bound is a finite number in the synx-core grammar: `parseFloat`
+      // read `5abc` as 5 and `Infinity` as a bound, where Rust skips both.
+      const lo = clampBound(markers[idx + 1] ?? '');
+      const hi = clampBound(markers[idx + 2] ?? '');
       if (!isNaN(lo) && !isNaN(hi)) {
         if (lo > hi) {
           obj[key] = `CONSTRAINT_ERR: clamp min (${lo}) > max (${hi})`;
-        } else if (typeof obj[key] === 'number') {
-          obj[key] = Math.min(hi, Math.max(lo, obj[key] as number));
+        } else if (isNum(obj[key])) {
+          obj[key] = Math.min(hi, Math.max(lo, Number(obj[key])));
         }
       }
     }
 
     // ── :round ──
     // Syntax: key:round:N value  (N = decimal places, default 0)
-    if (markers.includes('round')) {
+    if ((mb & MK_ROUND) !== 0) {
       const idx = markers.indexOf('round');
       const decimals = parseInt(markers[idx + 1] ?? '0', 10) || 0;
-      if (typeof obj[key] === 'number') {
+      if (isNum(obj[key])) {
         const factor = Math.pow(10, decimals);
-        obj[key] = Math.round((obj[key] as number) * factor) / factor;
+        obj[key] = Math.round(Number(obj[key]) * factor) / factor;
       }
     }
 
     // ── :map ──
     // Syntax: key:map:source_key\n  - lookup_val result_text
-    if (markers.includes('map') && Array.isArray(obj[key])) {
+    if ((mb & MK_MAP) !== 0 && Array.isArray(obj[key])) {
       const idx = markers.indexOf('map');
       const sourceKey = markers[idx + 1] ?? '';
-      const lookupVal = String(sourceKey ? (deepGet(root, sourceKey) ?? deepGet(obj, sourceKey) ?? '') : '');
+      const lookupVal = sourceKey ? valueToString(deepGet(root, sourceKey) ?? deepGet(obj, sourceKey) ?? '') : '';
       const arr = obj[key] as string[];
       const found = arr.find((item) => {
-        const s = String(item);
+        if (typeof item !== 'string') return false;
+        const s = item;
         const sep = s.indexOf(' ');
         return sep !== -1 && s.substring(0, sep).trim() === lookupVal;
       });
@@ -531,7 +599,7 @@ export function resolve(
 
     // ── :format ──
     // Syntax: key:format:PATTERN value  (e.g. %.2f, %05d)
-    if (markers.includes('format')) {
+    if ((mb & MK_FORMAT) !== 0) {
       const idx = markers.indexOf('format');
       const pattern = markers[idx + 1] ?? '%s';
       obj[key] = applyFormatPattern(pattern, obj[key]);
@@ -541,7 +609,7 @@ export function resolve(
     // Literal substring replacement on a string value. `to` defaults to "" (deletion).
     // Limitation: `from` and `to` cannot themselves contain `:` since the marker
     // chain is colon-delimited; for those cases use {interpolation} instead.
-    if (markers.includes('replace') && typeof obj[key] === 'string') {
+    if ((mb & MK_REPLACE) !== 0 && typeof obj[key] === 'string') {
       const idx = markers.indexOf('replace');
       const from = markers[idx + 1];
       const to = markers[idx + 2] ?? '';
@@ -552,13 +620,16 @@ export function resolve(
 
     // ── :sort  /  :sort:desc ──     @since 3.6.2
     // Sort an array. Default direction is ascending; `:sort:desc` reverses.
-    // Numbers compare numerically; mixed/string entries fall back to localeCompare.
-    if (markers.includes('sort') && Array.isArray(obj[key])) {
+    // Numbers compare numerically; any other pair compares as text by code
+    // point, as synx-core does.
+    // spec: `localeCompare` ordered by the machine's locale — `{a}` before
+    // `list` here, after it in Rust — and a group as "[object Object]".
+    if ((mb & MK_SORT) !== 0 && Array.isArray(obj[key])) {
       const idx = markers.indexOf('sort');
       const dir = markers[idx + 1];
       const sorted = (obj[key] as SynxValue[]).slice().sort((a, b) => {
-        if (typeof a === 'number' && typeof b === 'number') return a - b;
-        return String(a).localeCompare(String(b));
+        if (isNum(a) && isNum(b)) return Number(a) - Number(b);
+        return compareUnicodeScalar(valueToString(a), valueToString(b));
       });
       if (dir === 'desc') sorted.reverse();
       obj[key] = sorted;
@@ -567,13 +638,13 @@ export function resolve(
     // ── :sum ──     @since 3.6.2
     // Sum the numeric items of an array. Non-numeric entries are ignored.
     // Returns an integer when all summands are integers, otherwise a float.
-    if (markers.includes('sum') && Array.isArray(obj[key])) {
+    if ((mb & MK_SUM) !== 0 && Array.isArray(obj[key])) {
       let total = 0;
       let allInt = true;
       for (const v of obj[key] as SynxValue[]) {
-        if (typeof v === 'number') {
-          total += v;
-          if (!Number.isInteger(v)) allInt = false;
+        if (isNum(v)) {
+          total += Number(v);
+          if (!Number.isInteger(Number(v))) allInt = false;
         } else if (typeof v === 'string' && v !== '' && !isNaN(Number(v))) {
           const n = Number(v);
           total += n;
@@ -586,7 +657,7 @@ export function resolve(
     // ── :fallback ──
     // Syntax: key:fallback:DEFAULT_PATH value
     // If value is empty OR file does not exist, use the fallback.
-    if (markers.includes('fallback')) {
+    if ((mb & MK_FALLBACK) !== 0) {
       const idx = markers.indexOf('fallback');
       const defaultVal = markers[idx + 1] ?? '';
       const current = obj[key];
@@ -607,7 +678,7 @@ export function resolve(
     // ── :once ──
     // Syntax: key:once  or  key:once:uuid  or  key:once:random  or  key:once:timestamp
     // Generates a value once and persists it in a .synx.lock file.
-    if (markers.includes('once')) {
+    if ((mb & MK_ONCE) !== 0) {
       const idx = markers.indexOf('once');
       const genType = markers[idx + 1] ?? 'uuid';
       const lockPath = pathModule && options.basePath
@@ -636,7 +707,7 @@ export function resolve(
     // ── :version ──
     // Syntax: key:version:OP:REQUIRED value
     // Compares current version string against required, returns bool.
-    if (markers.includes('version') && typeof obj[key] === 'string') {
+    if ((mb & MK_VERSION) !== 0 && typeof obj[key] === 'string') {
       const idx = markers.indexOf('version');
       const op = markers[idx + 1] ?? '>=';
       const required = markers[idx + 2] ?? '0';
@@ -645,7 +716,7 @@ export function resolve(
 
     // ── :watch ──
     // Syntax: key:watch:KEY_PATH ./file  (reads at parse time)
-    if (markers.includes('watch') && typeof obj[key] === 'string') {
+    if ((mb & MK_WATCH) !== 0 && typeof obj[key] === 'string') {
       if (!fs || !pathModule) {
         obj[key] = 'WATCH_ERR: not supported in browser';
       } else {
@@ -677,7 +748,7 @@ export function resolve(
 
     // ── :prompt ──
     // Converts a subtree to a SYNX-formatted string wrapped in a labeled code fence.
-    if (markers.includes('prompt')) {
+    if ((mb & MK_PROMPT) !== 0) {
       const idx = markers.indexOf('prompt');
       const label = markers[idx + 1] ?? key;
       const val = obj[key];
@@ -709,10 +780,11 @@ export function resolve(
   // `[...]` constraints declared for its name anywhere in the document
   // (`validate_field_constraints`), and finally `(type)` hints against the
   // resolved value. The constraint pass was missing here until 3.7.4.
-  if (isTop && constraintRegistry && constraintRegistry.size > 0) {
-    validateFieldConstraints(obj, constraintRegistry);
+  // perf: one walk checks both, constraints then type per field — the same
+  // order the two separate walks gave each field.
+  if (isTop && ((constraintRegistry && constraintRegistry.size > 0) || (typeRegistry && typeRegistry.size > 0))) {
+    validateFields(obj, constraintRegistry, typeRegistry);
   }
-  if (isTop && typeRegistry && typeRegistry.size > 0) validateFieldTypes(obj, typeRegistry);
 
   return obj;
 }
@@ -740,7 +812,7 @@ function maskSecretLiterals(obj: SynxObject): void {
     ) {
       const v = obj[key];
       if (!(v instanceof SynxSecret) && (v === null || typeof v !== 'object')) {
-        obj[key] = new SynxSecret(String(v)) as any;
+        obj[key] = new SynxSecret(valueToString(v)) as any;
         continue;
       }
     }
@@ -760,26 +832,42 @@ function applyInheritance(obj: SynxObject): void {
     const meta = metaMap[key];
     if (!meta || !meta.markers.includes('inherit')) continue;
 
-    // Two supported syntaxes:
-    //   production:inherit:base       → "base" is markers[idx+1]
-    //   production:inherit base       → "base" is meta.args[0] (parser promotes value into args)
+    // Two supported syntaxes, as in synx-core:
+    //   production:inherit:base:extra  → parents are every marker after `inherit`
+    //   production:inherit base        → parser promotes "base" into meta.args
+    // Only the first parent was used here; synx-core merges them all in order.
     const idx = meta.markers.indexOf('inherit');
-    const parentName = meta.markers[idx + 1] || (meta.args && meta.args[0]);
-    if (!parentName) continue;
-
-    const parentObj = obj[parentName];
-    if (!parentObj || typeof parentObj !== 'object' || Array.isArray(parentObj)) continue;
+    let parents = meta.markers.slice(idx + 1);
+    if (parents.length === 0 && meta.args && meta.args.length > 0) parents = meta.args.slice();
+    if (parents.length === 0) continue;
 
     const childObj = obj[key];
-    if (!childObj || typeof childObj !== 'object' || Array.isArray(childObj)) continue;
+    if (!isPlainObject(childObj)) continue;
 
-    // Merge: parent fields first, child fields override
-    const merged: SynxObject = { ...(parentObj as SynxObject), ...(childObj as SynxObject) };
-    // Copy over __synx metadata from both parent and child
-    const parentMeta: SynxMetaMap | undefined = (parentObj as any).__synx;
+    // Parents left to right, then the child. Each field keeps the metadata of
+    // the object its value came from: a field the child redefines as a plain
+    // literal no longer runs the parent's markers on that literal.
+    const merged: SynxObject = {};
+    const mergedMeta: SynxMetaMap = {};
+    for (const parentName of parents) {
+      const parentObj = obj[parentName];
+      if (!isPlainObject(parentObj)) continue;
+      const parentMeta: SynxMetaMap | undefined = (parentObj as any).__synx;
+      for (const k of Object.keys(parentObj as SynxObject)) {
+        // A copy, not the parent's own subtree: two children of one parent
+        // shared it, so it was resolved twice and edits to one showed in both.
+        merged[k] = cloneTree((parentObj as SynxObject)[k]);
+        if (parentMeta?.[k]) mergedMeta[k] = parentMeta[k];
+        else delete mergedMeta[k];
+      }
+    }
     const childMeta: SynxMetaMap | undefined = (childObj as any).__synx;
-    if (parentMeta || childMeta) {
-      const mergedMeta = { ...(parentMeta || {}), ...(childMeta || {}) };
+    for (const k of Object.keys(childObj as SynxObject)) {
+      merged[k] = (childObj as SynxObject)[k];
+      if (childMeta?.[k]) mergedMeta[k] = childMeta[k];
+      else delete mergedMeta[k];
+    }
+    if (Object.keys(mergedMeta).length > 0) {
       Object.defineProperty(merged, '__synx', {
         value: mergedMeta,
         enumerable: false,
@@ -789,6 +877,19 @@ function applyInheritance(obj: SynxObject): void {
     }
     obj[key] = merged;
   }
+}
+
+/** Deep copy of a parsed subtree, `__synx` metadata included. */
+function cloneTree(v: SynxValue): SynxValue {
+  if (Array.isArray(v)) return v.map(cloneTree);
+  if (v === null || typeof v !== 'object') return v;
+  const out: SynxObject = {};
+  for (const k of Object.keys(v)) out[k] = cloneTree((v as SynxObject)[k]);
+  const meta = (v as any).__synx;
+  if (meta) {
+    Object.defineProperty(out, '__synx', { value: meta, enumerable: false, writable: true, configurable: true });
+  }
+  return out;
 }
 
 // ─── Auto-{} interpolation ───────────────────────────────
@@ -813,21 +914,21 @@ function resolveInterpolation(
         if (includesMap.size > 1) return 'INCLUDE_ERR: multiple !include — specify alias';
         const firstInclude = includesMap.values().next().value!;
         const val = deepGet(firstInclude, ref);
-        return val != null ? String(val) : _match;
+        return val !== undefined ? valueToString(val) : _match;
       }
       // Look up by alias
       if (includesMap) {
         const incl = includesMap.get(scope);
         if (incl) {
           const val = deepGet(incl, ref);
-          return val != null ? String(val) : _match;
+          return val !== undefined ? valueToString(val) : _match;
         }
       }
       return _match;
     }
     // {key} — local file
     const val = deepGet(root, ref) ?? deepGet(local, ref);
-    return val != null ? String(val) : _match;
+    return val !== undefined ? valueToString(val) : _match;
   });
 }
 
@@ -860,51 +961,7 @@ function loadIncludes(
   return map;
 }
 
-// ─── Global type validation (mirrors synx-core build_type_registry / validate_field_types) ───
-
-function buildTypeRegistry(obj: SynxObject, registry = new Map<string, string>(), depth = 0): Map<string, string> {
-  if (depth > MAX_RESOLVE_DEPTH) return registry;
-  const metaMap: SynxMetaMap | undefined = (obj as any).__synx;
-  if (metaMap) {
-    for (const key of Object.keys(metaMap)) {
-      const hint = metaMap[key]?.typeHint;
-      if (hint && !registry.has(key)) registry.set(key, hint);
-    }
-  }
-  for (const key of Object.keys(obj)) {
-    const v = obj[key];
-    if (Array.isArray(v)) {
-      for (const item of v) if (isPlainObject(item)) buildTypeRegistry(item as SynxObject, registry, depth + 1);
-    } else if (isPlainObject(v)) buildTypeRegistry(v as SynxObject, registry, depth + 1);
-  }
-  return registry;
-}
-
-// ─── Global constraint validation (mirrors synx-core build_constraint_registry / validate_field_constraints) ───
-
-function buildConstraintRegistry(
-  obj: SynxObject,
-  registry = new Map<string, SynxConstraints>(),
-  depth = 0,
-): Map<string, SynxConstraints> {
-  if (depth > MAX_RESOLVE_DEPTH) return registry;
-  const metaMap: SynxMetaMap | undefined = (obj as any).__synx;
-  if (metaMap) {
-    for (const key of Object.keys(metaMap)) {
-      const c = metaMap[key]?.constraints;
-      if (!c) continue;
-      const existing = registry.get(key);
-      registry.set(key, existing ? mergeConstraints(existing, c) : { ...c });
-    }
-  }
-  for (const key of Object.keys(obj)) {
-    const v = obj[key];
-    if (Array.isArray(v)) {
-      for (const item of v) if (isPlainObject(item)) buildConstraintRegistry(item as SynxObject, registry, depth + 1);
-    } else if (isPlainObject(v)) buildConstraintRegistry(v as SynxObject, registry, depth + 1);
-  }
-  return registry;
-}
+// ─── Global type and constraint validation (mirrors synx-core collect_registries / validate_fields) ───
 
 /** The stricter of two declarations for one field name, as `merge_constraints` in synx-core. */
 function mergeConstraints(base: SynxConstraints, incoming: SynxConstraints): SynxConstraints {
@@ -919,21 +976,62 @@ function mergeConstraints(base: SynxConstraints, incoming: SynxConstraints): Syn
   return out;
 }
 
-function validateFieldConstraints(obj: SynxObject, registry: Map<string, SynxConstraints>, depth = 0): void {
+/** Both registries in one walk: each object's own declarations, then its children. */
+function collectRegistries(
+  obj: SynxObject,
+  types: Map<string, string>,
+  constraints: Map<string, SynxConstraints>,
+  depth = 0,
+): void {
+  if (depth > MAX_RESOLVE_DEPTH) return;
+  const metaMap: SynxMetaMap | undefined = (obj as any).__synx;
+  if (metaMap) {
+    for (const key of Object.keys(metaMap)) {
+      const meta = metaMap[key];
+      if (!meta) continue;
+      if (meta.typeHint && !types.has(key)) types.set(key, meta.typeHint);
+      const c = meta.constraints;
+      if (c) {
+        const existing = constraints.get(key);
+        constraints.set(key, existing ? mergeConstraints(existing, c) : { ...c });
+      }
+    }
+  }
+  for (const key of Object.keys(obj)) {
+    const v = obj[key];
+    if (Array.isArray(v)) {
+      for (const item of v) if (isPlainObject(item)) collectRegistries(item as SynxObject, types, constraints, depth + 1);
+    } else if (isPlainObject(v)) collectRegistries(v as SynxObject, types, constraints, depth + 1);
+  }
+}
+
+/** Field constraints, then the field's type, for every field — one walk. */
+function validateFields(
+  obj: SynxObject,
+  constraints: Map<string, SynxConstraints> | undefined,
+  types: Map<string, string> | undefined,
+  depth = 0,
+): void {
   if (depth > MAX_RESOLVE_DEPTH) return;
   for (const key of Object.keys(obj)) {
     if (key === '__synx') continue;
-    const c = registry.get(key);
-    const current = obj[key];
-    // A value the per-key pass already replaced is not re-validated: the
-    // error string's own length would be checked against min/max.
-    const errored = typeof current === 'string'
-      && (current.startsWith('CONSTRAINT_ERR:') || current.startsWith('TYPE_ERR:'));
-    if (c && !errored) validateConstraints(obj, key, c);
+    const c = constraints?.get(key);
+    if (c) {
+      const current = obj[key];
+      // A value the per-key pass already replaced is not re-validated: the
+      // error string's own length would be checked against min/max.
+      const errored = typeof current === 'string'
+        && (current.startsWith('CONSTRAINT_ERR:') || current.startsWith('TYPE_ERR:'));
+      if (!errored) validateConstraints(obj, key, c);
+    }
+    const expected = types?.get(key);
+    if (expected !== undefined && !valueMatchesType(obj[key], expected)) {
+      obj[key] = `TYPE_ERR: '${key}' expected ${expected} but got ${valueTypeName(obj[key])}`;
+    }
     const child = obj[key];
     if (Array.isArray(child)) {
-      for (const item of child) if (isPlainObject(item)) validateFieldConstraints(item as SynxObject, registry, depth + 1);
-    } else if (isPlainObject(child)) validateFieldConstraints(child as SynxObject, registry, depth + 1);
+      for (const item of child) if (isPlainObject(item)) validateFields(item as SynxObject, constraints, types, depth + 1);
+    } else if (isPlainObject(child)) validateFields(child as SynxObject, constraints, types, depth + 1);
   }
 }
 
@@ -962,21 +1060,6 @@ function valueTypeName(v: unknown): string {
   if (typeof v === 'boolean') return 'bool';
   if (typeof v === 'string') return 'string';
   return 'object';
-}
-
-function validateFieldTypes(obj: SynxObject, registry: Map<string, string>, depth = 0): void {
-  if (depth > MAX_RESOLVE_DEPTH) return;
-  for (const key of Object.keys(obj)) {
-    if (key === '__synx') continue;
-    const expected = registry.get(key);
-    if (expected !== undefined && !valueMatchesType(obj[key], expected)) {
-      obj[key] = `TYPE_ERR: '${key}' expected ${expected} but got ${valueTypeName(obj[key])}`;
-    }
-    const child = obj[key];
-    if (Array.isArray(child)) {
-      for (const item of child) if (isPlainObject(item)) validateFieldTypes(item as SynxObject, registry, depth + 1);
-    } else if (isPlainObject(child)) validateFieldTypes(child as SynxObject, registry, depth + 1);
-  }
 }
 
 // ─── Constraint enforcement ───────────────────────────────────────────────
@@ -1018,7 +1101,9 @@ function validateConstraints(obj: SynxObject, key: string, c: import('./types').
 
   // enum check
   if (c.enum) {
-    const strVal = String(val);
+    // As synx-core reads it: a list, group or secret is "" (`String([1])` let
+    // a one-item list pass `[enum:1]`).
+    const strVal = typeof val === 'object' ? '' : valueToString(val);
     if (!c.enum.includes(strVal)) {
       obj[key] = `CONSTRAINT_ERR: '${key}' must be one of [${c.enum.join('|')}]`;
       return;
@@ -1030,7 +1115,7 @@ function validateConstraints(obj: SynxObject, key: string, c: import('./types').
   const n = typeof val === 'number' ? val
           : typeof val === 'bigint' ? Number(val)
           : typeof val === 'string' && (c.min !== undefined || c.max !== undefined)
-            ? [...val].length : null;
+            ? scalarLength(val) : null;
   if (n !== null) {
     if (c.min !== undefined && n < c.min) {
       obj[key] = `CONSTRAINT_ERR: '${key}' value ${n} is below min ${c.min}`;
@@ -1057,8 +1142,25 @@ function validateConstraints(obj: SynxObject, key: string, c: import('./types').
 // ─── New-marker helpers ───────────────────────────────────
 
 function applyFormatPattern(pattern: string, value: unknown): string {
-  const n = typeof value === 'number' ? value : parseFloat(String(value));
-  if (isNaN(n)) return String(value);
+  // spec: only a number is formatted, as in synx-core — a string (a quoted
+  // `"3.14"`, an i64 overflow) passes through as written, and a group or list
+  // reads as empty instead of "[object Object]".
+  if (typeof value === 'bigint') {
+    // Integer patterns pad the exact digits; Number() would round them.
+    const z = pattern.match(/^%0(\d+)d$/) ?? pattern.match(/^%(\d+)d$/);
+    if (z) return String(value).padStart(parseInt(z[1], 10), pattern.charAt(1) === '0' ? '0' : ' ');
+    if (!/[fe]/.test(pattern)) return String(value);
+    value = Number(value);
+  }
+  if (typeof value !== 'number') {
+    if (value === null || value === undefined) return 'null';
+    if (typeof value === 'object' && !(value instanceof SynxSecret)) return '';
+    return String(value);
+  }
+  const n = value;
+  // A fractional number only takes a float pattern; with any other it is
+  // written as it is, as synx-core does for a Float.
+  if (!Number.isInteger(n) && !/[fe]/.test(pattern)) return numberToText(n);
 
   // %.2f → fixed decimals
   const floatMatch = pattern.match(/^%\.(\d+)f$/);
@@ -1162,11 +1264,11 @@ function stringifyValue(value: unknown, indent: number): string {
   if (value === null || value === undefined) return `${sp}null\n`;
   // SynxSecret is an object, but must serialize as its [SECRET] mask — never recurse into _value.
   if (value instanceof SynxSecret) return `${sp}${String(value)}\n`;
-  if (typeof value === 'boolean' || typeof value === 'number') return `${sp}${value}\n`;
+  if (typeof value === 'boolean' || typeof value === 'number') return `${sp}${valueToString(value)}\n`;
   if (typeof value === 'string') return `${sp}${value}\n`;
   if (Array.isArray(value)) {
     let out = '';
-    for (const item of value) out += `${sp}  - ${String(item)}\n`;
+    for (const item of value) out += `${sp}  - ${valueToString(item)}\n`;
     return out;
   }
   if (typeof value === 'object') {
@@ -1182,9 +1284,9 @@ function stringifyValue(value: unknown, indent: number): string {
         out += stringifyValue(v, indent + 2);
       } else if (Array.isArray(v)) {
         out += `${sp}${k}\n`;
-        for (const item of v) out += `${sp}  - ${String(item)}\n`;
+        for (const item of v) out += `${sp}  - ${valueToString(item)}\n`;
       } else {
-        out += `${sp}${k} ${v ?? 'null'}\n`;
+        out += `${sp}${k} ${valueToString(v)}\n`;
       }
     }
     return out;
@@ -1199,6 +1301,40 @@ function stringifyValue(value: unknown, indent: number): string {
  * constraint then rejected its own declared type. Mirrors `wants_string` in
  * synx-core.
  */
+/**
+ * Text of a value placed inside a string — interpolation, `:join`, `:map`,
+ * `:prompt` lists. Mirrors synx-core's `value_to_string`: a secret stays
+ * masked and a group or list contributes nothing (`String()` gave
+ * "[object Object]" and "a,b"), `null` reads as "null".
+ */
+const CLAMP_BOUND_RE = /^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/;
+
+/** A `:clamp` bound: a finite number written as synx-core reads one, else NaN. */
+function clampBound(s: string): number {
+  if (!CLAMP_BOUND_RE.test(s)) return NaN;
+  const n = Number(s);
+  return Number.isFinite(n) ? n : NaN;
+}
+
+function valueToString(v: unknown): string {
+  if (v === null || v === undefined) return 'null';
+  if (typeof v === 'object') return v instanceof SynxSecret ? '[SECRET]' : '';
+  if (typeof v === 'number') return numberToText(v);
+  return String(v);
+}
+
+/**
+ * A number as text, the way synx-core writes it (its `Display`): plain
+ * decimal, never an exponent.
+ *
+ * spec: `String(1e-7)` is "1e-7" and `String(1e21)` is "1e+21"; Rust writes
+ * "0.0000001" and "1000000000000000000000". Interpolation, `:join`, `:calc`
+ * operands and enum checks of such a number differed between the two.
+ */
+function numberToText(n: number): string {
+  return expandExponent(String(n));
+}
+
 function wantsString(meta: SynxMeta | undefined): boolean {
   return meta?.typeHint === 'string' || meta?.constraints?.type === 'string';
 }
@@ -1338,13 +1474,98 @@ function replaceWord(haystack: string, word: string, replacement: string): strin
   return result;
 }
 
-/** Substitute all variable references in `expr` without creating RegExp objects. */
-function replaceVars(expr: string, vars: Map<string, string>): string {
-  // Process longer keys first to avoid partial-match issues (e.g. "hp" vs "base_hp")
-  const sorted = [...vars.entries()].sort((a, b) => b[0].length - a[0].length);
-  let result = expr;
-  for (const [k, v] of sorted) result = replaceWord(result, k, v);
-  return result;
+/**
+ * Root keys a single-pass token lookup cannot reach, per root object. The root
+ * key set is fixed once resolution starts (values change, keys do not).
+ */
+const ROOT_CALC_SPECIAL = new WeakMap<object, string[]>();
+
+/**
+ * A key whole-word substitution can reach in ways a token lookup cannot: one
+ * with a non-word character (`max-hp`, `a.b`, `цена`), or one a substituted
+ * number can itself spell (`2`, `1e` of `1e+21`, `NaN`, `Infinity`).
+ */
+function isCalcSpecialKey(k: string): boolean {
+  for (let i = 0; i < k.length; i++) if (!isWordChar(k.charCodeAt(i))) return true;
+  return /^\d+e?$/.test(k) || k === 'NaN' || k === 'Infinity';
+}
+
+function rootCalcSpecial(root: SynxObject): string[] {
+  let special = ROOT_CALC_SPECIAL.get(root);
+  if (!special) {
+    special = Object.keys(root).filter(isCalcSpecialKey);
+    ROOT_CALC_SPECIAL.set(root, special);
+  }
+  return special;
+}
+
+const hasOwn = Object.prototype.hasOwnProperty;
+
+/**
+ * A number for arithmetic markers. An integer beyond 2^53 is a `bigint` here
+ * and an i64 in synx-core, which uses it in `:calc`, `:clamp`, `:round`,
+ * `:sum` and `:sort` as a float — so they did nothing with it in TypeScript.
+ */
+function isNum(v: unknown): v is number | bigint {
+  return typeof v === 'number' || typeof v === 'bigint';
+}
+
+/**
+ * Substitute numeric variables into a `:calc` expression — a key of `local`
+ * first (it shadows the root), then a root key.
+ *
+ * perf: one pass over the expression's words with a property lookup each. The
+ * previous version collected every numeric key of the root into a map and ran
+ * a whole-expression `replaceWord` per key, so N calcs over a root of N keys
+ * were quadratic (an active document of 2000 sections took 0.6 s). The
+ * sequential form remains for documents with a special key holding a number,
+ * where it is the exact semantics.
+ */
+function substituteCalcVars(expr: string, local: SynxObject, selfKey: string, root: SynxObject): string {
+  const localIsRoot = local === root;
+  let special = false;
+  for (const k of rootCalcSpecial(root)) {
+    if (isNum(root[k]) && !(localIsRoot && k === selfKey)) { special = true; break; }
+  }
+  if (!special && !localIsRoot) {
+    for (const k of Object.keys(local)) {
+      if (k !== selfKey && isNum(local[k]) && isCalcSpecialKey(k)) { special = true; break; }
+    }
+  }
+  if (special) {
+    const vars = new Map<string, string>();
+    for (const rKey of Object.keys(root)) {
+      if (isNum(root[rKey])) vars.set(rKey, String(Number(root[rKey])));
+    }
+    for (const rKey of Object.keys(local)) {
+      if (rKey !== selfKey && isNum(local[rKey])) vars.set(rKey, String(Number(local[rKey])));
+    }
+    // Longer keys first so `hp` cannot eat into `base_hp`.
+    const sorted = [...vars.entries()].sort((a, b) => b[0].length - a[0].length);
+    let result = expr;
+    for (const [k, v] of sorted) result = replaceWord(result, k, v);
+    return result;
+  }
+
+  let out = '';
+  let i = 0;
+  const len = expr.length;
+  while (i < len) {
+    if (isWordChar(expr.charCodeAt(i))) {
+      const start = i;
+      while (i < len && isWordChar(expr.charCodeAt(i))) i++;
+      const token = expr.substring(start, i);
+      let v: unknown;
+      if (token !== selfKey && hasOwn.call(local, token) && isNum(local[token])) v = Number(local[token]);
+      else if (hasOwn.call(root, token) && isNum(root[token])) v = Number(root[token]);
+      out += v === undefined ? token : numberToText(v as number);
+    } else {
+      const start = i;
+      while (i < len && !isWordChar(expr.charCodeAt(i))) i++;
+      out += expr.substring(start, i);
+    }
+  }
+  return out;
 }
 
 /**
@@ -1375,8 +1596,8 @@ function replaceDotPaths(expr: string, root: SynxObject): string {
       const token = expr.substring(start, i);
       if (hasDot && token.indexOf('.') !== -1) {
         const val = deepGet(root, token);
-        if (typeof val === 'number') {
-          out += String(val);
+        if (isNum(val)) {
+          out += String(Number(val));
           continue;
         }
       }

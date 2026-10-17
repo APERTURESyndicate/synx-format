@@ -14,8 +14,9 @@ constexpr size_t kMaxJsonDepth = 128;
 /// secrets rendered as the literal `"[SECRET]"`.
 void write_json(std::string& out, const Value& val);
 
-/// Rust `f64::to_string()`: shortest round-trip digits, never an exponent, `.0`
-/// appended to whole numbers. Used when a float is interpolated or stringified.
+/// A float as Rust's `Value` Display writes it: `f64` Display (shortest
+/// round-trip digits, plain decimal, never an exponent) with `.0` appended when
+/// there is no `.` (`5.0`, `0.25`, `1000000000000000000000.0`).
 std::string float_to_display_string(double f);
 
 /// Convenience: returns a fresh JSON string.

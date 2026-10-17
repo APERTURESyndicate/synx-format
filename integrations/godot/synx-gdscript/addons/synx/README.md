@@ -16,7 +16,7 @@ That's it. Everything is registered through GDScript `class_name` so the API is
 available globally:
 
 ```gdscript
-var data := Synx.parse_to_variant("name Alice\nage 30")
+var data: Dictionary = Synx.parse_to_variant("name Alice\nage 30")
 # data == { "name": "Alice", "age": 30 }
 ```
 
@@ -37,7 +37,7 @@ inventory
 """
 
 # As plain Variant (Dictionary/Array of strings/ints/...).
-var d := Synx.parse_to_variant(text)
+var d: Dictionary = Synx.parse_to_variant(text)
 print(d["server"]["port"])  # 8080
 ```
 
@@ -53,7 +53,7 @@ double_port:calc port * 2
 
 var opts := SynxOptions.new()
 opts.env = { "PORT": "8080" }
-var d := Synx.parse_active_to_variant(text, opts)
+var d: Dictionary = Synx.parse_active_to_variant(text, opts)
 print(d["port"])         # 8080
 print(d["double_port"])  # 16160
 ```
@@ -107,13 +107,14 @@ var json := Synx.to_json(r)
 | `:inherit` (multi-parent merge) | ✅ |
 | `{interpolation}` (`{key}`, `{key.path}`, `{key:alias}`, `{key:include}`) | ✅ |
 | `:prompt`, `:vision`, `:audio` | ✅ |
-| `.synxb` binary format (DEFLATE-compressed, wire-compatible with Rust) | ✅ |
+| `.synxb` binary format (raw DEFLATE, wire-compatible with Rust both ways) | ✅ |
 | Structural diff | ✅ |
 | Canonical formatter | ✅ |
 | Tool-mode reshape (`!tool` / `!tool + !schema`) | ✅ |
 | `__proto__` / `constructor` / `prototype` key rejection | ✅ |
 | Resource caps (input size, nesting depth, multiline body, list items) | ✅ |
 | **WASM marker packages** | ❌ replaced by `marker_callables` (`Callable`-based) |
+| **SYNXL** (`.synxl` datasets) | ❌ not implemented in this port |
 
 ### Custom markers via Callables
 
@@ -160,11 +161,19 @@ traversal are rejected with `INCLUDE_ERR` / `WATCH_ERR`. Override the base via
 ## Running the test suite
 
 ```bash
-godot --headless --path integrations/godot/synx-gdscript --script tests/test_runner.gd
+godot --headless --path integrations/godot/synx-gdscript --import
+godot --headless --path integrations/godot/synx-gdscript -s tests/test_runner.gd
 ```
 
-The runner executes 35+ unit tests plus the shared conformance corpus from
-`tests/conformance/cases/*.synx` (if reachable from the project root).
+`--import` registers the addon's `class_name` scripts (once, and after adding
+a script). The runner checks the repository's SYNX conformance suite
+(`tests/conformance/cases`, byte for byte), regression cases whose expected
+output comes from `synx-core`, and unit tests; it exits non-zero on a
+failure. On Windows run the Godot executable itself — the WinGet `godot` link
+of the .NET build hangs in ".NET: Initializing module".
+
+`tests/bench.gd -- <dir> [runs]` prints parse and JSON timings for every
+`.synx` file in a directory.
 
 ## Layout
 
@@ -178,6 +187,8 @@ addons/synx/
   synx_parse_result.gd       — parse result + IncludeDirective / UseDirective
   synx_options.gd            — engine options
   synx_rng.gd                — RNG façade
+  synx_text.gd               — Unicode whitespace / UTF-8 helpers
+  synx_num.gd                — f64 / i64 text exactly as synx-core reads and writes it
   synx_parser.gd             — static parser
   synx_engine.gd             — !active engine core + includes/jail
   synx_engine_markers.gd     — marker dispatch + constraints + plural rules
@@ -186,18 +197,21 @@ addons/synx/
   synx_json.gd               — value → canonical JSON
   synx_formatter.gd          — canonical .synx reformatter
   synx_binary.gd             — .synxb compile / decompile
+  synx_inflate.gd            — raw DEFLATE decoder (Godot only inflates zlib)
   synx_diff.gd               — structural diff
 tests/
   test_runner.gd             — SceneTree-based headless test runner
+  bench.gd                   — parse / JSON timings
 examples/
   demo.tscn                  — minimal scene (optional)
 ```
 
 ## Parity status
 
-All conformance cases under `tests/conformance/cases/` should produce the same
-canonical JSON output as `synx-core` (Rust) and `@aperturesyndicate/synx-format`
-(TypeScript). Where a marker mutates external state (`:once` writes to
+Targets SYNX 3.8.0. Every case under `tests/conformance/cases/` produces the
+same canonical JSON as `synx-core` (Rust), byte for byte; differential runs
+against `synx-core` cover parse/resolve, stringify, `.synxb` in both
+directions and `format`. Where a marker mutates external state (`:once` writes to
 `.synx.lock`, `:spam` keeps in-process buckets), GDScript implementation follows
 the same semantics.
 

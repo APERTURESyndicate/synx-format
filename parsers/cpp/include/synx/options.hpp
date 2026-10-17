@@ -26,11 +26,13 @@ struct UseDirective {
     std::string alias;
 };
 
-/// User-supplied custom marker.
+/// User-supplied custom marker, run where Rust runs WASM markers: after the
+/// built-in markers of the key, once — the first registered non-built-in
+/// marker of the chain.
 ///
 /// Signature: (key, args, current_value) -> resolved_value.
 ///   * `key`   — name of the field being resolved
-///   * `args`  — argument list parsed from `:marker:arg1:arg2`
+///   * `args`  — the chain parts after the marker: `:marker:arg1:arg2`
 ///   * `value` — value already on the field (may be Null)
 ///
 /// Returning `Value::make_null()` is valid. Throwing is not allowed (exceptions
@@ -50,7 +52,7 @@ struct Options {
     std::optional<size_t> max_include_depth;
     /// Path to installed packages root. Default: `./synx_packages`.
     std::optional<std::string> packages_path;
-    /// Strict mode — fail on unknown markers, missing required env, etc.
+    /// Report every constraint / type violation on stderr as well (C++ extension).
     bool strict = false;
     /// Custom (non-builtin) markers. Looked up by marker name.
     std::unordered_map<std::string, MarkerFn> marker_fns;

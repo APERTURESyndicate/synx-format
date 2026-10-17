@@ -233,6 +233,10 @@ greeting:random          // key = "greeting:random", value = {} (object)
 
 > 💡 This is a security feature: a static file will **never** execute code, access environment variables, or run commands.
 
+**How a live config resolves.** Markers run in document order: a marker sees every key above it, at any depth, already resolved. Each object keeps its own declarations — every item of a list, and an object whose key contains a dot (`a.b`), carries its own markers, never those of a sibling item or of the object `b` inside `a`. A number placed into text (`{key}`, `:join`, `:template`, a `:calc` operand) is written in plain decimal: `0.0000001`, never `1e-7`.
+
+> Since 3.8.0 every implementation follows this. Earlier the Rust engine resolved nested objects before their parent's markers, let list items share one declaration per key, and TypeScript wrote small and large numbers with an exponent.
+
 ---
 
 ### 3.2 Full List of Functions (`:`)
@@ -334,6 +338,8 @@ As a JSON file:
 ```
 
 **Supported operations:** `+`, `-`, `*`, `/`, `%` (remainder), `(`, `)`.
+
+**Names.** A name refers to a key of the same object first, then to a root key, so a nested `total:calc price * 2` uses its own object's `price` when there is one.
 
 > ⚠️ Arithmetic only. No arbitrary code. The parser uses a safe evaluator, not `eval()`.
 
@@ -709,7 +715,7 @@ code:format:%04d 42
 # → "0042"
 ```
 
-Supported patterns: `%.Nf` (float), `%d` (int), `%0Nd` (zero-padded). Max width/precision: 4096/1024.
+Supported patterns: `%.Nf` (float), `%d` (int), `%0Nd` (zero-padded). Max width/precision: 4096/1024. A whole float takes an integer pattern: `12.0` under `%05d` is `00012`.
 
 ---
 

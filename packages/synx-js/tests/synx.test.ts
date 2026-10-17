@@ -629,3 +629,33 @@ describe('Security — Deep Nesting', () => {
     }
   });
 });
+
+describe('Synx.format — block bodies', () => {
+  it('keeps a |+ block verbatim and is idempotent', () => {
+    const src = 'code |+\n  zeta()\n    alpha()\n  beta\nname x\n';
+    const out = Synx.format(src);
+    expect(out).toBe('code |+\n  zeta()\n    alpha()\n  beta\n\nname x\n');
+    expect(Synx.parse(out).code).toBe(Synx.parse(src).code);
+    expect(Synx.format(out)).toBe(out);
+  });
+
+  it('sorts keys by code point, not by locale', () => {
+    const out = Synx.format('b 1\n_a 2\nB 3\n');
+    expect(out.split('\n').filter(Boolean).map((l) => l.split(' ')[0])).toEqual(['_a', 'b', 'B']);
+  });
+});
+
+describe('3.8.0 — hostile documents end cleanly', () => {
+  it('skips :clamp when a bound is not a finite number', () => {
+    const r = Synx.parse('!active\nv:clamp:nan:5 3\nx:clamp:1:Infinity 7\nz:clamp:5abc:9 1\ny:clamp:2:9 12\n') as Record<string, unknown>;
+    expect(r).toEqual({ v: 3, x: 7, z: 1, y: 9 });
+  });
+
+  it('formats a document nested past the depth cap', () => {
+    let text = '';
+    for (let i = 0; i < 140; i++) text += '  '.repeat(i) + `k${i}\n`;
+    const out = Synx.format(text);
+    expect(out.startsWith('k0')).toBe(true);
+    expect(out.split('\n').filter(Boolean).length).toBeLessThan(140);
+  });
+});

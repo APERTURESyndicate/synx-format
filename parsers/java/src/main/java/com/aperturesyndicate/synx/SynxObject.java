@@ -48,6 +48,50 @@ public final class SynxObject implements Iterable<Map.Entry<String, SynxValue>> 
         return entries.entrySet().iterator();
     }
 
+    private static final java.util.Comparator<Map.Entry<String, SynxValue>> BY_KEY_UTF16 =
+        (a, b) -> a.getKey().compareTo(b.getKey());
+
+    /**
+     * The entries in key order (code point order) — what every canonical writer iterates.
+     * Built straight into an array instead of copying the entry set.
+     */
+    @SuppressWarnings("unchecked")
+    List<Map.Entry<String, SynxValue>> sortedEntries() {
+        Map.Entry<String, SynxValue>[] arr = new Map.Entry[entries.size()];
+        int i = 0;
+        boolean surrogates = false;
+        for (Map.Entry<String, SynxValue> e : entries.entrySet()) {
+            String k = e.getKey();
+            if (!surrogates) {
+                for (int j = 0; j < k.length(); j++) {
+                    if (Character.isSurrogate(k.charAt(j))) { surrogates = true; break; }
+                }
+            }
+            arr[i++] = e;
+        }
+        // Without surrogates UTF-16 order is code point order, and String.compareTo is fast.
+        if (arr.length > 1) java.util.Arrays.sort(arr, surrogates ? SynxParser.BY_KEY : BY_KEY_UTF16);
+        return java.util.Arrays.asList(arr);
+    }
+
+    /** A deep copy: nested objects and arrays are copied too. */
+    public SynxObject copy() {
+        SynxObject out = new SynxObject();
+        for (var e : entries.entrySet()) out.entries.put(e.getKey(), deepCopy(e.getValue()));
+        return out;
+    }
+
+    /** Deep-copies objects and arrays; scalars are immutable and returned as they are. */
+    public static SynxValue deepCopy(SynxValue v) {
+        if (v instanceof SynxValue.Obj o) return SynxValue.ofObject(o.map().copy());
+        if (v instanceof SynxValue.Arr a) {
+            List<SynxValue> out = new ArrayList<>(a.values().size());
+            for (SynxValue item : a.values()) out.add(deepCopy(item));
+            return SynxValue.ofArray(out);
+        }
+        return v;
+    }
+
     @Override
     public boolean equals(Object other) {
         if (this == other) return true;

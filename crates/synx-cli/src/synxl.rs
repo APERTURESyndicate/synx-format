@@ -1082,7 +1082,7 @@ fn csv_to_synxl(reopen: Reopen<'_>, delim: char, out: &mut dyn Write) -> Result<
     while let Some(row) = rows.next_row()? {
         row_no += 1;
         check_row_arity(&row, &header, row_no)?;
-        let mut map = std::collections::HashMap::with_capacity(header.len() + 1);
+        let mut map = synx_core::Map::with_capacity_and_hasher(header.len() + 1, Default::default());
         for (c, name) in header.iter().enumerate() {
             map.insert(name.clone(), kinds[c].cast(&row[c]));
         }
@@ -1761,7 +1761,7 @@ mod tests {
         // §14.3 — promoting every column leaves arity 0, which the writer now
         // refuses instead of emitting a document that reads back differently.
         let fields = vec![FieldDecl::new_block("a"), FieldDecl::new_block("b")];
-        let mut map = std::collections::HashMap::new();
+        let mut map = synx_core::Map::default();
         map.insert("a".to_string(), Value::Int(1));
         map.insert("b".to_string(), Value::Int(2));
         let mut buf: Vec<u8> = Vec::new();

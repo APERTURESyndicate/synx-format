@@ -24,7 +24,7 @@ use std::fmt;
 use memchr::memchr;
 
 use crate::parser::{self, ParserOptions};
-use crate::value::{Constraints, Value};
+use crate::value::{Constraints, Map, Value};
 
 // ─── §13 Resource limits ─────────────────────────────────────
 
@@ -874,7 +874,7 @@ impl ReaderCore {
         };
 
         let fl = &self.field_lists[fl_idx];
-        let mut obj: HashMap<String, Value> = HashMap::with_capacity(fl.fields.len());
+        let mut obj: Map = Map::with_capacity_and_hasher(fl.fields.len(), Default::default());
 
         // `trim_wsp`, not `trim`: §3.3 draws the line between structure and
         // content, and trimming *within* a record line takes only spaces and
@@ -949,7 +949,7 @@ impl ReaderCore {
         // §11.2 — block diagnostics report the line *inside the block* that
         // carries the offending key, so the block's key/line map is built the
         // first time one is needed (never for a clean record).
-        let mut key_lines: Option<HashMap<&str, usize>> = None;
+        let mut key_lines: Option<HashMap<String, usize>> = None;
 
         // §9.3 — match block keys by exact name, visiting them in lexicographic
         // order so the diagnostic sequence is reproducible despite the HashMap.
@@ -1655,43 +1655,17 @@ pub fn parse_lines_with(text: &str, opts: &SynxlOptions) -> Result<SynxlDocument
 /// Map each top-level block key to the 1-based source line that declares it.
 ///
 /// §11.2 requires `UnknownBlockKey` / `BlockFieldNotDeclared` to report the
-/// line inside the block, but the SYNX parser returns no positions. The keys
-/// that end up at the root of the embedded document are those at the block's
-/// shallowest indent (SYNX §8.6 stack repair), so re-scanning that one level is
-/// enough — and it only runs when a diagnostic is actually being emitted.
-fn block_key_lines(block: &str, first_line_no: usize) -> HashMap<&str, usize> {
-    // A key lands at the root of the embedded document when its indent is at
-    // or below every indent seen before it: the first line opens the root
-    // level, and SYNX §8.6 stack repair pulls any later dedent back up to it.
-    // Comparing against the block's *overall* minimum instead would skip the
-    // deeper-but-still-root keys, and their diagnostics would then fall back
-    // to the record line — the divergence §11.2 forbids.
-    let mut running_min = usize::MAX;
-    let mut map: HashMap<&str, usize> = HashMap::new();
-    for (i, line) in block.split('\n').enumerate() {
-        let line = line.strip_suffix('\r').unwrap_or(line);
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let indent = line.len() - line.trim_start().len();
-        if indent > running_min {
-            continue;
-        }
-        running_min = indent;
-        // Lines SYNX never turns into a key (SYNX §7) plus `!` lines, which
-        // SYNXL discards inside a block (§9.4).
-        if trimmed.starts_with("- ") || trimmed.starts_with('!') {
-            continue;
-        }
-        match trimmed.as_bytes()[0] {
-            b'[' | b':' | b'-' | b'#' | b'/' | b'(' => continue,
-            _ => {}
-        }
-        let key_end = trimmed
-            .find(|c: char| c == ' ' || c == '\t' || c == '[' || c == ':' || c == '(')
-            .unwrap_or(trimmed.len());
-        map.entry(&trimmed[..key_end]).or_insert(first_line_no + i);
+/// line inside the block. The SYNX parser itself records which line put each
+/// key at the root, so stack repair, list items and multiline bodies are
+/// decided exactly as in the parse. It only runs when a diagnostic is emitted.
+///
+/// spec: until 3.8.0 a "running minimum indent" stood in for the parser: a
+/// deeper line after a key with a value (`7 x` / `<NBSP>name zz`), which the
+/// parser lifts to the root, fell back to the record line.
+fn block_key_lines(block: &str, first_line_no: usize) -> HashMap<String, usize> {
+    let mut map = parser::root_key_lines(block, ParserOptions { directives: false, nondeterministic_hints: false });
+    for line in map.values_mut() {
+        *line += first_line_no;
     }
     map
 }
@@ -2134,11 +2108,13 @@ fn check_constraints(key: &str, value: &Value, c: &Constraints) -> Option<String
         }
     }
 
-    // Numbers compare by value, strings by length — same rule as the engine.
+    // Numbers compare by value, strings by length — same rule as the engine,
+    // which counts Unicode scalar values. This counted UTF-8 bytes, so a
+    // three-letter `мир` failed `[max:4]` here and passed in TypeScript.
     let num = match value {
         Value::Int(n) => Some(*n as f64),
         Value::Float(f) => Some(*f),
-        Value::String(s) if c.min.is_some() || c.max.is_some() => Some(s.len() as f64),
+        Value::String(s) if c.min.is_some() || c.max.is_some() => Some(s.chars().count() as f64),
         _ => None,
     };
     if let Some(n) = num {
@@ -2159,13 +2135,9 @@ fn check_constraints(key: &str, value: &Value, c: &Constraints) -> Option<String
             if let Value::String(ref s) = value {
                 // An invalid or backtracking-prone regex is skipped silently,
                 // matching the engine and the TypeScript reader.
-                if crate::engine::has_nested_quantifier(pattern) {
-                    return None;
-                }
-                if let Ok(re) = regex::Regex::new(pattern) {
-                    if !re.is_match(s) {
-                        return Some(format!("`{}` does not match pattern /{}/", key, pattern));
-                    }
+                // perf: compiled once per pattern, not once per cell.
+                if crate::engine::pattern_rejects(pattern, s) {
+                    return Some(format!("`{}` does not match pattern /{}/", key, pattern));
                 }
             }
         }
@@ -2500,9 +2472,53 @@ fn inline_needs_quote(s: &str, hint: Option<&str>) -> bool {
             // in an `int` column comes back as null with a `CastFailed`. §7.4
             // exempts quoted parts from casting, so quoting is what preserves
             // the string.
-            Some(h) => cast_typed_checked(s, h) != Some(Value::String(s.to_string())),
-            None => cast_inline(s) != Value::String(s.to_string()),
+            Some(h) => !typed_cast_keeps_string(s, h),
+            None => !auto_cast_keeps_string(s),
         }
+}
+
+/// Does `cast_typed_checked(s, hint)` give back the string `s` itself?
+///
+/// perf: the same decision as comparing the cast against `Value::String`,
+/// without the two strings that comparison allocated for every cell.
+fn typed_cast_keeps_string(s: &str, hint: &str) -> bool {
+    match hint {
+        "int" | "float" | "bool" => false,
+        "string" => true,
+        _ => auto_cast_keeps_string(s),
+    }
+}
+
+/// Does `cast_inline(s)` give back the string `s` itself? Mirrors
+/// `parser::cast`: literals and numbers become other types, everything else
+/// (including an integer that overflows i64) stays the string.
+fn auto_cast_keeps_string(s: &str) -> bool {
+    if is_quote_wrapped(s) {
+        return true;
+    }
+    if matches!(s, "true" | "false" | "null") {
+        return false;
+    }
+    let b = s.as_bytes();
+    let start = usize::from(b.first() == Some(&b'-'));
+    if b.len() <= start || !b[start].is_ascii_digit() {
+        return true;
+    }
+    let mut dot = None;
+    for (j, &c) in b.iter().enumerate().skip(start) {
+        if c == b'.' {
+            if dot.is_some() {
+                return true;
+            }
+            dot = Some(j);
+        } else if !c.is_ascii_digit() {
+            return true;
+        }
+    }
+    match dot {
+        None => s.parse::<i64>().is_err(),
+        Some(dp) => !(dp > start && dp < b.len() - 1 && s.parse::<f64>().is_ok()),
+    }
 }
 
 /// A quote character that does not occur in `s`, or `None` if both do.
@@ -2558,14 +2574,20 @@ fn write_float(out: &mut String, f: f64) {
     if !f.is_finite() {
         return;
     }
-    let s = f.to_string();
-    if !s.contains('e') && !s.contains('E') {
-        out.push_str(&s);
-        if !s.contains('.') {
+    // perf: formatted straight into `out` — no String per float.
+    let start = out.len();
+    {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{}", f);
+    }
+    let written = &out[start..];
+    if !written.contains('e') && !written.contains('E') {
+        if !written.contains('.') {
             out.push_str(".0");
         }
         return;
     }
+    out.truncate(start);
     // Exponent form: spell the value out in full. f64 decimals terminate, so
     // the expansion is exact.
     let expanded = format!("{:.*}", FLOAT_EXPANSION_PRECISION, f);
@@ -2582,7 +2604,7 @@ fn trim_float(f: f64) -> String {
 // ─── §14 Block serialization (SYNX subset) ───────────────────
 
 /// Write `key: value` as SYNX at `indent` columns.
-fn write_synx_entry(out: &mut String, key: &str, value: &Value, indent: usize, depth: usize) {
+pub(crate) fn write_synx_entry(out: &mut String, key: &str, value: &Value, indent: usize, depth: usize) {
     if depth > MAX_WRITE_DEPTH {
         return;
     }
@@ -2644,10 +2666,15 @@ fn write_synx_item(out: &mut String, item: &Value, indent: usize, depth: usize) 
             keys.sort_unstable();
             // The `- ` line has to carry a key whose value fits on it; SYNX
             // attaches everything deeper to the *item*, not to that key.
-            let head = keys
-                .iter()
-                .position(|k| dash_line_safe(&map[*k]))
-                .unwrap_or(0);
+            let head_safe = keys.iter().position(|k| dash_line_safe(&map[*k]));
+            let head = head_safe.unwrap_or(0);
+            // §14.1 — an item is an object only when a deeper line follows its
+            // `- ` line. A one-key item (`- item x` / `item y`) had none and
+            // came back as the string "item y"; an item whose every value is
+            // too big for the `- ` line lost the head value outright. Writing
+            // the head again in full below covers both: a repeated key is
+            // legal, the last one wins, and the line makes the item an object.
+            let repeat_head = head_safe.is_none() || keys.len() == 1;
             // An empty object in a list has no key to hang on the `- ` line.
             // SYNX writes it as a bare dash, which is how it parsed in the
             // first place; indexing `keys` here would panic instead.
@@ -2670,7 +2697,7 @@ fn write_synx_item(out: &mut String, item: &Value, indent: usize, depth: usize) 
             }
             out.push('\n');
             for (i, k) in keys.iter().enumerate() {
-                if i == head {
+                if i == head && !repeat_head {
                     continue;
                 }
                 write_synx_entry(out, k, &map[*k], indent + 2, depth + 1);
@@ -2729,7 +2756,10 @@ fn synx_scalar(value: &Value) -> Option<String> {
             write_float(&mut s, *f);
             Some(s)
         }
-        Value::String(s) | Value::Secret(s) => {
+        // safety: a secret is written as its mask, never as the plaintext —
+        // `Synx::stringify` and `decompile` write through here.
+        Value::Secret(_) => Some("[SECRET]".to_string()),
+        Value::String(s) => {
             if s.contains('\n') || s.contains(" #") || s.contains(" //") {
                 return None;
             }
@@ -2749,7 +2779,9 @@ fn synx_value_needs_quote(s: &str) -> bool {
         || s == "|"
         || s == "|+"
         || is_quote_wrapped(s)
-        || !matches!(parser::cast(s), Value::String(ref v) if v == s)
+        // perf: the cast decision without the cast — `parser::cast` built a
+        // String for every value just to compare it.
+        || !auto_cast_keeps_string(s)
 }
 
 // ─── Small helpers ───────────────────────────────────────────
@@ -2812,6 +2844,15 @@ mod tests {
     }
 
     // ── §4 document structure ───────────────────────────────
+
+    // Validation counts a string in Unicode scalar values, like the engine and
+    // the TypeScript reader; it used to count UTF-8 bytes here.
+    #[test]
+    fn validate_string_length_counts_characters() {
+        let src = "!synxl 1\n!fields w[max:3] ; e[min:2, max:2]\n\u{043c}\u{0438}\u{0440} ; \u{1f600}\u{1f600}\n";
+        let doc = parse_lines_with(src, &SynxlOptions { validate: true }).unwrap();
+        assert!(doc.diagnostics.is_empty(), "{:?}", doc.diagnostics);
+    }
 
     #[test]
     fn parses_prologue_and_simple_records() {
@@ -3735,7 +3776,7 @@ mod tests {
     fn writer_promotes_multiline_values_to_a_block() {
         // §14.3 — an LF forces promotion even though the field is inline.
         let fields = vec![FieldDecl::new("id"), FieldDecl::new("text")];
-        let mut rec = HashMap::new();
+        let mut rec = Map::default();
         rec.insert("id".to_string(), Value::Int(1));
         rec.insert("text".to_string(), Value::String("line one\n  line two".into()));
         let records = vec![Value::Object(rec)];
@@ -3750,7 +3791,7 @@ mod tests {
     fn writer_promotes_values_that_cannot_be_quoted() {
         // A value with a `;` and both quote characters has no inline form.
         let fields = vec![FieldDecl::new("id"), FieldDecl::new("a")];
-        let mut rec = HashMap::new();
+        let mut rec = Map::default();
         rec.insert("id".to_string(), Value::Int(1));
         rec.insert("a".to_string(), Value::String("mix \" and ' and ; here".into()));
         let records = vec![Value::Object(rec)];
@@ -3768,7 +3809,7 @@ mod tests {
         // and only column would leave arity 0 — which §5.3.4 rejects. The
         // writer must say so, not emit a document its own parser refuses.
         let fields = vec![FieldDecl::new("a")];
-        let mut rec = HashMap::new();
+        let mut rec = Map::default();
         rec.insert("a".to_string(), Value::String("mix \" and ' and ; here".into()));
         let records = vec![Value::Object(rec)];
 
@@ -3792,7 +3833,7 @@ mod tests {
         // §5.3.4 — promoting every column would produce an unparsable document,
         // so the last inline column stays inline even when it wants quoting.
         let fields = vec![FieldDecl::new("a")];
-        let mut rec = HashMap::new();
+        let mut rec = Map::default();
         rec.insert("a".to_string(), Value::String("'x\"y".into()));
         let records = vec![Value::Object(rec)];
         let out = write_lines(&fields, &records).unwrap();
@@ -3818,7 +3859,7 @@ mod tests {
     #[test]
     fn float_round_trips_through_exponent_form() {
         let fields = vec![FieldDecl::new("a"), FieldDecl::new("b"), FieldDecl::new("c")];
-        let mut rec = HashMap::new();
+        let mut rec = Map::default();
         rec.insert("a".to_string(), Value::Float(1e300));
         rec.insert("b".to_string(), Value::Float(5.0));
         rec.insert("c".to_string(), Value::Float(f64::NAN));

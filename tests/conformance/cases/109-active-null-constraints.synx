@@ -1,0 +1,4 @@
+!active
+port[type:int]:env SYNX_CONFORMANCE_UNSET_VAR
+mode[enum:a|b]:env SYNX_CONFORMANCE_UNSET_VAR
+name[min:3]:env SYNX_CONFORMANCE_UNSET_VAR

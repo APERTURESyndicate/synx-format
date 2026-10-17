@@ -1,9 +1,10 @@
-// Canonical SYNX text reformatter. Mirrors fmt_canonical in synx-core/src/lib.rs.
+// Canonical SYNX text reformatter. Port of `fmt_canonical` in synx-core/src/lib.rs.
 #include "synx/formatter.hpp"
+
 #include "synx/parser.hpp"
+#include "unicode.hpp"
 
 #include <algorithm>
-#include <cctype>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -12,24 +13,9 @@ namespace synx {
 
 namespace {
 
-inline std::string_view trim_view(std::string_view s) noexcept {
-    size_t start = 0;
-    while (start < s.size() && (s[start] == ' ' || s[start] == '\t' || s[start] == '\r')) ++start;
-    size_t end = s.size();
-    while (end > start && (s[end - 1] == ' ' || s[end - 1] == '\t' || s[end - 1] == '\r')) --end;
-    return s.substr(start, end - start);
-}
-
-inline bool starts_with(std::string_view s, std::string_view prefix) noexcept {
-    return s.size() >= prefix.size()
-        && std::char_traits<char>::compare(s.data(), prefix.data(), prefix.size()) == 0;
-}
-
-inline size_t indent_of(std::string_view line) noexcept {
-    size_t i = 0;
-    while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) ++i;
-    return i;
-}
+using detail::ends_with;
+using detail::starts_with;
+using detail::trim_view;
 
 struct FmtNode {
     std::string header;
@@ -38,110 +24,111 @@ struct FmtNode {
     bool is_multiline = false;
 };
 
-void split_lines(std::string_view text, std::vector<std::string_view>& out) {
+// Rust `str::lines`: split at `\n`, drop one trailing `\r`, no final empty line.
+std::vector<std::string_view> split_lines(std::string_view text) {
+    std::vector<std::string_view> out;
     size_t start = 0;
-    for (size_t i = 0; i <= text.size(); ++i) {
-        if (i == text.size() || text[i] == '\n') {
-            std::string_view line = text.substr(start, i - start);
-            // Strip trailing \r for CRLF.
-            if (!line.empty() && line.back() == '\r') {
-                line.remove_suffix(1);
-            }
-            out.push_back(line);
-            start = i + 1;
-        }
+    while (start < text.size()) {
+        size_t nl = text.find('\n', start);
+        size_t end = nl == std::string_view::npos ? text.size() : nl;
+        std::string_view line = text.substr(start, end - start);
+        if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+        out.push_back(line);
+        start = end + 1;
     }
+    return out;
 }
 
-void fmt_parse(const std::vector<std::string_view>& lines,
-               size_t start,
-               size_t base,
-               size_t depth,
-               std::vector<FmtNode>& nodes,
-               size_t& next_idx) {
-    next_idx = start;
+size_t fmt_parse(const std::vector<std::string_view>& lines, size_t start, size_t base, size_t depth,
+                 std::vector<FmtNode>& nodes) {
     if (depth > kMaxFmtParseDepth) {
-        return;
+        // safety: the deeper subtree is dropped, but its lines are consumed —
+        // returning `start` left the caller on the same line forever.
+        size_t i = start;
+        while (i < lines.size() && (trim_view(lines[i]).empty() || detail::indent_len(lines[i]) >= base)) ++i;
+        return i;
     }
     size_t i = start;
     while (i < lines.size()) {
         std::string_view raw = lines[i];
         std::string_view t = trim_view(raw);
         if (t.empty()) { ++i; continue; }
-        size_t ind = indent_of(raw);
+        size_t ind = detail::indent_len(raw);
         if (ind < base) break;
         if (ind > base) { ++i; continue; }
         if (starts_with(t, "- ") || t[0] == '#' || starts_with(t, "//")) { ++i; continue; }
-
+        // `|+` opens a block too: its lines are text and keep their indent
+        // relative to the first; they are never parsed as keys nor sorted.
+        const bool preserve = ends_with(t, " |+") || t == "|+";
         FmtNode node;
         node.header = std::string(t);
-        node.is_multiline = (t == "|") || (t.size() >= 2 && t[t.size() - 2] == ' ' && t.back() == '|');
+        node.is_multiline = preserve || ends_with(t, " |") || t == "|";
+        size_t block_base = static_cast<size_t>(-1);
         ++i;
-
         while (i < lines.size()) {
             std::string_view cr = lines[i];
             std::string_view ct = trim_view(cr);
             if (ct.empty()) { ++i; continue; }
-            size_t ci = indent_of(cr);
+            size_t ci = detail::indent_len(cr);
             if (ci <= base) break;
-            if (node.is_multiline || starts_with(ct, "- ")) {
+            if (preserve) {
+                if (block_base == static_cast<size_t>(-1)) block_base = ci;
+                std::string_view body = detail::trim_end_view(cr);
+                size_t cut = detail::strip_boundary(body, std::min(block_base, ci));
+                node.list_items.emplace_back(body.substr(cut));
+                ++i;
+            } else if (node.is_multiline || starts_with(ct, "- ")) {
                 node.list_items.emplace_back(ct);
                 ++i;
             } else if (ct[0] == '#' || starts_with(ct, "//")) {
                 ++i;
             } else {
-                std::vector<FmtNode> subs;
-                size_t ni = i;
-                fmt_parse(lines, i, ci, depth + 1, subs, ni);
-                for (auto& s : subs) node.children.push_back(std::move(s));
-                i = ni;
+                i = fmt_parse(lines, i, ci, depth + 1, node.children);
             }
         }
         nodes.push_back(std::move(node));
     }
-    next_idx = i;
+    return i;
 }
 
-std::string fmt_sort_key(const std::string& header) {
+// The key of a header, lowercased: up to the first whitespace, `[`, `:` or `(`.
+std::string sort_key(const std::string& header) {
     size_t end = 0;
     while (end < header.size()) {
-        char c = header[end];
-        if (c == ' ' || c == '\t' || c == '[' || c == ':' || c == '(') break;
-        ++end;
+        unsigned char c = static_cast<unsigned char>(header[end]);
+        if (c == '[' || c == ':' || c == '(') break;
+        if (detail::ws_len_at(header, end) != 0) break;
+        end += detail::utf8_len(c);
     }
-    std::string out = header.substr(0, end);
-    for (char& c : out) {
-        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    }
-    return out;
+    return detail::to_lowercase(std::string_view(header).substr(0, end));
 }
 
 void fmt_sort(std::vector<FmtNode>& nodes) {
-    std::stable_sort(nodes.begin(), nodes.end(),
-        [](const FmtNode& a, const FmtNode& b) {
-            return fmt_sort_key(a.header) < fmt_sort_key(b.header);
-        });
+    // Stable, by code point of the lowercased key; each key is computed once.
+    std::vector<std::pair<std::string, size_t>> keyed;
+    keyed.reserve(nodes.size());
+    for (size_t i = 0; i < nodes.size(); ++i) keyed.emplace_back(sort_key(nodes[i].header), i);
+    std::stable_sort(keyed.begin(), keyed.end(),
+                     [](const auto& a, const auto& b) { return a.first < b.first; });
+    std::vector<FmtNode> sorted;
+    sorted.reserve(nodes.size());
+    for (const auto& k : keyed) sorted.push_back(std::move(nodes[k.second]));
+    nodes = std::move(sorted);
     for (auto& n : nodes) fmt_sort(n.children);
 }
 
-void fmt_emit(const std::vector<FmtNode>& nodes, size_t indent_lvl, std::string& out) {
-    std::string sp(indent_lvl, ' ');
-    std::string item_sp(indent_lvl + 2, ' ');
+void fmt_emit(const std::vector<FmtNode>& nodes, size_t indent, std::string& out) {
     for (const auto& n : nodes) {
-        out.append(sp);
+        out.append(indent, ' ');
         out.append(n.header);
         out.push_back('\n');
-        if (!n.children.empty()) {
-            fmt_emit(n.children, indent_lvl + 2, out);
-        }
+        if (!n.children.empty()) fmt_emit(n.children, indent + 2, out);
         for (const auto& li : n.list_items) {
-            out.append(item_sp);
+            out.append(indent + 2, ' ');
             out.append(li);
             out.push_back('\n');
         }
-        if (indent_lvl == 0 && (!n.children.empty() || !n.list_items.empty())) {
-            out.push_back('\n');
-        }
+        if (indent == 0 && (!n.children.empty() || !n.list_items.empty())) out.push_back('\n');
     }
 }
 
@@ -149,17 +136,14 @@ void fmt_emit(const std::vector<FmtNode>& nodes, size_t indent_lvl, std::string&
 
 std::string format(std::string_view text) {
     std::string_view clamped = clamp_synx_text(text);
-
-    std::vector<std::string_view> lines;
-    lines.reserve(64);
-    split_lines(clamped, lines);
+    std::vector<std::string_view> lines = split_lines(clamped);
 
     std::vector<std::string_view> directives;
     size_t body_start = 0;
     for (size_t i = 0; i < lines.size(); ++i) {
         std::string_view t = trim_view(lines[i]);
-        if (t == "!active" || t == "!lock" || t == "!tool"
-            || t == "!schema" || t == "!llm" || t == "#!mode:active") {
+        if (t == "!active" || t == "!lock" || t == "!tool" || t == "!schema" || t == "!llm"
+            || t == "#!mode:active") {
             directives.push_back(t);
             body_start = i + 1;
         } else if (t.empty() || t[0] == '#' || starts_with(t, "//")) {
@@ -170,13 +154,11 @@ std::string format(std::string_view text) {
     }
 
     std::vector<FmtNode> nodes;
-    size_t next = body_start;
-    fmt_parse(lines, body_start, 0, 0, nodes, next);
+    fmt_parse(lines, body_start, 0, 0, nodes);
     fmt_sort(nodes);
 
     std::string out;
-    out.reserve(std::min(clamped.size(), kMaxSynxInputBytes) + 64);
-
+    out.reserve(std::max<size_t>(std::min(clamped.size(), kMaxSynxInputBytes), 64));
     if (!directives.empty()) {
         for (size_t i = 0; i < directives.size(); ++i) {
             if (i > 0) out.push_back('\n');
@@ -185,11 +167,8 @@ std::string format(std::string_view text) {
         out.append("\n\n");
     }
     fmt_emit(nodes, 0, out);
-
-    // Trim trailing blank lines, ensure single newline at end.
-    while (!out.empty() && (out.back() == '\n' || out.back() == ' ' || out.back() == '\t')) {
-        out.pop_back();
-    }
+    // Trailing blank lines go; the text ends in exactly one newline.
+    out.resize(detail::trim_end_view(out).size());
     out.push_back('\n');
     return out;
 }

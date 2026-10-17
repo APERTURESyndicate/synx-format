@@ -1,5 +1,5 @@
 // Package synx provides a native Go parser for the SYNX (Active Data Format).
-// Parity with crates/synx-core 3.6.x — no cgo, no external dependencies.
+// Parity with crates/synx-core 3.8.0 — no cgo, no external dependencies.
 package synx
 
 // Kind tags every SynxValue concrete type. Stable wire numbers (used by
@@ -98,12 +98,12 @@ func (SecretValue) isSynxValue() {}
 
 // ─── Constructors ───────────────────────────────────────────────────────────
 
-func Bool(b bool) Value      { return BoolValue{V: b} }
-func Int(n int64) Value      { return IntValue{V: n} }
-func Float(f float64) Value  { return FloatValue{V: f} }
-func String(s string) Value  { return StringValue{V: s} }
-func Secret(s string) Value  { return SecretValue{V: s} }
-func Array(v []Value) Value  { return ArrayValue{V: v} }
+func Bool(b bool) Value       { return BoolValue{V: b} }
+func Int(n int64) Value       { return IntValue{V: n} }
+func Float(f float64) Value   { return FloatValue{V: f} }
+func String(s string) Value   { return StringValue{V: s} }
+func Secret(s string) Value   { return SecretValue{V: s} }
+func Array(v []Value) Value   { return ArrayValue{V: v} }
 func Object_(o *Object) Value { return ObjectValue{V: o} }
 
 // NewArray returns an empty array Value.

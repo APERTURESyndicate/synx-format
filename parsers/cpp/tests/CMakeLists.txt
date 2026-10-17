@@ -13,16 +13,23 @@ add_executable(synx_tests
     test_engine_env.cpp
     test_multiline.cpp
     test_constraints.cpp
-    test_conformance.cpp)
+    test_conformance.cpp
+    test_380.cpp)
 
 target_link_libraries(synx_tests PRIVATE synx)
 target_include_directories(synx_tests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 
 # Conformance corpus lives at the repo root.
 target_compile_definitions(synx_tests PRIVATE
     SYNX_CONFORMANCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/conformance/cases")
+
+# The binary tests check DEFLATE only when the library has it.
+if(SYNX_HAVE_ZLIB)
+    target_compile_definitions(synx_tests PRIVATE SYNX_HAVE_ZLIB=1)
+endif()
 
 # Run every registered test by name.
 add_test(NAME synx_tests COMMAND synx_tests)

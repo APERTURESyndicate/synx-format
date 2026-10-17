@@ -52,10 +52,9 @@ bool starts_with_tool(std::string_view input) {
 
 SYNX_TEST(conformance_corpus_matches_expected_json) {
     std::filesystem::path dir = SYNX_CONFORMANCE_DIR;
-    if (dir.empty() || !std::filesystem::exists(dir)) {
-        // Corpus not present in this checkout — skip silently.
-        return;
-    }
+    // A missing corpus is a failure: a runner that checks nothing proves nothing.
+    EXPECT_TRUE(!dir.empty() && std::filesystem::exists(dir));
+    if (dir.empty() || !std::filesystem::exists(dir)) return;
     std::vector<std::filesystem::path> inputs;
     for (const auto& entry : std::filesystem::directory_iterator(dir)) {
         if (entry.path().extension() == ".synx") inputs.push_back(entry.path());
@@ -67,7 +66,11 @@ SYNX_TEST(conformance_corpus_matches_expected_json) {
     for (const auto& path : inputs) {
         std::filesystem::path expected_path = path;
         expected_path.replace_extension(".expected.json");
-        if (!std::filesystem::exists(expected_path)) continue;
+        if (!std::filesystem::exists(expected_path)) {
+            ++mismatched;
+            std::fprintf(stderr, "  corpus case without expected JSON: %s\n", path.filename().string().c_str());
+            continue;
+        }
 
         // Raw bytes: stripping a BOM is the parser's job, not the runner's.
         const std::string input = read_text(path);
@@ -91,6 +94,6 @@ SYNX_TEST(conformance_corpus_matches_expected_json) {
         }
     }
     std::printf("    [corpus] checked %d cases, %d mismatched\n", checked, mismatched);
-    EXPECT_TRUE(checked > 0);
+    EXPECT_TRUE(checked >= 34);  // the 3.8.0 corpus: 001–019 and 100–114
     EXPECT_EQ(mismatched, 0);
 }

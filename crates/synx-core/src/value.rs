@@ -2,6 +2,19 @@
 
 use std::collections::HashMap;
 
+/// Hasher for every SYNX object and metadata map.
+///
+/// perf: foldhash is several times faster than SipHash on short keys and is
+/// randomly seeded per map, so hostile keys cannot be pre-computed to collide.
+pub type MapHasher = foldhash::fast::RandomState;
+
+/// An object: keys in source order.
+///
+/// spec: order is load-bearing — active-mode markers resolve in the order the
+/// document declares them (`total:calc price + tax` after `tax:calc …`), as
+/// in every other implementation. A `HashMap` made that order random per run.
+pub type Map<V = Value> = indexmap::IndexMap<std::string::String, V, MapHasher>;
+
 /// SYNX value types.
 #[derive(Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -13,7 +26,7 @@ pub enum Value {
     Bool(bool),
     Null,
     Array(Vec<Value>),
-    Object(HashMap<std::string::String, Value>),
+    Object(Map),
     /// Secret value — displays as [SECRET], real value accessible via as_secret()
     Secret(std::string::String),
 }
@@ -64,14 +77,14 @@ impl Value {
         }
     }
 
-    pub fn as_object(&self) -> Option<&HashMap<std::string::String, Value>> {
+    pub fn as_object(&self) -> Option<&Map> {
         match self {
             Value::Object(m) => Some(m),
             _ => None,
         }
     }
 
-    pub fn as_object_mut(&mut self) -> Option<&mut HashMap<std::string::String, Value>> {
+    pub fn as_object_mut(&mut self) -> Option<&mut Map> {
         match self {
             Value::Object(m) => Some(m),
             _ => None,
@@ -175,7 +188,7 @@ pub struct Constraints {
 }
 
 /// Map of key → metadata for one object level.
-pub type MetaMap = HashMap<String, Meta>;
+pub type MetaMap = Map<Meta>;
 
 /// Include directive: !include path [alias]
 #[derive(Debug, Clone)]
@@ -207,7 +220,7 @@ pub struct ParseResult {
     pub llm: bool,
     /// Metadata for each nesting level, keyed by dot-path prefix.
     /// "" = root level, "server" = server sub-object, etc.
-    pub metadata: HashMap<String, MetaMap>,
+    pub metadata: Map<MetaMap>,
     /// !include directives parsed from the file.
     pub includes: Vec<IncludeDirective>,
     /// !use directives parsed from the file (package imports).

@@ -1,5 +1,6 @@
 // Structural diff. Mirrors crates/synx-core/src/diff.rs.
 
+import 'num.dart';
 import 'value.dart';
 
 class SynxDiffChange {
@@ -43,7 +44,7 @@ SynxDiffResult diff(SynxObject a, SynxObject b) {
       added.set(entry.key, entry.value);
     }
   }
-  unchanged.sort();
+  sortCodePoints(unchanged);
   return SynxDiffResult(added, removed, changed, unchanged);
 }
 

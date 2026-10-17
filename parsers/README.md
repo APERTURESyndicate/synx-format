@@ -28,10 +28,14 @@ currently goes into the implementations that carry real demand:
   Python, Node and WASM bindings;
 - **TypeScript `packages/synx-js`** (npm `@aperturesyndicate/synx-format`).
 
-The native ports (C++, Dart, .NET, Go, Java, Swift, Godot/GDScript) remain
-supported on SYNX 3.7 but track releases with a lag: their demand is an order
-of magnitude lower, so fixes land there after they have settled in the two
-implementations above. For a new project, prefer Rust or TypeScript.
+The native ports (C++, Dart, .NET, Go, Java, Swift, Godot/GDScript) were
+brought to SYNX 3.8.0 together with the core: each passes the conformance
+suite byte for byte and was checked against synx-core on thousands of
+generated documents (parse and resolve, `format`, `stringify`, `.synxb`).
+None of them reads or writes SYNXL yet — that is Rust, TypeScript and the
+bindings built on synx-core. Their demand is an order of magnitude lower, so
+new work still lands in the two implementations above first; for a new
+project, prefer Rust or TypeScript.
 
 `../tree-sitter-synx/` holds the editor/Linguist grammar (separate from the
 runtime parsers above). `../crates/synx-lsp` is the language server, not a

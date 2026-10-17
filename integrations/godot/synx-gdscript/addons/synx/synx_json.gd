@@ -2,28 +2,26 @@
 class_name SynxJson
 extends RefCounted
 
-# Canonical JSON emitter — output parity with synx-core::to_json:
-#   • keys at every object level sorted lexicographically
-#   • strings escape: " \ \n \r \t and other < 0x20 → \uXXXX
-#   • secrets → "[SECRET]" literal
-#   • floats use Godot's str() (shortest round-trip)
-#   • depth capped at MAX_JSON_DEPTH; deeper subtrees become null
-#
-# Output is intentionally compact (no spaces) — matches Rust output.
+# Canonical JSON, byte for byte as synx-core `to_json` writes it:
+#   • keys sorted by code point at every level, no whitespace
+#   • strings escape " \ \n \r \t and every other control character < 0x20
+#     as \u00xx; nothing else is escaped
+#   • floats in the ryu layout ("1.0", "0.001", "1e21"); NaN/±inf → null
+#   • secrets → "[SECRET]"; deeper than MAX_JSON_DEPTH → null
 
 const MAX_JSON_DEPTH: int = 128
 
+static var _rx_escape: RegEx = null
+static var _key_cache: Dictionary = {}
+
 
 static func to_json(value: SynxValue) -> String:
-	var out := ""
-	_write(value, 0, _StringBuf.new(out)) if false else null
-	# GDScript can't pass strings by reference cleanly, so build via array join.
-	var sink: Array[String] = []
+	var sink := PackedStringArray()
 	_emit(value, 0, sink)
 	return "".join(sink)
 
 
-static func _emit(value: SynxValue, depth: int, sink: Array[String]) -> void:
+static func _emit(value: SynxValue, depth: int, sink: PackedStringArray) -> void:
 	if depth > MAX_JSON_DEPTH:
 		sink.append("null")
 		return
@@ -35,11 +33,10 @@ static func _emit(value: SynxValue, depth: int, sink: Array[String]) -> void:
 		SynxValue.Kind.INT:
 			sink.append(str(value.data))
 		SynxValue.Kind.FLOAT:
-			sink.append(_format_float(value.data))
+			sink.append(format_float(value.data))
 		SynxValue.Kind.STRING:
-			sink.append(_quote(value.data))
+			sink.append(quote(value.data))
 		SynxValue.Kind.SECRET:
-			# Secrets are redacted in JSON — never expose the underlying string.
 			sink.append("\"[SECRET]\"")
 		SynxValue.Kind.ARRAY:
 			sink.append("[")
@@ -61,53 +58,66 @@ static func _emit(value: SynxValue, depth: int, sink: Array[String]) -> void:
 				if not first2:
 					sink.append(",")
 				first2 = false
-				sink.append(_quote(String(k)))
+				# perf: keys repeat across objects; their JSON form is cached.
+				var qk: Variant = _key_cache.get(k)
+				if qk == null:
+					qk = quote(k)
+					if _key_cache.size() >= 8192:
+						_key_cache.clear()
+					_key_cache[k] = qk
+				sink.append(qk)
 				sink.append(":")
 				_emit(map[k], depth + 1, sink)
 			sink.append("}")
 
 
-static func _quote(s: String) -> String:
-	var out := "\""
+static func quote(s: String) -> String:
+	if _rx_escape == null:
+		_rx_escape = RegEx.new()
+		_rx_escape.compile("[\"\\\\\\x00-\\x1f]")
+	if _rx_escape.search(s) == null:
+		return "\"" + s + "\""
+	var out := PackedStringArray()
+	out.append("\"")
 	var n := s.length()
+	var run := 0
 	for i in n:
 		var ch := s.unicode_at(i)
+		var esc := ""
 		if ch == 34:
-			out += "\\\""
+			esc = "\\\""
 		elif ch == 92:
-			out += "\\\\"
+			esc = "\\\\"
 		elif ch == 10:
-			out += "\\n"
+			esc = "\\n"
 		elif ch == 13:
-			out += "\\r"
+			esc = "\\r"
 		elif ch == 9:
-			out += "\\t"
+			esc = "\\t"
 		elif ch < 0x20:
-			out += "\\u%04x" % ch
+			esc = "\\u00%02x" % ch
 		else:
-			out += s.substr(i, 1)
-	out += "\""
-	return out
+			continue
+		if i > run:
+			out.append(s.substr(run, i - run))
+		out.append(esc)
+		run = i + 1
+	if run < n:
+		out.append(s.substr(run))
+	out.append("\"")
+	return "".join(out)
+
+
+# Kept for callers of the 3.7 API.
+static func _quote(s: String) -> String:
+	return quote(s)
+
+
+static func format_float(f: float) -> String:
+	if is_nan(f) or is_inf(f):
+		return "null"
+	return SynxNum.ryu(f)
 
 
 static func _format_float(f: float) -> String:
-	# Reproduce Rust ryu-like shortest representation: "1.5" not "1.50000",
-	# and "1.0" not "1" when the value is integral.
-	if f != f: # NaN — JSON has no NaN; emit null.
-		return "null"
-	if f == INF:
-		return "1e999"
-	if f == -INF:
-		return "-1e999"
-	var s := str(f)
-	# Godot prints "1" for integral floats; canonical JSON for SYNX keeps "1.0".
-	if not ("." in s) and not ("e" in s) and not ("E" in s):
-		s += ".0"
-	return s
-
-
-# Reserved for a future streaming version — currently unused.
-class _StringBuf:
-	var s: String
-	func _init(initial: String = "") -> void:
-		s = initial
+	return format_float(f)

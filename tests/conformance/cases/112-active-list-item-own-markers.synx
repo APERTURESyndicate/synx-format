@@ -1,0 +1,10 @@
+!active
+servers
+  - name a
+    port:env:default:7001 SYNX_CONFORMANCE_UNSET_VAR
+  - name b
+    port 8080
+  - name c
+    port[type:int, max:9] 77
+  - name d
+    port 5

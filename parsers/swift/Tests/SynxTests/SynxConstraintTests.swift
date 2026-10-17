@@ -138,13 +138,15 @@ final class SynxConstraintTests: XCTestCase {
         XCTAssertEqual(o["m"], .string("CALC_ERR: SYNX :calc \(dash) division by zero"))
         XCTAssertEqual(o["p1"], .string("CALC_ERR: SYNX :calc \(dash) missing closing parenthesis"))
         XCTAssertEqual(o["p2"], .string("CALC_ERR: SYNX :calc \(dash) unexpected token at position 3"))
-        XCTAssertEqual(o["star"], .string("CALC_ERR: SYNX :calc \(dash) unexpected token: Op(42)"))
-        XCTAssertEqual(o["rp"], .string("CALC_ERR: SYNX :calc \(dash) unexpected token: RParen"))
+        // 3.8.0: the token as written, not Rust's `{:?}` of it.
+        XCTAssertEqual(o["star"], .string("CALC_ERR: SYNX :calc \(dash) unexpected token: '*'"))
+        XCTAssertEqual(o["rp"], .string("CALC_ERR: SYNX :calc \(dash) unexpected token: ')'"))
         XCTAssertEqual(o["hole"], .string("CALC_ERR: SYNX :calc \(dash) unexpected end of expression"))
         XCTAssertEqual(o["num"], .string("CALC_ERR: SYNX :calc \(dash) invalid number: '1.2.3'"))
         XCTAssertEqual(o["op"], .string("CALC_ERR: SYNX :calc \(dash) invalid number: '-'"))
         XCTAssertEqual(o["bad"], .string("CALC_ERR: SYNX :calc \(dash) unexpected token at position 1"))
-        XCTAssertEqual(o["uni"], .string("CALC_ERR: SYNX :calc \(dash) unexpected character: '\u{00C3}' in expression"))
+        // 3.8.0: the whole character, not its first byte read as Latin-1.
+        XCTAssertEqual(o["uni"], .string("CALC_ERR: SYNX :calc \(dash) unexpected character: 'м' in expression"))
     }
 
     func test_calc_too_long_expression() {

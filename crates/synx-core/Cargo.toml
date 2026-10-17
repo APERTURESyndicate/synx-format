@@ -1,6 +1,6 @@
 [package]
 name = "synx-core"
-version = "3.7.4"
+version = "3.8.0"
 edition = "2021"
 authors = ["APERTURESyndicate <support@aperturesyndicate.com>"]
 description = "SYNX — The Active Data Format. Core parser + engine with full !active support."
@@ -11,6 +11,10 @@ categories = ["parser-implementations", "config"]
 
 [dependencies]
 memchr = "2"
+# perf: objects keep source order (deterministic resolution, JS parity) and
+# hash with foldhash instead of SipHash.
+indexmap = "2"
+foldhash = "0.1"
 itoa = "1"
 ryu = "1"
 miniz_oxide = "0.8"
@@ -27,7 +31,7 @@ sha2 = { version = "0.10", optional = true }
 
 [features]
 default = []
-serde = ["dep:serde"]
+serde = ["dep:serde", "indexmap/serde"]
 jsonschema = ["dep:jsonschema"]
 wasm = ["dep:wasmi"]
 signing = ["dep:ed25519-dalek", "dep:rand", "dep:sha2"]

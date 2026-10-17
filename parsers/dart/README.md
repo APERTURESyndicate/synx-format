@@ -66,6 +66,9 @@ final opts = SynxOptions()
 final r = parseActive('!active\nslug:upper hello', opts);
 ```
 
+`args` are the marker-chain parts after the custom marker (`key:upper:a:b` → `[a, b]`),
+as synx-core passes them to a WASM marker; one custom marker applies per key.
+
 ## Layout
 
 ```
@@ -75,6 +78,8 @@ parsers/dart/
 │   ├── synx.dart                 # public API
 │   └── src/
 │       ├── value.dart            # sealed class SynxValue + 8 subclasses
+│       ├── num.dart              # Rust number text (Display, ryu, {:.N}) and parse grammars
+│       ├── constraints.dart      # [constraints] checks, pattern cache
 │       ├── meta.dart             # Meta, Constraints, ParseResult, directives
 │       ├── options.dart          # Options, SynxMarkerFn
 │       ├── parser.dart           # text → tree
@@ -94,6 +99,7 @@ parsers/dart/
     ├── diff_test.dart
     ├── binary_test.dart
     ├── engine_test.dart
+    ├── release_380_test.dart     # 3.8.0 parity cases (expectations from synx-core)
     └── conformance_test.dart
 ```
 
@@ -125,13 +131,12 @@ parsers/dart/
 
 ## Wire compatibility
 
-* **JSON**: byte-for-byte identical to Rust ryu/itoa output for typical inputs.
-  Floats use Dart's `double.toString()` (shortest round-trip) plus a mandatory
-  `.0` suffix so JSON parsers see a Float, not an Int.
+* **JSON**: byte-for-byte identical to Rust `write_json`: keys sorted by code point,
+  floats in the ryu layout (`1.0`, `1e-7`, `1.2345678901234569e23`).
 * **`.synxb`**: identical magic / version / flags / string table / DEFLATE
   payload as `crates/synx-core`. Compression goes through
   `ZLibCodec(raw: true, level: 9)` — raw DEFLATE — matching Rust
   `miniz_oxide::deflate::compress_to_vec(_, 9)` / Go `compress/flate level 9` /
   Java `Deflater(9, nowrap=true)`.
-* **Canonical text format**: same sort key and indentation rules as Rust
-  `fmt_canonical`.
+* **Canonical text format** and **stringify**: byte-identical to Rust `fmt_canonical`
+  and `Synx::stringify` (the SYNXL §14.1 round-trip writer).

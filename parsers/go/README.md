@@ -1,9 +1,11 @@
 # SYNX — native Go parser
 
 `parsers/go` is the **native** SYNX parser written in pure Go. No cgo, no
-`synx-c` cdylib at runtime, no `CGO_ENABLED=1`. Mirrors the canonical Rust
-engine 1:1 (parse / `!active` / `.synxb` / canonical JSON / diff / format /
-`!tool`).
+`synx-c` cdylib at runtime, no `CGO_ENABLED=1`. Implements **SYNX 3.8.0** as
+`crates/synx-core` does it: parse, `!active` resolution, `.synxb`, canonical
+JSON, stringify, diff, format and `!tool` give the reference's output byte for
+byte (the conformance corpus in `tests/conformance` is replayed by
+`conformance_test.go`).
 
 Targets:
 
@@ -18,7 +20,8 @@ Targets:
 | External deps | None (only stdlib: `compress/flate`, `regexp`, `math/rand`) |
 | Build | `go build ./...` |
 | Tests | `go test ./...` |
-| Wire-compat with Rust | yes (canonical JSON + `.synxb` raw DEFLATE) |
+| Wire-compat with Rust | yes (canonical JSON, `.synxb` payload) |
+| Version | `synx.Version` = `3.8.0` |
 
 ## Quick start
 
@@ -83,8 +86,9 @@ parsers/go/
 ├── stringify.go    // Stringify + Format
 ├── diff.go         // Diff + DiffToValue
 ├── binary.go       // .synxb compile/decompile (compress/flate raw DEFLATE)
-├── engine.go       // Resolve, helpers, validation
-├── markers.go      // 27 builtin marker functions
+├── engine.go       // Resolve: document-order walk, markers, inheritance
+├── markers.go      // marker helpers: :format, :version, files, !use, :once
+├── constraints.go  // constraints, registries, field validation
 ├── synx.go         // top-level wrappers
 └── *_test.go       // unit + conformance corpus runner
 ```
@@ -104,10 +108,27 @@ parsers/go/
 | Serialize / JSON depth | 128 |
 | Constraint enum parts | 4096 |
 
+## Active mode
+
+Resolution follows synx-core: one pass per object in document order — for
+each key, first its child object (or each object item of its list), then the
+key's own markers, then `{…}` interpolation over the object — so a marker sees
+every key above it already resolved, at any depth. Declarations belong to the
+object that holds the key: `ParseResult.Metadata` is an ordered
+`*MetadataTree` keyed by metadata path, where a list item is `list.#0` and a
+`.` or `\` inside a key is escaped (`a\.b`); `MetadataTree.Get(path)` returns
+an ordered `*MetaMap`.
+
 ## What's unsupported (versus Rust core)
 
-* **WASM custom markers** — replaced by `Options.MarkerFns` (Go closures).
-  Builtin markers always win over a custom marker with the same name.
+* **SYNXL** (`.synxl`) is not implemented — see `../README.md`.
+* **WASM custom markers** — replaced by `Options.MarkerFns` (Go closures),
+  applied after the built-in markers, before the key's constraints. Builtin
+  markers always win over a custom marker with the same name.
+* **`[pattern]`** runs on Go's `regexp` (RE2). The reference uses Rust's
+  `regex` crate; both are RE2-style, but the dialects differ at the edges
+  (Unicode classes such as `\d`, `\pL`, unusual repetition syntax), so a rare
+  pattern can match differently or be accepted by one and skipped by the other.
 * **`:signing`** — Ed25519 signature verification not ported (consistent
   with the C++ / Swift / Java / GDScript ports).
 * `:vision` / `:audio` are passthrough envelopes; consumers attach media
@@ -115,12 +136,19 @@ parsers/go/
 
 ## Wire compatibility
 
-* **JSON**: byte-for-byte identical to Rust ryu/itoa output. Floats use
-  `%.17g` with a mandatory `.0` suffix.
-* **`.synxb`**: identical magic / version / flags / string table / DEFLATE
-  payload as `crates/synx-core`. Files written here decompile under
-  Rust / C# / Swift / Java / GDScript / C++ and vice-versa. Compression goes
-  through `compress/flate.NewWriter(_, flate.BestCompression)` — raw DEFLATE
-  (no zlib wrapper) — matching `miniz_oxide::deflate::compress_to_vec(_, 9)`.
-* **Canonical text format**: same sort key and indentation rules as the
-  Rust `fmt_canonical`.
+* **JSON**: byte-for-byte identical to Rust ryu/itoa output (shortest
+  round-trip floats in ryu's layout: `1e-7`, `1.2345678901234569e23`, `5.0`).
+* **`.synxb`**: identical magic / version / flags and an identical
+  uncompressed payload — the string table is ordered by use count as in
+  synx-core, so the same document always compiles to the same bytes. Files
+  written here decompile under Rust / C# / Swift / Java / GDScript / C++ and
+  vice-versa. Compression goes through
+  `compress/flate.NewWriter(_, flate.BestCompression)` — raw DEFLATE, no zlib
+  wrapper; the compressed bytes differ from `miniz_oxide`'s, the decoded
+  payload does not.
+* **Stringify / decompile**: the SYNXL §14.1 block writer of synx-core —
+  strings that would read back as another type or a comment are quoted, `|+`
+  bodies are kept, secrets are written as `[SECRET]`.
+* **Canonical text format**: same sort key (code point order of the
+  lowercased key, stable) and indentation rules as the Rust `fmt_canonical`;
+  a `|` / `|+` body is content and is never sorted.

@@ -5,6 +5,9 @@ use napi::JsUnknown;
 use napi_derive::napi;
 use synx_core::{self, Value, Options, Mode};
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 /// Convert a synx_core::Value into a napi JsUnknown for zero-copy return to JS.
 fn value_to_js(env: &Env, val: &Value) -> Result<JsUnknown> {
     match val {
@@ -67,7 +70,7 @@ fn js_to_value(env: &Env, val: JsUnknown) -> Result<Value> {
                 Ok(Value::Array(arr))
             } else {
                 let keys = napi::JsObject::keys(&obj)?;
-                let mut map = std::collections::HashMap::new();
+                let mut map = synx_core::Map::default();
                 for key in keys {
                     let v: JsUnknown = obj.get_named_property(&key)?;
                     map.insert(key, js_to_value(env, v)?);
@@ -194,8 +197,8 @@ pub fn is_synxb(data: Buffer) -> bool {
 pub fn diff(env: Env, a: JsUnknown, b: JsUnknown) -> Result<JsUnknown> {
     let val_a = js_to_value(&env, a)?;
     let val_b = js_to_value(&env, b)?;
-    let map_a = match val_a { Value::Object(m) => m, _ => std::collections::HashMap::new() };
-    let map_b = match val_b { Value::Object(m) => m, _ => std::collections::HashMap::new() };
+    let map_a = match val_a { Value::Object(m) => m, _ => synx_core::Map::default() };
+    let map_b = match val_b { Value::Object(m) => m, _ => synx_core::Map::default() };
     let result = synx_core::Synx::diff(&map_a, &map_b);
     let val = synx_core::diff_to_value(&result);
     value_to_js(&env, &val)

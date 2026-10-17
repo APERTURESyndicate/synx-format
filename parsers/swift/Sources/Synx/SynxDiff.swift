@@ -35,7 +35,7 @@ public enum SynxDiff {
         for entry in b.entries where a[entry.key] == nil {
             added.set(entry.key, to: entry.value)
         }
-        unchanged.sort()
+        unchanged.sort { $0.bytesLess($1) }
         return SynxDiffResult(added: added, removed: removed, changed: changed, unchanged: unchanged)
     }
 

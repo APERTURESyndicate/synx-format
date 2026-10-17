@@ -1,8 +1,8 @@
 // Conformance corpus runner — replays every `NNN-*.synx` case in the shared
 // corpus through the Swift parser and compares the canonical JSON projection
 // byte for byte against the sibling `.expected.json`. The corpus lives at
-// `tests/conformance/cases` in the repo root; the test skips silently when
-// running outside that checkout.
+// `tests/conformance/cases` in the repo root; a run without it fails — a
+// runner that checks nothing proves nothing.
 import XCTest
 @testable import Synx
 
@@ -10,7 +10,7 @@ final class ConformanceTests: XCTestCase {
 
     func test_corpus_matches_expected_json() throws {
         guard let dir = findCorpus() else {
-            // No corpus on this run — that's fine.
+            XCTFail("conformance corpus tests/conformance/cases not found from \(FileManager.default.currentDirectoryPath)")
             return
         }
         let fm = FileManager.default
@@ -23,7 +23,10 @@ final class ConformanceTests: XCTestCase {
             let expectedPath = (dir as NSString).appendingPathComponent(base + ".expected.json")
             guard fm.fileExists(atPath: expectedPath),
                   let inputData = fm.contents(atPath: inputPath),
-                  let expectedData = fm.contents(atPath: expectedPath) else { continue }
+                  let expectedData = fm.contents(atPath: expectedPath) else {
+                mismatches.append("\(base): no readable .expected.json")
+                continue
+            }
             // Decode without touching a BOM: stripping it is the parser's job.
             let input = String(decoding: inputData, as: UTF8.self)
             let expected = String(decoding: expectedData, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
@@ -41,7 +44,8 @@ final class ConformanceTests: XCTestCase {
             }
         }
         print("[corpus] checked \(checked) cases, \(mismatches.count) mismatched")
-        XCTAssertGreaterThan(checked, 0, "no conformance cases with .expected.json found in \(dir)")
+        // The 3.8.0 corpus: 001–019 and 100–114.
+        XCTAssertGreaterThanOrEqual(checked, 34, "conformance cases missing in \(dir)")
         XCTAssertTrue(mismatches.isEmpty,
                       "\(mismatches.count) of \(checked) conformance cases differ:\n" + mismatches.joined(separator: "\n"))
     }

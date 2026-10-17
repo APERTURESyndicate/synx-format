@@ -121,64 +121,50 @@ enum SynxMode { static_, active }
 
 /// Insertion-ordered string → SynxValue container. Used wherever a JSON-style
 /// "object" is needed. Equality is order-insensitive; iteration follows
-/// insertion order.
+/// insertion order (overwriting a key keeps its place, as Rust `IndexMap`).
+///
+/// perf: backed by a hash map — lookups were a linear scan, which made a
+/// document with N keys in one object O(N²) to parse.
 class SynxObject {
-  final List<MapEntry<String, SynxValue>> _entries = [];
+  final Map<String, SynxValue> _map = <String, SynxValue>{};
 
   SynxObject();
 
   /// Number of entries.
-  int get length => _entries.length;
-  bool get isEmpty => _entries.isEmpty;
-  bool get isNotEmpty => _entries.isNotEmpty;
+  int get length => _map.length;
+  bool get isEmpty => _map.isEmpty;
+  bool get isNotEmpty => _map.isNotEmpty;
 
   /// Look up a key. Returns null when absent.
-  SynxValue? operator [](String key) {
-    for (final e in _entries) {
-      if (e.key == key) return e.value;
-    }
-    return null;
-  }
+  SynxValue? operator [](String key) => _map[key];
 
   /// Insert or overwrite a key.
-  void operator []=(String key, SynxValue value) => set(key, value);
+  void operator []=(String key, SynxValue value) => _map[key] = value;
 
-  void set(String key, SynxValue value) {
-    for (var i = 0; i < _entries.length; i++) {
-      if (_entries[i].key == key) {
-        _entries[i] = MapEntry(key, value);
-        return;
-      }
-    }
-    _entries.add(MapEntry(key, value));
-  }
+  void set(String key, SynxValue value) => _map[key] = value;
 
-  bool remove(String key) {
-    for (var i = 0; i < _entries.length; i++) {
-      if (_entries[i].key == key) {
-        _entries.removeAt(i);
-        return true;
-      }
-    }
-    return false;
-  }
+  bool remove(String key) => _map.remove(key) != null;
 
-  bool contains(String key) => this[key] != null;
+  bool contains(String key) => _map.containsKey(key);
 
-  List<String> get keys => _entries.map((e) => e.key).toList();
+  /// A snapshot of the keys in insertion order.
+  List<String> get keys => _map.keys.toList();
   List<String> get sortedKeys => keys..sort();
-  List<MapEntry<String, SynxValue>> get entries => List.unmodifiable(_entries);
+  List<MapEntry<String, SynxValue>> get entries => List.unmodifiable(_map.entries);
+
+  /// Live, read-only views (no copy). Do not mutate the object while iterating.
+  Iterable<String> get keyView => _map.keys;
+  Iterable<MapEntry<String, SynxValue>> get entryView => _map.entries;
 
   /// Returns a value for `key`, or `fallback` when absent.
   SynxValue getOr(String key, SynxValue fallback) => this[key] ?? fallback;
 
   @override
   bool operator ==(Object other) {
-    if (other is! SynxObject || _entries.length != other._entries.length) return false;
-    for (final e in _entries) {
-      final v = other[e.key];
-      if (v == null && !other.contains(e.key)) return false;
-      if (e.value != v) return false;
+    if (other is! SynxObject || _map.length != other._map.length) return false;
+    for (final e in _map.entries) {
+      final v = other._map[e.key];
+      if (v == null || e.value != v) return false;
     }
     return true;
   }
@@ -186,7 +172,7 @@ class SynxObject {
   @override
   int get hashCode {
     var h = 0;
-    for (final e in _entries) {
+    for (final e in _map.entries) {
       h ^= Object.hash(e.key, e.value);
     }
     return h;

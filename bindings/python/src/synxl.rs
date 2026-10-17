@@ -28,7 +28,7 @@ use synx_core::synxl::{
 };
 use synx_core::Value;
 
-use crate::{py_to_value, value_to_py};
+use crate::{py_to_value, value_to_py, value_to_py_cached, KeyCache};
 
 create_exception!(
     synx_native,
@@ -145,7 +145,8 @@ impl PySynxlDocument {
     /// itself with nothing to signal it. Rebuilding costs a conversion per
     /// call and keeps every view consistent.
     fn record_list(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
-        let items: Vec<Py<PyAny>> = self.doc.records.iter().map(|v| value_to_py(py, v)).collect();
+        let mut keys = KeyCache::default();
+        let items: Vec<Py<PyAny>> = self.doc.records.iter().map(|v| value_to_py_cached(py, v, &mut keys)).collect();
         Ok(PyList::new(py, items)?.unbind())
     }
 }

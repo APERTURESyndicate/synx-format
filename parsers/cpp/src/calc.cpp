@@ -1,7 +1,8 @@
 // Safe arithmetic evaluator for `:calc`. Byte-for-byte port of crates/synx-core/src/calc.rs,
 // including its error messages (`SYNX :calc — …`, with the em dash).
 #include "synx/calc.hpp"
-#include "unicode_ws.hpp"
+#include "numfmt.hpp"
+#include "unicode.hpp"
 
 #include <cmath>
 #include <cstdint>
@@ -25,43 +26,6 @@ struct Token {
 };
 
 inline bool is_digit(char c) noexcept { return c >= '0' && c <= '9'; }
-
-// Rust `ch as char`: one byte widened to U+00xx, then UTF-8 encoded.
-std::string widen_byte(unsigned char b) {
-    std::string out;
-    if (b < 0x80) {
-        out.push_back(static_cast<char>(b));
-    } else {
-        out.push_back(static_cast<char>(0xC0 | (b >> 6)));
-        out.push_back(static_cast<char>(0x80 | (b & 0x3F)));
-    }
-    return out;
-}
-
-// Rust `str::parse::<f64>` for the shapes the tokenizer can produce: an optional
-// `-`, digits and dots, at least one digit, at most one dot (`5.`, `.5`, `-.5` are fine).
-bool parse_number(const std::string& s, double& out) {
-    size_t i = 0;
-    bool neg = false;
-    if (i < s.size() && s[i] == '-') { neg = true; ++i; }
-    std::string int_part, frac_part;
-    bool seen_dot = false;
-    for (; i < s.size(); ++i) {
-        if (s[i] == '.') {
-            if (seen_dot) return false;
-            seen_dot = true;
-        } else if (seen_dot) {
-            frac_part.push_back(s[i]);
-        } else {
-            int_part.push_back(s[i]);
-        }
-    }
-    if (int_part.empty() && frac_part.empty()) return false;
-    std::string norm = (int_part.empty() ? "0" : int_part) + "." + (frac_part.empty() ? "0" : frac_part);
-    out = std::strtod(norm.c_str(), nullptr);
-    if (neg) out = -out;
-    return true;
-}
 
 bool tokenize(std::string_view expr, std::vector<Token>& out, std::string& err) {
     size_t i = 0;
@@ -91,7 +55,7 @@ bool tokenize(std::string_view expr, std::vector<Token>& out, std::string& err) 
             }
             std::string num_str(expr.substr(start, i - start));
             double v = 0.0;
-            if (!parse_number(num_str, v)) {
+            if (!detail::parse_f64(num_str, v)) {
                 err = std::string(kPrefix) + "invalid number: '" + num_str + "'";
                 return false;
             }
@@ -115,8 +79,9 @@ bool tokenize(std::string_view expr, std::vector<Token>& out, std::string& err) 
             continue;
         }
 
+        // The whole character, not its first byte read as Latin-1.
         err = std::string(kPrefix) + "unexpected character: '"
-            + widen_byte(static_cast<unsigned char>(ch)) + "' in expression";
+            + std::string(expr.substr(i, detail::utf8_len(static_cast<unsigned char>(ch)))) + "' in expression";
         return false;
     }
     return true;
@@ -220,12 +185,9 @@ private:
             out = v;
             return true;
         }
-        // Mirrors Rust's `{:?}` of the offending token.
-        if (t.kind == TokenKind::Op) {
-            err = std::string(kPrefix) + "unexpected token: Op(" + std::to_string(static_cast<unsigned>(t.op)) + ")";
-        } else {
-            err = std::string(kPrefix) + "unexpected token: RParen";
-        }
+        // The token as written (Rust `token_text`).
+        std::string text = t.kind == TokenKind::Op ? std::string(1, static_cast<char>(t.op)) : std::string(")");
+        err = std::string(kPrefix) + "unexpected token: '" + text + "'";
         return false;
     }
 

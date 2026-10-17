@@ -1,0 +1,9 @@
+!active
+price 100
+tax:calc price * 0.2
+total:calc price + tax
+limit 5
+svc
+  limit 100
+  price:calc limit * 2
+  note Total is {total}

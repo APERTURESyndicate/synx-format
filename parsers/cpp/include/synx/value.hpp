@@ -99,20 +99,22 @@ public:
     const char* type_name() const noexcept;
 
 private:
-    void clear() noexcept;
+    void destroy() noexcept;
     void copy_from(const Value& other);
     void move_from(Value&& other) noexcept;
 
     Kind kind_;
+    // Exactly one member is alive, the one `kind_` names (none for Null).
+    // vector<Pair> with `Pair` still incomplete is fine in C++17; its members
+    // are only used in value.cpp, where `Pair` is complete.
     union {
         bool b_;
         int64_t i_;
         double f_;
+        std::string str_;  // String / Secret
+        Array arr_;
+        Object obj_;
     };
-    // Non-trivial members live outside the union and are conditionally valid.
-    std::string str_;   // String / Secret
-    Array arr_;         // Array
-    Object obj_;        // Object — forward-declared `Pair`, vector<incomplete> OK in C++17
 };
 
 /// Object entry (key/value). Defined after Value so vector<Pair> can be used by Value.

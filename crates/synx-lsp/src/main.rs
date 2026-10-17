@@ -216,6 +216,10 @@ fn diagnose(text: &str, workspace_roots: &[PathBuf]) -> Vec<Diagnostic> {
             .split('[').next().unwrap_or("")
             .split('(').next().unwrap_or("");
 
+        // A key line closes every deeper scope: siblings under different
+        // parents (`db.url`, `redis.url`) are not duplicates. The scopes were
+        // keyed by indent alone, so every such pair was flagged.
+        keys_by_indent.retain(|&ind, _| ind <= indent);
         let scope_keys = keys_by_indent.entry(indent).or_default();
         if let Some((_, prev_line)) = scope_keys.iter().find(|(k, _)| k == base_key) {
             diags.push(Diagnostic {
@@ -359,27 +363,78 @@ fn build_symbols(text: &str) -> Vec<DocumentSymbol> {
     match result.root {
         synx_core::Value::Object(map) => {
             let lines: Vec<&str> = text.lines().collect();
-            map_to_symbols(&map, &lines, 0)
+            map_to_symbols(&map, &lines, 0, lines.len())
         }
         _ => vec![],
     }
 }
 
-fn map_to_symbols(
-    map: &HashMap<String, synx_core::Value>,
-    lines: &[&str],
-    base_indent: usize,
-) -> Vec<DocumentSymbol> {
+/// Line, indent and block end of each direct child key in `lines[from..to]`.
+///
+/// The children are the lines at the block's shallowest indent; a key's block
+/// runs to the next line at or above that indent. One pass per block — the
+/// previous lookup scanned the whole file for every key (quadratic) and took
+/// the first match anywhere, so `cache.port` pointed at `db.port`. A repeated
+/// key resolves to its last declaration, the one the parser keeps.
+fn child_key_lines<'a>(lines: &[&'a str], from: usize, to: usize) -> HashMap<&'a str, (usize, usize, usize)> {
+    let mut out: HashMap<&'a str, (usize, usize, usize)> = HashMap::new();
+    let mut level: Option<usize> = None;
+    let mut open: Option<&'a str> = None;
+    for i in from..to {
+        let line = lines[i];
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("//") || trimmed.starts_with('!') {
+            continue;
+        }
+        let indent = line.len() - line.trim_start().len();
+        let lvl = *level.get_or_insert(indent);
+        if indent > lvl {
+            continue;
+        }
+        if let Some(k) = open.take() {
+            if let Some(e) = out.get_mut(k) {
+                e.2 = i;
+            }
+        }
+        if trimmed.starts_with("- ") {
+            continue;
+        }
+        let key = trimmed
+            .split(|c: char| c.is_whitespace() || c == ':' || c == '[' || c == '(')
+            .next()
+            .unwrap_or("");
+        if !key.is_empty() {
+            out.insert(key, (i, indent, to));
+            open = Some(key);
+        }
+    }
+    out
+}
+
+/// At most `max` bytes of `s`, cut on a character boundary.
+fn clip(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+fn map_to_symbols(map: &synx_core::Map, lines: &[&str], from: usize, to: usize) -> Vec<DocumentSymbol> {
     let mut symbols = Vec::new();
+    let children = child_key_lines(lines, from, to);
     let mut sorted_keys: Vec<&String> = map.keys().collect();
     sorted_keys.sort();
 
     for key in sorted_keys {
         let val = &map[key];
-        let line_num = find_key_line(lines, key, base_indent);
+        let (line_num, indent, block_end) = children.get(key.as_str()).copied().unwrap_or((from, 0, from));
         let range = Range::new(
-            Position::new(line_num, base_indent as u32),
-            Position::new(line_num, (base_indent + key.len()) as u32),
+            Position::new(line_num as u32, indent as u32),
+            Position::new(line_num as u32, (indent + key.len()) as u32),
         );
 
         let kind = match val {
@@ -393,8 +448,10 @@ fn map_to_symbols(
         };
 
         let detail = match val {
+            // `&s[..37]` panicked on a multi-byte character at that offset —
+            // a long Cyrillic value took the language server down.
             synx_core::Value::String(s) => {
-                if s.len() > 40 { format!("{}...", &s[..37]) } else { s.clone() }
+                if s.len() > 40 { format!("{}...", clip(s, 37)) } else { s.clone() }
             }
             synx_core::Value::Int(n) => n.to_string(),
             synx_core::Value::Float(f) => f.to_string(),
@@ -418,30 +475,15 @@ fn map_to_symbols(
         };
 
         if let synx_core::Value::Object(inner) = val {
-            let children = map_to_symbols(inner, lines, base_indent + 2);
-            if !children.is_empty() {
-                sym.children = Some(children);
+            let nested = map_to_symbols(inner, lines, line_num + 1, block_end.max(line_num + 1));
+            if !nested.is_empty() {
+                sym.children = Some(nested);
             }
         }
 
         symbols.push(sym);
     }
     symbols
-}
-
-fn find_key_line(lines: &[&str], key: &str, min_indent: usize) -> u32 {
-    for (i, line) in lines.iter().enumerate() {
-        let indent = line.len() - line.trim_start().len();
-        if indent < min_indent { continue; }
-        let trimmed = line.trim();
-        let line_key = trimmed.split(|c: char| c.is_whitespace() || c == ':' || c == '[' || c == '(')
-            .next()
-            .unwrap_or("");
-        if line_key == key {
-            return i as u32;
-        }
-    }
-    0
 }
 
 // ─── LanguageServer impl ────────────────────────────────────────────────────
@@ -634,4 +676,38 @@ async fn main() {
         workspace_roots: Mutex::new(Vec::new()),
     });
     Server::new(stdin, stdout, socket).serve(service).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Each nested key points at its own line, and a long multi-byte value is
+    // clipped on a character boundary instead of panicking.
+    #[test]
+    fn symbols_point_at_their_own_lines() {
+        let text = "db\n  port 5432\ncache\n  port 6379\nnote ааааааааааааааааааааааааааааааааааааааааааааааа\n";
+        let syms = build_symbols(text);
+        let cache = syms.iter().find(|s| s.name == "cache").unwrap();
+        let port = &cache.children.as_ref().unwrap()[0];
+        assert_eq!(port.range.start.line, 3);
+        let db = syms.iter().find(|s| s.name == "db").unwrap();
+        assert_eq!(db.children.as_ref().unwrap()[0].range.start.line, 1);
+        assert!(syms.iter().any(|s| s.name == "note"));
+    }
+
+    #[test]
+    fn same_key_under_different_parents_is_not_a_duplicate() {
+        let text = "database
+  url x
+redis
+  url y
+redis2
+  url z
+  url w
+";
+        let dups: Vec<_> = diagnose(text, &[]).into_iter().filter(|d| d.message.starts_with("Duplicate key")).collect();
+        assert_eq!(dups.len(), 1);
+        assert_eq!(dups[0].range.start.line, 6);
+    }
 }

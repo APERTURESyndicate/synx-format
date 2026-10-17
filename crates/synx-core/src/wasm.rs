@@ -351,7 +351,7 @@ fn json_to_value(v: &serde_json::Value) -> Value {
             Value::Array(arr.iter().map(json_to_value).collect())
         }
         serde_json::Value::Object(map) => {
-            let mut m = HashMap::new();
+            let mut m = crate::Map::default();
             for (k, val) in map {
                 m.insert(k.clone(), json_to_value(val));
             }
@@ -498,7 +498,7 @@ mod tests {
         assert_eq!(value_to_json_string(&Value::Int(42)), "42");
         assert_eq!(value_to_json_string(&Value::String("hi".into())), "hi");
         assert_eq!(value_to_json_string(&Value::Secret("k".into())), "[SECRET]");
-        let mut m = HashMap::new();
+        let mut m = crate::Map::default();
         m.insert("a\"b".to_string(), Value::Array(vec![Value::String("x\"y".into()), Value::Secret("k".into())]));
         let json = value_to_json_string(&Value::Object(m));
         assert_eq!(serde_json::from_str::<serde_json::Value>(&json).unwrap(), serde_json::json!({"a\"b": ["x\"y", "[SECRET]"]}));

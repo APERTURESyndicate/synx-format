@@ -1,0 +1,1 @@
+{"servers":[{"name":"a","port":7001,"weight":10},{"name":"b","port":8080}]}

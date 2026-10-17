@@ -68,7 +68,7 @@ internal static class SynxDiff
                 result.Added[key] = bVal;
         }
 
-        result.Unchanged.Sort(StringComparer.Ordinal);
+        result.Unchanged.Sort(CodePointComparer.Instance);
         return result;
     }
 

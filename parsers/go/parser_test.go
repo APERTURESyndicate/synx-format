@@ -88,7 +88,8 @@ func TestParseActiveMetadata(t *testing.T) {
 	if r.Mode != ModeActive {
 		t.Fatalf("mode != active")
 	}
-	if r.Metadata[""] == nil || r.Metadata[""]["tax"].Markers[0] != "calc" {
+	m, ok := r.Metadata.Get("").Get("tax")
+	if !ok || m.Markers[0] != "calc" {
 		t.Fatalf("missing calc metadata")
 	}
 }
@@ -106,7 +107,11 @@ func TestParsePrototypePollutionRejected(t *testing.T) {
 
 func TestParseConstraints(t *testing.T) {
 	r := Parse("!active\nname[min:3, max:30, required] Wario")
-	c := r.Metadata[""]["name"].Constraints
+	m, ok := r.Metadata.Get("").Get("name")
+	if !ok {
+		t.Fatalf("missing name metadata")
+	}
+	c := m.Constraints
 	if c == nil || c.Min == nil || *c.Min != 3 {
 		t.Fatalf("min")
 	}

@@ -1,14 +1,17 @@
 // SYNX parser — converts raw text into a value tree with metadata.
-// Mirrors crates/synx-core/src/parser.rs line-for-line where practical.
+// Port of crates/synx-core/src/parser.rs.
 #include "synx/parser.hpp"
-#include "unicode_ws.hpp"
+
+#include "internal.hpp"
+#include "synx/key_index.hpp"
+#include "numfmt.hpp"
+#include "paths.hpp"
+#include "unicode.hpp"
 
 #include <algorithm>
 #include <cstdint>
-#include <cstdlib>
 #include <cstring>
 #include <optional>
-#include <random>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -16,124 +19,10 @@
 
 namespace synx {
 
-namespace {
+namespace detail {
 
-using detail::trim_end_view;
-using detail::trim_view;
-using detail::ws_len_at;
-using detail::ws_len_before;
-
-// ─── small utility helpers ───────────────────────────────────────────────────
-
-inline bool is_space(char c) noexcept { return c == ' ' || c == '\t'; }
-
-inline bool starts_with(std::string_view s, std::string_view prefix) noexcept {
-    return s.size() >= prefix.size() && std::memcmp(s.data(), prefix.data(), prefix.size()) == 0;
-}
-
-// Same indent-count semantics as Rust `(raw.len() - raw.trim_start().len()) as i32`:
-// bytes of leading Unicode whitespace.
-inline int indent_of(std::string_view raw) noexcept {
-    size_t pos = 0;
-    while (pos < raw.size()) {
-        size_t n = ws_len_at(raw, pos);
-        if (n == 0) break;
-        pos += n;
-    }
-    return static_cast<int>(pos);
-}
-
-// Byte offset of the first character at or past `strip` bytes of leading
-// whitespace; always a character boundary (a multi-byte indent character must
-// not be cut in half). Rust `strip_boundary`.
-inline size_t strip_boundary(std::string_view s, size_t strip) noexcept {
-    size_t off = 0;
-    while (off < strip && off < s.size()) {
-        size_t n = ws_len_at(s, off);
-        if (n == 0) break;
-        off += n;
-    }
-    return off;
-}
-
-// Longest prefix of `s` that fits in `limit` bytes without splitting a character.
-inline size_t utf8_prefix_len(std::string_view s, size_t limit) noexcept {
-    if (s.size() <= limit) return s.size();
-    size_t end = limit;
-    while (end > 0 && (static_cast<unsigned char>(s[end]) & 0xC0) == 0x80) --end;
-    return end;
-}
-
-// Strip trailing ` //` or ` #` inline comments. Same behaviour as parser.rs `strip_comment`.
-std::string strip_comment(std::string_view val) {
-    std::string r(val);
-    auto p = r.find(" //");
-    if (p != std::string::npos) {
-        r.resize(p);
-    }
-    p = r.find(" #");
-    if (p != std::string::npos) {
-        r.resize(p);
-    }
-    while (!r.empty() && (r.back() == ' ' || r.back() == '\t' || r.back() == '\r')) {
-        r.pop_back();
-    }
-    return r;
-}
-
-// Strict int parser — no leading zeros stripping, no exponent (matches Rust `i64::parse`).
-bool parse_int(std::string_view s, int64_t& out) noexcept {
-    if (s.empty()) {
-        return false;
-    }
-    size_t i = 0;
-    bool neg = false;
-    if (s[0] == '-') {
-        neg = true;
-        i = 1;
-        if (i >= s.size()) {
-            return false;
-        }
-    }
-    int64_t v = 0;
-    for (; i < s.size(); ++i) {
-        char c = s[i];
-        if (c < '0' || c > '9') {
-            return false;
-        }
-        int d = c - '0';
-        // Overflow check (best-effort, no exceptions)
-        if (v > (INT64_MAX - d) / 10) {
-            return false;
-        }
-        v = v * 10 + d;
-    }
-    out = neg ? -v : v;
-    return true;
-}
-
-// Strict-ish float parser — accepts `[-]?\d+(\.\d+)?` (matches the `all_numeric` Rust path).
-bool parse_float(std::string_view s, double& out) noexcept {
-    if (s.empty()) {
-        return false;
-    }
-    std::string tmp(s);
-    char* end = nullptr;
-    double v = std::strtod(tmp.c_str(), &end);
-    if (end == nullptr || end == tmp.c_str() || *end != '\0') {
-        return false;
-    }
-    out = v;
-    return true;
-}
-
-// ─── value casting (matches `cast` and `cast_typed` in parser.rs) ───────────
-
-Value cast_value(std::string_view val);
-
-// Returns `nullopt` when val is neither quoted nor a recognised keyword,
-// so the caller can fall through to numeric / string fallback.
-std::optional<Value> cast_quoted_or_keyword(std::string_view val) {
+Value cast_value(std::string_view val) {
+    // Quoted strings keep their literal text ("null", "true", "123" stay strings).
     if (val.size() >= 2) {
         char first = val.front();
         char last = val.back();
@@ -144,132 +33,79 @@ std::optional<Value> cast_quoted_or_keyword(std::string_view val) {
     if (val == "true") return Value::make_bool(true);
     if (val == "false") return Value::make_bool(false);
     if (val == "null") return Value::make_null();
-    return std::nullopt;
-}
-
-Value cast_value(std::string_view val) {
-    if (auto early = cast_quoted_or_keyword(val); early.has_value()) {
-        return std::move(*early);
-    }
-
-    size_t len = val.size();
-    if (len == 0) {
-        return Value::make_string("");
-    }
+    const size_t len = val.size();
+    if (len == 0) return Value::make_string(std::string());
     size_t start = 0;
     if (val[0] == '-') {
-        if (len == 1) {
-            return Value::make_string(std::string(val));
-        }
+        if (len == 1) return Value::make_string(std::string(val));
         start = 1;
     }
-    char c0 = val[start];
-    if (c0 < '0' || c0 > '9') {
-        return Value::make_string(std::string(val));
-    }
-
-    bool seen_dot = false;
-    bool all_numeric = true;
-    size_t dot_pos = std::string_view::npos;
-    for (size_t j = start; j < len; ++j) {
-        char c = val[j];
-        if (c == '.') {
-            if (seen_dot) {
+    if (val[start] >= '0' && val[start] <= '9') {
+        size_t dot = std::string_view::npos;
+        bool all_numeric = true;
+        for (size_t j = start; j < len; ++j) {
+            char c = val[j];
+            if (c == '.') {
+                if (dot != std::string_view::npos) { all_numeric = false; break; }
+                dot = j;
+            } else if (c < '0' || c > '9') {
                 all_numeric = false;
                 break;
             }
-            seen_dot = true;
-            dot_pos = j;
-        } else if (c < '0' || c > '9') {
-            all_numeric = false;
-            break;
         }
-    }
-    if (!all_numeric) {
-        return Value::make_string(std::string(val));
-    }
-    if (seen_dot) {
-        if (dot_pos > start && dot_pos < len - 1) {
-            double f = 0.0;
-            if (parse_float(val, f)) {
-                return Value::make_float(f);
+        if (all_numeric) {
+            if (dot != std::string_view::npos) {
+                double f = 0.0;
+                if (dot > start && dot < len - 1 && parse_f64(val, f)) return Value::make_float(f);
+            } else {
+                int64_t n = 0;
+                if (parse_i64(val, n)) return Value::make_int(n);
             }
         }
-        return Value::make_string(std::string(val));
-    }
-    int64_t n = 0;
-    if (parse_int(val, n)) {
-        return Value::make_int(n);
     }
     return Value::make_string(std::string(val));
-}
-
-// Process-wide RNG for `(random)` type hints. Seeded once via random_device.
-std::mt19937_64& rng_global() noexcept {
-    static std::mt19937_64 r{std::random_device{}()};
-    return r;
 }
 
 Value cast_typed(std::string_view val, std::string_view hint) {
     if (hint == "int") {
         int64_t n = 0;
-        return Value::make_int(parse_int(val, n) ? n : 0);
+        return Value::make_int(parse_i64(val, n) ? n : 0);
     }
     if (hint == "float") {
         double f = 0.0;
-        return Value::make_float(parse_float(val, f) ? f : 0.0);
+        return Value::make_float(parse_f64(val, f) ? f : 0.0);
     }
-    if (hint == "bool") {
-        std::string_view t = trim_view(val);
-        return Value::make_bool(t == "true");
-    }
-    if (hint == "string") {
-        return Value::make_string(std::string(val));
-    }
-    if (hint == "random" || hint == "random:int") {
-        std::uniform_int_distribution<int64_t> dist{0, INT64_MAX};
-        return Value::make_int(dist(rng_global()));
-    }
-    if (hint == "random:float") {
-        std::uniform_real_distribution<double> dist{0.0, 1.0};
-        return Value::make_float(dist(rng_global()));
-    }
-    if (hint == "random:bool") {
-        std::uniform_int_distribution<int> dist{0, 1};
-        return Value::make_bool(dist(rng_global()) != 0);
-    }
+    if (hint == "bool") return Value::make_bool(trim_view(val) == "true");
+    if (hint == "string") return Value::make_string(std::string(val));
+    if (hint == "random" || hint == "random:int") return Value::make_int(random_i64());
+    if (hint == "random:float") return Value::make_float(random_f64_01());
+    if (hint == "random:bool") return Value::make_bool(random_bool());
     return cast_value(val);
 }
-
-// ─── constraints parser ─────────────────────────────────────────────────────
 
 Constraints parse_constraints(std::string_view raw) {
     Constraints c;
     size_t i = 0;
-    while (i < raw.size()) {
+    while (i <= raw.size()) {
         size_t comma = raw.find(',', i);
-        std::string_view part = trim_view(raw.substr(i, (comma == std::string_view::npos ? raw.size() : comma) - i));
-        i = (comma == std::string_view::npos ? raw.size() : comma + 1);
-        if (part.empty()) {
-            continue;
-        }
+        size_t end = comma == std::string_view::npos ? raw.size() : comma;
+        std::string_view part = trim_view(raw.substr(i, end - i));
+        i = end + 1;
+        if (part.empty()) continue;
         if (part == "required") {
             c.required = true;
         } else if (part == "readonly") {
             c.readonly = true;
         } else {
             size_t colon = part.find(':');
-            if (colon == std::string_view::npos) {
-                continue;
-            }
+            if (colon == std::string_view::npos) continue;
             std::string_view k = trim_view(part.substr(0, colon));
             std::string_view v = trim_view(part.substr(colon + 1));
+            double d = 0.0;
             if (k == "min") {
-                double d = 0.0;
-                if (parse_float(v, d)) c.min = d;
+                c.min = parse_f64(v, d) ? std::optional<double>(d) : std::nullopt;
             } else if (k == "max") {
-                double d = 0.0;
-                if (parse_float(v, d)) c.max = d;
+                c.max = parse_f64(v, d) ? std::optional<double>(d) : std::nullopt;
             } else if (k == "type") {
                 c.type_name = std::string(v);
             } else if (k == "pattern") {
@@ -277,15 +113,12 @@ Constraints parse_constraints(std::string_view raw) {
             } else if (k == "enum") {
                 std::vector<std::string> vals;
                 size_t p = 0;
-                size_t count = 0;
-                // `p <= v.size()` matches Rust `str::split('|')`: "" → [""], "a|" → ["a", ""].
-                while (p <= v.size() && count < kMaxConstraintEnumParts) {
+                while (vals.size() < kMaxConstraintEnumParts) {
                     size_t pipe = v.find('|', p);
-                    std::string_view seg = v.substr(p, (pipe == std::string_view::npos ? v.size() : pipe) - p);
-                    vals.emplace_back(seg);
+                    size_t e = pipe == std::string_view::npos ? v.size() : pipe;
+                    vals.emplace_back(v.substr(p, e - p));
                     if (pipe == std::string_view::npos) break;
                     p = pipe + 1;
-                    ++count;
                 }
                 c.enum_values = std::move(vals);
             }
@@ -294,266 +127,599 @@ Constraints parse_constraints(std::string_view raw) {
     return c;
 }
 
-// ─── one key-line decomposition ─────────────────────────────────────────────
+std::string_view strip_comment(std::string_view val) noexcept {
+    std::string_view r = val;
+    if (r.find(' ') != std::string_view::npos) {
+        size_t p = r.find(" //");
+        if (p != std::string_view::npos) r = r.substr(0, p);
+        p = r.find(" #");
+        if (p != std::string_view::npos) r = r.substr(0, p);
+    }
+    return trim_end_view(r);
+}
+
+} // namespace detail
+
+namespace {
+
+using detail::cast_typed;
+using detail::cast_value;
+using detail::indent_len;
+using detail::KeyIndex;
+using detail::parse_constraints;
+using detail::parse_f64;
+using detail::push_item_segment;
+using detail::push_key_segment;
+using detail::split_whitespace;
+using detail::starts_with;
+using detail::strip_boundary;
+using detail::strip_comment;
+using detail::trim_end_view;
+using detail::trim_view;
+using detail::utf8_len;
+using detail::utf8_prefix_len;
+using detail::ws_len_at;
+
+/// Keys that would reach a JS consumer's prototype chain instead of its data.
+inline bool is_reserved_js_key(std::string_view key) noexcept {
+    return key == "__proto__" || key == "constructor" || key == "prototype";
+}
+
+// ─── one key line, borrowed from the source text ────────────────────────────
 
 struct ParsedLine {
-    std::string key;
-    std::optional<std::string> type_hint;
-    std::string value;
-    std::vector<std::string> markers;
+    std::string_view key;
+    std::optional<std::string_view> type_hint;
+    std::string_view value;
+    std::vector<std::string_view> markers;
     std::vector<std::string> marker_args;
     std::optional<Constraints> constraints;
 };
 
-std::optional<ParsedLine> parse_line(std::string_view trimmed) {
-    if (trimmed.empty()
-        || trimmed[0] == '#'
-        || starts_with(trimmed, "//")
-        || starts_with(trimmed, "- ")) {
-        return std::nullopt;
+bool parse_line(std::string_view t, ParsedLine& out) {
+    if (t.empty() || t[0] == '#' || starts_with(t, "//") || starts_with(t, "- ")) return false;
+    char first = t[0];
+    if (first == '[' || first == ':' || first == '-' || first == '#' || first == '/' || first == '(') {
+        return false;
     }
-
-    char first = trimmed[0];
-    if (first == '[' || first == ':' || first == '-'
-        || first == '#' || first == '/' || first == '(') {
-        return std::nullopt;
-    }
-
-    size_t len = trimmed.size();
+    const size_t len = t.size();
     size_t pos = 0;
     while (pos < len) {
-        char ch = trimmed[pos];
-        if (ch == ' ' || ch == '\t' || ch == '[' || ch == ':' || ch == '(') {
-            break;
-        }
+        char ch = t[pos];
+        if (ch == ' ' || ch == '\t' || ch == '[' || ch == ':' || ch == '(') break;
         ++pos;
     }
+    out.key = t.substr(0, pos);
+    out.type_hint.reset();
+    out.markers.clear();
+    out.marker_args.clear();
+    out.constraints.reset();
 
-    ParsedLine out;
-    out.key = std::string(trimmed.substr(0, pos));
-
-    // Optional `(type)`
-    if (pos < len && trimmed[pos] == '(') {
+    // Optional `(type)`.
+    if (pos < len && t[pos] == '(') {
         size_t start = pos + 1;
-        size_t rel = trimmed.substr(start).find(')');
-        if (rel != std::string_view::npos) {
-            out.type_hint = std::string(trimmed.substr(start, rel));
-            pos = start + rel + 1;
+        size_t close = t.find(')', start);
+        if (close != std::string_view::npos) {
+            out.type_hint = t.substr(start, close - start);
+            pos = close + 1;
         } else {
-            pos = start;
+            pos += 1;
         }
     }
 
-    // Optional `[constraints]` — balanced bracket scan
-    if (pos < len && trimmed[pos] == '[') {
+    // Optional `[constraints]` — balanced scan, so `^[A-Z]{2}$` keeps its own `]`.
+    if (pos < len && t[pos] == '[') {
         size_t cstart = pos + 1;
         size_t depth = 1;
         size_t scan = cstart;
         while (scan < len && depth > 0) {
-            char b = trimmed[scan];
-            if (b == '[') ++depth;
-            else if (b == ']') {
+            if (t[scan] == '[') {
+                ++depth;
+            } else if (t[scan] == ']') {
                 --depth;
                 if (depth == 0) break;
             }
             ++scan;
         }
         if (depth == 0) {
-            out.constraints = parse_constraints(trimmed.substr(cstart, scan - cstart));
+            out.constraints = parse_constraints(t.substr(cstart, scan - cstart));
             pos = scan + 1;
         } else {
-            // Unbalanced — fall back to first `]`
-            size_t rel = trimmed.substr(cstart).find(']');
+            size_t rel = t.find(']', cstart);
             if (rel != std::string_view::npos) {
-                out.constraints = parse_constraints(trimmed.substr(cstart, rel));
-                pos = cstart + rel + 1;
+                out.constraints = parse_constraints(t.substr(cstart, rel - cstart));
+                pos = rel + 1;
             } else {
-                out.constraints = parse_constraints(trimmed.substr(cstart));
+                out.constraints = parse_constraints(t.substr(cstart));
                 pos = len;
             }
         }
     }
 
-    // Optional `:markers`
-    if (pos < len && trimmed[pos] == ':') {
+    // Optional `:markers`.
+    if (pos < len && t[pos] == ':') {
         size_t mstart = pos + 1;
         size_t mend = mstart;
-        while (mend < len && trimmed[mend] != ' ' && trimmed[mend] != '\t') {
-            ++mend;
-        }
-        std::string_view chain = trimmed.substr(mstart, mend - mstart);
+        while (mend < len && t[mend] != ' ' && t[mend] != '\t') ++mend;
+        std::string_view chain = t.substr(mstart, mend - mstart);
         size_t p = 0;
-        size_t segs = 0;
-        while (p <= chain.size() && segs < kMaxMarkerChainSegments) {
+        while (out.markers.size() < kMaxMarkerChainSegments) {
             size_t colon = chain.find(':', p);
-            std::string_view seg = chain.substr(p, (colon == std::string_view::npos ? chain.size() : colon) - p);
-            out.markers.emplace_back(seg);
-            ++segs;
+            size_t e = colon == std::string_view::npos ? chain.size() : colon;
+            out.markers.push_back(chain.substr(p, e - p));
             if (colon == std::string_view::npos) break;
             p = colon + 1;
         }
         pos = mend;
     }
 
-    // Skip whitespace
-    while (pos < len && (trimmed[pos] == ' ' || trimmed[pos] == '\t')) {
-        ++pos;
-    }
+    while (pos < len && (t[pos] == ' ' || t[pos] == '\t')) ++pos;
+    out.value = pos < len ? strip_comment(t.substr(pos)) : std::string_view();
 
-    out.value = (pos < len) ? strip_comment(trimmed.substr(pos)) : std::string{};
-
-    // :random — extract weight percentages from value into args
-    bool has_random = false;
-    bool has_inherit = false;
-    for (const auto& m : out.markers) {
-        if (m == "random") has_random = true;
-        if (m == "inherit") has_inherit = true;
-    }
-    if (has_random && !out.value.empty()) {
-        std::vector<std::string> nums;
-        std::string_view v(out.value);
-        size_t p = 0;
-        while (p < v.size()) {
-            while (p < v.size() && (v[p] == ' ' || v[p] == '\t')) ++p;
-            size_t start = p;
-            while (p < v.size() && v[p] != ' ' && v[p] != '\t') ++p;
-            if (p > start) {
-                std::string tok(v.substr(start, p - start));
+    if (!out.markers.empty() && !out.value.empty()) {
+        auto has = [&](std::string_view name) {
+            return std::find(out.markers.begin(), out.markers.end(), name) != out.markers.end();
+        };
+        // `:random` — the value carries the weight percentages.
+        if (has("random")) {
+            std::vector<std::string> nums;
+            split_whitespace(out.value, [&](std::string_view tok) {
                 double d = 0.0;
-                if (parse_float(tok, d)) {
-                    nums.push_back(std::move(tok));
-                }
+                if (parse_f64(tok, d)) nums.emplace_back(tok);
+            });
+            if (!nums.empty()) {
+                out.marker_args = std::move(nums);
+                out.value = std::string_view();
             }
         }
-        if (!nums.empty()) {
-            out.marker_args = std::move(nums);
-            out.value.clear();
+        // `:inherit` — a non-empty value names the parent: the line opens a group.
+        if (!out.value.empty() && has("inherit")) {
+            out.marker_args = {std::string(trim_view(out.value))};
+            out.value = std::string_view();
         }
     }
-    // :inherit — value names the parent; promote into marker_args and clear value.
-    if (has_inherit && !out.value.empty()) {
-        std::string_view t = trim_view(out.value);
-        out.marker_args = {std::string(t)};
-        out.value.clear();
-    }
-
-    return out;
+    return true;
 }
 
-// ─── stack / tree helpers ────────────────────────────────────────────────────
+// ─── stack / tree ────────────────────────────────────────────────────────────
 
-enum class StackEntryKind : uint8_t { Root, Key, ListItem };
+enum class FrameKind : uint8_t { Root, Key, ListItem };
 
-struct StackEntry {
-    StackEntryKind kind;
-    std::string key;           // for Key and ListItem.list_key
-    size_t item_idx = 0;       // for ListItem only
+struct Frame {
+    int indent;
+    FrameKind kind;
+    std::string_view key;  // Key: its key; ListItem: the list's key.
+    size_t item_idx = 0;   // ListItem only.
+    size_t parent = 0;     // ListItem only: stack index of the frame holding the list.
+    KeyIndex index;        // over the frame's own object, once it outgrows a scan
 };
 
-// Returns metadata dot-path from current stack.
-std::string build_path(const std::vector<std::pair<int, StackEntry>>& stack) {
-    std::string out;
-    bool first = true;
-    for (size_t i = 1; i < stack.size(); ++i) {
-        if (stack[i].second.kind == StackEntryKind::Key) {
-            if (!first) out.push_back('.');
-            out += stack[i].second.key;
-            first = false;
-        }
-    }
-    return out;
-}
+constexpr size_t kIndexThreshold = 16;
 
-// Walk the stack into the target parent. `parent` always carries kind == Object.
-Object* navigate_to_parent(Object* root,
-                           const std::vector<std::pair<int, StackEntry>>& stack,
-                           size_t target_idx) {
-    if (target_idx == 0) return root;
-    Object* current = root;
-    for (size_t i = 1; i <= target_idx && i < stack.size(); ++i) {
-        const StackEntry& e = stack[i].second;
-        switch (e.kind) {
-            case StackEntryKind::Root:
-                return nullptr; // unreachable in well-formed input
-            case StackEntryKind::Key: {
-                bool found = false;
-                for (auto& p : *current) {
-                    if (p.key == e.key) {
-                        Object* child = p.value.as_object_mut();
-                        if (!child) return nullptr;
-                        current = child;
-                        found = true;
-                        break;
-                    }
-                }
-                if (!found) return nullptr;
-                break;
-            }
-            case StackEntryKind::ListItem: {
-                bool found = false;
-                for (auto& p : *current) {
-                    if (p.key == e.key) {
-                        Array* arr = p.value.as_array_mut();
-                        if (!arr || e.item_idx >= arr->size()) return nullptr;
-                        Object* inner = (*arr)[e.item_idx].as_object_mut();
-                        if (!inner) return nullptr;
-                        current = inner;
-                        found = true;
-                        break;
-                    }
-                }
-                if (!found) return nullptr;
-                break;
-            }
+/// Position of `key` in `obj`, or npos.
+size_t find_key(Object& obj, KeyIndex& idx, std::string_view key) {
+    if (obj.size() < kIndexThreshold) {
+        for (size_t i = 0; i < obj.size(); ++i) {
+            if (obj[i].key == key) return i;
         }
+        return std::string_view::npos;
     }
-    return current;
-}
-
-void insert_value(Object* root,
-                  const std::vector<std::pair<int, StackEntry>>& stack,
-                  size_t parent_idx,
-                  const std::string& key,
-                  Value v) {
-    Object* parent = navigate_to_parent(root, stack, parent_idx);
-    if (!parent) return;
-    for (auto& p : *parent) {
-        if (p.key == key) {
-            p.value = std::move(v);
-            return;
-        }
-    }
-    parent->push_back(Pair{key, std::move(v)});
+    auto key_of = [](const Pair& p) { return std::string_view(p.key); };
+    idx.sync(obj, key_of);
+    size_t at = idx.find(obj, key, key_of);
+    return at == KeyIndex::npos ? std::string_view::npos : at;
 }
 
 struct BlockState {
     int indent;
-    std::string key;
+    std::string_view key;
     std::string content;
     size_t stack_idx;
-    // SYNX 3.7 `|+`: keep continuation lines' indent relative to the first
-    // non-empty content line. `base_indent < 0` means "not yet locked".
+    // `|+` keeps each line's indent relative to the first non-empty one.
     bool preserve_indent;
-    int base_indent;
+    int base_indent;  // -1 until the first content line locks it.
 };
 
 struct ListState {
     int indent;
-    std::string key;
+    std::string_view key;
     size_t stack_idx;
 };
 
-// Length of byte range bounded by line_starts (handling trailing \r\n).
-inline std::string_view line_view(std::string_view text,
-                                  const std::vector<size_t>& line_starts,
-                                  size_t i,
-                                  size_t total_bytes) noexcept {
-    size_t s = line_starts[i];
-    size_t e = (i + 1 < line_starts.size()) ? line_starts[i + 1] - 1 : total_bytes;
-    if (e > s && e > 0 && text[e - 1] == '\r') {
-        --e;
+class Parser {
+public:
+    Parser(std::string_view text, ParseResult& result) : text_(text), r_(result) {
+        root_ = r_.root.as_object_mut();
+        stack_.reserve(16);
+        stack_.push_back(Frame{-1, FrameKind::Root, {}, 0, 0, {}});
     }
-    return text.substr(s, e - s);
+
+    void run();
+
+private:
+    // The frames from the root to `target` (root excluded), in descending order.
+    // A ListItem's parent is the frame that holds its list, which need not be the
+    // frame below it: an object opened between a list key and its first item
+    // sits in between without being an ancestor.
+    size_t frame_chain(size_t target, size_t* chain) const {
+        size_t n = 0;
+        size_t idx = target;
+        while (idx > 0 && n <= kMaxParseNestingDepth) {
+            chain[n++] = idx;
+            idx = stack_[idx].kind == FrameKind::ListItem ? stack_[idx].parent : idx - 1;
+        }
+        std::reverse(chain, chain + n);
+        return n;
+    }
+
+    // The cache holds one parent. Navigating to another one — the root included —
+    // replaces it, which is what keeps it sound: pushing onto a list moves that
+    // list's items, and the list's parent is navigated first.
+    Object* navigate(size_t target) {
+        if (cache_idx_ == target) return cache_obj_;
+        if (target == 0) {
+            cache_idx_ = 0;
+            cache_obj_ = root_;
+            return root_;
+        }
+        size_t chain[kMaxParseNestingDepth + 2];
+        size_t n = frame_chain(target, chain);
+        Object* current = root_;
+        for (size_t c = 0; c < n; ++c) {
+            Frame& f = stack_[chain[c]];
+            // The frame's own index covers its object; the lookup here is in
+            // the parent, whose frame is the previous chain entry (or root).
+            KeyIndex& parent_index = c == 0 ? stack_[0].index : stack_[chain[c - 1]].index;
+            size_t at = find_key(*current, parent_index, f.key);
+            if (at == std::string_view::npos) return nullptr;
+            Value& child = (*current)[at].value;
+            if (f.kind == FrameKind::Key) {
+                current = child.as_object_mut();
+                if (!current) return nullptr;
+            } else {
+                Array* arr = child.as_array_mut();
+                if (!arr || f.item_idx >= arr->size()) return nullptr;
+                current = (*arr)[f.item_idx].as_object_mut();
+                if (!current) return nullptr;
+            }
+        }
+        cache_idx_ = target;
+        cache_obj_ = current;
+        return current;
+    }
+
+    void push_frame(Frame f) {
+        stack_.push_back(std::move(f));
+        invalidate();
+    }
+    void pop_frame() {
+        stack_.pop_back();
+        invalidate();
+    }
+    void invalidate() {
+        cache_idx_ = static_cast<size_t>(-1);
+        cache_obj_ = nullptr;
+        meta_path_valid_ = false;
+    }
+
+    void insert_value(size_t parent_idx, std::string_view key, Value v) {
+        Object* target = navigate(parent_idx);
+        if (!target) return;  // broken path: the line is dropped, never misplaced
+        size_t at = find_key(*target, stack_[parent_idx].index, key);
+        if (at != std::string_view::npos) {
+            (*target)[at].value = std::move(v);
+        } else {
+            target->push_back(Pair{std::string(key), std::move(v)});
+        }
+    }
+
+    const std::string& meta_path() {
+        if (!meta_path_valid_) {
+            meta_path_.clear();
+            if (stack_.size() > 1) {
+                size_t chain[kMaxParseNestingDepth + 2];
+                size_t n = frame_chain(stack_.size() - 1, chain);
+                for (size_t c = 0; c < n; ++c) {
+                    const Frame& f = stack_[chain[c]];
+                    if (!meta_path_.empty()) meta_path_.push_back('.');
+                    push_key_segment(meta_path_, f.key);
+                    if (f.kind == FrameKind::ListItem) push_item_segment(meta_path_, f.item_idx);
+                }
+            }
+            meta_path_valid_ = true;
+        }
+        return meta_path_;
+    }
+
+    // The first non-blank line at or after byte `from`, CR excluded.
+    bool next_content_line(size_t from, std::string_view& line) const {
+        size_t p = from;
+        while (p <= text_.size()) {
+            const void* hit = p < text_.size() ? std::memchr(text_.data() + p, '\n', text_.size() - p) : nullptr;
+            size_t nl = hit ? static_cast<size_t>(static_cast<const char*>(hit) - text_.data()) : text_.size();
+            size_t end = (nl > p && text_[nl - 1] == '\r') ? nl - 1 : nl;
+            std::string_view l = text_.substr(p, end - p);
+            if (!trim_view(l).empty()) {
+                line = l;
+                return true;
+            }
+            p = nl + 1;
+        }
+        return false;
+    }
+
+    void handle_list_item(std::string_view t, int indent, size_t pos);
+    void handle_key_line(ParsedLine& p, int indent, size_t pos);
+
+    std::string_view text_;
+    ParseResult& r_;
+    Object* root_;
+    std::vector<Frame> stack_;
+    size_t cache_idx_ = static_cast<size_t>(-1);
+    Object* cache_obj_ = nullptr;
+    std::string meta_path_;
+    bool meta_path_valid_ = false;
+    std::optional<BlockState> block_;
+    std::optional<ListState> list_;
+};
+
+void Parser::handle_list_item(std::string_view t, int indent, size_t pos) {
+    // Pop every frame of the previous item — its own and any object nested in it.
+    while (stack_.size() > 1 && stack_.back().indent >= indent) pop_frame();
+
+    std::string_view val_str = strip_comment(trim_view(t.substr(2)));
+
+    // A more deeply indented, non-item next line makes this item an object.
+    bool nested = false;
+    std::string_view peek;
+    if (next_content_line(pos, peek)) {
+        std::string_view pt = trim_view(peek);
+        int pi = static_cast<int>(indent_len(peek));
+        if (pi > indent && !starts_with(pt, "- ") && pt[0] != '#' && !starts_with(pt, "//")) nested = true;
+    }
+
+    const std::string_view list_key = list_->key;
+    const size_t list_stack_idx = list_->stack_idx;
+    Object* parent = navigate(list_stack_idx);
+    if (!parent) return;
+    size_t at = find_key(*parent, stack_[list_stack_idx].index, list_key);
+    if (at == std::string_view::npos) {
+        parent->push_back(Pair{std::string(list_key), Value::make_array()});
+        at = parent->size() - 1;
+    }
+    Array* arr = (*parent)[at].value.as_array_mut();
+    if (!arr || arr->size() >= kMaxListItems) return;
+    if (nested) {
+        Object item;
+        ParsedLine p;
+        if (parse_line(val_str, p)) {
+            Value v = p.type_hint ? cast_typed(p.value, *p.type_hint)
+                    : !p.value.empty() ? cast_value(p.value)
+                    : Value::make_object();
+            if (!is_reserved_js_key(p.key)) item.push_back(Pair{std::string(p.key), std::move(v)});
+        } else {
+            item.push_back(Pair{"_value", cast_value(val_str)});
+        }
+        size_t item_idx = arr->size();
+        arr->push_back(Value::make_object(std::move(item)));
+        if (stack_.size() < kMaxParseNestingDepth) {
+            push_frame(Frame{indent, FrameKind::ListItem, list_key, item_idx, list_stack_idx, {}});
+        }
+    } else {
+        arr->push_back(cast_value(val_str));
+    }
+}
+
+void Parser::handle_key_line(ParsedLine& p, int indent, size_t pos) {
+    while (stack_.size() > 1 && stack_.back().indent >= indent) pop_frame();
+    const size_t parent_idx = stack_.size() - 1;
+
+    // A key that replaces an object or a list replaces its declarations too.
+    if (r_.mode == Mode::Active && !r_.metadata.empty()) {
+        Object* parent = navigate(parent_idx);
+        bool replaces_tree = false;
+        if (parent) {
+            size_t at = find_key(*parent, stack_[parent_idx].index, p.key);
+            if (at != std::string_view::npos) {
+                const Value& old = (*parent)[at].value;
+                replaces_tree = old.is_object() || old.is_array();
+            }
+        }
+        if (replaces_tree) {
+            std::string prefix = meta_path();
+            if (!prefix.empty()) prefix.push_back('.');
+            push_key_segment(prefix, p.key);
+            r_.metadata.retain([&](const std::string& path, const MetaMap&) {
+                return !(path == prefix
+                         || (path.size() > prefix.size() && path.compare(0, prefix.size(), prefix) == 0
+                             && path[prefix.size()] == '.'));
+            });
+        }
+    }
+
+    if (r_.mode == Mode::Active && (!p.markers.empty() || p.constraints || p.type_hint)) {
+        Meta m;
+        m.markers.reserve(p.markers.size());
+        for (std::string_view mk : p.markers) m.markers.emplace_back(mk);
+        m.args = std::move(p.marker_args);
+        if (p.type_hint) m.type_hint = std::string(*p.type_hint);
+        m.constraints = std::move(p.constraints);
+        r_.metadata[meta_path()].insert_or_assign(std::string(p.key), std::move(m));
+    }
+
+    const bool is_block = p.value == "|" || p.value == "|+";
+    bool is_list_marker = false;
+    for (std::string_view m : p.markers) {
+        if (m == "random" || m == "unique" || m == "geo" || m == "join") {
+            is_list_marker = true;
+            break;
+        }
+    }
+
+    if (is_block) {
+        insert_value(parent_idx, p.key, Value::make_string(std::string()));
+        block_ = BlockState{indent, p.key, std::string(), parent_idx, p.value == "|+", -1};
+    } else if (is_list_marker && p.value.empty()) {
+        // The key exists even when the list stays empty.
+        insert_value(parent_idx, p.key, Value::make_array());
+        list_ = ListState{indent, p.key, parent_idx};
+    } else if (p.value.empty()) {
+        std::string_view peek;
+        if (next_content_line(pos, peek) && starts_with(trim_view(peek), "- ")) {
+            insert_value(parent_idx, p.key, Value::make_array());
+            list_ = ListState{indent, p.key, parent_idx};
+            return;
+        }
+        insert_value(parent_idx, p.key, Value::make_object());
+        // Past the cap the object is still inserted; nesting stops growing.
+        if (stack_.size() < kMaxParseNestingDepth) {
+            push_frame(Frame{indent, FrameKind::Key, p.key, 0, 0, {}});
+        }
+    } else {
+        Value v = p.type_hint ? cast_typed(p.value, *p.type_hint) : cast_value(p.value);
+        insert_value(parent_idx, p.key, std::move(v));
+    }
+}
+
+void Parser::run() {
+    bool in_block_comment = false;
+    ParsedLine parsed;
+    const size_t total = text_.size();
+    size_t pos = 0;
+    while (pos <= total) {
+        const size_t start = pos;
+        const void* hit = start < total ? std::memchr(text_.data() + start, '\n', total - start) : nullptr;
+        const size_t nl = hit ? static_cast<size_t>(static_cast<const char*>(hit) - text_.data()) : total;
+        pos = nl + 1;
+        const size_t end = (nl > start && text_[nl - 1] == '\r') ? nl - 1 : nl;
+        const std::string_view raw = text_.substr(start, end - start);
+        const std::string_view t = trim_view(raw);
+
+        // A blank line is never structural and never body (§8.4.1).
+        if (t.empty()) continue;
+        const int indent = static_cast<int>(indent_len(raw));
+
+        // Multiline body first: `#`, `//`, `###` and `!…` are content there.
+        if (block_) {
+            BlockState& blk = *block_;
+            if (indent > blk.indent) {
+                if (blk.content.size() < kMaxMultilineBlockBytes) {
+                    if (!blk.content.empty()) blk.content.push_back('\n');
+                    size_t room = kMaxMultilineBlockBytes - std::min(blk.content.size(), kMaxMultilineBlockBytes);
+                    if (room > 0) {
+                        std::string_view slice;
+                        if (blk.preserve_indent) {
+                            if (blk.base_indent < 0) blk.base_indent = indent;
+                            size_t strip = static_cast<size_t>(std::min(blk.base_indent, indent));
+                            std::string_view raw_trim = trim_end_view(raw);
+                            size_t cut = strip_boundary(raw_trim, strip);
+                            slice = cut < raw_trim.size() ? raw_trim.substr(cut) : std::string_view();
+                        } else {
+                            slice = t;
+                        }
+                        size_t n = utf8_prefix_len(slice, room);
+                        blk.content.append(slice.data(), n);
+                        if (n < slice.size()) r_.truncated = true;
+                    }
+                } else {
+                    r_.truncated = true;
+                }
+                continue;
+            }
+            std::string content = std::move(blk.content);
+            std::string_view key = blk.key;
+            size_t idx = blk.stack_idx;
+            block_.reset();
+            insert_value(idx, key, Value::make_string(std::move(content)));
+        }
+
+        if (t == "###") {
+            in_block_comment = !in_block_comment;
+            continue;
+        }
+        if (in_block_comment) continue;
+
+        // Directives (§6).
+        if (t[0] == '!' || starts_with(t, "#!mode:")) {
+            if (t == "!active") { r_.mode = Mode::Active; continue; }
+            if (t == "!lock") { r_.locked = true; continue; }
+            if (t == "!tool") { r_.tool = true; continue; }
+            if (t == "!schema") { r_.schema = true; continue; }
+            if (t == "!llm") { r_.llm = true; continue; }
+            if (starts_with(t, "!include ")) {
+                if (r_.includes.size() < kMaxIncludeDirectives) {
+                    std::string_view rest = trim_view(t.substr(9));
+                    size_t split = 0;
+                    while (split < rest.size() && ws_len_at(rest, split) == 0) {
+                        split += utf8_len(static_cast<unsigned char>(rest[split]));
+                    }
+                    std::string path(rest.substr(0, split));
+                    std::string alias;
+                    if (split < rest.size()) {
+                        alias = std::string(trim_view(rest.substr(split + ws_len_at(rest, split))));
+                    } else {
+                        // Alias from the file name: `./db.synx` → `db`.
+                        size_t slash = path.find_last_of("/\\");
+                        std::string_view name = slash == std::string::npos
+                            ? std::string_view(path) : std::string_view(path).substr(slash + 1);
+                        auto ends = [&](std::string_view suf) {
+                            return name.size() >= suf.size() && name.substr(name.size() - suf.size()) == suf;
+                        };
+                        if (ends(".synx") || ends(".SYNX")) name.remove_suffix(5);
+                        alias = std::string(name);
+                    }
+                    r_.includes.push_back(IncludeDirective{std::move(path), std::move(alias)});
+                }
+                continue;
+            }
+            if (starts_with(t, "!use ")) {
+                std::string_view rest = trim_view(t.substr(5));
+                if (!rest.empty() && rest[0] == '@') {
+                    size_t as = rest.find(" as ");
+                    std::string package(trim_view(rest.substr(0, as)));
+                    std::string alias;
+                    if (as != std::string_view::npos) {
+                        alias = std::string(trim_view(rest.substr(as + 4)));
+                    } else {
+                        size_t slash = package.find_last_of('/');
+                        alias = slash == std::string::npos ? package : package.substr(slash + 1);
+                    }
+                    if (!package.empty()) r_.uses.push_back(UseDirective{std::move(package), std::move(alias)});
+                }
+                continue;
+            }
+            if (starts_with(t, "#!mode:")) {
+                r_.mode = trim_view(t.substr(7)) == "active" ? Mode::Active : Mode::Static;
+                continue;
+            }
+        }
+
+        if (t[0] == '#' || starts_with(t, "//")) continue;
+
+        if (starts_with(t, "- ")) {
+            if (list_ && indent > list_->indent) {
+                handle_list_item(t, indent, pos);
+                continue;
+            }
+        } else if (list_ && indent <= list_->indent) {
+            // A non-item line at or above the list's indent closes it.
+            list_.reset();
+            while (stack_.size() > 1 && stack_.back().kind == FrameKind::ListItem
+                   && stack_.back().indent >= indent) {
+                pop_frame();
+            }
+        }
+
+        if (!parse_line(t, parsed)) continue;
+        // `__proto__` / `constructor` / `prototype` never reach a JS consumer.
+        if (is_reserved_js_key(parsed.key)) continue;
+        handle_key_line(parsed, indent, pos);
+    }
+
+    if (block_) {
+        insert_value(block_->stack_idx, block_->key, Value::make_string(std::move(block_->content)));
+        block_.reset();
+    }
 }
 
 } // namespace
@@ -561,369 +727,57 @@ inline std::string_view line_view(std::string_view text,
 // ─── public API ─────────────────────────────────────────────────────────────
 
 std::string_view clamp_synx_text(std::string_view text) noexcept {
-    // A single leading U+FEFF is dropped first (SYNX §2.1; §6 matches directives
-    // with a leading BOM ignored). It is not Unicode whitespace, so trimming
-    // alone would leave the BOM bytes + `!active` as a key and never enter Active mode.
+    // A single leading U+FEFF is dropped (SYNX §2.1/§6): it is not whitespace,
+    // and left in place it would turn `!active` into a key.
     if (text.size() >= 3 && static_cast<unsigned char>(text[0]) == 0xEF
-        && static_cast<unsigned char>(text[1]) == 0xBB
-        && static_cast<unsigned char>(text[2]) == 0xBF) {
+        && static_cast<unsigned char>(text[1]) == 0xBB && static_cast<unsigned char>(text[2]) == 0xBF) {
         text.remove_prefix(3);
     }
-    if (text.size() <= kMaxSynxInputBytes) {
-        return text;
-    }
-    // UTF-8 safe truncation: back off until the previous byte is not a continuation byte.
+    if (text.size() <= kMaxSynxInputBytes) return text;
     size_t end = kMaxSynxInputBytes;
-    while (end > 0 && (static_cast<unsigned char>(text[end]) & 0xC0) == 0x80) {
-        --end;
-    }
+    while (end > 0 && (static_cast<unsigned char>(text[end]) & 0xC0) == 0x80) --end;
     return text.substr(0, end);
 }
 
 ParseResult parse(std::string_view text) {
+    // A leading U+FEFF is dropped (§2.1), not lost content: it does not count.
+    const bool bom = text.size() >= 3 && static_cast<unsigned char>(text[0]) == 0xEF
+                  && static_cast<unsigned char>(text[1]) == 0xBB && static_cast<unsigned char>(text[2]) == 0xBF;
+    const size_t original = bom ? text.size() - 3 : text.size();
     text = clamp_synx_text(text);
-
-    // Bound number of newlines we index.
+    // Line cap: keep at most kMaxLineStarts - 1 newlines.
     {
-        size_t max_nl = kMaxLineStarts > 0 ? kMaxLineStarts - 1 : 0;
         size_t seen = 0;
         size_t scan = 0;
         while (scan < text.size()) {
             const void* p = std::memchr(text.data() + scan, '\n', text.size() - scan);
             if (!p) break;
-            if (seen >= max_nl) {
-                size_t cut = static_cast<size_t>(static_cast<const char*>(p) - text.data());
-                text = text.substr(0, cut);
+            size_t at = static_cast<size_t>(static_cast<const char*>(p) - text.data());
+            if (seen >= kMaxLineStarts - 1) {
+                text = text.substr(0, at);
                 break;
             }
             ++seen;
-            scan = static_cast<size_t>(static_cast<const char*>(p) - text.data()) + 1;
+            scan = at + 1;
         }
     }
-
-    const size_t total = text.size();
-    std::vector<size_t> line_starts;
-    line_starts.reserve(64);
-    line_starts.push_back(0);
-    {
-        size_t scan = 0;
-        while (scan < total) {
-            const void* p = std::memchr(text.data() + scan, '\n', total - scan);
-            if (!p) break;
-            size_t pos = static_cast<size_t>(static_cast<const char*>(p) - text.data());
-            line_starts.push_back(pos + 1);
-            scan = pos + 1;
-        }
-    }
-    const size_t line_count = line_starts.size();
-
     ParseResult result;
-    result.root = Value::make_object();
-    Object* root = result.root.as_object_mut();
-
-    std::vector<std::pair<int, StackEntry>> stack;
-    stack.reserve(16);
-    stack.push_back({-1, StackEntry{StackEntryKind::Root, {}, 0}});
-
-    std::optional<BlockState> block;
-    std::optional<ListState> list;
-    bool in_block_comment = false;
-
-    size_t i = 0;
-    while (i < line_count) {
-        std::string_view raw = line_view(text, line_starts, i, total);
-        std::string_view t = trim_view(raw);
-
-        // A blank line is never structural and never body (§8.4.1).
-        if (t.empty()) { ++i; continue; }
-
-        int indent = indent_of(raw);
-
-        // Continue multiline block. Runs before every line-class rule below on
-        // purpose: a `|` / `|+` body is raw text (§8.4.1), so `#`, `//`, `###`
-        // and `!…` are ordinary content there.
-        if (block.has_value()) {
-            if (indent > block->indent) {
-                if (block->content.size() < kMaxMultilineBlockBytes) {
-                    if (!block->content.empty()) {
-                        block->content.push_back('\n');
-                    }
-                    size_t room = kMaxMultilineBlockBytes - block->content.size();
-                    std::string_view slice;
-                    if (block->preserve_indent) {
-                        // `|+` (SYNX 3.7): lock the base indent to the first
-                        // non-empty continuation line, then strip exactly that
-                        // many leading whitespace bytes from each subsequent
-                        // line, never cutting inside a character. See spec §8.4.1.
-                        if (block->base_indent < 0) {
-                            block->base_indent = indent;
-                        }
-                        size_t strip = static_cast<size_t>(std::min(block->base_indent, indent));
-                        // Trim trailing whitespace but keep indentation beyond `strip`.
-                        std::string_view raw_trim = trim_end_view(raw);
-                        size_t cut = strip_boundary(raw_trim, strip);
-                        slice = cut < raw_trim.size() ? raw_trim.substr(cut) : std::string_view{};
-                    } else {
-                        slice = t;
-                    }
-                    size_t n = utf8_prefix_len(slice, room);
-                    block->content.append(slice.data(), n);
-                }
-                ++i; continue;
-            }
-            insert_value(root, stack, block->stack_idx, block->key,
-                         Value::make_string(std::move(block->content)));
-            block.reset();
-        }
-
-        // Directives
-        if (t == "!active") { result.mode = Mode::Active; ++i; continue; }
-        if (t == "!lock")   { result.locked = true;     ++i; continue; }
-        if (t == "!tool")   { result.tool = true;       ++i; continue; }
-        if (t == "!schema") { result.schema = true;     ++i; continue; }
-        if (t == "!llm")    { result.llm = true;        ++i; continue; }
-        if (starts_with(t, "!include ")) {
-            if (result.includes.size() < kMaxIncludeDirectives) {
-                std::string_view rest = trim_view(t.substr(9));
-                size_t ws = 0;
-                while (ws < rest.size() && rest[ws] != ' ' && rest[ws] != '\t') ++ws;
-                std::string path(rest.substr(0, ws));
-                std::string alias;
-                if (ws < rest.size()) {
-                    alias = std::string(trim_view(rest.substr(ws)));
-                }
-                if (alias.empty() && !path.empty()) {
-                    size_t slash = path.find_last_of("/\\");
-                    std::string base = (slash == std::string::npos) ? path : path.substr(slash + 1);
-                    auto strip_suffix = [&](const std::string& suf) -> bool {
-                        if (base.size() >= suf.size()
-                            && base.compare(base.size() - suf.size(), suf.size(), suf) == 0) {
-                            base.resize(base.size() - suf.size());
-                            return true;
-                        }
-                        return false;
-                    };
-                    if (!strip_suffix(".synx")) {
-                        strip_suffix(".SYNX");
-                    }
-                    alias = std::move(base);
-                }
-                result.includes.push_back(IncludeDirective{std::move(path), std::move(alias)});
-            }
-            ++i; continue;
-        }
-        if (starts_with(t, "!use ")) {
-            std::string_view rest = trim_view(t.substr(5));
-            if (!rest.empty() && rest[0] == '@') {
-                size_t as_pos = rest.find(" as ");
-                std::string package, alias;
-                if (as_pos == std::string_view::npos) {
-                    package = std::string(trim_view(rest));
-                } else {
-                    package = std::string(trim_view(rest.substr(0, as_pos)));
-                    alias = std::string(trim_view(rest.substr(as_pos + 4)));
-                }
-                if (alias.empty() && !package.empty()) {
-                    size_t slash = package.find_last_of('/');
-                    alias = (slash == std::string::npos) ? package : package.substr(slash + 1);
-                }
-                if (!package.empty()) {
-                    result.uses.push_back(UseDirective{std::move(package), std::move(alias)});
-                }
-            }
-            ++i; continue;
-        }
-        if (starts_with(t, "#!mode:")) {
-            std::string_view declared = trim_view(t.substr(7));
-            result.mode = (declared == "active") ? Mode::Active : Mode::Static;
-            ++i; continue;
-        }
-
-        if (t == "###") { in_block_comment = !in_block_comment; ++i; continue; }
-        if (in_block_comment) { ++i; continue; }
-
-        if (t[0] == '#' || starts_with(t, "//")) { ++i; continue; }
-
-        // Continue list items
-        if (starts_with(t, "- ")) {
-            if (list.has_value() && indent > list->indent) {
-                // Pop list-item frames at same/deeper indent
-                while (stack.size() > 1) {
-                    const auto& back = stack.back();
-                    if (back.second.kind == StackEntryKind::ListItem && back.first >= indent) {
-                        stack.pop_back();
-                    } else {
-                        break;
-                    }
-                }
-
-                std::string val_str = strip_comment(trim_view(t.substr(2)));
-
-                // Peek next non-empty line to detect nested object form
-                size_t peek = i + 1;
-                bool nested = false;
-                while (peek < line_count) {
-                    std::string_view pl = line_view(text, line_starts, peek, total);
-                    std::string_view pt = trim_view(pl);
-                    if (pt.empty()) { ++peek; continue; }
-                    int pi = indent_of(pl);
-                    if (pi > indent && !starts_with(pt, "- ") && pt[0] != '#' && !starts_with(pt, "//")) {
-                        nested = true;
-                    }
-                    break;
-                }
-
-                std::string list_key = list->key;
-                size_t list_stack_idx = list->stack_idx;
-
-                Object* parent = navigate_to_parent(root, stack, list_stack_idx);
-                if (parent) {
-                    // Find-or-create the array
-                    Value* arr_val = nullptr;
-                    for (auto& p : *parent) {
-                        if (p.key == list_key) { arr_val = &p.value; break; }
-                    }
-                    if (!arr_val) {
-                        parent->push_back(Pair{list_key, Value::make_array()});
-                        arr_val = &parent->back().value;
-                    }
-                    Array* arr = arr_val->as_array_mut();
-                    if (arr && arr->size() < kMaxListItems) {
-                        if (nested) {
-                            Object item_obj;
-                            std::optional<ParsedLine> parsed = parse_line(val_str);
-                            if (parsed.has_value()) {
-                                Value v = parsed->type_hint.has_value()
-                                    ? cast_typed(parsed->value, *parsed->type_hint)
-                                    : (parsed->value.empty()
-                                        ? Value::make_object()
-                                        : cast_value(parsed->value));
-                                item_obj.push_back(Pair{parsed->key, std::move(v)});
-                            } else {
-                                item_obj.push_back(Pair{"_value", cast_value(val_str)});
-                            }
-                            size_t item_idx = arr->size();
-                            arr->push_back(Value::make_object(std::move(item_obj)));
-                            if (stack.size() < kMaxParseNestingDepth) {
-                                stack.push_back({indent,
-                                    StackEntry{StackEntryKind::ListItem, std::move(list_key), item_idx}});
-                            }
-                        } else {
-                            arr->push_back(cast_value(val_str));
-                        }
-                    }
-                }
-                ++i; continue;
-            }
-        } else if (list.has_value() && indent <= list->indent) {
-            list.reset();
-            while (stack.size() > 1) {
-                const auto& back = stack.back();
-                if (back.second.kind == StackEntryKind::ListItem && back.first >= indent) {
-                    stack.pop_back();
-                } else {
-                    break;
-                }
-            }
-        }
-
-        // Key line
-        std::optional<ParsedLine> parsed = parse_line(t);
-        if (parsed.has_value()) {
-            ParsedLine& p = *parsed;
-            if (p.key == "__proto__" || p.key == "constructor" || p.key == "prototype") {
-                ++i; continue;
-            }
-
-            // Pop stack to correct parent
-            while (stack.size() > 1 && stack.back().first >= indent) {
-                stack.pop_back();
-            }
-            size_t parent_idx = stack.size() - 1;
-
-            if (result.mode == Mode::Active
-                && (!p.markers.empty() || p.constraints.has_value() || p.type_hint.has_value())) {
-                std::string path = build_path(stack);
-                Meta m;
-                m.markers = p.markers;
-                m.args = p.marker_args;
-                m.type_hint = p.type_hint;
-                m.constraints = p.constraints;
-                result.metadata[path][p.key] = std::move(m);
-            }
-
-            // `|` (3.6) trims each continuation line; `|+` (3.7) preserves
-            // indent relative to the first non-empty line. Spec §8.4.1.
-            bool is_block = (p.value == "|" || p.value == "|+");
-            bool preserve_indent = (p.value == "|+");
-            bool is_list_marker = false;
-            for (const auto& m : p.markers) {
-                if (m == "random" || m == "unique" || m == "geo" || m == "join") {
-                    is_list_marker = true;
-                    break;
-                }
-            }
-
-            if (is_block) {
-                insert_value(root, stack, parent_idx, p.key, Value::make_string(""));
-                block = BlockState{indent, p.key, {}, parent_idx, preserve_indent, -1};
-            } else if (is_list_marker && p.value.empty()) {
-                insert_value(root, stack, parent_idx, p.key, Value::make_array());
-                list = ListState{indent, p.key, parent_idx};
-            } else if (p.value.empty()) {
-                // Peek for upcoming list
-                size_t peek = i + 1;
-                while (peek < line_count) {
-                    std::string_view pl = line_view(text, line_starts, peek, total);
-                    std::string_view pt = trim_view(pl);
-                    if (!pt.empty()) {
-                        if (starts_with(pt, "- ")) {
-                            insert_value(root, stack, parent_idx, p.key, Value::make_array());
-                            list = ListState{indent, p.key, parent_idx};
-                            goto consumed_line; // 1-level break (over inner while loop only)
-                        }
-                        break;
-                    }
-                    ++peek;
-                }
-                insert_value(root, stack, parent_idx, p.key, Value::make_object());
-                if (stack.size() < kMaxParseNestingDepth) {
-                    stack.push_back({indent, StackEntry{StackEntryKind::Key, p.key, 0}});
-                }
-            } else {
-                Value v = p.type_hint.has_value()
-                    ? cast_typed(p.value, *p.type_hint)
-                    : cast_value(p.value);
-                insert_value(root, stack, parent_idx, p.key, std::move(v));
-            }
-        }
-    consumed_line:
-        ++i;
-    }
-
-    // Flush pending block
-    if (block.has_value()) {
-        insert_value(root, stack, block->stack_idx, block->key,
-                     Value::make_string(std::move(block->content)));
-    }
-
+    // Either cap having bitten means input was dropped before parsing began.
+    result.truncated = text.size() < original;
+    Parser(text, result).run();
     return result;
 }
 
 Value reshape_tool_output(const Value& root, bool schema) {
     const Object* obj = root.as_object();
-    if (!obj) {
-        return root;
-    }
+    if (!obj) return root;
+
+    std::vector<const Pair*> entries;
+    entries.reserve(obj->size());
+    for (const auto& p : *obj) entries.push_back(&p);
+    std::sort(entries.begin(), entries.end(), [](const Pair* a, const Pair* b) { return a->key < b->key; });
 
     if (schema) {
-        // Sort by key for deterministic output
-        std::vector<const Pair*> entries;
-        entries.reserve(obj->size());
-        for (const auto& p : *obj) entries.push_back(&p);
-        std::sort(entries.begin(), entries.end(),
-                  [](const Pair* a, const Pair* b) { return a->key < b->key; });
-
         Array tools;
         tools.reserve(entries.size());
         for (const Pair* p : entries) {
@@ -937,25 +791,15 @@ Value reshape_tool_output(const Value& root, bool schema) {
         return Value::make_object(std::move(out));
     }
 
-    if (obj->empty()) {
-        Object out;
+    Object out;
+    if (entries.empty()) {
         out.push_back(Pair{"tool", Value::make_null()});
         out.push_back(Pair{"params", Value::make_object()});
         return Value::make_object(std::move(out));
     }
-
-    // First key in sorted order — matches Rust deterministic pick.
-    std::vector<const Pair*> entries;
-    entries.reserve(obj->size());
-    for (const auto& p : *obj) entries.push_back(&p);
-    std::sort(entries.begin(), entries.end(),
-              [](const Pair* a, const Pair* b) { return a->key < b->key; });
-
     const Pair* first = entries.front();
-    Value params = first->value.is_object() ? first->value : Value::make_object();
-    Object out;
     out.push_back(Pair{"tool", Value::make_string(first->key)});
-    out.push_back(Pair{"params", std::move(params)});
+    out.push_back(Pair{"params", first->value.is_object() ? first->value : Value::make_object()});
     return Value::make_object(std::move(out));
 }
 

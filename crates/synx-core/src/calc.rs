@@ -65,13 +65,25 @@ fn tokenize(expr: &str) -> Result<Vec<Token>, String> {
             continue;
         }
 
+        // The whole character, not its first byte read as Latin-1 (`м` → `Ð`).
+        let shown = expr[i..].chars().next().unwrap_or('\u{fffd}');
         return Err(format!(
             "SYNX :calc — unexpected character: '{}' in expression",
-            ch as char
+            shown
         ));
     }
 
     Ok(tokens)
+}
+
+/// A token as written, for error messages (identical in every implementation).
+fn token_text(t: &Token) -> String {
+    match t {
+        Token::Number(n) => n.to_string(),
+        Token::Op(b) => (*b as char).to_string(),
+        Token::LParen => "(".to_string(),
+        Token::RParen => ")".to_string(),
+    }
 }
 
 /// Recursive descent parser.
@@ -173,7 +185,7 @@ impl ExprParser {
                     _ => Err("SYNX :calc — missing closing parenthesis".into()),
                 }
             }
-            other => Err(format!("SYNX :calc — unexpected token: {:?}", other)),
+            other => Err(format!("SYNX :calc — unexpected token: '{}'", token_text(other))),
         }
     }
 }

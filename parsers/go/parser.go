@@ -1,7 +1,7 @@
 package synx
 
 import (
-	"bytes"
+	"math"
 	"math/rand"
 	"strconv"
 	"strings"
@@ -11,98 +11,208 @@ import (
 
 // Resource caps (parity with crates/synx-core/src/parser.rs).
 const (
-	MaxInputBytes      = 16 * 1024 * 1024
-	MaxLineStarts      = 2_000_000
-	MaxNestingDepth    = 128
-	MaxMultilineBytes  = 1024 * 1024
-	MaxListItems       = 1 << 20
-	MaxIncludes        = 4096
-	MaxEnumParts       = 4096
-	MaxMarkerSegments  = 512
+	MaxInputBytes     = 16 * 1024 * 1024
+	MaxLineStarts     = 2_000_000
+	MaxNestingDepth   = 128
+	MaxMultilineBytes = 1024 * 1024
+	MaxListItems      = 1 << 20
+	MaxIncludes       = 4096
+	MaxEnumParts      = 4096
+	MaxMarkerSegments = 512
 )
 
 // ClampText truncates `text` to a UTF-8-safe prefix bounded by MaxInputBytes.
 //
 // A single leading U+FEFF byte-order mark is dropped first (SYNX §2.1). It is
-// not whitespace to `strings.TrimSpace`, so left in place it would glue itself
-// to the first key and silently turn a BOM-prefixed `!active` into a plain key.
+// not whitespace, so left in place it would glue itself to the first key and
+// silently turn a BOM-prefixed `!active` into a plain key.
 func ClampText(text string) string {
 	text = strings.TrimPrefix(text, "\uFEFF")
-	b := []byte(text)
-	if len(b) <= MaxInputBytes {
+	if len(text) <= MaxInputBytes {
 		return text
 	}
 	end := MaxInputBytes
-	for end > 0 && b[end]&0xC0 == 0x80 {
+	for end > 0 && !utf8.RuneStart(text[end]) {
 		end--
 	}
-	return string(b[:end])
+	return text[:end]
+}
+
+// parseEnd is the byte length to parse: the whole text, or the prefix before
+// the newline that would exceed MaxLineStarts lines.
+func parseEnd(text string) int {
+	maxNewlines := MaxLineStarts - 1
+	seen, scan := 0, 0
+	for scan < len(text) {
+		rel := strings.IndexByte(text[scan:], '\n')
+		if rel < 0 {
+			break
+		}
+		if seen >= maxNewlines {
+			return scan + rel
+		}
+		seen++
+		scan += rel + 1
+	}
+	return len(text)
+}
+
+// ─── internal types ─────────────────────────────────────────────────────────
+
+type frameKind uint8
+
+const (
+	frameRoot frameKind = iota
+	frameKey
+	frameListItem
+)
+
+// stackFrame is one open object. obj is the object itself: objects are
+// reference values, so a frame needs no re-navigation from the root, and a
+// frame is popped before anything can replace its object in the parent.
+type stackFrame struct {
+	indent  int
+	kind    frameKind
+	key     string // frameKey: the key; frameListItem: the list's key
+	itemIdx int    // frameListItem only
+	parent  int    // frameListItem: stack index of the object holding the list
+	obj     *Object
+}
+
+type blockState struct {
+	indent  int
+	key     string
+	content strings.Builder
+	parent  *Object
+	// `|+` (SYNX 3.7) keeps each continuation line's indent relative to the
+	// first one; baseIndent is locked on the first content line (-1 = unset).
+	preserveIndent bool
+	baseIndent     int
+}
+
+type listState struct {
+	indent   int
+	key      string
+	stackIdx int
+	parent   *Object
+	pos      int // position of key in parent, -1 until known
+}
+
+// parsedLine is one key line; every string is a slice of the line.
+type parsedLine struct {
+	key         string
+	typeHint    string
+	hasTypeHint bool
+	value       string
+	markers     []string
+	markerArgs  []string
+	constraints *Constraints
+}
+
+type parser struct {
+	text          string
+	stack         []stackFrame
+	metaPath      string
+	metaPathValid bool
+	result        ParseResult
+}
+
+func (p *parser) push(f stackFrame) {
+	p.stack = append(p.stack, f)
+	p.metaPathValid = false
+}
+
+func (p *parser) pop() {
+	p.stack[len(p.stack)-1] = stackFrame{}
+	p.stack = p.stack[:len(p.stack)-1]
+	p.metaPathValid = false
+}
+
+// currentPath is the metadata path of the top frame. It follows the frame
+// chain rather than the whole stack: a list item's parent is the object that
+// holds the list, which need not be the frame below it.
+func (p *parser) currentPath() string {
+	if p.metaPathValid {
+		return p.metaPath
+	}
+	p.metaPathValid = true
+	if len(p.stack) <= 1 {
+		p.metaPath = ""
+		return ""
+	}
+	var chain [MaxNestingDepth + 1]int
+	n := 0
+	for idx := len(p.stack) - 1; idx > 0 && n < len(chain); {
+		chain[n] = idx
+		n++
+		if p.stack[idx].kind == frameListItem {
+			idx = p.stack[idx].parent
+		} else {
+			idx--
+		}
+	}
+	var sb strings.Builder
+	for i := n - 1; i >= 0; i-- {
+		f := &p.stack[chain[i]]
+		if sb.Len() > 0 {
+			sb.WriteByte('.')
+		}
+		writeKeySegment(&sb, f.key)
+		if f.kind == frameListItem {
+			sb.WriteString(".#")
+			sb.WriteString(strconv.Itoa(f.itemIdx))
+		}
+	}
+	p.metaPath = sb.String()
+	return p.metaPath
 }
 
 // Parse converts SYNX text into a ParseResult.
 func Parse(text string) ParseResult {
-	b := []byte(ClampText(text))
+	// A leading BOM is not input that a limit dropped.
+	originalLen := len(strings.TrimPrefix(text, "\uFEFF"))
+	text = ClampText(text)
+	text = text[:parseEnd(text)]
 
-	// Bound number of indexed newlines.
-	maxNl := MaxLineStarts - 1
-	{
-		seen, scan := 0, 0
-		for scan < len(b) {
-			if b[scan] == '\n' {
-				if seen >= maxNl {
-					b = b[:scan]
-					break
-				}
-				seen++
-			}
-			scan++
-		}
-	}
-
-	// Index line starts.
-	lineStarts := make([]int, 1, 64)
-	lineStarts[0] = 0
-	for scan := 0; scan < len(b); scan++ {
-		if b[scan] == '\n' {
-			lineStarts = append(lineStarts, scan+1)
-		}
-	}
-	lineCount := len(lineStarts)
-
-	result := ParseResult{
-		Root:     NewObject(),
-		Metadata: MetadataTree{},
-	}
-	rootObj, _ := AsObject(result.Root)
-	stack := []stackFrame{{indent: -1, kind: seRoot}}
+	root := NewObjectMap()
+	p := &parser{text: text}
+	p.result = ParseResult{Root: Object_(root), Metadata: NewMetadataTree()}
+	p.result.Truncated = len(text) < originalLen
+	p.stack = make([]stackFrame, 1, 16)
+	p.stack[0] = stackFrame{indent: -1, kind: frameRoot, obj: root}
+	r := &p.result
 
 	var block *blockState
 	var list *listState
 	inBlockComment := false
 
-	i := 0
-	for i < lineCount {
-		raw := lineBytes(b, lineStarts, i)
-		rawStr := string(raw)
-		t := strings.TrimSpace(rawStr)
+	pos := 0
+	for pos <= len(text) {
+		start := pos
+		nl := strings.IndexByte(text[start:], '\n')
+		if nl < 0 {
+			nl = len(text)
+		} else {
+			nl += start
+		}
+		pos = nl + 1
+		end := nl
+		if end > start && text[end-1] == '\r' {
+			end--
+		}
+		raw := text[start:end]
+		trimmed := trimWS(raw)
 
 		// A blank line is never structural and never body: SYNX §8.4.1 does not
 		// preserve blank lines inside a multiline body.
-		if t == "" {
-			i++
+		if trimmed == "" {
 			continue
 		}
+		indent := indentLen(raw)
 
-		indent := indentOf(raw)
-
-		// Continue multiline block.
-		//
-		// This branch runs before every line-class rule below, and that order
-		// is load-bearing: a `|` / `|+` body is raw text (SYNX §8.4.1), so `#`,
-		// `//`, `###` and `!…` lines are ordinary content there. Classifying
-		// first would delete comment lines out of code samples, let a stray
-		// `###` swallow the rest of the record and turn a dataset row into a
-		// directive.
+		// Continue a multiline block. This runs before every line-class rule
+		// below: a `|` / `|+` body is raw text (SYNX §8.4.1), so `#`, `//`,
+		// `###` and `!…` lines are ordinary content there.
 		if block != nil {
 			if indent > block.indent {
 				if block.content.Len() < MaxMultilineBytes {
@@ -110,240 +220,174 @@ func Parse(text string) ParseResult {
 						block.content.WriteByte('\n')
 					}
 					room := MaxMultilineBytes - block.content.Len()
-					// `|+` (SYNX 3.7): lock base indent to the first non-empty
-					// continuation line and strip that many leading whitespace
-					// bytes; anything indented further is preserved. The cut is
-					// walked rune by rune so a multi-byte indent character
-					// (U+00A0, U+3000…) is never split.
-					var slice string
-					if block.preserveIndent {
-						if block.baseIndent < 0 {
-							block.baseIndent = indent
-						}
-						strip := block.baseIndent
-						if indent < strip {
-							strip = indent
-						}
-						trimEnd := strings.TrimRightFunc(rawStr, unicode.IsSpace)
-						cut := stripBoundary(trimEnd, strip)
-						if cut < len(trimEnd) {
-							slice = trimEnd[cut:]
+					if room > 0 {
+						var slice string
+						if block.preserveIndent {
+							if block.baseIndent < 0 {
+								block.baseIndent = indent
+							}
+							strip := block.baseIndent
+							if indent < strip {
+								strip = indent
+							}
+							rawTrimEnd := trimRightWS(raw)
+							if cut := stripBoundary(rawTrimEnd, strip); cut < len(rawTrimEnd) {
+								slice = rawTrimEnd[cut:]
+							}
 						} else {
-							slice = ""
+							slice = trimmed
 						}
-					} else {
-						slice = t
+						n := utf8PrefixLen(slice, room)
+						block.content.WriteString(slice[:n])
+						if n < len(slice) {
+							r.Truncated = true
+						}
 					}
-					block.content.WriteString(slice[:utf8PrefixLen(slice, room)])
+				} else {
+					r.Truncated = true
 				}
-				i++
 				continue
 			}
-			insertValue(rootObj, stack, block.stackIdx, block.key, String(block.content.String()))
+			block.parent.Set(block.key, String(block.content.String()))
 			block = nil
 		}
 
-		// Directives
-		switch t {
-		case "!active":
-			result.Mode = ModeActive
-			i++
-			continue
-		case "!lock":
-			result.Locked = true
-			i++
-			continue
-		case "!tool":
-			result.Tool = true
-			i++
-			continue
-		case "!schema":
-			result.Schema = true
-			i++
-			continue
-		case "!llm":
-			result.Llm = true
-			i++
-			continue
-		}
-		if strings.HasPrefix(t, "!include ") {
-			if len(result.Includes) < MaxIncludes {
-				rest := strings.TrimSpace(t[9:])
-				path, alias := rest, ""
-				if ws := firstWhitespace(rest); ws >= 0 {
-					path = rest[:ws]
-					alias = strings.TrimSpace(rest[ws:])
-				}
-				if alias == "" {
-					base := path
-					if slash := strings.LastIndexAny(base, "/\\"); slash >= 0 {
-						base = base[slash+1:]
-					}
-					if strings.HasSuffix(base, ".synx") || strings.HasSuffix(base, ".SYNX") {
-						base = base[:len(base)-5]
-					}
-					alias = base
-				}
-				result.Includes = append(result.Includes, IncludeDirective{Path: path, Alias: alias})
-			}
-			i++
-			continue
-		}
-		if strings.HasPrefix(t, "!use ") {
-			rest := strings.TrimSpace(t[5:])
-			if len(rest) > 0 && rest[0] == '@' {
-				pkg, alias := rest, ""
-				if idx := strings.Index(rest, " as "); idx >= 0 {
-					pkg = strings.TrimSpace(rest[:idx])
-					alias = strings.TrimSpace(rest[idx+4:])
-				}
-				if alias == "" {
-					if slash := strings.LastIndex(pkg, "/"); slash >= 0 {
-						alias = pkg[slash+1:]
-					} else {
-						alias = pkg
-					}
-				}
-				if pkg != "" {
-					result.Uses = append(result.Uses, UseDirective{Package: pkg, Alias: alias})
-				}
-			}
-			i++
-			continue
-		}
-		if strings.HasPrefix(t, "#!mode:") {
-			declared := strings.TrimSpace(t[7:])
-			if declared == "active" {
-				result.Mode = ModeActive
-			} else {
-				result.Mode = ModeStatic
-			}
-			i++
-			continue
-		}
-
-		if t == "###" {
+		if trimmed == "###" {
 			inBlockComment = !inBlockComment
-			i++
 			continue
 		}
 		if inBlockComment {
-			i++
-			continue
-		}
-		if t[0] == '#' || strings.HasPrefix(t, "//") {
-			i++
 			continue
 		}
 
-		// List items
-		if strings.HasPrefix(t, "- ") {
+		// Directive lines (§6) all start with `!` or `#!mode:`.
+		if trimmed[0] == '!' || strings.HasPrefix(trimmed, "#!mode:") {
+			if p.directive(trimmed) {
+				continue
+			}
+		}
+
+		if trimmed[0] == '#' || strings.HasPrefix(trimmed, "//") {
+			continue
+		}
+
+		if strings.HasPrefix(trimmed, "- ") {
 			if list != nil && indent > list.indent {
-				for len(stack) > 1 {
-					back := stack[len(stack)-1]
-					if back.kind == seListItem && back.indent >= indent {
-						stack = stack[:len(stack)-1]
-					} else {
-						break
-					}
+				// Pop every frame of the previous item — its own frame and any
+				// object nested inside it.
+				for len(p.stack) > 1 && p.stack[len(p.stack)-1].indent >= indent {
+					p.pop()
 				}
-				valStr := stripComment(strings.TrimSpace(t[2:]))
+				valStr := stripComment(trimWS(trimmed[2:]))
+
+				// The item is an object when the next content line is deeper
+				// and is neither another item nor a comment.
 				nested := false
-				for peek := i + 1; peek < lineCount; peek++ {
-					pl := lineBytes(b, lineStarts, peek)
-					pt := strings.TrimSpace(string(pl))
-					if pt == "" {
-						continue
-					}
-					pi := indentOf(pl)
-					if pi > indent && !strings.HasPrefix(pt, "- ") &&
-						!strings.HasPrefix(pt, "#") && !strings.HasPrefix(pt, "//") {
+				if ps, pe, ok := nextContentLine(text, pos); ok {
+					pl := text[ps:pe]
+					pt := trimWS(pl)
+					if indentLen(pl) > indent && !strings.HasPrefix(pt, "- ") &&
+						pt[0] != '#' && !strings.HasPrefix(pt, "//") {
 						nested = true
 					}
-					break
 				}
 
-				listKey := list.key
-				listStackIdx := list.stackIdx
-				newIdx := -1
-				mutateArray(rootObj, stack, listStackIdx, listKey, func(arr *[]Value) {
-					if len(*arr) >= MaxListItems {
-						return
+				parent := list.parent
+				if list.pos < 0 {
+					list.pos = parent.find(list.key)
+					if list.pos < 0 {
+						parent.Set(list.key, ArrayValue{V: []Value{}})
+						list.pos = parent.find(list.key)
 					}
-					if nested {
-						item := NewObjectMap()
-						if p := parseLine(valStr); p != nil {
-							var v Value
-							if p.typeHint != "" {
-								v = castTyped(p.value, p.typeHint)
-							} else if p.value == "" {
-								v = NewObject()
-							} else {
-								v = castValue(p.value)
-							}
-							item.Set(p.key, v)
-						} else {
-							item.Set("_value", castValue(valStr))
-						}
-						newIdx = len(*arr)
-						*arr = append(*arr, Object_(item))
-					} else {
-						*arr = append(*arr, castValue(valStr))
-					}
-				})
-				if newIdx >= 0 && len(stack) < MaxNestingDepth {
-					stack = append(stack, stackFrame{indent: indent, kind: seListItem, key: listKey, itemIdx: newIdx})
 				}
-				i++
+				av, isArr := parent.pairs[list.pos].Value.(ArrayValue)
+				if !isArr || len(av.V) >= MaxListItems {
+					continue
+				}
+				if nested {
+					item := NewObjectMap()
+					if pl, ok := parseLine(valStr); ok {
+						var v Value
+						switch {
+						case pl.hasTypeHint:
+							v = castTyped(pl.value, pl.typeHint)
+						case pl.value != "":
+							v = cast(pl.value)
+						default:
+							v = NewObject()
+						}
+						if !isReservedJSKey(pl.key) {
+							item.Set(pl.key, v)
+						}
+					} else {
+						item.Set("_value", cast(valStr))
+					}
+					itemIdx := len(av.V)
+					av.V = append(av.V, Object_(item))
+					parent.pairs[list.pos].Value = av
+					if len(p.stack) < MaxNestingDepth {
+						p.push(stackFrame{indent: indent, kind: frameListItem, key: list.key,
+							itemIdx: itemIdx, parent: list.stackIdx, obj: item})
+					}
+				} else {
+					av.V = append(av.V, cast(valStr))
+					parent.pairs[list.pos].Value = av
+				}
 				continue
 			}
 		} else if list != nil && indent <= list.indent {
+			// A non-item line at or below the list's indent closes it.
 			list = nil
-			for len(stack) > 1 {
-				back := stack[len(stack)-1]
-				if back.kind == seListItem && back.indent >= indent {
-					stack = stack[:len(stack)-1]
+			for len(p.stack) > 1 {
+				top := p.stack[len(p.stack)-1]
+				if top.kind == frameListItem && top.indent >= indent {
+					p.pop()
 				} else {
 					break
 				}
 			}
 		}
 
-		// Key line
-		p := parseLine(t)
-		if p == nil {
-			i++
+		pl, ok := parseLine(trimmed)
+		if !ok || isReservedJSKey(pl.key) {
 			continue
 		}
-		if p.key == "__proto__" || p.key == "constructor" || p.key == "prototype" {
-			i++
-			continue
+		for len(p.stack) > 1 && p.stack[len(p.stack)-1].indent >= indent {
+			p.pop()
 		}
-		for len(stack) > 1 && stack[len(stack)-1].indent >= indent {
-			stack = stack[:len(stack)-1]
-		}
-		parentIdx := len(stack) - 1
+		parentIdx := len(p.stack) - 1
+		parent := p.stack[parentIdx].obj
 
-		if result.Mode == ModeActive && (len(p.markers) > 0 || p.constraints != nil || p.typeHint != "") {
-			path := buildPath(stack)
-			meta := Meta{
-				Markers:     p.markers,
-				Args:        p.markerArgs,
-				TypeHint:    p.typeHint,
-				Constraints: p.constraints,
+		// A key that replaces an object or list replaces its declarations too.
+		if r.Mode == ModeActive && r.Metadata.Len() > 0 {
+			if old, exists := parent.Get(pl.key); exists && isContainer(old) {
+				prefix := p.currentPath()
+				var sb strings.Builder
+				sb.WriteString(prefix)
+				if prefix != "" {
+					sb.WriteByte('.')
+				}
+				writeKeySegment(&sb, pl.key)
+				pfx := sb.String()
+				r.Metadata.retain(func(path string) bool {
+					return !(path == pfx || (len(path) > len(pfx) && strings.HasPrefix(path, pfx) && path[len(pfx)] == '.'))
+				})
 			}
-			if result.Metadata[path] == nil {
-				result.Metadata[path] = MetaMap{}
-			}
-			result.Metadata[path][p.key] = meta
 		}
 
-		// `|` (3.6) trims each continuation line; `|+` (3.7) preserves
-		// indent relative to the first non-empty line. See spec §8.4.1.
-		isBlock := p.value == "|" || p.value == "|+"
-		preserveIndent := p.value == "|+"
+		if r.Mode == ModeActive && (len(pl.markers) > 0 || pl.constraints != nil || pl.hasTypeHint) {
+			r.Metadata.level(p.currentPath()).Set(pl.key, Meta{
+				Markers:     pl.markers,
+				Args:        pl.markerArgs,
+				TypeHint:    pl.typeHint,
+				Constraints: pl.constraints,
+				typeHintSet: pl.hasTypeHint,
+			})
+		}
+
+		isBlock := pl.value == "|" || pl.value == "|+"
 		isListMarker := false
-		for _, m := range p.markers {
+		for _, m := range pl.markers {
 			if m == "random" || m == "unique" || m == "geo" || m == "join" {
 				isListMarker = true
 				break
@@ -352,52 +396,142 @@ func Parse(text string) ParseResult {
 
 		switch {
 		case isBlock:
-			insertValue(rootObj, stack, parentIdx, p.key, String(""))
-			block = &blockState{
-				indent: indent, key: p.key, stackIdx: parentIdx,
-				preserveIndent: preserveIndent, baseIndent: -1,
+			parent.Set(pl.key, String(""))
+			block = &blockState{indent: indent, key: pl.key, parent: parent,
+				preserveIndent: pl.value == "|+", baseIndent: -1}
+		case isListMarker && pl.value == "":
+			parent.Set(pl.key, ArrayValue{V: []Value{}})
+			list = &listState{indent: indent, key: pl.key, stackIdx: parentIdx, parent: parent, pos: -1}
+		case pl.value == "":
+			if ps, pe, ok := nextContentLine(text, pos); ok && strings.HasPrefix(trimWS(text[ps:pe]), "- ") {
+				parent.Set(pl.key, ArrayValue{V: []Value{}})
+				list = &listState{indent: indent, key: pl.key, stackIdx: parentIdx, parent: parent, pos: -1}
+				continue
 			}
-		case isListMarker && p.value == "":
-			insertValue(rootObj, stack, parentIdx, p.key, NewArray())
-			list = &listState{indent: indent, key: p.key, stackIdx: parentIdx}
-		case p.value == "":
-			becameList := false
-			for peek := i + 1; peek < lineCount; peek++ {
-				pl := lineBytes(b, lineStarts, peek)
-				pt := strings.TrimSpace(string(pl))
-				if pt == "" {
-					continue
-				}
-				if strings.HasPrefix(pt, "- ") {
-					insertValue(rootObj, stack, parentIdx, p.key, NewArray())
-					list = &listState{indent: indent, key: p.key, stackIdx: parentIdx}
-					becameList = true
-				}
-				break
-			}
-			if !becameList {
-				insertValue(rootObj, stack, parentIdx, p.key, NewObject())
-				if len(stack) < MaxNestingDepth {
-					stack = append(stack, stackFrame{indent: indent, kind: seKey, key: p.key})
-				}
+			child := NewObjectMap()
+			parent.Set(pl.key, Object_(child))
+			if len(p.stack) < MaxNestingDepth {
+				p.push(stackFrame{indent: indent, kind: frameKey, key: pl.key, obj: child})
 			}
 		default:
 			var v Value
-			if p.typeHint != "" {
-				v = castTyped(p.value, p.typeHint)
+			if pl.hasTypeHint {
+				v = castTyped(pl.value, pl.typeHint)
 			} else {
-				v = castValue(p.value)
+				v = cast(pl.value)
 			}
-			insertValue(rootObj, stack, parentIdx, p.key, v)
+			parent.Set(pl.key, v)
 		}
-		i++
 	}
 
 	if block != nil {
-		insertValue(rootObj, stack, block.stackIdx, block.key, String(block.content.String()))
+		block.parent.Set(block.key, String(block.content.String()))
 	}
+	return p.result
+}
 
-	return result
+// directive applies one directive line and reports whether it was one.
+// Unknown `!…` lines fall through to the generic line handling.
+func (p *parser) directive(t string) bool {
+	r := &p.result
+	switch t {
+	case "!active":
+		r.Mode = ModeActive
+		return true
+	case "!lock":
+		r.Locked = true
+		return true
+	case "!tool":
+		r.Tool = true
+		return true
+	case "!schema":
+		r.Schema = true
+		return true
+	case "!llm":
+		r.Llm = true
+		return true
+	}
+	if strings.HasPrefix(t, "!include ") {
+		if len(r.Includes) < MaxIncludes {
+			rest := strings.TrimSpace(t[9:])
+			path, alias, hasAlias := rest, "", false
+			if ws := strings.IndexFunc(rest, unicode.IsSpace); ws >= 0 {
+				path = rest[:ws]
+				_, size := utf8.DecodeRuneInString(rest[ws:])
+				alias = strings.TrimSpace(rest[ws+size:])
+				hasAlias = true
+			}
+			if !hasAlias {
+				name := path
+				if slash := strings.LastIndexAny(name, "/\\"); slash >= 0 {
+					name = name[slash+1:]
+				}
+				if strings.HasSuffix(name, ".synx") {
+					name = name[:len(name)-5]
+				} else if strings.HasSuffix(name, ".SYNX") {
+					name = name[:len(name)-5]
+				}
+				alias = name
+			}
+			r.Includes = append(r.Includes, IncludeDirective{Path: path, Alias: alias})
+		}
+		return true
+	}
+	if strings.HasPrefix(t, "!use ") {
+		rest := strings.TrimSpace(t[5:])
+		if strings.HasPrefix(rest, "@") {
+			pkg, alias := rest, ""
+			hasAlias := false
+			if idx := strings.Index(rest, " as "); idx >= 0 {
+				pkg = rest[:idx]
+				alias = strings.TrimSpace(rest[idx+4:])
+				hasAlias = true
+			}
+			pkg = strings.TrimSpace(pkg)
+			if !hasAlias {
+				alias = pkg
+				if slash := strings.LastIndexByte(pkg, '/'); slash >= 0 {
+					alias = pkg[slash+1:]
+				}
+			}
+			if pkg != "" {
+				r.Uses = append(r.Uses, UseDirective{Package: pkg, Alias: alias})
+			}
+		}
+		return true
+	}
+	if strings.HasPrefix(t, "#!mode:") {
+		if strings.TrimSpace(t[7:]) == "active" {
+			r.Mode = ModeActive
+		} else {
+			r.Mode = ModeStatic
+		}
+		return true
+	}
+	return false
+}
+
+// nextContentLine finds the first non-blank line at or after byte `from`,
+// as (start, end) with a trailing CR excluded.
+func nextContentLine(text string, from int) (int, int, bool) {
+	p := from
+	for p <= len(text) {
+		nl := strings.IndexByte(text[p:], '\n')
+		if nl < 0 {
+			nl = len(text)
+		} else {
+			nl += p
+		}
+		end := nl
+		if end > p && text[end-1] == '\r' {
+			end--
+		}
+		if trimWS(text[p:end]) != "" {
+			return p, end, true
+		}
+		p = nl + 1
+	}
+	return 0, 0, false
 }
 
 // ReshapeToolOutput reshapes the parsed tree for `!tool` mode.
@@ -413,10 +547,7 @@ func ReshapeToolOutput(root Value, schema bool) Value {
 			def := NewObjectMap()
 			def.Set("name", String(k))
 			v, _ := obj.Get(k)
-			if v == nil {
-				v = Null
-			}
-			def.Set("params", v)
+			def.Set("params", CloneValue(v))
 			tools = append(tools, Object_(def))
 		}
 		out := NewObjectMap()
@@ -434,7 +565,7 @@ func ReshapeToolOutput(root Value, schema bool) Value {
 	firstVal, _ := obj.Get(firstKey)
 	var params Value
 	if _, ok := firstVal.(ObjectValue); ok {
-		params = firstVal
+		params = CloneValue(firstVal)
 	} else {
 		params = NewObject()
 	}
@@ -444,177 +575,135 @@ func ReshapeToolOutput(root Value, schema bool) Value {
 	return Object_(out)
 }
 
-// ─── internal types ─────────────────────────────────────────────────────────
-
-type stackEntryKind uint8
-
-const (
-	seRoot stackEntryKind = iota
-	seKey
-	seListItem
-)
-
-type stackFrame struct {
-	indent  int
-	kind    stackEntryKind
-	key     string // for seKey and seListItem.listKey
-	itemIdx int    // for seListItem only
-}
-
-type blockState struct {
-	indent   int
-	key      string
-	content  bytes.Buffer
-	stackIdx int
-	// SYNX 3.7 `|+`: preserveIndent keeps indent relative to the first
-	// non-empty continuation line instead of trimming each line fully.
-	// baseIndent is locked on the first content line; -1 means "unlocked".
-	preserveIndent bool
-	baseIndent     int
-}
-
-type listState struct {
-	indent   int
-	key      string
-	stackIdx int
-}
-
-type parsedLine struct {
-	key         string
-	typeHint    string
-	value       string
-	markers     []string
-	markerArgs  []string
-	constraints *Constraints
-}
-
 // ─── line decomposer ────────────────────────────────────────────────────────
 
-func parseLine(trimmed string) *parsedLine {
-	if trimmed == "" {
-		return nil
+func parseLine(trimmed string) (parsedLine, bool) {
+	var out parsedLine
+	if trimmed == "" || trimmed[0] == '#' || strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, "- ") {
+		return out, false
 	}
-	if trimmed[0] == '#' || strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, "- ") {
-		return nil
+	switch trimmed[0] {
+	case '[', ':', '-', '/', '(':
+		return out, false
 	}
-	first := trimmed[0]
-	if first == '[' || first == ':' || first == '-' || first == '/' || first == '(' {
-		return nil
-	}
-	b := []byte(trimmed)
+	n := len(trimmed)
 	pos := 0
-	for pos < len(b) {
-		ch := b[pos]
+	for pos < n {
+		ch := trimmed[pos]
 		if ch == ' ' || ch == '\t' || ch == '[' || ch == ':' || ch == '(' {
 			break
 		}
 		pos++
 	}
-	out := &parsedLine{key: string(b[:pos])}
+	out.key = trimmed[:pos]
 
-	if pos < len(b) && b[pos] == '(' {
+	if pos < n && trimmed[pos] == '(' {
 		start := pos + 1
-		scan := start
-		for scan < len(b) && b[scan] != ')' {
-			scan++
-		}
-		if scan < len(b) {
-			out.typeHint = string(b[start:scan])
-			pos = scan + 1
+		if c := strings.IndexByte(trimmed[start:], ')'); c >= 0 {
+			out.typeHint = trimmed[start : start+c]
+			out.hasTypeHint = true
+			pos = start + c + 1
 		} else {
-			pos = start
+			pos++
 		}
 	}
 
-	if pos < len(b) && b[pos] == '[' {
+	// Balanced scan so `^[A-Z]{2}$` does not close the block at its own `]`.
+	if pos < n && trimmed[pos] == '[' {
 		cstart := pos + 1
 		depth := 1
 		scan := cstart
-		for scan < len(b) && depth > 0 {
-			switch b[scan] {
+		for scan < n && depth > 0 {
+			switch trimmed[scan] {
 			case '[':
 				depth++
 			case ']':
 				depth--
-				if depth == 0 {
-				}
 			}
 			if depth == 0 {
 				break
 			}
 			scan++
 		}
+		var c Constraints
 		if depth == 0 {
-			c := parseConstraints(string(b[cstart:scan]))
-			out.constraints = &c
+			c = parseConstraints(trimmed[cstart:scan])
 			pos = scan + 1
+		} else if rel := strings.IndexByte(trimmed[cstart:], ']'); rel >= 0 {
+			c = parseConstraints(trimmed[cstart : cstart+rel])
+			pos = cstart + rel + 1
 		} else {
-			sweep := cstart
-			for sweep < len(b) && b[sweep] != ']' {
-				sweep++
-			}
-			if sweep < len(b) {
-				c := parseConstraints(string(b[cstart:sweep]))
-				out.constraints = &c
-				pos = sweep + 1
-			} else {
-				c := parseConstraints(string(b[cstart:]))
-				out.constraints = &c
-				pos = len(b)
-			}
+			c = parseConstraints(trimmed[cstart:])
+			pos = n
 		}
+		out.constraints = &c
 	}
 
-	if pos < len(b) && b[pos] == ':' {
+	if pos < n && trimmed[pos] == ':' {
 		mstart := pos + 1
 		mend := mstart
-		for mend < len(b) && b[mend] != ' ' && b[mend] != '\t' {
+		for mend < n && trimmed[mend] != ' ' && trimmed[mend] != '\t' {
 			mend++
 		}
-		chain := string(b[mstart:mend])
-		segs := 0
-		for _, seg := range splitN(chain, ':', MaxMarkerSegments) {
-			out.markers = append(out.markers, seg)
-			segs++
-			if segs >= MaxMarkerSegments {
+		chain := trimmed[mstart:mend]
+		count := strings.Count(chain, ":") + 1
+		if count > MaxMarkerSegments {
+			count = MaxMarkerSegments
+		}
+		out.markers = make([]string, 0, count)
+		for len(out.markers) < MaxMarkerSegments {
+			i := strings.IndexByte(chain, ':')
+			if i < 0 {
+				out.markers = append(out.markers, chain)
 				break
 			}
+			out.markers = append(out.markers, chain[:i])
+			chain = chain[i+1:]
 		}
 		pos = mend
 	}
 
-	for pos < len(b) && (b[pos] == ' ' || b[pos] == '\t') {
+	for pos < n && (trimmed[pos] == ' ' || trimmed[pos] == '\t') {
 		pos++
 	}
-	value := ""
-	if pos < len(b) {
-		value = stripComment(string(b[pos:]))
+	if pos < n {
+		out.value = stripComment(trimmed[pos:])
 	}
-	out.value = value
 
-	if containsString(out.markers, "random") && out.value != "" {
-		var nums []string
-		for _, tok := range strings.Fields(out.value) {
-			if _, err := strconv.ParseFloat(tok, 64); err == nil {
-				nums = append(nums, tok)
+	if len(out.markers) > 0 && out.value != "" {
+		// `:random` reads its weights from the value.
+		if containsString(out.markers, "random") {
+			var nums []string
+			for _, tok := range strings.FieldsFunc(out.value, unicode.IsSpace) {
+				if _, ok := parseRustFloat(tok); ok {
+					nums = append(nums, tok)
+				}
+			}
+			if len(nums) > 0 {
+				out.markerArgs = nums
+				out.value = ""
 			}
 		}
-		if len(nums) > 0 {
-			out.markerArgs = nums
+		// `:inherit` with a value names the parent instead of a scalar.
+		if out.value != "" && containsString(out.markers, "inherit") {
+			out.markerArgs = []string{strings.TrimSpace(out.value)}
 			out.value = ""
 		}
 	}
-	if containsString(out.markers, "inherit") && out.value != "" {
-		out.markerArgs = []string{strings.TrimSpace(out.value)}
-		out.value = ""
-	}
-	return out
+	return out, true
 }
 
+// parseConstraints parses the body of a `[…]` block.
 func parseConstraints(raw string) Constraints {
 	var c Constraints
-	for _, rawPart := range strings.Split(raw, ",") {
-		part := strings.TrimSpace(rawPart)
+	for raw != "" {
+		var part string
+		if i := strings.IndexByte(raw, ','); i >= 0 {
+			part, raw = raw[:i], raw[i+1:]
+		} else {
+			part, raw = raw, ""
+		}
+		part = strings.TrimSpace(part)
 		if part == "" {
 			continue
 		}
@@ -634,26 +723,31 @@ func parseConstraints(raw string) Constraints {
 		v := strings.TrimSpace(part[colon+1:])
 		switch k {
 		case "min":
-			if d, err := strconv.ParseFloat(v, 64); err == nil {
+			c.Min = nil
+			if d, ok := parseRustFloat(v); ok {
 				c.Min = &d
 			}
 		case "max":
-			if d, err := strconv.ParseFloat(v, 64); err == nil {
+			c.Max = nil
+			if d, ok := parseRustFloat(v); ok {
 				c.Max = &d
 			}
 		case "type":
 			c.TypeName = v
+			c.typeNameSet = true
 		case "pattern":
 			c.Pattern = v
+			c.patternSet = true
 		case "enum":
-			vals := []string{}
-			count := 0
-			for _, piece := range strings.Split(v, "|") {
-				if count >= MaxEnumParts {
+			vals := make([]string, 0, strings.Count(v, "|")+1)
+			for len(vals) < MaxEnumParts {
+				i := strings.IndexByte(v, '|')
+				if i < 0 {
+					vals = append(vals, v)
 					break
 				}
-				vals = append(vals, strings.TrimSpace(piece))
-				count++
+				vals = append(vals, v[:i])
+				v = v[i+1:]
 			}
 			c.EnumValues = vals
 		}
@@ -663,7 +757,8 @@ func parseConstraints(raw string) Constraints {
 
 // ─── casting ────────────────────────────────────────────────────────────────
 
-func castValue(val string) Value {
+// cast is SYNX §8.3 automatic casting.
+func cast(val string) Value {
 	if len(val) >= 2 {
 		f, l := val[0], val[len(val)-1]
 		if (f == '"' && l == '"') || (f == '\'' && l == '\'') {
@@ -677,8 +772,7 @@ func castValue(val string) Value {
 		return Bool(false)
 	case "null":
 		return Null
-	}
-	if val == "" {
+	case "":
 		return String("")
 	}
 	start := 0
@@ -688,98 +782,207 @@ func castValue(val string) Value {
 		}
 		start = 1
 	}
-	if val[start] < '0' || val[start] > '9' {
-		return String(val)
-	}
-	seenDot, allNumeric := false, true
-	dotPos := -1
-	for j := start; j < len(val); j++ {
-		c := val[j]
-		if c == '.' {
-			if seenDot {
+	if val[start] >= '0' && val[start] <= '9' {
+		dotPos := -1
+		allNumeric := true
+		for j := start; j < len(val); j++ {
+			c := val[j]
+			if c == '.' {
+				if dotPos >= 0 {
+					allNumeric = false
+					break
+				}
+				dotPos = j
+			} else if c < '0' || c > '9' {
 				allNumeric = false
 				break
 			}
-			seenDot = true
-			dotPos = j
-		} else if c < '0' || c > '9' {
-			allNumeric = false
-			break
 		}
-	}
-	if !allNumeric {
-		return String(val)
-	}
-	if seenDot {
-		if dotPos > start && dotPos < len(val)-1 {
-			if d, err := strconv.ParseFloat(val, 64); err == nil {
-				return Float(d)
+		if allNumeric {
+			if dotPos >= 0 {
+				if dotPos > start && dotPos < len(val)-1 {
+					if d, ok := parseRustFloat(val); ok {
+						return Float(d)
+					}
+				}
+			} else if n, err := strconv.ParseInt(val, 10, 64); err == nil {
+				return Int(n)
 			}
 		}
-		return String(val)
-	}
-	if n, err := strconv.ParseInt(val, 10, 64); err == nil {
-		return Int(n)
 	}
 	return String(val)
 }
 
+// castTyped is SYNX §8.3 typed casting.
 func castTyped(val, hint string) Value {
 	switch hint {
 	case "int":
-		n, _ := strconv.ParseInt(val, 10, 64)
+		n, err := strconv.ParseInt(val, 10, 64)
+		if err != nil {
+			n = 0
+		}
 		return Int(n)
 	case "float":
-		f, _ := strconv.ParseFloat(val, 64)
+		f, ok := parseRustFloat(val)
+		if !ok {
+			f = 0
+		}
 		return Float(f)
 	case "bool":
 		return Bool(strings.TrimSpace(val) == "true")
 	case "string":
 		return String(val)
 	case "random", "random:int":
-		return Int(rand.Int63())
+		return Int(rand.Int63n(2147483647))
 	case "random:float":
-		return Float(rand.Float64())
+		return Float(float64(rand.Int63n(10000)) / 10000)
 	case "random:bool":
-		return Bool(rand.Intn(2) == 1)
+		return Bool(rand.Intn(2) == 0)
 	}
-	return castValue(val)
+	return cast(val)
+}
+
+// parseRustFloat reads a float with Rust's `str::parse::<f64>` grammar:
+// optional sign, then digits with an optional fraction and exponent, or
+// `inf` / `infinity` / `nan` in any case. Go's ParseFloat also takes hex
+// floats and underscores, which Rust rejects; out-of-range values are ±inf
+// (or zero), not errors.
+func parseRustFloat(s string) (float64, bool) {
+	if s == "" {
+		return 0, false
+	}
+	i := 0
+	if s[0] == '+' || s[0] == '-' {
+		i = 1
+	}
+	if i >= len(s) {
+		return 0, false
+	}
+	body := s[i:]
+	switch strings.ToLower(body) {
+	case "inf", "infinity":
+		if s[0] == '-' {
+			return math.Inf(-1), true
+		}
+		return math.Inf(1), true
+	case "nan":
+		return math.NaN(), true
+	}
+	digits := 0
+	j := 0
+	for j < len(body) && body[j] >= '0' && body[j] <= '9' {
+		j++
+		digits++
+	}
+	if j < len(body) && body[j] == '.' {
+		j++
+		for j < len(body) && body[j] >= '0' && body[j] <= '9' {
+			j++
+			digits++
+		}
+	}
+	if digits == 0 {
+		return 0, false
+	}
+	if j < len(body) && (body[j] == 'e' || body[j] == 'E') {
+		j++
+		if j < len(body) && (body[j] == '+' || body[j] == '-') {
+			j++
+		}
+		expDigits := 0
+		for j < len(body) && body[j] >= '0' && body[j] <= '9' {
+			j++
+			expDigits++
+		}
+		if expDigits == 0 {
+			return 0, false
+		}
+	}
+	if j != len(body) {
+		return 0, false
+	}
+	f, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		if ne, ok := err.(*strconv.NumError); !ok || ne.Err != strconv.ErrRange {
+			return 0, false
+		}
+	}
+	return f, true
+}
+
+// parseRustUint reads an unsigned integer like Rust's `str::parse::<u64>`,
+// which accepts one leading `+`.
+func parseRustUint(s string) (uint64, bool) {
+	if strings.HasPrefix(s, "+") {
+		s = s[1:]
+		if s == "" || s[0] == '+' || s[0] == '-' {
+			return 0, false
+		}
+	}
+	n, err := strconv.ParseUint(s, 10, 64)
+	return n, err == nil
 }
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
-func lineBytes(b []byte, starts []int, i int) []byte {
-	s := starts[i]
-	var e int
-	if i+1 < len(starts) {
-		e = starts[i+1] - 1
-	} else {
-		e = len(b)
-	}
-	if e > s && b[e-1] == '\r' {
-		e--
-	}
-	return b[s:e]
+func isReservedJSKey(key string) bool {
+	return key == "__proto__" || key == "constructor" || key == "prototype"
 }
 
-// indentOf measures leading whitespace in bytes over Unicode whitespace
-// (SYNX §4), so U+00A0 or U+3000 count as indentation like a space does.
-func indentOf(line []byte) int {
+func isContainer(v Value) bool {
+	switch v.(type) {
+	case ObjectValue, ArrayValue:
+		return true
+	}
+	return false
+}
+
+// isASCIIWS is SYNX whitespace inside the ASCII range — what Unicode
+// White_Space accepts below U+0080.
+func isASCIIWS(b byte) bool {
+	return b == ' ' || (b >= '\t' && b <= '\r')
+}
+
+// trimWS trims Unicode whitespace from both ends, with an ASCII fast path.
+func trimWS(s string) string {
+	start := 0
+	for start < len(s) && isASCIIWS(s[start]) {
+		start++
+	}
+	if start < len(s) && s[start] >= utf8.RuneSelf {
+		return strings.TrimFunc(s[start:], unicode.IsSpace)
+	}
+	end := len(s)
+	for end > start && isASCIIWS(s[end-1]) {
+		end--
+	}
+	if end > start && s[end-1] >= utf8.RuneSelf {
+		return strings.TrimRightFunc(s[start:end], unicode.IsSpace)
+	}
+	return s[start:end]
+}
+
+// trimRightWS trims trailing Unicode whitespace.
+func trimRightWS(s string) string {
+	end := len(s)
+	for end > 0 && isASCIIWS(s[end-1]) {
+		end--
+	}
+	if end > 0 && s[end-1] >= utf8.RuneSelf {
+		return strings.TrimRightFunc(s[:end], unicode.IsSpace)
+	}
+	return s[:end]
+}
+
+// indentLen is the UTF-8 byte length of the leading Unicode whitespace
+// (SYNX §4): U+00A0 counts 2, U+3000 counts 3, a tab or a space 1.
+func indentLen(s string) int {
 	i := 0
-	for i < len(line) {
-		c := line[i]
-		if c < utf8.RuneSelf {
-			if c != ' ' && c != '\t' && c != '\v' && c != '\f' {
-				break
-			}
-			i++
-			continue
-		}
-		r, size := utf8.DecodeRune(line[i:])
-		if !unicode.IsSpace(r) {
-			break
-		}
-		i += size
+	for i < len(s) && isASCIIWS(s[i]) {
+		i++
+	}
+	if i < len(s) && s[i] >= utf8.RuneSelf {
+		return len(s) - len(strings.TrimLeftFunc(s, unicode.IsSpace))
 	}
 	return i
 }
@@ -813,48 +1016,17 @@ func utf8PrefixLen(s string, limit int) int {
 	return end
 }
 
-func firstWhitespace(s string) int {
-	for i := 0; i < len(s); i++ {
-		if s[i] == ' ' || s[i] == '\t' {
-			return i
-		}
-	}
-	return -1
-}
-
+// stripComment cuts an inline ` //` or ` #` comment and trailing whitespace.
 func stripComment(val string) string {
-	r := val
-	if p := strings.Index(r, " //"); p >= 0 {
-		r = r[:p]
-	}
-	if p := strings.Index(r, " #"); p >= 0 {
-		r = r[:p]
-	}
-	for len(r) > 0 {
-		last := r[len(r)-1]
-		if last == ' ' || last == '\t' || last == '\r' {
-			r = r[:len(r)-1]
-			continue
+	if strings.IndexByte(val, ' ') >= 0 {
+		if p := strings.Index(val, " //"); p >= 0 {
+			val = val[:p]
 		}
-		break
-	}
-	return r
-}
-
-func splitN(s string, sep byte, max int) []string {
-	out := make([]string, 0, 4)
-	start := 0
-	for i := 0; i < len(s); i++ {
-		if s[i] == sep {
-			out = append(out, s[start:i])
-			start = i + 1
-			if len(out) >= max {
-				break
-			}
+		if p := strings.Index(val, " #"); p >= 0 {
+			val = val[:p]
 		}
 	}
-	out = append(out, s[start:])
-	return out
+	return trimRightWS(val)
 }
 
 func containsString(arr []string, s string) bool {
@@ -866,105 +1038,53 @@ func containsString(arr []string, s string) bool {
 	return false
 }
 
-// ─── path navigation (tree mutation helpers) ────────────────────────────────
-
-func buildPath(stack []stackFrame) string {
-	var parts []string
-	for _, f := range stack[1:] {
-		if f.kind == seKey {
-			parts = append(parts, f.key)
-		}
-	}
-	return strings.Join(parts, ".")
-}
-
-func insertValue(root *Object, stack []stackFrame, parentIdx int, key string, value Value) {
-	if parentIdx == 0 {
-		root.Set(key, value)
+// writeKeySegment appends `key` to a metadata path as one segment: `.` and
+// `\` inside the key are escaped with `\`, so the object `a.b` and the object
+// `b` inside `a` never share a path.
+func writeKeySegment(sb *strings.Builder, key string) {
+	if strings.IndexByte(key, '.') < 0 && strings.IndexByte(key, '\\') < 0 {
+		sb.WriteString(key)
 		return
 	}
-	path := stack[1 : parentIdx+1]
-	setValueAtPath(root, path, key, value)
-}
-
-func setValueAtPath(obj *Object, path []stackFrame, key string, value Value) {
-	if len(path) == 0 {
-		obj.Set(key, value)
-		return
-	}
-	head := path[0]
-	rest := path[1:]
-	switch head.kind {
-	case seKey:
-		v, ok := obj.Get(head.key)
-		if !ok {
-			return
+	for i := 0; i < len(key); i++ {
+		if key[i] == '.' || key[i] == '\\' {
+			sb.WriteByte('\\')
 		}
-		child, ok := AsObject(v)
-		if !ok {
-			return
-		}
-		setValueAtPath(child, rest, key, value)
-	case seListItem:
-		v, ok := obj.Get(head.key)
-		if !ok {
-			return
-		}
-		arr, ok := AsArray(v)
-		if !ok || head.itemIdx >= len(arr) {
-			return
-		}
-		item, ok := AsObject(arr[head.itemIdx])
-		if !ok {
-			return
-		}
-		setValueAtPath(item, rest, key, value)
+		sb.WriteByte(key[i])
 	}
 }
 
-func mutateArray(root *Object, stack []stackFrame, parentIdx int, listKey string, transform func(*[]Value)) {
-	path := stack[1 : parentIdx+1]
-	mutateArrayPath(root, path, listKey, transform)
+// keySegment is `key` as one metadata-path segment (see writeKeySegment).
+func keySegment(key string) string {
+	if strings.IndexByte(key, '.') < 0 && strings.IndexByte(key, '\\') < 0 {
+		return key
+	}
+	var sb strings.Builder
+	writeKeySegment(&sb, key)
+	return sb.String()
 }
 
-func mutateArrayPath(obj *Object, path []stackFrame, listKey string, transform func(*[]Value)) {
-	if len(path) == 0 {
-		v, _ := obj.Get(listKey)
-		arr, _ := AsArray(v)
-		if arr == nil {
-			arr = []Value{}
-		}
-		transform(&arr)
-		obj.Set(listKey, Array(arr))
-		return
+// MetaPathSegments splits a metadata path into its unescaped segments:
+// `a\.b.c` is ["a.b", "c"].
+func MetaPathSegments(path string) []string {
+	if path == "" {
+		return nil
 	}
-	head := path[0]
-	rest := path[1:]
-	switch head.kind {
-	case seKey:
-		v, ok := obj.Get(head.key)
-		if !ok {
-			return
+	var out []string
+	var seg strings.Builder
+	for i := 0; i < len(path); i++ {
+		switch path[i] {
+		case '\\':
+			if i+1 < len(path) {
+				i++
+				seg.WriteByte(path[i])
+			}
+		case '.':
+			out = append(out, seg.String())
+			seg.Reset()
+		default:
+			seg.WriteByte(path[i])
 		}
-		child, ok := AsObject(v)
-		if !ok {
-			return
-		}
-		mutateArrayPath(child, rest, listKey, transform)
-	case seListItem:
-		v, ok := obj.Get(head.key)
-		if !ok {
-			return
-		}
-		arr, ok := AsArray(v)
-		if !ok || head.itemIdx >= len(arr) {
-			return
-		}
-		item, ok := AsObject(arr[head.itemIdx])
-		if !ok {
-			return
-		}
-		mutateArrayPath(item, rest, listKey, transform)
 	}
+	return append(out, seg.String())
 }
-

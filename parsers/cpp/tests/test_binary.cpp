@@ -1,20 +1,22 @@
 #include "test_helpers.hpp"
 #include "synx/binary.hpp"
 #include "synx/parser.hpp"
+#include "internal.hpp"
 
 using namespace synx;
 
-#if defined(SYNX_HAVE_ZLIB) || 1 // We rely on the compiler define from CMake;
-                                 // when zlib is absent compile() returns an error
-                                 // (test below tolerates either path).
-
 SYNX_TEST(binary_static_roundtrip) {
     ParseResult r = parse("name App\nport 8080\n");
+    // The payload layer runs in every build; DEFLATE needs zlib.
+    std::vector<uint8_t> payload = detail::encode_synxb_payload(r, false);
+    auto plain = detail::decode_synxb_payload(detail::synxb_flags(r, false), payload.data(), payload.size());
+    EXPECT_TRUE(plain.ok() && plain.value().root.equals(r.root));
     auto compiled = compile(r, false);
-    if (!compiled.ok()) {
-        // zlib not linked — skip silently.
-        return;
-    }
+#if !defined(SYNX_HAVE_ZLIB)
+    EXPECT_FALSE(compiled.ok());
+    return;
+#endif
+    EXPECT_TRUE(compiled.ok());
     EXPECT_TRUE(is_synxb(compiled.value()));
     auto restored = decompile(compiled.value());
     EXPECT_TRUE(restored.ok());
@@ -33,5 +35,3 @@ SYNX_TEST(binary_invalid_magic_rejected) {
     auto res = decompile(bytes);
     EXPECT_FALSE(res.ok());
 }
-
-#endif

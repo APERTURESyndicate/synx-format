@@ -21,7 +21,10 @@ function loadBinding() {
 
         tried.push(releasePath);
 
-        if (!fs.existsSync(nodeFile) && fs.existsSync(dllFile)) {
+        // A rebuilt DLL replaces the copy: copying only when the .node was
+        // missing kept loading the first build after every `cargo build`.
+        if (fs.existsSync(dllFile) &&
+            (!fs.existsSync(nodeFile) || fs.statSync(dllFile).mtimeMs > fs.statSync(nodeFile).mtimeMs)) {
             fs.mkdirSync(releasePath, { recursive: true });
             fs.copyFileSync(dllFile, nodeFile);
         }

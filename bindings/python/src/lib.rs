@@ -4,6 +4,9 @@
 use pyo3::prelude::*;
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::types::{PyDict, PyList};
+
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use synx_core::{self, Value, Mode, Options};
 
 mod synxl;
@@ -31,6 +34,40 @@ fn encode_hex(bytes: &[u8]) -> String {
         let _ = write!(&mut s, "{b:02x}");
     }
     s
+}
+
+/// Python key objects already made during one conversion, by key text.
+///
+/// perf: a dataset repeats the same field names in every record; reusing the
+/// `str` object skips decoding and allocating it again (700k times for 100k
+/// records of 7 fields). Scoped to one conversion, so it never outlives the
+/// objects it hands out.
+pub(crate) type KeyCache = std::collections::HashMap<String, Py<pyo3::types::PyString>, synx_core::MapHasher>;
+
+/// [`value_to_py`] sharing key objects through `cache`.
+pub(crate) fn value_to_py_cached(py: Python<'_>, val: &Value, cache: &mut KeyCache) -> Py<PyAny> {
+    match val {
+        Value::Array(arr) => {
+            let items: Vec<Py<PyAny>> = arr.iter().map(|v| value_to_py_cached(py, v, cache)).collect();
+            PyList::new(py, &items).unwrap().into_any().unbind()
+        }
+        Value::Object(map) => {
+            let dict = PyDict::new(py);
+            for (k, v) in map {
+                let key = match cache.get(k.as_str()) {
+                    Some(key) => key.clone_ref(py),
+                    None => {
+                        let key = pyo3::types::PyString::new(py, k).unbind();
+                        cache.insert(k.clone(), key.clone_ref(py));
+                        key
+                    }
+                };
+                dict.set_item(key, value_to_py_cached(py, v, cache)).unwrap();
+            }
+            dict.into_any().unbind()
+        }
+        _ => value_to_py(py, val),
+    }
 }
 
 /// Convert synx_core::Value to a Python object.
@@ -114,7 +151,7 @@ fn py_to_value_at(py: Python<'_>, obj: &Bound<'_, PyAny>, depth: usize) -> PyRes
         }
         Ok(Value::Array(arr))
     } else if let Ok(dict) = obj.cast::<PyDict>() {
-        let mut map = std::collections::HashMap::new();
+        let mut map = synx_core::Map::default();
         for (k, v) in dict.iter() {
             let key: String = k.extract()?;
             map.insert(key, py_to_value_at(py, &v, depth + 1)?);
@@ -333,8 +370,8 @@ fn to_prompt_block(text: &str, label: &str) -> PyResult<String> {
 fn diff(py: Python<'_>, a: &Bound<'_, PyAny>, b: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
     let val_a = py_to_value(py, a)?;
     let val_b = py_to_value(py, b)?;
-    let map_a = match val_a { Value::Object(m) => m, _ => std::collections::HashMap::new() };
-    let map_b = match val_b { Value::Object(m) => m, _ => std::collections::HashMap::new() };
+    let map_a = match val_a { Value::Object(m) => m, _ => synx_core::Map::default() };
+    let map_b = match val_b { Value::Object(m) => m, _ => synx_core::Map::default() };
     let result = synx_core::Synx::diff(&map_a, &map_b);
     let val = synx_core::diff_to_value(&result);
     Ok(value_to_py(py, &val))

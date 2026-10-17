@@ -42,34 +42,6 @@ public enum SynxCalc {
 
     private static func isDigit(_ b: UInt8) -> Bool { b >= 0x30 && b <= 0x39 }
 
-    /// Rust `str::parse::<f64>` for the only shapes the tokenizer can produce:
-    /// optional `-`, digits and dots. Needs at least one digit and at most one dot.
-    private static func parseNumber(_ s: [UInt8]) -> Double? {
-        var i = 0
-        var neg = false
-        if i < s.count && s[i] == 0x2D { neg = true; i += 1 }
-        var intPart = ""
-        var frac = ""
-        var seenDot = false
-        while i < s.count {
-            let b = s[i]
-            if b == 0x2E {
-                if seenDot { return nil }
-                seenDot = true
-            } else if seenDot {
-                frac.append(Character(UnicodeScalar(b)))
-            } else {
-                intPart.append(Character(UnicodeScalar(b)))
-            }
-            i += 1
-        }
-        if intPart.isEmpty && frac.isEmpty { return nil }
-        guard let d = Double((intPart.isEmpty ? "0" : intPart) + "." + (frac.isEmpty ? "0" : frac)) else {
-            return nil
-        }
-        return neg ? -d : d
-    }
-
     private static func tokenize(_ b: [UInt8], into tokens: inout [Token]) -> String? {
         var i = 0
         let len = b.count
@@ -91,7 +63,7 @@ public enum SynxCalc {
                 if ch == 0x2D { i += 1 }
                 while i < len && (isDigit(b[i]) || b[i] == 0x2E) { i += 1 }
                 let numStr = Array(b[start..<i])
-                guard let d = parseNumber(numStr) else {
+                guard let d = RustNumber.parseF64(numStr) else {
                     return prefix + "invalid number: '\(String(decoding: numStr, as: UTF8.self))'"
                 }
                 tokens.append(.number(d))
@@ -102,8 +74,9 @@ public enum SynxCalc {
             }
             if ch == 0x28 { tokens.append(.lparen); i += 1; continue }
             if ch == 0x29 { tokens.append(.rparen); i += 1; continue }
-            // Rust prints `ch as char`: a single byte widened to U+00xx.
-            return prefix + "unexpected character: '\(Character(UnicodeScalar(ch)))' in expression"
+            // The whole character, not its first byte read as Latin-1.
+            let shown = String(decoding: b[i..<min(i + utf8Len(ch), len)], as: UTF8.self)
+            return prefix + "unexpected character: '\(shown)' in expression"
         }
         return nil
     }
@@ -188,10 +161,11 @@ public enum SynxCalc {
                 if pos >= tokens.count { return SynxCalc.prefix + "missing closing parenthesis" }
                 if case .rparen = tokens[pos] { pos += 1; out = v; return nil }
                 return SynxCalc.prefix + "missing closing parenthesis"
+            // The token as written (Rust `token_text`).
             case .op(let c):
-                return SynxCalc.prefix + "unexpected token: Op(\(c))"
+                return SynxCalc.prefix + "unexpected token: '\(Character(Unicode.Scalar(c)))'"
             case .rparen:
-                return SynxCalc.prefix + "unexpected token: RParen"
+                return SynxCalc.prefix + "unexpected token: ')'"
             }
         }
     }

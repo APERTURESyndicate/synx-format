@@ -7,9 +7,9 @@ import java.util.Objects;
 /** Metadata attached to one key (markers, args, optional type hint, optional constraints). */
 public final class SynxMeta {
     public List<String> markers = new ArrayList<>();
-    /** One arg per marker in the chain — same length as {@link #markers}. */
+    /** Positional arguments: the weights of {@code :random}, the parent of {@code :inherit name}. */
     public List<String> args = new ArrayList<>();
-    public String typeHint;          // nullable
+    public String typeHint;          // nullable; "" for an empty {@code key()}
     public SynxConstraints constraints; // nullable
 
     public SynxMeta() {}

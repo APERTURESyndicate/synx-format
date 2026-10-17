@@ -1,4 +1,4 @@
-/// SYNX — native Dart parser. Parity with crates/synx-core 3.6.x.
+/// SYNX — native Dart parser. Parity with crates/synx-core 3.8.0.
 library synx;
 
 import 'src/binary.dart' as binmod;

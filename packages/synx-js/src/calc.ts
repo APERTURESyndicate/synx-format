@@ -11,6 +11,9 @@ type Token =
   | { type: 'op'; value: string }
   | { type: 'paren'; value: '(' | ')' };
 
+/** A number literal as Rust's `f64::from_str` reads the tokenizer's run. */
+const NUMBER_RE = /^-?(?:\d+\.?\d*|\.\d+)$/;
+
 /**
  * Tokenize an arithmetic expression string.
  */
@@ -42,6 +45,9 @@ function tokenize(expr: string): Token[] {
         num += expr[i];
         i++;
       }
+      // spec: a malformed literal is an error, as in synx-core — `parseFloat`
+      // read a lone `-` as NaN and `1.2.3` as 1.2 without a word.
+      if (!NUMBER_RE.test(num)) throw new Error(`SYNX :calc — invalid number: '${num}'`);
       tokens.push({ type: 'number', value: parseFloat(num) });
       continue;
     }
@@ -60,7 +66,7 @@ function tokenize(expr: string): Token[] {
       continue;
     }
 
-    throw new Error(`SYNX :calc — unexpected character: '${ch}' in expression`);
+    throw new Error(`SYNX :calc — unexpected character: '${String.fromCodePoint(expr.codePointAt(i)!)}' in expression`);
   }
 
   return tokens;
@@ -142,7 +148,7 @@ class ExprParser {
       return val;
     }
 
-    throw new Error(`SYNX :calc — unexpected token: ${JSON.stringify(tok)}`);
+    throw new Error(`SYNX :calc — unexpected token: '${tok.value}'`);
   }
 }
 

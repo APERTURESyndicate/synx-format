@@ -11,12 +11,12 @@ import 'package:test/test.dart';
 void main() {
   final dir = _findCorpus();
 
-  test('corpus is present with at least 24 cases', () {
+  test('corpus is present with at least 34 cases', () {
     if (dir == null) {
       markTestSkipped('conformance corpus not present in this checkout');
       return;
     }
-    expect(_cases(dir).length, greaterThanOrEqualTo(24));
+    expect(_cases(dir).length, greaterThanOrEqualTo(34));
   });
 
   if (dir == null) return;

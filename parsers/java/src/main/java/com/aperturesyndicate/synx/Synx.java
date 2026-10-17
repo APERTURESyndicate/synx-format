@@ -5,6 +5,9 @@ public final class Synx {
 
     private Synx() {}
 
+    /** The SYNX release this port implements. */
+    public static final String VERSION = "3.8.0";
+
     /** Parse SYNX text and return the top-level object (static mode only). */
     public static SynxObject parse(String text) {
         SynxParseResult r = SynxParser.parse(text);

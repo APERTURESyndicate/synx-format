@@ -1,5 +1,7 @@
-// Canonical JSON encoder — sorted keys, secrets redacted, floats with marker.
+// Canonical JSON encoder — synx-core `write_json`: keys sorted by code point,
+// secrets redacted, floats in the ryu layout.
 
+import 'num.dart';
 import 'value.dart';
 
 const int maxJsonDepth = 128;
@@ -18,28 +20,21 @@ void _write(StringBuffer out, SynxValue v, int depth) {
   switch (v) {
     case SynxNull():
       out.write('null');
-      return;
     case SynxBool(value: var b):
       out.write(b ? 'true' : 'false');
-      return;
     case SynxInt(value: var n):
-      out.write(n.toString());
-      return;
+      out.write(n);
     case SynxFloat(value: var f):
+      // JSON has no NaN / ±Infinity — emit null so output stays valid.
       if (f.isNaN || f.isInfinite) {
         out.write('null');
-        return;
+      } else {
+        writeRyu(out, f);
       }
-      out.write(_floatString(f));
-      return;
     case SynxStr(value: var s):
-      out.write('"');
-      _escape(out, s);
-      out.write('"');
-      return;
+      _string(out, s);
     case SynxSecret():
       out.write('"[SECRET]"');
-      return;
     case SynxArr(values: var arr):
       out.write('[');
       for (var i = 0; i < arr.length; i++) {
@@ -47,93 +42,48 @@ void _write(StringBuffer out, SynxValue v, int depth) {
         _write(out, arr[i], depth + 1);
       }
       out.write(']');
-      return;
     case SynxObj(map: var map):
       out.write('{');
-      final keys = map.sortedKeys;
-      var first = true;
-      for (final k in keys) {
-        if (!first) out.write(',');
-        first = false;
-        out.write('"');
-        _escape(out, k);
-        out.write('":');
-        _write(out, map[k] ?? synxNull(), depth + 1);
+      final keys = sortCodePoints(map.keys);
+      for (var i = 0; i < keys.length; i++) {
+        if (i > 0) out.write(',');
+        _string(out, keys[i]);
+        out.write(':');
+        _write(out, map[keys[i]]!, depth + 1);
       }
       out.write('}');
-      return;
   }
 }
 
-/// Shortest round-trip form with the same layout as Rust's `ryu` (what the
-/// reference `to_json` emits): plain decimals while the decimal exponent stays
-/// within [-5, 16), otherwise `d.ddde<N>`, and a mandatory `.0` on whole
-/// numbers. Dart's own `toString` switches layout at different magnitudes
-/// (`1e16` prints as `10000000000000000.0`, `1e-6` as `0.000001`).
-String _floatString(double f) {
-  if (f == 0) return f.isNegative ? '-0.0' : '0.0';
-  final e = f.abs().toStringAsExponential();
-  final ePos = e.indexOf('e');
-  final digits = e.substring(0, ePos).replaceFirst('.', '');
-  final exp = int.parse(e.substring(ePos + 1));
-  final length = digits.length;
-  final kk = exp + 1;
-  final k = kk - length;
+const String _hex = '0123456789abcdef';
 
-  final sb = StringBuffer();
-  if (f < 0) sb.write('-');
-  if (k >= 0 && kk <= 16) {
-    sb.write(digits);
-    sb.write('0' * k);
-    sb.write('.0');
-  } else if (kk > 0 && kk <= 16) {
-    sb.write(digits.substring(0, kk));
-    sb.write('.');
-    sb.write(digits.substring(kk));
-  } else if (kk > -5 && kk <= 0) {
-    sb.write('0.');
-    sb.write('0' * -kk);
-    sb.write(digits);
-  } else if (length == 1) {
-    sb.write(digits);
-    sb.write('e');
-    sb.write(kk - 1);
-  } else {
-    sb.write(digits.substring(0, 1));
-    sb.write('.');
-    sb.write(digits.substring(1));
-    sb.write('e');
-    sb.write(kk - 1);
-  }
-  return sb.toString();
-}
-
-void _escape(StringBuffer out, String s) {
+/// A JSON string literal. perf: unescaped runs are copied whole.
+void _string(StringBuffer out, String s) {
+  out.write('"');
+  var start = 0;
   for (var i = 0; i < s.length; i++) {
     final c = s.codeUnitAt(i);
+    if (c >= 0x20 && c != 0x22 && c != 0x5C) continue;
+    if (i > start) out.write(s.substring(start, i));
     switch (c) {
       case 0x22:
         out.write('\\"');
-        break;
       case 0x5C:
         out.write('\\\\');
-        break;
       case 0x0A:
         out.write('\\n');
-        break;
       case 0x0D:
         out.write('\\r');
-        break;
       case 0x09:
         out.write('\\t');
-        break;
       default:
-        if (c < 0x20) {
-          out.write('\\u');
-          out.write(c.toRadixString(16).padLeft(4, '0'));
-        } else {
-          out.writeCharCode(c);
-        }
+        out
+          ..write('\\u00')
+          ..write(_hex[c >> 4])
+          ..write(_hex[c & 0xF]);
     }
+    start = i + 1;
   }
+  out.write(start == 0 ? s : s.substring(start));
+  out.write('"');
 }

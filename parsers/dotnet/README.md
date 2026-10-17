@@ -88,7 +88,8 @@ dotnet run -c Release --project tools/Synx.FuzzReplay -- --bench tests/conforman
 - **`SynxFormat.Parse(string)`** — static parse → `Dictionary<string, SynxValue>` (no `!active` engine: markers are not resolved).
 - **`SynxFormat.ParseActive(string, SynxOptions?)`** — parse + resolve (`:calc`, `:env`, `:ref`, `:alias`, constraints, includes, interpolation, …) — targets parity with `synx-core::engine::resolve`.
 - **`SynxFormat.ParseFull` / `ParseFullActive`** — full `SynxParseResult` including `Metadata` and `Includes`.
-- **`SynxFormat.ParseTool(string)`** — parse + `reshape_tool_output` (matches Rust when the file is not `!active`).
+- **`SynxFormat.ParseTool(string, SynxOptions?)`** — parse (resolving an `!active` document first) + `reshape_tool_output`, as Rust `Synx::parse_tool`.
+- **`SynxFormat.Stringify` / `Format` / `Compile` / `Decompile` / `Diff`** — the synx-core writers: stringify round-trips data (SYNXL §14.1 block writer), `.synxb` carries metadata unless resolved.
 - **`SynxFormat.ToJson`** — canonical JSON string for a value or root map.
 - **`SynxFormat.Deserialize<T>(string, JsonSerializerOptions?)`** — parse then deserialize directly into `T` via `System.Text.Json`. Replaces `JsonSerializer.Deserialize<T>(SynxFormat.ToJson(SynxFormat.Parse(text)))`.
 - **`SynxFormat.DeserializeActive<T>(string, SynxOptions?, JsonSerializerOptions?)`** — parse + engine resolve then deserialize into `T`.
@@ -141,7 +142,5 @@ dotnet add package APERTURESyndicate.Synx --source /absolute/path/to/synx-format
 2. Create an [API key](https://www.nuget.org/account/apikeys) whose **glob** includes `APERTURESyndicate.Synx` or `*`.
 3. **PowerShell:** `$env:NUGET_API_KEY = '…token only…'` — **do not** wrap the key in `<` `>`.
 4. Repo root: **`.\publish-csharp.bat`** (clears old `*.nupkg` in `artifacts/nuget`, pushes only **`APERTURESyndicate.Synx.*.nupkg`**).
-
-Next: `.synxb`, `diff` in C#; broaden engine parity tests beyond smoke cases.
 
 **Tests:** library targets **.NET 8**; test project and **`Synx.FuzzReplay`** may target **.NET 10** on machines where only a newer runtime is installed — adjust `<TargetFramework>` in the respective `.csproj` files if `dotnet run` fails with a framework error.

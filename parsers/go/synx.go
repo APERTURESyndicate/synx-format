@@ -2,6 +2,9 @@ package synx
 
 import "strings"
 
+// Version is the SYNX release this port implements.
+const Version = "3.8.0"
+
 // ParseRoot is sugar for `Parse(text)` returning only the top-level object.
 // Static mode only — call ParseActive to resolve `!active` markers.
 func ParseRoot(text string) *Object {

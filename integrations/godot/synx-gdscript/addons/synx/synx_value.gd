@@ -18,6 +18,9 @@ enum Kind { NULL, BOOL, INT, FLOAT, STRING, ARRAY, OBJECT, SECRET }
 
 var kind: int = Kind.NULL
 var data = null
+# OBJECT only: the declarations of this object's keys — Dictionary
+# key → SynxMeta, or null when none were declared (see SynxMeta).
+var meta = null
 
 static func make_null() -> SynxValue:
 	var v := SynxValue.new()
@@ -133,7 +136,7 @@ func equals(other: SynxValue) -> bool:
 			var mb: Dictionary = other.data
 			if ma.size() != mb.size():
 				return false
-			for k in ma.keys():
+			for k in ma:
 				if not mb.has(k):
 					return false
 				var av: SynxValue = ma[k]
@@ -143,7 +146,8 @@ func equals(other: SynxValue) -> bool:
 			return true
 	return false
 
-# Deep clone — used by markers that fork values.
+# Deep clone — used by markers that fork values. Declarations are copied
+# with the objects that hold them.
 func clone() -> SynxValue:
 	match kind:
 		Kind.NULL:
@@ -166,10 +170,13 @@ func clone() -> SynxValue:
 			return SynxValue.make_array(out)
 		Kind.OBJECT:
 			var d: Dictionary = {}
-			for k in data.keys():
+			for k in data:
 				var v: SynxValue = data[k]
 				d[k] = v.clone()
-			return SynxValue.make_object(d)
+			var o := SynxValue.make_object(d)
+			if meta != null:
+				o.meta = (meta as Dictionary).duplicate()
+			return o
 	return SynxValue.make_null()
 
 # String form for display/format — matches `Display for Value` in Rust.
@@ -182,7 +189,7 @@ func _to_string() -> String:
 		Kind.INT:
 			return str(data)
 		Kind.FLOAT:
-			var s := str(data)
+			var s := SynxNum.display(data)
 			return s if "." in s else s + ".0"
 		Kind.STRING, Kind.SECRET:
 			return data

@@ -1,0 +1,8 @@
+!active
+port
+  port[enum:a|b] x
+port
+a
+  x(int) 1
+a 5
+x hello

@@ -1,6 +1,6 @@
 // swift-tools-version: 5.9
 //
-// SYNX — native Swift parser. Parity with crates/synx-core 3.6.x.
+// SYNX — native Swift parser. Parity with crates/synx-core 3.8.0 (`Synx.version`).
 //
 // Targets: macOS 12+, iOS 15+, watchOS 8+, tvOS 15+, Linux (5.9+ toolchain).
 // No FFI to synx-c; the entire engine is pure Swift.
@@ -27,8 +27,8 @@ let package = Package(
             dependencies: ["Synx"],
             path: "Tests/SynxTests",
             resources: [
-                // Conformance corpus is referenced from disk relative to the
-                // workspace; tests skip silently when it's not bundled.
+                // The conformance corpus is read from the repository checkout
+                // (tests/conformance/cases); a run without it fails.
             ]
         ),
     ]

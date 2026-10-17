@@ -873,3 +873,16 @@ describe('SYNXL — public API surface', () => {
     expect(Object.getPrototypeOf(doc.records[0].values)).toBe(Object.prototype);
   });
 });
+
+describe('SYNXL — validation parity with synx-core', () => {
+  it('counts string length in Unicode scalar values', () => {
+    const doc = parseSynxl('!synxl 1\n!fields w[max:3] ; e[min:2, max:2]\nмир ; \u{1f600}\u{1f600}\n', { validate: true });
+    expect(doc.diagnostics).toEqual([]);
+  });
+
+  it('checks patterns up to 256 characters, as synx-core does', () => {
+    const pattern = '^' + 'a?'.repeat(70) + 'b$';
+    const doc = parseSynxl(`!synxl 1\n!fields v[pattern:${pattern}]\nzzz\n`, { validate: true });
+    expect(doc.diagnostics.map((d) => d.kind)).toEqual(['ConstraintViolation']);
+  });
+});

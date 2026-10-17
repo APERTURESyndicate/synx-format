@@ -14,6 +14,305 @@ All notable changes to this repository are documented in this file.
 > for `3.7.0` was free, so npm and every other registry — plus the
 > git tag — now publish on the same version number.
 
+## [3.8.0] — 2026-10-17
+
+A speed and parity release. Every parser path was measured against 3.7.4 on
+the same corpus, rewritten where the time went, and checked by differential
+fuzzing — 3.7.4 against 3.8.0, Rust against TypeScript, and each writer
+against its own reader. The fuzzing and review found 55 defects; all are fixed, and
+synx-core and TypeScript now agree on every one of more than 70 000 generated
+documents, static and active.
+
+### Speed
+
+Best of interleaved runs on one machine (Windows 11, system allocator unless
+noted), 3.7.4 → 3.8.0, same inputs, output checked identical. `bench-config`
+is a 2.5 KB service config; `static-mid` / `static-large` are generated
+documents of 134 KB and 4 MB; `active-mid` / `active-large` are 36 KB and
+1.2 MB with markers; `real` is the 46 production configs of the
+APERTURESyndicate platform, parsed in turn.
+
+**Parse** (`!active` documents include resolution):
+
+| Document | synx-core | TypeScript (Node 24) | TypeScript (Bun 1.3) | Python binding |
+|---|---|---|---|---|
+| bench-config | 38.6 → 17.6 µs **×2.19** | 34.0 → 20.4 µs **×1.66** | 43.1 → 25.8 µs **×1.67** | 50.3 → 17.6 µs **×2.86** |
+| static-mid | 1.78 → 0.97 ms **×1.84** | 1.70 → 1.24 ms **×1.37** | 2.06 → 1.33 ms **×1.55** | 2.48 → 1.16 ms **×2.13** |
+| static-large | 60.1 → 35.3 ms **×1.70** | 53.9 → 38.2 ms **×1.41** | 68.3 → 42.6 ms **×1.60** | — |
+| active-mid | 2.08 → 0.57 ms **×3.64** | 1.23 → 0.86 ms **×1.43** | 2.10 → 1.26 ms **×1.66** | — |
+| active-large | 81.0 → 22.5 ms **×3.61** | 297.5 → 31.1 ms **×9.56** | 331.0 → 49.2 ms **×6.73** | — |
+| real, 46 configs | 3.57 → 1.47 ms **×2.43** | 2.75 → 2.20 ms **×1.25** | 3.76 → 2.46 ms **×1.53** | 4.12 → 1.51 ms **×2.72** |
+
+**SYNXL, JSON and `.synxb`** (`flat-100k` is 100 000 seven-field records,
+7 MB; `blocks-20k` is 20 000 records with `[block]` fields, 2.9 MB):
+
+| Operation | synx-core | TypeScript (Node 24) |
+|---|---|---|
+| SYNXL read, flat-100k | 69.6 → 74.3 ms **×0.94** · with mimalloc 37.0 → 36.0 ms **×1.03** | 130.4 → 76.3 ms **×1.71** |
+| SYNXL read, blocks-20k | 60.3 → 40.8 ms **×1.48** | 84.2 → 68.0 ms **×1.24** |
+| SYNXL write, flat-100k | 104.2 → 55.6 ms **×1.88** | 131.0 → 79.6 ms **×1.64** |
+| SYNXL write, blocks-20k | 19.9 → 13.3 ms **×1.50** | 34.8 → 31.7 ms **×1.10** |
+| SYNXL read + records, Python | 173.7 → 83.2 ms **×2.09** | — |
+| JSON projection, static-large | 11.9 → 7.6 ms **×1.57** | 113.1 → 53.7 ms **×2.11** (Bun) |
+| `.synxb` compile, static-large | 86.7 → 52.5 ms **×1.65** | 131.7 → 82.2 ms **×1.60** |
+| `.synxb` decompile, static-large | 42.0 → 33.3 ms **×1.26** | **×0.73** — see below |
+| `.synxb` size, static-large | 92.0 → 89.0 KB | 144.6 → 86.0 KB |
+| `.synxb` size, active-large | 210.7 → 169.3 KB | — |
+
+Two numbers go down. synx-core's flat SYNXL read makes one more allocation
+per record — an `IndexMap` keeps its entries and its index in two buffers —
+and the Windows system allocator charges ~50 ns for it; with mimalloc the
+read is level with 3.7.4, and the compact strings planned for 4.0 make it
+×1.49. TypeScript's `.synxb` decompile now writes through the round-trip
+writer, which quotes what must be quoted; 3.7.4 was faster because it wrote
+text that read back as different data.
+
+Where it came from:
+
+- **synx-core.** Objects are `IndexMap` with the `foldhash` hasher instead of
+  `HashMap` with SipHash: faster, and in source order, which also made
+  resolution deterministic (see below). The parser borrows keys and values
+  from the input instead of copying each line, trims with an ASCII fast path
+  and finds line ends with `memchr`; the engine classifies a marker chain once
+  into a bitmask instead of ~35 string scans per key, walks with one path
+  buffer, caches compiled `[pattern]`s, and substitutes `:calc` names by token
+  instead of rescanning the expression per key. Validators work in place.
+- **TypeScript.** Lines are walked as offsets into the text instead of split
+  and trimmed copies; `:calc` substitution by token removed a quadratic pass
+  (the ×8–×10 on `active-large`); integers up to 15 digits skip the BigInt
+  path; the JSON writer escapes only when a string needs it.
+- **SYNXL.** Rust writes floats in place and checks quoting without two
+  allocations per cell; TypeScript reads cells with a cursor instead of slicing,
+  builds block arrays only when a record has a block, caches the writer's
+  inline text and compiles each `[pattern]` once.
+- **`.synxb`.** The string table is ordered by use count, so frequent strings
+  get one-byte indexes: files are 3–20 % smaller in Rust and up to 40 % in
+  TypeScript, and — unlike 3.7.4, whose output depended on hash order — the
+  same document always compiles to the same bytes.
+- **Bindings.** The Node and Python extensions use mimalloc: allocation was
+  nearly half of parse time with the Windows system allocator. Python also
+  reuses key strings within one conversion.
+
+### Security
+
+- **`!use` could read outside the packages directory.** synx-core joined the
+  package name and the manifest's `main` / `wasm` paths onto
+  `synx_packages/` as written, so `!use @a/../../secret` parsed
+  `<anywhere>/src/main.synx` into the document, and a published package could
+  point its `main` at any file — the escape `!include` already refused. Both
+  must now be relative paths with no root, drive or `..` segment; a package
+  directory that is itself a symlink keeps working. TypeScript does not load
+  `!use` packages.
+- **A hostile document could stop synx-core:**
+  - `:clamp:nan:5` panicked (`f64::clamp` with a NaN bound). A bound must now
+    be a finite number in the Rust grammar, otherwise the marker is skipped —
+    TypeScript skipped NaN already, but read `5abc` as 5 and `Infinity` as a
+    bound; both implementations now agree.
+  - A file that `:include`s itself overflowed the stack: the pre-pass that
+    registers `:include` keys for `{key:alias}` resolved the file without the
+    depth cap every other include path has. Each level was also resolved
+    twice, so a chain of includes cost 2^depth resolutions; the marker now
+    reuses the pre-pass result.
+  - `format` looped forever on a document nested deeper than its 128-level
+    cap (Rust and TypeScript alike): the deeper subtree was dropped without
+    consuming its lines.
+
+### Active mode
+
+- **Markers resolve in document order, deterministically.** synx-core walked
+  objects in hash order: `tax:calc price * 0.2` / `total:calc price + tax`
+  failed with `CALC_ERR` in about half of runs, an `:alias` of an `:env` key
+  returned either the value or the variable's name, and when one field was
+  declared with two types the winner was random. Nested objects were also
+  resolved before their parent's markers, so `x {a}` inside an object saw an
+  unresolved `a`. Rust now follows TypeScript: one pass in document order.
+- **Every object keeps its own declarations.**
+  - Markers inside list items were never applied in synx-core; after that was
+    fixed, all items still shared one declaration per key, so `port[max:9]` in
+    the third server replaced `port:env:default:7001` of the first.
+  - A key containing a dot (`a.b`) shared its markers with `b` inside `a`.
+  - A key that replaced an object or a list kept the replaced subtree's
+    markers and constraints.
+  - Type and constraint registries counted declarations of objects that had
+    since been overwritten.
+- **`:inherit`** carries each field's markers from the object its value came
+  from (synx-core passed the parent's `:env` variable *name* as the value),
+  merges several parents left to right in both implementations, copies nested
+  subtrees instead of sharing them (TypeScript), and leaves a list or scalar
+  child as written instead of replacing it with `{}` (synx-core).
+- **`:calc`** — a name refers to the key of the same object first, then to a
+  root key (synx-core looked at the root first). Errors read the same in both
+  implementations; synx-core no longer garbles non-ASCII text in them, and
+  TypeScript rejects malformed literals (`1.2.3`, a lone `-`) instead of
+  reading a prefix.
+- **Constraints on `null`** check only `[enum]` in both (synx-core reported
+  `CONSTRAINT_ERR` for `[type]`, `[min]`, `[max]` and `[pattern]`).
+- **Values in text** read the same everywhere: a number is plain decimal
+  (TypeScript put `1e-7` and `1e+21` into interpolation, `:join`, `:calc`
+  operands and enum checks where synx-core writes `0.0000001`), a group or a
+  list is empty text and `null` is `null` (TypeScript wrote
+  `[object Object]`).
+- **`:format`** — a whole float takes an integer pattern (`12.0` under `%05d`
+  is `00012`; synx-core printed `12`); TypeScript no longer formats a quoted
+  number or an object, and keeps a 64-bit integer exact under `%d`.
+- **`:sort`** compares text by code point in both; TypeScript used
+  `localeCompare`, so the order depended on the machine's locale.
+- **`:version`** reads `1.2.3-beta` as 1.2.3 (synx-core dropped the third part).
+- TypeScript applies `:clamp`, `:round`, `:sum`, `:sort` and `:calc` to integers
+  above 2^53, which it used to skip.
+
+### Parsing
+
+- **List items.** synx-core dropped the keys of an item that followed an item
+  holding a nested object, and lost keys when an object opened between a list
+  key and its first item. TypeScript kept a list on the frame stack, so a
+  deeper non-item key became a property of the array that no serializer
+  emits; a scalar item left the previous item open; and items after a
+  re-declared list key went into a detached array, without closing the
+  frames above them.
+- **Unicode whitespace** follows SYNX §4 in TypeScript as it did in synx-core:
+  indentation is measured in UTF-8 (U+00A0 counts 2, U+3000 counts 3 — a tab
+  and an NBSP were the same depth in TypeScript and different depths in Rust,
+  so the two built different trees), trailing Unicode whitespace is trimmed
+  from keys, values and `|` lines, a line of U+00A0 is blank to look-ahead,
+  and the `|+` prefix is cut by whole characters.
+- **`(float)`** in TypeScript reads the whole value with the Rust float
+  grammar instead of `parseFloat`'s prefix (`2 + 2` was `2`).
+- synx-core set `truncated` on every document that starts with a BOM; the
+  dropped U+FEFF is not lost content.
+
+### Writers: stringify, `.synxb`, format
+
+- **`Synx.stringify` and `.synxb` decompile now round-trip.** In 3.7.4, 1 777 of
+  3 000 random documents came back different through `.synxb`: strings that
+  read as other types were written bare (`"007"` → `7`, `"true"` → `true`),
+  `|+` was written as `|` (code lost its indentation), and objects inside list
+  items became text. Both implementations now write through the SYNXL §14.1
+  writer, which quotes such strings, keeps `|+`, repeats a list item's head
+  when needed, and masks secrets. Property fuzz: 0 of 3 000 differ, in both.
+- **`format`** treated the lines of a `|+` body as child keys and sorted them,
+  rewriting the code or prompt text inside. Both implementations now keep the
+  body and its relative indentation; the result is data-preserving,
+  idempotent and byte-identical between Rust and TypeScript. TypeScript sorted
+  keys with `localeCompare`, overflowed the stack on 100 000+ siblings and
+  had no depth cap; synx-core's sort was unstable.
+- **TypeScript `.synxb`** wrote nothing for integers above 2^53, producing a
+  corrupt file, and rounded them on read.
+
+### SYNXL
+
+- A string's `[min]`/`[max]` length counts Unicode characters in both readers
+  (synx-core counted bytes, TypeScript UTF-16 units).
+- The `[pattern]` length cap is 256 in TypeScript, as in synx-core and the
+  active engine (it was 128).
+- A typed cell keeps U+00A0 as data (§7.4): `5` followed by U+00A0 under
+  `(int)` is `CastFailed` in TypeScript too.
+- `UnknownBlockKey` and `BlockFieldNotDeclared` report the line inside the block
+  that declares the key, as decided by the SYNX parser itself. Both readers
+  approximated it from indentation and fell back to the record line for a
+  deeper line after a key with a value; TypeScript also disagreed with Rust
+  on U+3000 indents.
+- Writer: an empty list is written as `key:join` (TypeScript wrote a bare key
+  that read back as `{}`), a one-key object in a list round-trips, and `-0.0`
+  keeps its sign.
+
+### Known limitations
+
+SYNX keeps one open list at a time (§8.5 of the frozen 3.6 core), so some
+data has no text form that reads back the same. `stringify` and `.synxb`
+decompile write such data, and the reader then drops or reshapes it:
+
+- a list inside a list item, followed by another item of the outer list —
+  the later items are dropped;
+- an empty object or an empty list as the last entry of a list item,
+  followed by another item — the next item is read into it;
+- trailing whitespace on a `|+` line, and a key that ends in Unicode
+  whitespace or reads as a directive (`!active`).
+
+The port sessions measured about 5 % of random documents affected. Lifting
+the first two needs a change to the frozen core and is left for 4.0.
+
+### Native ports
+
+Every native port was brought to 3.8.0 — most were rewritten as ports of
+synx-core's parser, engine and writers — and checked against synx-core on
+generated documents (parse and resolve, `format`, `stringify`, `.synxb`
+payload) with no difference. All pass the 34 conformance cases byte for byte;
+none reads or writes SYNXL yet.
+
+| Port | Tests | Checked against synx-core | Notable |
+|---|---|---|---|
+| Go | all pass | 23 000+ documents | `!active` 1.2 MB: 329 → 23.1 ms; a 4 MB document ×73 — key lookup was linear |
+| Java 17 | 102 | 10 000 documents | `!active` 1.2 MB: 179 → 28.7 ms; indentation and limits in UTF-8 bytes |
+| .NET 8 | 123 | 3 400+ documents | `!active` 1.2 MB: 9.7 s → 70 ms, allocations 20.5 GB → 39 MB; `:sort`, `:sum`, `:replace` added |
+| Dart 3 | 122 | 3 400+ documents | `!active` 1.2 MB: 18.4 s → 68 ms; parsing was quadratic |
+| C++17 | 107 | 21 000+ documents | `!active` 1.2 MB: 88.5 s → 32.7 ms; gcc 15, clang 22, MSVC 14.44, ASan clean |
+| Swift | 103 | 21 000+ documents | `!active` 1.2 MB: 46.6 s → 95 ms; rewritten to work on UTF-8 bytes |
+| Godot / GDScript | 176 | 31 000 documents | did not compile under Godot 4.7; parse ×1.6–1.9; `.synxb` now exchanges with synx-core |
+
+As in TypeScript, the writers in Java, Dart and GDScript got slower
+(×0.78–0.87) because they now quote what must be quoted. `.synxb`
+compression in C++ (zlib) and Swift (`Compression`) was not exercised on the
+release machine; the payload layer matches synx-core byte for byte.
+
+### Tools and bindings
+
+- **Language server:** document symbols are built in one pass per block instead
+  of one file scan per key, point at the right line (`cache.port` pointed at
+  `db.port`), and no longer crash on a long value with a multi-byte character
+  at the cut; same-named keys under different parents (`db.url`, `redis.url`)
+  are no longer reported as duplicates.
+- **Python:** dictionaries keep source order (they were in hash order).
+- **Node:** the loader replaces its `.node` copy after a rebuild instead of
+  loading the first build forever.
+
+### Compatibility
+
+- **Rust API.** `Value::Object` holds `synx_core::Map` — an
+  `indexmap::IndexMap<String, Value, foldhash::fast::RandomState>` — instead of
+  `HashMap<String, Value>`, and `ParseResult::metadata` uses the same map. Code
+  that reads objects through `get`, iteration or indexing compiles unchanged;
+  code that builds a `HashMap` and wraps it needs `Map::from_iter` or
+  `.into_iter().collect()`.
+- **Metadata paths** (`ParseResult::metadata`, `.synxb` with metadata) name a
+  list item as `list.#0` and escape `.` and `\` inside a key (`a\.b`). Before,
+  items had no path of their own.
+- **Native ports.** Go: `ParseResult.Metadata` is a `*MetadataTree` (dot-path
+  view as in synx-core) and `synx.Version` exists. Swift: `SynxMarkers.apply*`
+  are no longer public. Dart: `markerFns` receive the chain segments after the
+  marker name as `args`; `!use` finds packages as synx-core does
+  (`<packages>/@scope/name/` and the manifest's `main`, else `src/main.synx`,
+  where it read `<packages>/<pkg>/synx.synx`); `.synx.lock` uses the
+  synx-core `key value` format.
+- **Building the bindings from source** needs a C compiler for mimalloc; the
+  published wheels and Node binaries are prebuilt.
+- Documents: the active-mode changes above alter results only where 3.7.4 was
+  wrong or nondeterministic, or where Rust and TypeScript disagreed.
+
+### Tests
+
+New conformance cases: SYNX 019, 106–114; SYNXL 185–186. New differential
+fuzzers, run for this release: synx-core 3.8.0 against 3.7.4, synx-core
+against TypeScript (static, active, structured documents with lists of
+objects, dotted keys and Unicode indentation — 0 differences in 70 000+),
+SYNXL Rust against TypeScript (projection and diagnostics — 0 in 8 000),
+writer round-trip and format properties (0 in 3 000 and 2 000), and the Python
+and Node bindings against synx-core's own JSON (0 in 12 000 and 6 000).
+
+### Toward 4.0
+
+Two changes were prototyped on a copy of synx-core and measured with the same
+benches, allocation counter and fuzzers; both need an API break, so they wait
+for 4.0.
+
+- **Compact strings** for keys and values (inline up to 24 bytes): 41–83 %
+  fewer allocations, ×1.20–1.50 faster, identical output on 30 000 fuzz
+  documents. Key interning was dropped: 0.1 % of real keys exceed 24 bytes.
+- **Declarations stored on their objects** instead of a map of dotted paths:
+  ×1.05–1.08 in active mode, ±2 % static, identical output on 60 000 fuzz
+  documents. Its value is correctness — the three path defects fixed above
+  cannot occur — not speed.
+
 ## [3.7.4] — 2026-10-14
 
 A parity release. The parser fixes of 3.7.2 and 3.7.3 reached Rust, TypeScript

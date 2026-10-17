@@ -1,688 +1,762 @@
 package synx
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
-	"math"
+	"io"
 	"os"
+	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 	"unicode"
+	"unicode/utf8"
 )
 
-// All 27 marker bodies live here as methods on *resolver. The dispatch
-// table is in engine.go.
+// Helpers behind the marker bodies in engine.go, each a port of the function
+// of the same name in crates/synx-core/src/engine.rs.
 
-func (r *resolver) applyEnv(v Value, meta Meta) Value {
-	name, ok := AsString(v)
-	if !ok {
-		return v
-	}
-	forceString := wantsString(meta)
-	// A nil map reads the process environment; an explicit (even empty) map
-	// is the complete set of variables.
-	var val string
-	if r.opts.Env != nil {
-		val = r.opts.Env[name]
-	} else {
-		val, _ = os.LookupEnv(name)
-	}
-	if val != "" {
-		return castEngineText(val, forceString)
-	}
-	// Everything after `default` is rejoined with ':' so IPs (0.0.0.0) and
-	// compound values survive the marker split.
-	if idx := meta.MarkerIndex("default"); idx >= 0 && idx+1 < len(meta.Markers) {
-		return castEngineText(strings.Join(meta.Markers[idx+1:], ":"), forceString)
-	}
-	return Null
-}
+// ─── :format ────────────────────────────────────────────────────────────────
 
-func (r *resolver) applyDefault(v Value, meta Meta) Value {
-	if meta.HasMarker("env") {
-		return v
-	}
-	empty := false
-	if _, ok := v.(NullValue); ok {
-		empty = true
-	} else if s, ok := v.(StringValue); ok && s.V == "" {
-		empty = true
-	}
-	if !empty {
-		return v
-	}
-	idx := meta.MarkerIndex("default")
-	if idx >= 0 && idx+1 < len(meta.Markers) {
-		return castEngineText(strings.Join(meta.Markers[idx+1:], ":"), wantsString(meta))
-	}
-	return v
-}
-
-// wantsString reports whether text taken from outside the document (`:env`,
-// `:default`) must stay a string instead of going through castPrimitive.
-// Both `(string)` and `[type:string]` ask for that; with only the hint
-// honoured, `[type:string]:env ZIP` cast `007` to a number and then failed
-// its own type check.
-func wantsString(meta Meta) bool {
-	return meta.TypeHint == "string" ||
-		(meta.Constraints != nil && meta.Constraints.TypeName == "string")
-}
-
-func castEngineText(text string, forceString bool) Value {
-	if forceString {
-		return String(text)
-	}
-	return castPrimitive(text)
-}
-
-// castPrimitive types engine-sourced text. Integers go through ParseInt, so
-// 64-bit ids stay exact instead of passing through a float64.
-func castPrimitive(val string) Value {
-	if len(val) >= 2 {
-		f, l := val[0], val[len(val)-1]
-		if (f == '"' && l == '"') || (f == '\'' && l == '\'') {
-			return String(val[1 : len(val)-1])
+func applyFormatPattern(pattern string, v Value) string {
+	switch x := v.(type) {
+	case IntValue:
+		switch {
+		case strings.ContainsAny(pattern, "di"):
+			return formatIntPattern(pattern, x.V)
+		case strings.ContainsAny(pattern, "fe"):
+			return formatFloatPattern(pattern, float64(x.V))
 		}
-	}
-	switch val {
-	case "true":
-		return Bool(true)
-	case "false":
-		return Bool(false)
-	case "null":
-		return Null
-	}
-	if n, err := strconv.ParseInt(val, 10, 64); err == nil {
-		return Int(n)
-	}
-	// ParseFloat also takes Go-only spellings (hex floats, underscores).
-	if !strings.ContainsAny(val, "xXpP_") {
-		if f, err := strconv.ParseFloat(val, 64); err == nil {
-			return Float(f)
+		return strconv.FormatInt(x.V, 10)
+	case FloatValue:
+		switch {
+		case strings.ContainsAny(pattern, "fe"):
+			return formatFloatPattern(pattern, x.V)
+		case strings.ContainsAny(pattern, "di") && isWhole(x.V) && x.V < 9.0e15 && x.V > -9.0e15:
+			// A whole float takes an integer pattern: `12.0` under `%05d` is `00012`.
+			return formatIntPattern(pattern, f64ToI64(x.V))
 		}
+		return formatNumber(x.V)
+	case StringValue:
+		return x.V
 	}
-	return String(val)
+	return valueToString(v)
 }
 
-func (r *resolver) applyCalc(v Value) Value {
-	expr := valueToString(v)
-	if expr == "" {
-		return v
-	}
-	expr = r.interpolate(expr)
-	// Collect numeric sibling identifiers from the root scope.
-	pairs := make([]struct {
-		key string
-		val float64
-	}, 0)
-	for _, p := range r.root().Pairs() {
-		if d, ok := AsNumber(p.Value); ok {
-			pairs = append(pairs, struct {
-				key string
-				val float64
-			}{p.Key, d})
+func formatIntPattern(pattern string, n int64) string {
+	const maxWidth = 4096
+	if s, ok := strings.CutPrefix(pattern, "%"); ok {
+		inner, ok := strings.CutSuffix(s, "d")
+		if !ok {
+			inner, ok = strings.CutSuffix(s, "i")
 		}
-	}
-	sort.Slice(pairs, func(a, b int) bool { return len(pairs[a].key) > len(pairs[b].key) })
-	for _, p := range pairs {
-		expr = replaceWord(expr, p.key, fmt.Sprintf("%.17g", p.val))
-	}
-
-	res := SafeCalc(expr)
-	if !res.OK {
-		return v
-	}
-	if math.Floor(res.Value) == res.Value && math.Abs(res.Value) < 9.2233720368547758e18 {
-		return Int(int64(res.Value))
-	}
-	return Float(res.Value)
-}
-
-func (r *resolver) applyRef(v Value) Value {
-	path := valueToString(v)
-	if path == "" {
-		return v
-	}
-	if target := r.lookup(path); target != nil {
-		return target
-	}
-	return v
-}
-
-func (r *resolver) applySecret(v Value) Value {
-	if _, ok := v.(SecretValue); ok {
-		return v
-	}
-	if _, ok := v.(NullValue); ok {
-		return v
-	}
-	if s, ok := v.(StringValue); ok {
-		return Secret(s.V)
-	}
-	return Secret(valueToString(v))
-}
-
-func (r *resolver) applyRandom(v Value, meta Meta) Value {
-	var opts []string
-	if arr, ok := AsArray(v); ok {
-		for _, item := range arr {
-			opts = append(opts, valueToString(item))
-		}
-	} else if s, ok := AsString(v); ok {
-		for _, part := range strings.Split(s, ",") {
-			opts = append(opts, strings.TrimSpace(part))
-		}
-	}
-	if len(opts) == 0 {
-		return v
-	}
-	weights := make([]float64, 0, len(meta.Args))
-	for _, a := range meta.Args {
-		w, err := strconv.ParseFloat(a, 64)
-		if err != nil {
-			w = 1
-		}
-		weights = append(weights, w)
-	}
-	for len(weights) < len(opts) {
-		weights = append(weights, 1)
-	}
-	total := 0.0
-	for _, w := range weights {
-		total += w
-	}
-	if total <= 0 {
-		return v
-	}
-	pick := r.rng.Float64() * total
-	acc := 0.0
-	for i, w := range weights {
-		acc += w
-		if pick <= acc {
-			return String(opts[i])
-		}
-	}
-	return String(opts[len(opts)-1])
-}
-
-func (r *resolver) applyUnique(v Value) Value {
-	arr, ok := AsArray(v)
-	if !ok {
-		return v
-	}
-	out := make([]Value, 0, len(arr))
-	for _, item := range arr {
-		dup := false
-		for _, seen := range out {
-			if Equal(seen, item) {
-				dup = true
-				break
+		if ok {
+			text := strconv.FormatInt(n, 10)
+			if w, ok := strings.CutPrefix(inner, "0"); ok {
+				if width, ok := parseRustUint(w); ok {
+					return padLeft(text, '0', clampWidth(width, maxWidth))
+				}
 			}
-		}
-		if !dup {
-			out = append(out, item)
-		}
-	}
-	return Array(out)
-}
-
-func (r *resolver) applyGeo(v Value, meta Meta) Value {
-	if r.opts.Region == "" {
-		return v
-	}
-	for _, a := range meta.Args {
-		colon := strings.IndexByte(a, ':')
-		if colon < 0 {
-			continue
-		}
-		if a[:colon] == r.opts.Region {
-			return String(a[colon+1:])
-		}
-	}
-	return v
-}
-
-func (r *resolver) applyI18n(v Value, meta Meta) Value {
-	lang := r.opts.Lang
-	if lang == "" {
-		lang = "en"
-	}
-	lang2 := lang
-	if len(lang) >= 2 {
-		lang2 = lang[:2]
-	}
-	n, isNum := AsNumber(v)
-	category := "other"
-	if isNum {
-		category = pluralCategory(lang, n)
-	}
-	keys := []string{
-		lang + "." + category,
-		lang2 + "." + category,
-		lang,
-		lang2,
-		"other",
-	}
-	for _, key := range keys {
-		for _, a := range meta.Args {
-			colon := strings.IndexByte(a, ':')
-			if colon < 0 {
-				continue
-			}
-			if a[:colon] == key {
-				return String(a[colon+1:])
+			if width, ok := parseRustUint(inner); ok {
+				return padLeft(text, ' ', clampWidth(width, maxWidth))
 			}
 		}
 	}
-	return v
+	return strconv.FormatInt(n, 10)
 }
 
-func (r *resolver) applySplit(v Value, meta Meta) Value {
-	s, ok := AsString(v)
-	if !ok {
-		return v
+func clampWidth(w uint64, max int) int {
+	if w > uint64(max) {
+		return max
 	}
-	sep := ","
-	idx := meta.MarkerIndex("split")
-	if idx >= 0 && idx+1 < len(meta.Markers) {
-		sep = meta.Markers[idx+1]
-	}
-	out := []Value{}
-	if sep == "" {
-		for _, c := range s {
-			out = append(out, String(string(c)))
-		}
-	} else {
-		for _, part := range strings.Split(s, sep) {
-			out = append(out, String(strings.TrimSpace(part)))
-		}
-	}
-	return Array(out)
+	return int(w)
 }
 
-func (r *resolver) applyJoin(v Value, meta Meta) Value {
-	arr, ok := AsArray(v)
-	if !ok {
-		return v
+// padLeft right-aligns text in `width` characters (Rust `{:0>w$}` / `{:>w$}`:
+// the fill goes before a minus sign too).
+func padLeft(text string, fill byte, width int) string {
+	n := utf8.RuneCountInString(text)
+	if n >= width {
+		return text
 	}
-	sep := ","
-	idx := meta.MarkerIndex("join")
-	if idx >= 0 && idx+1 < len(meta.Markers) {
-		sep = meta.Markers[idx+1]
-	}
-	parts := make([]string, len(arr))
-	for i, x := range arr {
-		parts[i] = valueToString(x)
-	}
-	return String(strings.Join(parts, sep))
+	return strings.Repeat(string(fill), width-n) + text
 }
 
-func (r *resolver) applyClamp(v Value, meta Meta) Value {
-	d, ok := AsNumber(v)
-	if !ok {
-		return v
-	}
-	lo, hi := math.Inf(-1), math.Inf(1)
-	idx := meta.MarkerIndex("clamp")
-	if idx >= 0 && idx+2 < len(meta.Markers) {
-		if x, err := strconv.ParseFloat(meta.Markers[idx+1], 64); err == nil {
-			lo = x
-		}
-		if x, err := strconv.ParseFloat(meta.Markers[idx+2], 64); err == nil {
-			hi = x
-		}
-	}
-	if d < lo {
-		d = lo
-	}
-	if d > hi {
-		d = hi
-	}
-	if _, ok := v.(IntValue); ok {
-		return Int(int64(d))
-	}
-	return Float(d)
-}
-
-func (r *resolver) applyRound(v Value, meta Meta) Value {
-	d, ok := AsNumber(v)
-	if !ok {
-		return v
-	}
-	digits := 0
-	idx := meta.MarkerIndex("round")
-	if idx >= 0 && idx+1 < len(meta.Markers) {
-		if n, err := strconv.Atoi(meta.Markers[idx+1]); err == nil {
-			digits = n
-		}
-	}
-	factor := math.Pow(10, float64(digits))
-	rounded := math.Round(d*factor) / factor
-	if digits == 0 {
-		return Int(int64(rounded))
-	}
-	return Float(rounded)
-}
-
-func (r *resolver) applyMap(v Value, meta Meta) Value {
-	key := valueToString(v)
-	for _, a := range meta.Args {
-		colon := strings.IndexByte(a, ':')
-		if colon < 0 {
-			continue
-		}
-		if a[:colon] == key {
-			return String(a[colon+1:])
-		}
-	}
-	return v
-}
-
-func (r *resolver) applyFormat(v Value, meta Meta) Value {
-	idx := meta.MarkerIndex("format")
-	if idx < 0 || idx+1 >= len(meta.Markers) {
-		return v
-	}
-	pattern := r.interpolate(meta.Markers[idx+1])
-	n, _ := AsNumber(v)
-	sIn := valueToString(v)
-	return String(applyPrintf(pattern, n, sIn))
-}
-
-func (r *resolver) applyReplace(v Value, meta Meta) Value {
-	s, ok := AsString(v)
-	if !ok {
-		return v
-	}
-	idx := meta.MarkerIndex("replace")
-	if idx < 0 || idx+2 >= len(meta.Markers) {
-		return v
-	}
-	from := meta.Markers[idx+1]
-	to := meta.Markers[idx+2]
-	if from == "" {
-		return v
-	}
-	return String(strings.ReplaceAll(s, from, to))
-}
-
-func (r *resolver) applySort(v Value, meta Meta) Value {
-	arr, ok := AsArray(v)
-	if !ok {
-		return v
-	}
-	desc := false
-	idx := meta.MarkerIndex("sort")
-	if idx >= 0 && idx+1 < len(meta.Markers) {
-		desc = meta.Markers[idx+1] == "desc"
-	}
-	out := make([]Value, len(arr))
-	copy(out, arr)
-	sort.SliceStable(out, func(a, b int) bool {
-		da, na := AsNumber(out[a])
-		db, nb := AsNumber(out[b])
-		if na && nb {
-			if desc {
-				return da > db
+func formatFloatPattern(pattern string, f float64) string {
+	const maxPrec = 1024
+	if s, ok := strings.CutPrefix(pattern, "%"); ok {
+		if s == "e" {
+			if f == 0 {
+				return "0e+0"
 			}
-			return da < db
+			return jsExponential(f)
 		}
-		sa := valueToString(out[a])
-		sb := valueToString(out[b])
-		if desc {
-			return sa > sb
+		inner, ok := strings.CutSuffix(s, "f")
+		if !ok {
+			inner, ok = strings.CutSuffix(s, "e")
 		}
-		return sa < sb
-	})
-	return Array(out)
-}
-
-func (r *resolver) applySum(v Value) Value {
-	arr, ok := AsArray(v)
-	if !ok {
-		return v
-	}
-	total := 0.0
-	anyFloat := false
-	for _, item := range arr {
-		if d, ok := AsNumber(item); ok {
-			total += d
-			if _, ok := item.(FloatValue); ok {
-				anyFloat = true
+		if ok {
+			if precS, ok := strings.CutPrefix(inner, "."); ok {
+				if p, ok := parseRustUint(precS); ok {
+					prec := clampWidth(p, maxPrec)
+					if strings.HasSuffix(s, "e") {
+						return rustLowerExp(f, prec)
+					}
+					return rustFixed(f, prec)
+				}
 			}
 		}
 	}
-	if anyFloat {
-		return Float(total)
-	}
-	return Int(int64(total))
+	return rustFloatDisplay(f)
 }
 
-func (r *resolver) applyFallback(v Value, meta Meta) Value {
-	empty := false
-	if _, ok := v.(NullValue); ok {
-		empty = true
-	} else if s, ok := v.(StringValue); ok && s.V == "" {
-		empty = true
+// jsExponential is `%e`: shortest digits with a signed exponent and no
+// leading zeros (`1.23456789e+5`), the shape of JS `toExponential()`.
+func jsExponential(f float64) string {
+	if special, ok := nonFinite(f); ok {
+		return special
 	}
-	if !empty {
-		return v
+	raw := strconv.FormatFloat(f, 'e', -1, 64)
+	mant, exp, _ := strings.Cut(raw, "e")
+	sign := byte('+')
+	if exp != "" && (exp[0] == '+' || exp[0] == '-') {
+		sign = exp[0]
+		exp = exp[1:]
 	}
-	idx := meta.MarkerIndex("fallback")
-	if idx >= 0 && idx+1 < len(meta.Markers) {
-		return String(meta.Markers[idx+1])
+	exp = strings.TrimLeft(exp, "0")
+	if exp == "" {
+		exp = "0"
 	}
-	return v
+	mant = strings.TrimSuffix(mant, ".0")
+	return mant + "e" + string(sign) + exp
 }
 
-func (r *resolver) applyVersion(v Value) Value {
-	if _, ok := v.(StringValue); ok {
-		return v
+// rustLowerExp is Rust `{:.prec$e}`: `1.23e3`, `1.00e-3`.
+func rustLowerExp(f float64, prec int) string {
+	if special, ok := nonFinite(f); ok {
+		return special
 	}
-	return String(valueToString(v))
+	raw := strconv.FormatFloat(f, 'e', prec, 64)
+	mant, exp, _ := strings.Cut(raw, "e")
+	neg := strings.HasPrefix(exp, "-")
+	exp = strings.TrimLeft(strings.TrimLeft(exp, "+-"), "0")
+	if exp == "" {
+		exp = "0"
+	}
+	if neg {
+		exp = "-" + exp
+	}
+	return mant + "e" + exp
 }
 
-func (r *resolver) applyWatch(v Value) Value {
-	rel, ok := AsString(v)
-	if !ok {
-		return v
+// rustFixed is Rust `{:.prec$}`.
+func rustFixed(f float64, prec int) string {
+	if special, ok := nonFinite(f); ok {
+		return special
 	}
-	base := r.opts.BasePath
-	if base == "" {
-		base = "."
-	}
-	safe := r.jailPath(base, rel)
-	if safe == "" {
-		return v
-	}
-	data, err := readFile(safe)
-	if err != nil {
-		return v
-	}
-	return String(data)
+	return strconv.FormatFloat(f, 'f', prec, 64)
 }
 
-func (r *resolver) applyPrompt(v Value) Value {
-	s, ok := AsString(v)
-	if !ok {
-		return v
+func nonFinite(f float64) (string, bool) {
+	switch {
+	case f != f:
+		return "NaN", true
+	case f > 1.7976931348623157e308:
+		return "inf", true
+	case f < -1.7976931348623157e308:
+		return "-inf", true
 	}
-	return String(r.interpolate(s))
+	return "", false
 }
 
-func (r *resolver) applySpam(v Value, key string) Value {
-	spamMu.Lock()
-	defer spamMu.Unlock()
-	if _, ok := spamBuckets[key]; ok {
-		return Null
-	}
-	spamBuckets[key] = struct{}{}
-	return v
-}
-
-// ─── shared utilities ───────────────────────────────────────────────────────
-
-func readFile(p string) (string, error) {
-	data, err := os.ReadFile(p)
-	if err != nil {
-		return "", err
-	}
-	return string(data), nil
-}
-
-func replaceWord(s, word, repl string) string {
-	if word == "" {
-		return s
-	}
-	var sb strings.Builder
-	sb.Grow(len(s) + 16)
-	i := 0
-	for i < len(s) {
-		idx := strings.Index(s[i:], word)
-		if idx < 0 {
-			sb.WriteString(s[i:])
+// powi is LLVM's `__powidf2` — what Rust's `f64::powi` with a run-time
+// exponent compiles to — so `:round` scales by exactly the same factor.
+func powi(a float64, b int32) float64 {
+	recip := b < 0
+	r := 1.0
+	for {
+		if b&1 != 0 {
+			r *= a
+		}
+		b /= 2
+		if b == 0 {
 			break
 		}
-		found := i + idx
-		sb.WriteString(s[i:found])
-		leftOK := found == 0 || !isWordRune(rune(s[found-1]))
-		after := found + len(word)
-		rightOK := after == len(s) || !isWordRune(rune(s[after]))
-		if leftOK && rightOK {
-			sb.WriteString(repl)
-			i = after
+		a *= a
+	}
+	if recip {
+		return 1 / r
+	}
+	return r
+}
+
+// ─── :version ───────────────────────────────────────────────────────────────
+
+// leadingInt is the integer at the start of s (after whitespace, with an
+// optional sign), or 0 — JavaScript's `parseInt(s, 10) || 0`.
+func leadingInt(s string) int64 {
+	t := strings.TrimLeftFunc(s, isSpaceRune)
+	neg := false
+	if t != "" && (t[0] == '-' || t[0] == '+') {
+		neg = t[0] == '-'
+		t = t[1:]
+	}
+	var n int64
+	for i := 0; i < len(t) && t[i] >= '0' && t[i] <= '9'; i++ {
+		d := int64(t[i] - '0')
+		if n > (1<<63-1-d)/10 {
+			n = 1<<63 - 1
 		} else {
-			sb.WriteByte(s[found])
-			i = found + 1
+			n = n*10 + d
 		}
 	}
-	return sb.String()
+	if neg {
+		return -n
+	}
+	return n
 }
 
-func isWordRune(r rune) bool {
-	return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_'
-}
-
-func applyPrintf(pattern string, number float64, sIn string) string {
-	var sb strings.Builder
-	sb.Grow(len(pattern) + 16)
-	i := 0
-	for i < len(pattern) {
-		c := pattern[i]
-		if c != '%' {
-			sb.WriteByte(c)
-			i++
-			continue
+// compareVersions reads each dot-separated part for its leading integer, a
+// part with none counting as 0, so positions never shift (`1.2.3-beta` is
+// 1.2.3).
+func compareVersions(current, op, required string) bool {
+	cv := strings.Split(current, ".")
+	rv := strings.Split(required, ".")
+	n := len(cv)
+	if len(rv) > n {
+		n = len(rv)
+	}
+	ord := 0
+	for i := 0; i < n; i++ {
+		var a, b int64
+		if i < len(cv) {
+			a = leadingInt(cv[i])
 		}
-		if i+1 < len(pattern) && pattern[i+1] == '%' {
-			sb.WriteByte('%')
-			i += 2
-			continue
+		if i < len(rv) {
+			b = leadingInt(rv[i])
 		}
-		end := i + 1
-		for end < len(pattern) {
-			k := pattern[end]
-			if k == 'd' || k == 'i' || k == 'f' || k == 'e' || k == 'g' || k == 's' {
-				break
+		if a != b {
+			if a < b {
+				ord = -1
+			} else {
+				ord = 1
 			}
-			end++
-		}
-		if end >= len(pattern) {
-			sb.WriteString(pattern[i:])
 			break
 		}
-		// Convert C-style printf to Go's fmt directives.
-		spec := pattern[i : end+1]
-		kind := pattern[end]
-		goSpec := spec
-		if kind == 'i' {
-			goSpec = spec[:len(spec)-1] + "d"
-		}
-		switch kind {
-		case 'd', 'i':
-			sb.WriteString(fmt.Sprintf(goSpec, int64(number)))
-		case 'f', 'e', 'g':
-			sb.WriteString(fmt.Sprintf(goSpec, number))
-		case 's':
-			sb.WriteString(fmt.Sprintf(goSpec, sIn))
-		}
-		i = end + 1
 	}
-	return sb.String()
+	switch op {
+	case ">=":
+		return ord >= 0
+	case "<=":
+		return ord <= 0
+	case ">":
+		return ord > 0
+	case "<":
+		return ord < 0
+	case "==", "=":
+		return ord == 0
+	case "!=":
+		return ord != 0
+	}
+	return false
 }
 
-func pluralCategory(lang string, n float64) string {
-	two := lang
-	if len(lang) >= 2 {
-		two = lang[:2]
-	}
-	intN := int64(math.Floor(math.Abs(n)))
-	mod10 := intN % 10
-	mod100 := intN % 100
-	intLike := n == math.Floor(n)
+// ─── :i18n plural rules ─────────────────────────────────────────────────────
 
-	switch two {
-	case "ru", "uk", "be":
-		if intLike && mod10 == 1 && mod100 != 11 {
+// pluralCategory is the CLDR plural category for a language and an integer.
+func pluralCategory(lang string, n int64) string {
+	abs := uint64(n)
+	if n < 0 {
+		abs = uint64(-(n + 1)) + 1
+	}
+	n10, n100 := abs%10, abs%100
+	switch lang {
+	case "ru", "uk", "be", "pl":
+		switch {
+		case n10 == 1 && n100 != 11:
 			return "one"
-		}
-		if intLike && mod10 >= 2 && mod10 <= 4 && !(mod100 >= 12 && mod100 <= 14) {
+		case n10 >= 2 && n10 <= 4 && !(n100 >= 12 && n100 <= 14):
 			return "few"
 		}
-		if intLike && (mod10 == 0 || (mod10 >= 5 && mod10 <= 9) || (mod100 >= 11 && mod100 <= 14)) {
-			return "many"
-		}
-		return "other"
-	case "pl":
-		if intLike && n == 1 {
-			return "one"
-		}
-		if intLike && mod10 >= 2 && mod10 <= 4 && !(mod100 >= 12 && mod100 <= 14) {
-			return "few"
-		}
-		if intLike && n != 1 && (mod10 == 0 || mod10 == 1 ||
-			(mod10 >= 5 && mod10 <= 9) || (mod100 >= 12 && mod100 <= 14)) {
-			return "many"
-		}
-		return "other"
+		return "many"
 	case "cs", "sk":
-		if intLike && n == 1 {
+		switch {
+		case abs == 1:
 			return "one"
-		}
-		if intLike && intN >= 2 && intN <= 4 {
+		case abs >= 2 && abs <= 4:
 			return "few"
-		}
-		if !intLike {
-			return "many"
 		}
 		return "other"
 	case "ar":
-		if n == 0 {
+		switch {
+		case abs == 0:
 			return "zero"
-		}
-		if n == 1 {
+		case abs == 1:
 			return "one"
-		}
-		if n == 2 {
+		case abs == 2:
 			return "two"
-		}
-		if intLike && mod100 >= 3 && mod100 <= 10 {
+		case n100 >= 3 && n100 <= 10:
 			return "few"
-		}
-		if intLike && mod100 >= 11 {
+		case n100 >= 11 && n100 <= 99:
 			return "many"
 		}
 		return "other"
 	case "fr", "pt":
-		if n >= 0 && n < 2 {
+		if abs <= 1 {
 			return "one"
 		}
 		return "other"
 	case "ja", "zh", "ko", "vi", "th":
 		return "other"
 	}
-	if n == 1 {
+	if abs == 1 {
 		return "one"
 	}
 	return "other"
 }
+
+// ─── :prompt ────────────────────────────────────────────────────────────────
+
+// stringifyPrompt renders a value as SYNX text for `:prompt`.
+func stringifyPrompt(v Value, indent int) string {
+	spaces := strings.Repeat(" ", indent)
+	var sb strings.Builder
+	switch x := v.(type) {
+	case ObjectValue:
+		for _, key := range x.V.SortedKeys() {
+			val, _ := x.V.Get(key)
+			switch inner := val.(type) {
+			case ObjectValue:
+				sb.WriteString(spaces + key + "\n")
+				sb.WriteString(stringifyPrompt(val, indent+2))
+			case ArrayValue:
+				sb.WriteString(spaces + key + "\n")
+				for _, item := range inner.V {
+					sb.WriteString(spaces + "  - " + valueToString(item) + "\n")
+				}
+			default:
+				sb.WriteString(spaces + key + " " + valueToString(val) + "\n")
+			}
+		}
+	case ArrayValue:
+		for _, item := range x.V {
+			sb.WriteString(spaces + "  - " + valueToString(item) + "\n")
+		}
+	default:
+		sb.WriteString(spaces + valueToString(v) + "\n")
+	}
+	return sb.String()
+}
+
+// ─── :spam ──────────────────────────────────────────────────────────────────
+
+var (
+	spamMu      sync.Mutex
+	spamBuckets = map[string][]time.Time{}
+)
+
+func allowSpamAccess(bucket string, maxCalls, windowSec uint64) bool {
+	now := time.Now()
+	if windowSec < 1 {
+		windowSec = 1
+	}
+	window := time.Duration(windowSec) * time.Second
+	if windowSec > uint64(1<<62)/uint64(time.Second) {
+		window = time.Duration(1<<63 - 1)
+	}
+	spamMu.Lock()
+	defer spamMu.Unlock()
+	calls := spamBuckets[bucket]
+	kept := calls[:0]
+	for _, ts := range calls {
+		if now.Sub(ts) <= window {
+			kept = append(kept, ts)
+		}
+	}
+	if uint64(len(kept)) >= maxCalls {
+		spamBuckets[bucket] = kept
+		return false
+	}
+	spamBuckets[bucket] = append(kept, now)
+	return true
+}
+
+func nowUnix() int64 { return time.Now().Unix() }
+
+// ─── :once lock file ────────────────────────────────────────────────────────
+
+func readLockValue(lockPath, key string) (string, bool) {
+	content, err := os.ReadFile(lockPath)
+	if err != nil || !utf8.Valid(content) {
+		return "", false
+	}
+	for _, line := range rustLines(string(content)) {
+		if rest, ok := strings.CutPrefix(line, key); ok && strings.HasPrefix(rest, " ") {
+			return strings.TrimLeftFunc(rest, isSpaceRune), true
+		}
+	}
+	return "", false
+}
+
+func writeLockValue(lockPath, key, value string) {
+	var lines []string
+	if content, err := os.ReadFile(lockPath); err == nil && utf8.Valid(content) {
+		lines = rustLines(string(content))
+	}
+	newLine := key + " " + value
+	found := false
+	for i, line := range lines {
+		if strings.HasPrefix(line, key) && strings.HasPrefix(line[len(key):], " ") {
+			lines[i] = newLine
+			found = true
+			break
+		}
+	}
+	if !found {
+		lines = append(lines, newLine)
+	}
+	_ = os.WriteFile(lockPath, []byte(strings.Join(lines, "\n")+"\n"), 0o644)
+}
+
+// rustLines is Rust's `str::lines`: split on `\n`, drop one trailing `\r`
+// per line, no empty last line.
+func rustLines(s string) []string {
+	if s == "" {
+		return nil
+	}
+	s = strings.TrimSuffix(s, "\n")
+	parts := strings.Split(s, "\n")
+	for i, p := range parts {
+		parts[i] = strings.TrimSuffix(p, "\r")
+	}
+	return parts
+}
+
+// ─── files: jail, size, reads ───────────────────────────────────────────────
+
+// jailPath keeps `file` inside `base`. It returns the path to read, or the
+// reason it was refused (the text of the reference's SECURITY errors).
+func jailPath(base, file string) (string, string) {
+	if file != "" && (file[0] == '/' || file[0] == '\\') {
+		return "", fmt.Sprintf("SECURITY: rooted paths are not allowed: '%s'", file)
+	}
+	if filepath.IsAbs(file) {
+		return "", fmt.Sprintf("SECURITY: absolute paths are not allowed: '%s'", file)
+	}
+	baseCanon, err := canonicalize(base)
+	if err != nil {
+		baseCanon = base
+	}
+	full := joinPath(baseCanon, file)
+	fullCanon, err := canonicalize(full)
+	if err != nil {
+		if strings.Contains(full, "..") {
+			return "", fmt.Sprintf("SECURITY: path traversal detected: '%s'", file)
+		}
+		if !pathHasPrefix(full, baseCanon) {
+			return "", fmt.Sprintf("SECURITY: path escapes base directory: '%s'", file)
+		}
+		return full, ""
+	}
+	if !pathHasPrefix(fullCanon, baseCanon) {
+		return "", fmt.Sprintf("SECURITY: path escapes base directory: '%s'", file)
+	}
+	return fullCanon, ""
+}
+
+// canonicalize is `fs::canonicalize`: absolute, symlinks resolved, and an
+// error when the path does not exist.
+func canonicalize(p string) (string, error) {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return "", err
+	}
+	return filepath.EvalSymlinks(abs)
+}
+
+// joinPath is `Path::join`: no cleaning, and an absolute second part
+// replaces the first.
+func joinPath(a, b string) string {
+	if filepath.IsAbs(b) || a == "" {
+		return b
+	}
+	if strings.HasSuffix(a, "/") || strings.HasSuffix(a, string(filepath.Separator)) {
+		return a + b
+	}
+	return a + string(filepath.Separator) + b
+}
+
+func isPathSep(c byte) bool {
+	return c == '/' || (runtime.GOOS == "windows" && c == '\\')
+}
+
+// pathComponents splits a path the way `Path::components` compares it:
+// empty and `.` components (other than a leading one) are dropped.
+func pathComponents(p string) []string {
+	var out []string
+	start := 0
+	for i := 0; i <= len(p); i++ {
+		if i == len(p) || isPathSep(p[i]) {
+			c := p[start:i]
+			switch {
+			case i == 0 && len(p) > 0:
+				out = append(out, "/")
+			case c == "" || (c == "." && len(out) > 0):
+			default:
+				out = append(out, c)
+			}
+			start = i + 1
+		}
+	}
+	return out
+}
+
+// pathHasPrefix is `Path::starts_with`: whole components.
+func pathHasPrefix(p, base string) bool {
+	pc, bc := pathComponents(p), pathComponents(base)
+	if len(bc) > len(pc) {
+		return false
+	}
+	for i := range bc {
+		same := pc[i] == bc[i]
+		if !same && runtime.GOOS == "windows" {
+			same = strings.EqualFold(pc[i], bc[i])
+		}
+		if !same {
+			return false
+		}
+	}
+	return true
+}
+
+func parentDir(p string) string {
+	return filepath.Dir(p)
+}
+
+// fileExtension is `Path::extension`: none for a dot-file without another dot.
+func fileExtension(p string) string {
+	name := filepath.Base(p)
+	dot := strings.LastIndexByte(name, '.')
+	if dot <= 0 {
+		return ""
+	}
+	return name[dot+1:]
+}
+
+func checkFileSize(p string) string {
+	if fi, err := os.Stat(p); err == nil && fi.Size() > maxFileSize {
+		return fmt.Sprintf("SECURITY: file too large (%d bytes, max %d)", fi.Size(), maxFileSize)
+	}
+	return ""
+}
+
+var errInvalidUTF8 = errors.New("stream did not contain valid UTF-8")
+
+// readUTF8 is `fs::read_to_string`: the file must be valid UTF-8.
+func readUTF8(p string) (string, error) {
+	data, err := os.ReadFile(p)
+	if err != nil {
+		return "", err
+	}
+	if !utf8.Valid(data) {
+		return "", errInvalidUTF8
+	}
+	return string(data), nil
+}
+
+// ioErrText is the reference's portable I/O error text.
+func ioErrText(err error, ctx string) string {
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return "file not found: " + ctx
+	case errors.Is(err, os.ErrPermission):
+		return "permission denied: " + ctx
+	}
+	var pe *os.PathError
+	if errors.As(err, &pe) {
+		return pe.Err.Error()
+	}
+	return err.Error()
+}
+
+func isRegularFile(p string) bool {
+	fi, err := os.Stat(p)
+	return err == nil && fi.Mode().IsRegular()
+}
+
+// ─── !include / !use ────────────────────────────────────────────────────────
+
+func (r *resolver) loadIncludes(directives []IncludeDirective) *Object {
+	out := NewObjectMap()
+	if r.opts.IncludeDepth >= r.maxIncludeDepth() {
+		return out
+	}
+	for _, inc := range directives {
+		full, errText := jailPath(r.basePath(), inc.Path)
+		if errText != "" || checkFileSize(full) != "" {
+			continue
+		}
+		text, err := readUTF8(full)
+		if err != nil {
+			continue
+		}
+		out.Set(inc.Alias, r.parseIncluded(text, full))
+	}
+	return out
+}
+
+// loadPackages reads `<base>/<packages>/@scope/name` for each `!use`: the
+// manifest's `main` (or legacy `entry`), else `src/main.synx`.
+func (r *resolver) loadPackages(directives []UseDirective) *Object {
+	out := NewObjectMap()
+	if len(directives) == 0 {
+		return out
+	}
+	pkgBase := r.opts.PackagesPath
+	if pkgBase == "" {
+		pkgBase = "./synx_packages"
+	}
+	pkgRoot := joinPath(r.basePath(), pkgBase)
+	for _, ud := range directives {
+		if !isContainedRelative(ud.Package) {
+			continue
+		}
+		pkgDir := joinPath(pkgRoot, ud.Package)
+		entry, ok := readManifestMain(pkgDir)
+		if !ok {
+			entry = joinPath(joinPath(pkgDir, "src"), "main.synx")
+		}
+		if !isRegularFile(entry) || checkFileSize(entry) != "" {
+			continue
+		}
+		text, err := readUTF8(entry)
+		if err != nil {
+			continue
+		}
+		out.Set(ud.Alias, r.parseIncluded(text, entry))
+	}
+	return out
+}
+
+func readManifestMain(pkgDir string) (string, bool) {
+	text, err := readUTF8(joinPath(pkgDir, "synx-pkg.synx"))
+	if err != nil {
+		return "", false
+	}
+	for _, line := range rustLines(text) {
+		t := trimWS(line)
+		if rest, ok := strings.CutPrefix(t, "main "); ok {
+			if p := trimWS(rest); isContainedRelative(p) {
+				return joinPath(pkgDir, p), true
+			}
+		}
+		if rest, ok := strings.CutPrefix(t, "entry "); ok {
+			if p := trimWS(rest); isContainedRelative(p) {
+				return joinPath(pkgDir, p), true
+			}
+		}
+	}
+	return "", false
+}
+
+// isContainedRelative: a relative path with no root, drive, `:` or `..`
+// segment, judged by its text, so a package directory that is itself a symlink
+// (a linked local package) keeps working. A `!use` name or manifest `main`
+// that fails it would otherwise read files outside the packages directory.
+func isContainedRelative(p string) bool {
+	if p == "" || p[0] == '/' || p[0] == '\\' || strings.IndexByte(p, ':') >= 0 || filepath.IsAbs(p) {
+		return false
+	}
+	for _, seg := range strings.FieldsFunc(p, func(r rune) bool { return r == '/' || r == '\\' }) {
+		if seg == ".." {
+			return false
+		}
+	}
+	return true
+}
+
+// ─── :watch key paths ───────────────────────────────────────────────────────
+
+// extractFromFileContent follows a dot-path through a JSON or SYNX file.
+func extractFromFileContent(content, keyPath, ext string) (Value, bool) {
+	if ext == "json" {
+		dec := json.NewDecoder(strings.NewReader(content))
+		dec.UseNumber()
+		var parsed interface{}
+		if err := dec.Decode(&parsed); err != nil {
+			return nil, false
+		}
+		if _, err := dec.Token(); err != io.EOF {
+			return nil, false
+		}
+		cur := parsed
+		for _, part := range strings.Split(keyPath, ".") {
+			m, ok := cur.(map[string]interface{})
+			if !ok {
+				return nil, false
+			}
+			if cur, ok = m[part]; !ok {
+				return nil, false
+			}
+		}
+		return jsonToValue(cur), true
+	}
+	parsed := Parse(content)
+	cur := parsed.Root
+	for _, part := range strings.Split(keyPath, ".") {
+		obj, ok := cur.(ObjectValue)
+		if !ok {
+			return nil, false
+		}
+		if cur, ok = obj.V.Get(part); !ok {
+			return nil, false
+		}
+	}
+	return cur, true
+}
+
+func jsonToValue(v interface{}) Value {
+	switch x := v.(type) {
+	case nil:
+		return Null
+	case bool:
+		return Bool(x)
+	case json.Number:
+		s := x.String()
+		if !strings.ContainsAny(s, ".eE") {
+			if n, err := strconv.ParseInt(s, 10, 64); err == nil {
+				return Int(n)
+			}
+		}
+		if f, err := strconv.ParseFloat(s, 64); err == nil {
+			return Float(f)
+		}
+		return Null
+	case string:
+		return String(x)
+	case []interface{}:
+		out := make([]Value, len(x))
+		for i, item := range x {
+			out[i] = jsonToValue(item)
+		}
+		return Array(out)
+	case map[string]interface{}:
+		keys := make([]string, 0, len(x))
+		for k := range x {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		obj := newObjectCap(len(keys))
+		for _, k := range keys {
+			obj.Set(k, jsonToValue(x[k]))
+		}
+		return Object_(obj)
+	}
+	return Null
+}
+
+func isSpaceRune(r rune) bool { return unicode.IsSpace(r) }

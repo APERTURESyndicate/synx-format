@@ -22,7 +22,7 @@ inventory
   - Shield
   - Potion
 """
-	var d := Synx.parse_to_variant(text)
+	var d: Variant = Synx.parse_to_variant(text)
 	print("\n── static ──")
 	print(JSON.stringify(d, "  "))
 
@@ -39,7 +39,7 @@ name Alice
 """
 	var opts := SynxOptions.new()
 	opts.env = { "PORT": "8080" }
-	var d := Synx.parse_active_to_variant(text, opts)
+	var d: Variant = Synx.parse_active_to_variant(text, opts)
 	print("\n── active ──")
 	print(JSON.stringify(d, "  "))
 

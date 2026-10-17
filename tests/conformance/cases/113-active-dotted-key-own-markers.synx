@@ -1,0 +1,8 @@
+!active
+a.b
+  x:env:default:9 SYNX_UNSET_Q
+  y:split a,b
+a
+  b
+    x hello
+    y c,d

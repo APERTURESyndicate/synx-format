@@ -31,7 +31,7 @@ pub fn value_to_json_value(v: &Value) -> JsonValue {
 ///
 /// Nested SYNX paths (`server`, `server.ssl`) become nested `properties`. Only keys that have
 /// [`Meta::constraints`](crate::Meta::constraints) are emitted (same criterion as the JS `Synx.schema()`).
-pub fn metadata_to_json_schema(metadata: &std::collections::HashMap<String, MetaMap>) -> JsonValue {
+pub fn metadata_to_json_schema(metadata: &crate::Map<MetaMap>) -> JsonValue {
     let mut root = json!({
         "$schema": SCHEMA_URL,
         "type": "object",
@@ -44,11 +44,10 @@ pub fn metadata_to_json_schema(metadata: &std::collections::HashMap<String, Meta
 
     for prefix in keys {
         let mmap = &metadata[prefix];
-        let segments: Vec<&str> = if prefix.is_empty() {
-            vec![]
-        } else {
-            prefix.split('.').collect()
-        };
+        // A list item's `#<index>` segment is not a property: its fields
+        // describe the list's objects, as before 3.8.0.
+        let owned = crate::engine::meta_path_segments(prefix);
+        let segments: Vec<&str> = owned.iter().map(String::as_str).filter(|seg| !seg.starts_with('#')).collect();
         for (field_key, meta) in mmap.iter() {
             if let Some(ref c) = meta.constraints {
                 let prop = constraints_to_property(c);
@@ -219,12 +218,11 @@ pub fn validate_serde_json(instance: &JsonValue, schema: &JsonValue) -> Result<(
 mod tests {
     use super::*;
     use crate::value::Meta;
-    use std::collections::HashMap;
 
     #[test]
     fn nested_metadata_schema() {
-        let mut metadata: HashMap<String, MetaMap> = HashMap::new();
-        let mut root_map = MetaMap::new();
+        let mut metadata: crate::Map<MetaMap> = crate::Map::default();
+        let mut root_map = MetaMap::default();
         root_map.insert(
             "name".into(),
             Meta {

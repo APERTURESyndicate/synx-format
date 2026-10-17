@@ -19,13 +19,15 @@ struct ParseResult {
     bool schema = false;
     /// `!llm` directive — LLM-oriented envelope (semantic hints only).
     bool llm = false;
-    /// Metadata for each nesting level, keyed by dot-path prefix.
-    /// `""` = root level, `"server"` = server sub-object, etc.
+    /// Declarations of `!active` documents, per object (see `MetadataTree`).
     MetadataTree metadata;
     /// `!include` directives parsed from the file.
     std::vector<IncludeDirective> includes;
     /// `!use` directives parsed from the file (package imports).
     std::vector<UseDirective> uses;
+    /// Input was dropped: the text exceeded the size or line cap, or a
+    /// multiline body its byte cap.
+    bool truncated = false;
 };
 
 } // namespace synx

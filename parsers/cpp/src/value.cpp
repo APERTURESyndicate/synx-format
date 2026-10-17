@@ -2,108 +2,82 @@
 #include "synx/value.hpp"
 
 #include <cmath>
+#include <new>
 #include <utility>
 
 namespace synx {
 
 Value::Value() noexcept : kind_(Kind::Null), i_(0) {}
 
-Value::Value(const Value& other) : kind_(Kind::Null), i_(0) {
-    copy_from(other);
-}
+Value::Value(const Value& other) : kind_(Kind::Null), i_(0) { copy_from(other); }
 
-Value::Value(Value&& other) noexcept : kind_(Kind::Null), i_(0) {
-    move_from(std::move(other));
-}
+Value::Value(Value&& other) noexcept : kind_(Kind::Null), i_(0) { move_from(std::move(other)); }
 
-Value::~Value() = default;
+Value::~Value() { destroy(); }
 
+// Both assignments go through a temporary first, so assigning a value from a
+// part of itself (`v = v.as_array()[0]`) is safe.
 Value& Value::operator=(const Value& other) {
     if (this != &other) {
-        clear();
-        copy_from(other);
+        Value tmp(other);
+        destroy();
+        move_from(std::move(tmp));
     }
     return *this;
 }
 
 Value& Value::operator=(Value&& other) noexcept {
     if (this != &other) {
-        clear();
-        move_from(std::move(other));
+        Value tmp(std::move(other));
+        destroy();
+        move_from(std::move(tmp));
     }
     return *this;
 }
 
-void Value::clear() noexcept {
+void Value::destroy() noexcept {
+    switch (kind_) {
+        case Kind::String:
+        case Kind::Secret: str_.~basic_string(); break;
+        case Kind::Array: arr_.~Array(); break;
+        case Kind::Object: obj_.~Object(); break;
+        default: break;
+    }
     kind_ = Kind::Null;
     i_ = 0;
-    str_.clear();
-    arr_.clear();
-    obj_.clear();
 }
 
 void Value::copy_from(const Value& other) {
-    kind_ = other.kind_;
     switch (other.kind_) {
-        case Kind::Null:
-            i_ = 0;
-            break;
-        case Kind::Bool:
-            b_ = other.b_;
-            break;
-        case Kind::Int:
-            i_ = other.i_;
-            break;
-        case Kind::Float:
-            f_ = other.f_;
-            break;
+        case Kind::Null: i_ = 0; break;
+        case Kind::Bool: b_ = other.b_; break;
+        case Kind::Int: i_ = other.i_; break;
+        case Kind::Float: f_ = other.f_; break;
         case Kind::String:
-        case Kind::Secret:
-            str_ = other.str_;
-            break;
-        case Kind::Array:
-            arr_ = other.arr_;
-            break;
-        case Kind::Object:
-            obj_ = other.obj_;
-            break;
+        case Kind::Secret: new (&str_) std::string(other.str_); break;
+        case Kind::Array: new (&arr_) Array(other.arr_); break;
+        case Kind::Object: new (&obj_) Object(other.obj_); break;
     }
+    kind_ = other.kind_;
 }
 
 void Value::move_from(Value&& other) noexcept {
-    kind_ = other.kind_;
     switch (other.kind_) {
-        case Kind::Null:
-            i_ = 0;
-            break;
-        case Kind::Bool:
-            b_ = other.b_;
-            break;
-        case Kind::Int:
-            i_ = other.i_;
-            break;
-        case Kind::Float:
-            f_ = other.f_;
-            break;
+        case Kind::Null: i_ = 0; break;
+        case Kind::Bool: b_ = other.b_; break;
+        case Kind::Int: i_ = other.i_; break;
+        case Kind::Float: f_ = other.f_; break;
         case Kind::String:
-        case Kind::Secret:
-            str_ = std::move(other.str_);
-            break;
-        case Kind::Array:
-            arr_ = std::move(other.arr_);
-            break;
-        case Kind::Object:
-            obj_ = std::move(other.obj_);
-            break;
+        case Kind::Secret: new (&str_) std::string(std::move(other.str_)); break;
+        case Kind::Array: new (&arr_) Array(std::move(other.arr_)); break;
+        case Kind::Object: new (&obj_) Object(std::move(other.obj_)); break;
     }
-    other.kind_ = Kind::Null;
-    other.i_ = 0;
+    kind_ = other.kind_;
+    other.destroy();
 }
 
 // ─── factories ────────────────────────────────────────────────────────────────
-Value Value::make_null() noexcept {
-    return Value{};
-}
+Value Value::make_null() noexcept { return Value{}; }
 
 Value Value::make_bool(bool b) noexcept {
     Value v;
@@ -128,29 +102,29 @@ Value Value::make_float(double f) noexcept {
 
 Value Value::make_string(std::string s) {
     Value v;
+    new (&v.str_) std::string(std::move(s));
     v.kind_ = Kind::String;
-    v.str_ = std::move(s);
     return v;
 }
 
 Value Value::make_secret(std::string s) {
     Value v;
+    new (&v.str_) std::string(std::move(s));
     v.kind_ = Kind::Secret;
-    v.str_ = std::move(s);
     return v;
 }
 
 Value Value::make_array(Array a) {
     Value v;
+    new (&v.arr_) Array(std::move(a));
     v.kind_ = Kind::Array;
-    v.arr_ = std::move(a);
     return v;
 }
 
 Value Value::make_object(Object o) {
     Value v;
+    new (&v.obj_) Object(std::move(o));
     v.kind_ = Kind::Object;
-    v.obj_ = std::move(o);
     return v;
 }
 

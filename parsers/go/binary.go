@@ -9,16 +9,21 @@ import (
 	"io"
 	"math"
 	"sort"
+	"unicode/utf8"
 )
 
-// .synxb compact binary format. Wire-compatible with crates/synx-core 3.6.x.
+// .synxb compact binary format, wire-compatible with crates/synx-core.
 //
 // Layout:
 //   5 bytes magic "SYNXB"
 //   1 byte  version
 //   1 byte  flags
 //   4 bytes little-endian uint32 uncompressed-size
-//   raw DEFLATE payload (compress/flate.NewWriter level 9 = matches Rust miniz_oxide).
+//   raw DEFLATE payload: string table, value tree, [metadata, includes]
+//
+// The string table is ordered by use count (ties keep first-seen order), so
+// frequent strings get one-byte indexes and one document always compiles to
+// the same payload.
 
 var (
 	binaryMagic   = []byte{'S', 'Y', 'N', 'X', 'B'}
@@ -47,6 +52,13 @@ const (
 	tagSecret = 0x08
 )
 
+const (
+	// maxDecodedBytes bounds the inflated payload of an untrusted file.
+	maxDecodedBytes = 256 * 1024 * 1024
+	// maxDecodeDepth bounds ARRAY/OBJECT nesting while decoding.
+	maxDecodeDepth = 256
+)
+
 // IsSynxb reports whether `data` starts with the `.synxb` magic prefix.
 func IsSynxb(data []byte) bool {
 	return len(data) >= 5 && bytes.Equal(data[:5], binaryMagic)
@@ -57,13 +69,15 @@ func IsSynxb(data []byte) bool {
 func Compile(result ParseResult, resolved bool) ([]byte, error) {
 	st := newStringTable()
 	st.collectValue(result.Root)
-	hasMeta := !resolved && len(result.Metadata) > 0
+	hasMeta := !resolved && result.Metadata.Len() > 0
 	if hasMeta {
 		st.collectMetadata(result.Metadata)
 		st.collectIncludes(result.Includes)
 	}
+	st.orderByUse()
 
 	var payload bytes.Buffer
+	payload.Grow(1024)
 	st.encode(&payload)
 	encodeValue(&payload, result.Root, st)
 	if hasMeta {
@@ -119,16 +133,19 @@ func Decompile(data []byte) (ParseResult, error) {
 		return pr, errors.New("invalid .synxb magic (expected SYNXB)")
 	}
 	if data[5] != binaryVersion {
-		return pr, fmt.Errorf("unsupported .synxb version: %d", data[5])
+		return pr, fmt.Errorf("unsupported .synxb version: %d (expected %d)", data[5], binaryVersion)
 	}
 	flags := data[6]
-	uncomp := binary.LittleEndian.Uint32(data[7:11])
-	payload, err := inflateRaw(data[11:], int(uncomp))
+	uncomp := int(binary.LittleEndian.Uint32(data[7:11]))
+	if uncomp > maxDecodedBytes {
+		return pr, fmt.Errorf("declared size %d exceeds limit %d", uncomp, maxDecodedBytes)
+	}
+	payload, err := inflateRaw(data[11:], uncomp)
 	if err != nil {
 		return pr, fmt.Errorf("decompression failed: %w", err)
 	}
-	if uint32(len(payload)) != uncomp {
-		return pr, errors.New("size mismatch in decompressed payload")
+	if len(payload) != uncomp {
+		return pr, fmt.Errorf("size mismatch: expected %d, got %d", uncomp, len(payload))
 	}
 
 	cur := &cursor{data: payload}
@@ -136,7 +153,7 @@ func Decompile(data []byte) (ParseResult, error) {
 	if err != nil {
 		return pr, err
 	}
-	root, err := decodeValue(cur, reader)
+	root, err := decodeValue(cur, reader, 0)
 	if err != nil {
 		return pr, err
 	}
@@ -148,7 +165,7 @@ func Decompile(data []byte) (ParseResult, error) {
 	pr.Tool = flags&flagTool != 0
 	pr.Schema = flags&flagSchema != 0
 	pr.Llm = flags&flagLLM != 0
-	pr.Metadata = MetadataTree{}
+	pr.Metadata = NewMetadataTree()
 	if flags&flagHasMeta != 0 {
 		meta, err := decodeMetadata(cur, reader)
 		if err != nil {
@@ -182,6 +199,8 @@ func deflateRaw(data []byte) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// inflateRaw inflates at most maxDecodedBytes (+1 to detect an overrun), so
+// a small crafted stream cannot expand into gigabytes.
 func inflateRaw(data []byte, expected int) ([]byte, error) {
 	r := flate.NewReader(bytes.NewReader(data))
 	defer r.Close()
@@ -189,8 +208,12 @@ func inflateRaw(data []byte, expected int) ([]byte, error) {
 		expected = 1024
 	}
 	buf := bytes.NewBuffer(make([]byte, 0, expected))
-	if _, err := io.Copy(buf, r); err != nil {
+	n, err := io.Copy(buf, io.LimitReader(r, maxDecodedBytes+1))
+	if err != nil {
 		return nil, err
+	}
+	if n > maxDecodedBytes {
+		return nil, errors.New("decoded payload exceeds limit")
 	}
 	return buf.Bytes(), nil
 }
@@ -200,24 +223,45 @@ func inflateRaw(data []byte, expected int) ([]byte, error) {
 type stringTable struct {
 	strings []string
 	index   map[string]uint32
+	uses    []uint32
 }
 
 func newStringTable() *stringTable {
 	return &stringTable{index: map[string]uint32{}}
 }
 
-func (t *stringTable) intern(s string) uint32 {
+func (t *stringTable) intern(s string) {
 	if idx, ok := t.index[s]; ok {
-		return idx
+		t.uses[idx]++
+		return
 	}
-	idx := uint32(len(t.strings))
+	t.index[s] = uint32(len(t.strings))
 	t.strings = append(t.strings, s)
-	t.index[s] = idx
-	return idx
+	t.uses = append(t.uses, 1)
 }
 
-func (t *stringTable) indexOf(s string) uint32 {
-	return t.index[s]
+// orderByUse renumbers the table by descending use count; ties keep
+// first-seen order. The format is unchanged — a decoder reads indices
+// against whatever table it is given.
+func (t *stringTable) orderByUse() {
+	order := make([]uint32, len(t.strings))
+	for i := range order {
+		order[i] = uint32(i)
+	}
+	sort.SliceStable(order, func(a, b int) bool {
+		return t.uses[order[a]] > t.uses[order[b]]
+	})
+	ordered := make([]string, len(order))
+	for newIdx, old := range order {
+		s := t.strings[old]
+		t.index[s] = uint32(newIdx)
+		ordered[newIdx] = s
+	}
+	t.strings = ordered
+}
+
+func (t *stringTable) indexOf(s string) uint64 {
+	return uint64(t.index[s])
 }
 
 func (t *stringTable) collectValue(v Value) {
@@ -231,17 +275,19 @@ func (t *stringTable) collectValue(v Value) {
 			t.collectValue(item)
 		}
 	case ObjectValue:
-		for _, p := range x.V.Pairs() {
+		for _, p := range x.V.pairs {
 			t.intern(p.Key)
 			t.collectValue(p.Value)
 		}
 	}
 }
 
-func (t *stringTable) collectMetadata(tree MetadataTree) {
-	for path, m := range tree {
+func (t *stringTable) collectMetadata(tree *MetadataTree) {
+	for _, path := range tree.paths {
 		t.intern(path)
-		for key, meta := range m {
+		m := tree.levels[path]
+		for _, key := range m.keys {
+			meta := m.items[key]
 			t.intern(key)
 			for _, mk := range meta.Markers {
 				t.intern(mk)
@@ -249,15 +295,14 @@ func (t *stringTable) collectMetadata(tree MetadataTree) {
 			for _, a := range meta.Args {
 				t.intern(a)
 			}
-			if meta.TypeHint != "" {
+			if meta.hasTypeHint() {
 				t.intern(meta.TypeHint)
 			}
-			if meta.Constraints != nil {
-				c := meta.Constraints
-				if c.TypeName != "" {
+			if c := meta.Constraints; c != nil {
+				if c.hasTypeName() {
 					t.intern(c.TypeName)
 				}
-				if c.Pattern != "" {
+				if c.hasPattern() {
 					t.intern(c.Pattern)
 				}
 				for _, e := range c.EnumValues {
@@ -292,26 +337,40 @@ func decodeStringTable(cur *cursor) (*stringTableReader, error) {
 	if err != nil {
 		return nil, err
 	}
-	r := &stringTableReader{strings: make([]string, 0, count)}
+	r := &stringTableReader{strings: make([]string, 0, safeCapacity(count, cur))}
 	for i := uint64(0); i < count; i++ {
 		ln, err := decodeVarint(cur)
 		if err != nil {
 			return nil, err
 		}
-		if cur.pos+int(ln) > len(cur.data) {
+		if ln > uint64(len(cur.data)-cur.pos) {
 			return nil, errors.New("unexpected end of data in string table")
 		}
-		r.strings = append(r.strings, string(cur.data[cur.pos:cur.pos+int(ln)]))
+		raw := cur.data[cur.pos : cur.pos+int(ln)]
+		if !utf8.Valid(raw) {
+			return nil, errors.New("invalid UTF-8 in string table")
+		}
+		r.strings = append(r.strings, string(raw))
 		cur.pos += int(ln)
 	}
 	return r, nil
 }
 
-func (r *stringTableReader) get(idx uint32) (string, error) {
-	if int(idx) >= len(r.strings) {
-		return "", errors.New("string index out of bounds")
+func (r *stringTableReader) get(idx uint64) (string, error) {
+	if idx >= uint64(len(r.strings)) {
+		return "", fmt.Errorf("string index %d out of bounds (size %d)", idx, len(r.strings))
 	}
 	return r.strings[idx], nil
+}
+
+// safeCapacity bounds a capacity read from untrusted input: every element
+// costs at least one byte, so a count never exceeds the bytes left.
+func safeCapacity(count uint64, cur *cursor) int {
+	remaining := uint64(len(cur.data) - cur.pos)
+	if count > remaining {
+		return int(remaining)
+	}
+	return int(count)
 }
 
 // ─── varint / zigzag ────────────────────────────────────────────────────────
@@ -362,9 +421,9 @@ func encodeF64LE(out *bytes.Buffer, f float64) {
 	out.Write(buf[:])
 }
 
-func decodeF64LE(cur *cursor) (float64, error) {
+func decodeF64LE(cur *cursor, what string) (float64, error) {
 	if cur.pos+8 > len(cur.data) {
-		return 0, errors.New("unexpected end of data in float")
+		return 0, errors.New(what)
 	}
 	v := math.Float64frombits(binary.LittleEndian.Uint64(cur.data[cur.pos : cur.pos+8]))
 	cur.pos += 8
@@ -391,10 +450,10 @@ func encodeValue(out *bytes.Buffer, v Value, t *stringTable) {
 		encodeF64LE(out, x.V)
 	case StringValue:
 		out.WriteByte(tagString)
-		encodeVarint(out, uint64(t.indexOf(x.V)))
+		encodeVarint(out, t.indexOf(x.V))
 	case SecretValue:
 		out.WriteByte(tagSecret)
-		encodeVarint(out, uint64(t.indexOf(x.V)))
+		encodeVarint(out, t.indexOf(x.V))
 	case ArrayValue:
 		out.WriteByte(tagArray)
 		encodeVarint(out, uint64(len(x.V)))
@@ -403,21 +462,25 @@ func encodeValue(out *bytes.Buffer, v Value, t *stringTable) {
 		}
 	case ObjectValue:
 		out.WriteByte(tagObject)
-		keys := x.V.Keys()
-		sort.Strings(keys)
-		encodeVarint(out, uint64(len(keys)))
-		for _, k := range keys {
-			encodeVarint(out, uint64(t.indexOf(k)))
-			val, _ := x.V.Get(k)
+		pairs := sortedPairs(x.V)
+		encodeVarint(out, uint64(len(pairs)))
+		for _, p := range pairs {
+			encodeVarint(out, t.indexOf(p.Key))
+			val := p.Value
 			if val == nil {
 				val = Null
 			}
 			encodeValue(out, val, t)
 		}
+	default:
+		out.WriteByte(tagNull)
 	}
 }
 
-func decodeValue(cur *cursor, t *stringTableReader) (Value, error) {
+func decodeValue(cur *cursor, t *stringTableReader, depth int) (Value, error) {
+	if depth > maxDecodeDepth {
+		return nil, fmt.Errorf("nesting exceeds %d — refusing to decode", maxDecodeDepth)
+	}
 	if cur.pos >= len(cur.data) {
 		return nil, errors.New("unexpected end of data")
 	}
@@ -437,39 +500,32 @@ func decodeValue(cur *cursor, t *stringTableReader) (Value, error) {
 		}
 		return Int(zigzagDecode(raw)), nil
 	case tagFloat:
-		f, err := decodeF64LE(cur)
+		f, err := decodeF64LE(cur, "unexpected end of data in float")
 		if err != nil {
 			return nil, err
 		}
 		return Float(f), nil
-	case tagString:
+	case tagString, tagSecret:
 		idx, err := decodeVarint(cur)
 		if err != nil {
 			return nil, err
 		}
-		s, err := t.get(uint32(idx))
+		s, err := t.get(idx)
 		if err != nil {
 			return nil, err
+		}
+		if tag == tagSecret {
+			return Secret(s), nil
 		}
 		return String(s), nil
-	case tagSecret:
-		idx, err := decodeVarint(cur)
-		if err != nil {
-			return nil, err
-		}
-		s, err := t.get(uint32(idx))
-		if err != nil {
-			return nil, err
-		}
-		return Secret(s), nil
 	case tagArray:
 		count, err := decodeVarint(cur)
 		if err != nil {
 			return nil, err
 		}
-		arr := make([]Value, 0, count)
+		arr := make([]Value, 0, safeCapacity(count, cur))
 		for i := uint64(0); i < count; i++ {
-			v, err := decodeValue(cur, t)
+			v, err := decodeValue(cur, t, depth+1)
 			if err != nil {
 				return nil, err
 			}
@@ -481,17 +537,17 @@ func decodeValue(cur *cursor, t *stringTableReader) (Value, error) {
 		if err != nil {
 			return nil, err
 		}
-		obj := NewObjectMap()
+		obj := newObjectCap(safeCapacity(count, cur))
 		for i := uint64(0); i < count; i++ {
 			ki, err := decodeVarint(cur)
 			if err != nil {
 				return nil, err
 			}
-			k, err := t.get(uint32(ki))
+			k, err := t.get(ki)
 			if err != nil {
 				return nil, err
 			}
-			v, err := decodeValue(cur, t)
+			v, err := decodeValue(cur, t, depth+1)
 			if err != nil {
 				return nil, err
 			}
@@ -499,7 +555,7 @@ func decodeValue(cur *cursor, t *stringTableReader) (Value, error) {
 		}
 		return Object_(obj), nil
 	}
-	return nil, fmt.Errorf("unknown type tag 0x%02x", tag)
+	return nil, fmt.Errorf("unknown type tag: 0x%02x", tag)
 }
 
 // ─── metadata encode / decode ───────────────────────────────────────────────
@@ -512,7 +568,7 @@ func encodeConstraints(out *bytes.Buffer, c *Constraints, t *stringTable) {
 	if c.Max != nil {
 		bits |= 0x02
 	}
-	if c.TypeName != "" {
+	if c.hasTypeName() {
 		bits |= 0x04
 	}
 	if c.Required {
@@ -521,7 +577,7 @@ func encodeConstraints(out *bytes.Buffer, c *Constraints, t *stringTable) {
 	if c.Readonly {
 		bits |= 0x10
 	}
-	if c.Pattern != "" {
+	if c.hasPattern() {
 		bits |= 0x20
 	}
 	if c.EnumValues != nil {
@@ -534,121 +590,115 @@ func encodeConstraints(out *bytes.Buffer, c *Constraints, t *stringTable) {
 	if c.Max != nil {
 		encodeF64LE(out, *c.Max)
 	}
-	if c.TypeName != "" {
-		encodeVarint(out, uint64(t.indexOf(c.TypeName)))
+	if c.hasTypeName() {
+		encodeVarint(out, t.indexOf(c.TypeName))
 	}
-	if c.Pattern != "" {
-		encodeVarint(out, uint64(t.indexOf(c.Pattern)))
+	if c.hasPattern() {
+		encodeVarint(out, t.indexOf(c.Pattern))
 	}
 	if c.EnumValues != nil {
 		encodeVarint(out, uint64(len(c.EnumValues)))
 		for _, v := range c.EnumValues {
-			encodeVarint(out, uint64(t.indexOf(v)))
+			encodeVarint(out, t.indexOf(v))
 		}
 	}
 }
 
 func decodeConstraints(cur *cursor, t *stringTableReader) (*Constraints, error) {
 	if cur.pos >= len(cur.data) {
-		return nil, errors.New("unexpected end in constraints")
+		return nil, errors.New("unexpected end of data in constraints")
 	}
 	bits := cur.data[cur.pos]
 	cur.pos++
 	c := &Constraints{}
 	if bits&0x01 != 0 {
-		v, err := decodeF64LE(cur)
+		v, err := decodeF64LE(cur, "truncated min")
 		if err != nil {
 			return nil, err
 		}
 		c.Min = &v
 	}
 	if bits&0x02 != 0 {
-		v, err := decodeF64LE(cur)
+		v, err := decodeF64LE(cur, "truncated max")
 		if err != nil {
 			return nil, err
 		}
 		c.Max = &v
 	}
 	if bits&0x04 != 0 {
-		idx, err := decodeVarint(cur)
+		s, err := decodeIndexed(cur, t)
 		if err != nil {
 			return nil, err
 		}
-		s, err := t.get(uint32(idx))
-		if err != nil {
-			return nil, err
-		}
-		c.TypeName = s
+		c.TypeName, c.typeNameSet = s, true
 	}
-	if bits&0x08 != 0 {
-		c.Required = true
-	}
-	if bits&0x10 != 0 {
-		c.Readonly = true
-	}
+	c.Required = bits&0x08 != 0
+	c.Readonly = bits&0x10 != 0
 	if bits&0x20 != 0 {
-		idx, err := decodeVarint(cur)
+		s, err := decodeIndexed(cur, t)
 		if err != nil {
 			return nil, err
 		}
-		s, err := t.get(uint32(idx))
-		if err != nil {
-			return nil, err
-		}
-		c.Pattern = s
+		c.Pattern, c.patternSet = s, true
 	}
 	if bits&0x40 != 0 {
-		count, err := decodeVarint(cur)
+		vals, err := decodeStrings(cur, t)
 		if err != nil {
 			return nil, err
-		}
-		vals := make([]string, 0, count)
-		for i := uint64(0); i < count; i++ {
-			idx, err := decodeVarint(cur)
-			if err != nil {
-				return nil, err
-			}
-			s, err := t.get(uint32(idx))
-			if err != nil {
-				return nil, err
-			}
-			vals = append(vals, s)
 		}
 		c.EnumValues = vals
 	}
 	return c, nil
 }
 
-func encodeMetadata(out *bytes.Buffer, tree MetadataTree, t *stringTable) {
-	outerKeys := make([]string, 0, len(tree))
-	for k := range tree {
-		outerKeys = append(outerKeys, k)
+func decodeIndexed(cur *cursor, t *stringTableReader) (string, error) {
+	idx, err := decodeVarint(cur)
+	if err != nil {
+		return "", err
 	}
-	sort.Strings(outerKeys)
-	encodeVarint(out, uint64(len(outerKeys)))
-	for _, path := range outerKeys {
-		encodeVarint(out, uint64(t.indexOf(path)))
-		m := tree[path]
-		innerKeys := make([]string, 0, len(m))
-		for k := range m {
-			innerKeys = append(innerKeys, k)
+	return t.get(idx)
+}
+
+func decodeStrings(cur *cursor, t *stringTableReader) ([]string, error) {
+	count, err := decodeVarint(cur)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, safeCapacity(count, cur))
+	for i := uint64(0); i < count; i++ {
+		s, err := decodeIndexed(cur, t)
+		if err != nil {
+			return nil, err
 		}
-		sort.Strings(innerKeys)
-		encodeVarint(out, uint64(len(innerKeys)))
-		for _, fk := range innerKeys {
-			meta := m[fk]
-			encodeVarint(out, uint64(t.indexOf(fk)))
+		out = append(out, s)
+	}
+	return out, nil
+}
+
+func encodeMetadata(out *bytes.Buffer, tree *MetadataTree, t *stringTable) {
+	paths := tree.Paths()
+	sort.Strings(paths)
+	encodeVarint(out, uint64(len(paths)))
+	for _, path := range paths {
+		encodeVarint(out, t.indexOf(path))
+		m := tree.levels[path]
+		keys := m.Keys()
+		sort.Strings(keys)
+		encodeVarint(out, uint64(len(keys)))
+		for _, fk := range keys {
+			meta := m.items[fk]
+			encodeVarint(out, t.indexOf(fk))
 			encodeVarint(out, uint64(len(meta.Markers)))
 			for _, mk := range meta.Markers {
-				encodeVarint(out, uint64(t.indexOf(mk)))
+				encodeVarint(out, t.indexOf(mk))
 			}
 			encodeVarint(out, uint64(len(meta.Args)))
 			for _, a := range meta.Args {
-				encodeVarint(out, uint64(t.indexOf(a)))
+				encodeVarint(out, t.indexOf(a))
 			}
-			if meta.TypeHint != "" {
+			if meta.hasTypeHint() {
 				out.WriteByte(1)
-				encodeVarint(out, uint64(t.indexOf(meta.TypeHint)))
+				encodeVarint(out, t.indexOf(meta.TypeHint))
 			} else {
 				out.WriteByte(0)
 			}
@@ -662,18 +712,14 @@ func encodeMetadata(out *bytes.Buffer, tree MetadataTree, t *stringTable) {
 	}
 }
 
-func decodeMetadata(cur *cursor, t *stringTableReader) (MetadataTree, error) {
+func decodeMetadata(cur *cursor, t *stringTableReader) (*MetadataTree, error) {
 	outer, err := decodeVarint(cur)
 	if err != nil {
 		return nil, err
 	}
-	tree := make(MetadataTree, outer)
+	tree := NewMetadataTree()
 	for i := uint64(0); i < outer; i++ {
-		pi, err := decodeVarint(cur)
-		if err != nil {
-			return nil, err
-		}
-		path, err := t.get(uint32(pi))
+		path, err := decodeIndexed(cur, t)
 		if err != nil {
 			return nil, err
 		}
@@ -681,78 +727,43 @@ func decodeMetadata(cur *cursor, t *stringTableReader) (MetadataTree, error) {
 		if err != nil {
 			return nil, err
 		}
-		m := make(MetaMap, inner)
+		m := NewMetaMap()
 		for j := uint64(0); j < inner; j++ {
-			fki, err := decodeVarint(cur)
-			if err != nil {
-				return nil, err
-			}
-			fk, err := t.get(uint32(fki))
+			fk, err := decodeIndexed(cur, t)
 			if err != nil {
 				return nil, err
 			}
 			var meta Meta
-			mc, err := decodeVarint(cur)
-			if err != nil {
+			if meta.Markers, err = decodeStrings(cur, t); err != nil {
 				return nil, err
 			}
-			for k := uint64(0); k < mc; k++ {
-				idx, err := decodeVarint(cur)
-				if err != nil {
-					return nil, err
-				}
-				s, err := t.get(uint32(idx))
-				if err != nil {
-					return nil, err
-				}
-				meta.Markers = append(meta.Markers, s)
-			}
-			ac, err := decodeVarint(cur)
-			if err != nil {
+			if meta.Args, err = decodeStrings(cur, t); err != nil {
 				return nil, err
-			}
-			for k := uint64(0); k < ac; k++ {
-				idx, err := decodeVarint(cur)
-				if err != nil {
-					return nil, err
-				}
-				s, err := t.get(uint32(idx))
-				if err != nil {
-					return nil, err
-				}
-				meta.Args = append(meta.Args, s)
 			}
 			if cur.pos >= len(cur.data) {
-				return nil, errors.New("unexpected end in meta (type_hint flag)")
+				return nil, errors.New("unexpected end in meta")
 			}
 			hasTh := cur.data[cur.pos]
 			cur.pos++
 			if hasTh != 0 {
-				idx, err := decodeVarint(cur)
-				if err != nil {
+				if meta.TypeHint, err = decodeIndexed(cur, t); err != nil {
 					return nil, err
 				}
-				s, err := t.get(uint32(idx))
-				if err != nil {
-					return nil, err
-				}
-				meta.TypeHint = s
+				meta.typeHintSet = true
 			}
 			if cur.pos >= len(cur.data) {
-				return nil, errors.New("unexpected end in meta (constraints flag)")
+				return nil, errors.New("unexpected end in meta")
 			}
 			hasC := cur.data[cur.pos]
 			cur.pos++
 			if hasC != 0 {
-				c, err := decodeConstraints(cur, t)
-				if err != nil {
+				if meta.Constraints, err = decodeConstraints(cur, t); err != nil {
 					return nil, err
 				}
-				meta.Constraints = c
 			}
-			m[fk] = meta
+			m.Set(fk, meta)
 		}
-		tree[path] = m
+		tree.Set(path, m)
 	}
 	return tree, nil
 }
@@ -760,8 +771,8 @@ func decodeMetadata(cur *cursor, t *stringTableReader) (MetadataTree, error) {
 func encodeIncludes(out *bytes.Buffer, incs []IncludeDirective, t *stringTable) {
 	encodeVarint(out, uint64(len(incs)))
 	for _, inc := range incs {
-		encodeVarint(out, uint64(t.indexOf(inc.Path)))
-		encodeVarint(out, uint64(t.indexOf(inc.Alias)))
+		encodeVarint(out, t.indexOf(inc.Path))
+		encodeVarint(out, t.indexOf(inc.Alias))
 	}
 }
 
@@ -770,21 +781,13 @@ func decodeIncludes(cur *cursor, t *stringTableReader) ([]IncludeDirective, erro
 	if err != nil {
 		return nil, err
 	}
-	out := make([]IncludeDirective, 0, count)
+	out := make([]IncludeDirective, 0, safeCapacity(count, cur))
 	for i := uint64(0); i < count; i++ {
-		pi, err := decodeVarint(cur)
+		p, err := decodeIndexed(cur, t)
 		if err != nil {
 			return nil, err
 		}
-		ai, err := decodeVarint(cur)
-		if err != nil {
-			return nil, err
-		}
-		p, err := t.get(uint32(pi))
-		if err != nil {
-			return nil, err
-		}
-		a, err := t.get(uint32(ai))
+		a, err := decodeIndexed(cur, t)
 		if err != nil {
 			return nil, err
 		}

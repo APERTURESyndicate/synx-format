@@ -1,0 +1,7 @@
+!synxl 1
+!fields id ; body[block]
+
+1
+  k 1
+    other 2
+  body hello

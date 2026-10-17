@@ -2,26 +2,27 @@
 class_name SynxFormatter
 extends RefCounted
 
-# Canonical formatter: re-emit .synx text with sorted keys and stable spacing.
-# Mirrors `fmt_canonical` in synx-core/src/lib.rs.
-#
-# Rules:
-#   • Directive lines (!active/!lock/!tool/!schema/!llm) preserved at the top.
-#   • Comments stripped.
-#   • Keys at every nesting level sorted alphabetically (case-insensitive,
-#     stripping marker/constraint/type-hint suffix when computing sort key).
-#   • Exactly 2 spaces per nesting level.
-#   • One blank line between top-level blocks.
+# Canonical formatter — synx-core `fmt_canonical`:
+#   • directive lines (!active/!lock/!tool/!schema/!llm/#!mode:active) at the top
+#   • comments stripped
+#   • keys sorted at every level by their name, lowercased, by code point;
+#     the sort is stable (a repeated key keeps document order, so the last
+#     one still wins)
+#   • exactly 2 spaces per level; one blank line after a top-level block
+#   • a `|` / `|+` body is content: never parsed as keys nor sorted; a `|+`
+#     body keeps its indentation relative to its first line
+#   • nesting is capped at 128 (a deeper subtree is dropped)
 
 const MAX_FMT_PARSE_DEPTH: int = 128
 
 
 static func format(text: String) -> String:
-	var lines: PackedStringArray = text.split("\n", true)
-	var directives: Array[String] = []
+	text = SynxParser.clamp_text(text)
+	var lines := _lines(text)
+	var directives := PackedStringArray()
 	var body_start := 0
 	for i in lines.size():
-		var t := String(lines[i]).strip_edges()
+		var t := SynxText.trim(lines[i])
 		if t == "!active" or t == "!lock" or t == "!tool" or t == "!schema" or t == "!llm" or t == "#!mode:active":
 			directives.append(t)
 			body_start = i + 1
@@ -29,36 +30,76 @@ static func format(text: String) -> String:
 			body_start = i + 1
 		else:
 			break
-
 	var parsed := _parse(lines, body_start, 0, 0)
-	var nodes: Array = parsed["nodes"]
+	var nodes: Array = parsed[0]
 	_sort(nodes)
-
-	var out := ""
-	if directives.size() > 0:
-		out = "\n".join(directives) + "\n\n"
-	var sink: Array[String] = []
-	_emit(nodes, 0, sink)
-	out += "".join(sink)
-	# Trim trailing newlines, append exactly one.
-	var trimmed := out.rstrip("\n ")
-	return trimmed + "\n"
+	var out := PackedStringArray()
+	if not directives.is_empty():
+		out.append("\n".join(directives))
+		out.append("\n\n")
+	_emit(nodes, 0, out)
+	return SynxText.trim_end("".join(out)) + "\n"
 
 
-# Returns { "nodes": Array, "next": int }.
-static func _parse(lines: PackedStringArray, start: int, base: int, depth: int) -> Dictionary:
+# Rust `str::lines`: split on "\n", drop one trailing "\r" per line, no line
+# after a final newline.
+static func _lines(text: String) -> PackedStringArray:
+	var lines := text.split("\n")
+	if not lines.is_empty() and lines[lines.size() - 1].is_empty():
+		lines.resize(lines.size() - 1)
+	for i in lines.size():
+		var l := lines[i]
+		if l.ends_with("\r"):
+			lines[i] = l.substr(0, l.length() - 1)
+	return lines
+
+
+# UTF-8 bytes of the leading Unicode whitespace.
+static func _indent_of(line: String) -> int:
+	var w := 0
+	for i in line.length():
+		var c := line.unicode_at(i)
+		if not SynxText.is_ws(c):
+			break
+		w += SynxText.utf8_width(c)
+	return w
+
+
+# Byte offset → character offset of at most `limit` bytes of leading
+# whitespace, ending on a whole character.
+static func _ws_prefix_chars(s: String, limit: int) -> int:
+	var off := 0
+	var i := 0
+	while i < s.length():
+		var c := s.unicode_at(i)
+		if off >= limit or not SynxText.is_ws(c):
+			break
+		off += SynxText.utf8_width(c)
+		i += 1
+	return i
+
+
+# [nodes, next_line]; a node is [header, children, list_items].
+static func _parse(lines: PackedStringArray, start: int, base: int, depth: int) -> Array:
 	if depth > MAX_FMT_PARSE_DEPTH:
-		return {"nodes": [], "next": start}
+		# Past the cap the whole subtree is dropped: its lines are consumed up
+		# to the next one above this level (synx-core `fmt_parse`).
+		var j := start
+		while j < lines.size():
+			if not SynxText.trim(lines[j]).is_empty() and _indent_of(lines[j]) < base:
+				break
+			j += 1
+		return [[], j]
 	var nodes: Array = []
 	var i := start
 	var n := lines.size()
 	while i < n:
-		var raw := String(lines[i])
-		var t := raw.strip_edges()
+		var raw := lines[i]
+		var t := SynxText.trim(raw)
 		if t.is_empty():
 			i += 1
 			continue
-		var ind: int = raw.length() - raw.lstrip(" \t").length()
+		var ind := _indent_of(raw)
 		if ind < base:
 			break
 		if ind > base:
@@ -67,66 +108,73 @@ static func _parse(lines: PackedStringArray, start: int, base: int, depth: int) 
 		if t.begins_with("- ") or t.begins_with("#") or t.begins_with("//"):
 			i += 1
 			continue
-		var is_multiline := t.ends_with(" |") or t == "|"
-		var node := {
-			"header": t,
-			"children": [],
-			"list_items": [],
-			"is_multiline": is_multiline,
-		}
+		var preserve := t.ends_with(" |+") or t == "|+"
+		var multiline := preserve or t.ends_with(" |") or t == "|"
+		var block_base := -1
+		var children: Array = []
+		var items := PackedStringArray()
 		i += 1
 		while i < n:
-			var cr := String(lines[i])
-			var ct := cr.strip_edges()
+			var cr := lines[i]
+			var ct := SynxText.trim(cr)
 			if ct.is_empty():
 				i += 1
 				continue
-			var ci: int = cr.length() - cr.lstrip(" \t").length()
+			var ci := _indent_of(cr)
 			if ci <= base:
 				break
-			if node["is_multiline"] or ct.begins_with("- "):
-				(node["list_items"] as Array).append(ct)
+			if preserve:
+				if block_base < 0:
+					block_base = ci
+				var body := SynxText.trim_end(cr)
+				items.append(body.substr(_ws_prefix_chars(body, mini(block_base, ci))))
+				i += 1
+			elif multiline or ct.begins_with("- "):
+				items.append(ct)
 				i += 1
 			elif ct.begins_with("#") or ct.begins_with("//"):
 				i += 1
 			else:
 				var sub := _parse(lines, i, ci, depth + 1)
-				(node["children"] as Array).append_array(sub["nodes"])
-				i = sub["next"]
-		nodes.append(node)
-	return {"nodes": nodes, "next": i}
+				children.append_array(sub[0])
+				i = sub[1]
+		nodes.append([t, children, items])
+	return [nodes, i]
 
 
 static func _sort_key(header: String) -> String:
-	# Take everything before the first whitespace/[/:/( character — matches Rust.
-	var n := header.length()
-	for i in n:
-		var ch := header.unicode_at(i)
-		if ch == 32 or ch == 9 or ch == 91 or ch == 58 or ch == 40:
+	for i in header.length():
+		var c := header.unicode_at(i)
+		if c == 91 or c == 58 or c == 40 or SynxText.is_ws(c):
 			return header.substr(0, i).to_lower()
 	return header.to_lower()
 
 
 static func _sort(nodes: Array) -> void:
-	nodes.sort_custom(func(a, b): return SynxFormatter._sort_key(a["header"]) < SynxFormatter._sort_key(b["header"]))
+	if nodes.size() > 1:
+		var keyed: Array = []
+		for i in nodes.size():
+			keyed.append([_sort_key(nodes[i][0]), i, nodes[i]])
+		keyed.sort_custom(func(a: Array, b: Array) -> bool:
+			if a[0] != b[0]:
+				return a[0] < b[0]
+			return a[1] < b[1])
+		for i in keyed.size():
+			nodes[i] = keyed[i][2]
 	for node in nodes:
-		SynxFormatter._sort(node["children"])
+		_sort(node[1])
 
 
-static func _emit(nodes: Array, indent: int, sink: Array[String]) -> void:
+static func _emit(nodes: Array, indent: int, out: PackedStringArray) -> void:
 	var sp := " ".repeat(indent)
 	var item_sp := " ".repeat(indent + 2)
-	for n in nodes:
-		sink.append(sp)
-		sink.append(n["header"])
-		sink.append("\n")
-		var children: Array = n["children"]
-		if children.size() > 0:
-			_emit(children, indent + 2, sink)
-		var items: Array = n["list_items"]
+	for node in nodes:
+		out.append(sp + String(node[0]) + "\n")
+		var children: Array = node[1]
+		if not children.is_empty():
+			_emit(children, indent + 2, out)
+		var items: PackedStringArray = node[2]
 		for li in items:
-			sink.append(item_sp)
-			sink.append(String(li))
-			sink.append("\n")
-		if indent == 0 and (children.size() > 0 or items.size() > 0):
-			sink.append("\n")
+			out.append(item_sp + li + "\n")
+		if indent == 0 and (not children.is_empty() or not items.is_empty()):
+			out.append("\n")

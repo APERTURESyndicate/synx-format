@@ -14,7 +14,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { parseData } from './parser';
 import { resolve, SynxSecret } from './engine';
-import { toCanonicalJSONString } from './json';
+import { toCanonicalJSONString, compareUnicodeScalar } from './json';
 import {
   parseSynxl,
   streamSynxl,
@@ -22,6 +22,7 @@ import {
   synxlToJSON,
   synxlToNDJSON,
   writeSynxl,
+  writeSynxBody,
   splitRecordLine as synxlSplitRecordLine,
   utf8Length as synxlUtf8Length,
   SYNXL_VERSION,
@@ -277,7 +278,11 @@ class Synx {
     if (active) {
       out += '!active\n';
     }
-    out += serializeObject(obj, 0);
+    // spec: the round-trip block writer (SYNXL §14.1) — strings that would
+    // cast or be cut as a comment are quoted or carried as `|+`, multi-line
+    // text keeps its relative indent. The previous writer quoted nothing
+    // (`"007"` came back as 7) and printed objects in list items as [object Object].
+    out += writeSynxBody(obj);
     return out;
   }
 
@@ -633,11 +638,13 @@ class Synx {
     stripMetadata(parsed.root);
     const valueTree = parsed.root;
 
-    const strings: string[] = [];
+    let strings: string[] = [];
     const stringIndex = new Map<string, number>();
+    const uses: number[] = [];
 
     function internString(s: string): number {
-      if (stringIndex.has(s)) return stringIndex.get(s)!;
+      const known = stringIndex.get(s);
+      if (known !== undefined) return known;
       const idx = strings.length;
       strings.push(s);
       stringIndex.set(s, idx);
@@ -645,21 +652,28 @@ class Synx {
     }
 
     // First pass: collect strings (keys + string values) so the string table
-    // is written before encoded values reference it.
+    // is written before encoded values reference it, counting each use.
     function collectStrings(val: unknown): void {
       if (val === null || val === undefined) return;
-      if (typeof val === 'string') { internString(val); return; }
+      if (typeof val === 'string') { const i = internString(val); uses[i] = (uses[i] ?? 0) + 1; return; }
       if (Array.isArray(val)) { val.forEach(collectStrings); return; }
       if (typeof val === 'object') {
-        // Sort keys deterministically; matches Rust `entries.sort_unstable_by_key`.
-        const keys = Object.keys(val as Record<string, unknown>).sort();
-        for (const k of keys) {
-          internString(k);
+        for (const k of Object.keys(val as Record<string, unknown>)) {
+          const i = internString(k);
+          uses[i] = (uses[i] ?? 0) + 1;
           collectStrings((val as Record<string, unknown>)[k]);
         }
       }
     }
     collectStrings(valueTree);
+    // Most-used strings first (ties in first-seen order), as synx-core does:
+    // one-byte varints for the frequent ones and a regular index stream that
+    // deflate compresses well. The reader is indifferent to the order.
+    {
+      const order = strings.map((_, i) => i).sort((a, b) => (uses[b] - uses[a]) || (a - b));
+      strings = order.map((i) => strings[i]);
+      strings.forEach((str, i) => stringIndex.set(str, i));
+    }
 
     // Build the *uncompressed* payload (string table || value tree).
     const payload: number[] = [];
@@ -680,10 +694,17 @@ class Synx {
           writeZigzag(payload, val);
         } else {
           payload.push(0x04);
-          const view = new DataView(new ArrayBuffer(8));
-          view.setFloat64(0, val, true);
-          for (let i = 0; i < 8; i++) payload.push(view.getUint8(i));
+          FLOAT_SCRATCH.setFloat64(0, val, true);
+          for (let i = 0; i < 8; i++) payload.push(FLOAT_SCRATCH.getUint8(i));
         }
+        return;
+      }
+      // An integer beyond 2^53 is a bigint: it is an i64 like any other INT.
+      // It had no branch here, so nothing was written for it and every later
+      // value was read from the wrong offset.
+      if (typeof val === 'bigint') {
+        payload.push(0x03);
+        writeZigzag(payload, val);
         return;
       }
       if (typeof val === 'string') {
@@ -883,12 +904,12 @@ class Synx {
     if (header) header += '\n';
     // A well-formed `.synxb` has an object root, but a crafted file can carry a
     // bare scalar/null/array. Rust's decompiler renders that as a primitive
-    // line; matching it here keeps `serializeObject` from being handed a
+    // line; matching it here keeps the block writer from being handed a
     // non-object (it did `Object.entries(null)` and threw).
     if (value === null || typeof value !== 'object' || Array.isArray(value)) {
       return header + primitiveToSynx(value) + '\n';
     }
-    return header + serializeObject(value as SynxObject, 0);
+    return header + writeSynxBody(value as SynxObject);
   }
 
   /**
@@ -1115,8 +1136,18 @@ function writeVarintBig(buf: number[], value: bigint): void {
 
 function writeVarint(buf: number[], value: number): void {
   if (value < 0 || !Number.isFinite(value)) throw new SynxError('varint cannot encode this value');
-  writeVarintBig(buf, BigInt(Math.trunc(value)));
+  let v = Math.trunc(value);
+  if (v > Number.MAX_SAFE_INTEGER) { writeVarintBig(buf, BigInt(v)); return; }
+  // perf: plain arithmetic — the BigInt round trip ran for every varint.
+  while (v > 0x7f) {
+    buf.push((v % 0x80) | 0x80);
+    v = Math.floor(v / 0x80);
+  }
+  buf.push(v);
 }
+
+/** Scratch for float encoding — a DataView per float was allocated before. */
+const FLOAT_SCRATCH = new DataView(new ArrayBuffer(8));
 
 function readVarintBig(data: Uint8Array | Buffer, offset: number): [bigint, number] {
   let result = 0n;
@@ -1131,23 +1162,58 @@ function readVarintBig(data: Uint8Array | Buffer, offset: number): [bigint, numb
   return [result, offset];
 }
 
+/**
+ * A varint of up to 7 bytes (49 bits) as a plain number, or -1 in `fastEnd`
+ * when it is longer or truncated and needs the BigInt reader.
+ * perf: every index and length went through BigInt before.
+ */
+let fastEnd = 0;
+function readVarintFast(data: Uint8Array | Buffer, offset: number): number {
+  let result = 0;
+  let mul = 1;
+  for (let i = 0; i < 7 && offset < data.length; i++) {
+    const byte = data[offset++];
+    result += (byte & 0x7f) * mul;
+    if ((byte & 0x80) === 0) { fastEnd = offset; return result; }
+    mul *= 128;
+  }
+  fastEnd = -1;
+  return 0;
+}
+
 function readVarint(data: Uint8Array | Buffer, offset: number): [number, number] {
+  const v = readVarintFast(data, offset);
+  if (fastEnd >= 0) return [v, fastEnd];
   const [big, o] = readVarintBig(data, offset);
   return [Number(big), o];
 }
 
-function writeZigzag(buf: number[], value: number): void {
+function writeZigzag(buf: number[], value: number | bigint): void {
+  // perf: within ±2^52 the doubled magnitude is still exact as a number.
+  if (typeof value === 'number' && Math.abs(value) <= 2 ** 52) {
+    const v = Math.trunc(value);
+    writeVarint(buf, v >= 0 ? v * 2 : -v * 2 - 1);
+    return;
+  }
   // zigzag: (n << 1) ^ (n >> 63), kept in BigInt so the doubled magnitude never
   // rounds before it is written.
-  const n = BigInt(Math.trunc(value));
+  const n = typeof value === 'bigint' ? value : BigInt(Math.trunc(value));
   const zz = ((n << 1n) ^ (n >> 63n)) & ((1n << 64n) - 1n);
   writeVarintBig(buf, zz);
 }
 
-function readZigzag(data: Uint8Array | Buffer, offset: number): [number, number] {
+function readZigzag(data: Uint8Array | Buffer, offset: number): [number | bigint, number] {
+  const fast = readVarintFast(data, offset);
+  if (fastEnd >= 0) {
+    // ≤ 49 bits: the zigzag halving is exact as a number.
+    return [fast % 2 === 0 ? fast / 2 : -(fast + 1) / 2, fastEnd];
+  }
   const [raw, newOffset] = readVarintBig(data, offset);
-  const value = (raw >> 1n) ^ -(raw & 1n);
-  return [Number(value), newOffset];
+  const value = BigInt.asIntN(64, (raw >> 1n) ^ -(raw & 1n));
+  // An integer beyond 2^53 stays exact as a bigint, as the parser returns it;
+  // `Number()` rounded it to a neighbouring id.
+  const n = Number(value);
+  return [Number.isSafeInteger(n) ? n : value, newOffset];
 }
 
 function deepEqual(a: unknown, b: unknown): boolean {
@@ -1184,47 +1250,6 @@ function primitiveToSynx(v: unknown): string {
   return '[Object]';
 }
 
-function serializeObject(obj: SynxObject, indent: number): string {
-  let out = '';
-  const spaces = ' '.repeat(indent);
-
-  for (const [key, val] of Object.entries(obj)) {
-    if (Array.isArray(val)) {
-      out += `${spaces}${key}\n`;
-      for (const item of val) {
-        if (item instanceof SynxSecret) {
-          out += `${spaces}  - ${String(item)}\n`;
-        } else if (item && typeof item === 'object' && !Array.isArray(item)) {
-          const entries = Object.entries(item as SynxObject);
-          if (entries.length > 0) {
-            const [firstKey, firstVal] = entries[0];
-            out += `${spaces}  - ${firstKey} ${firstVal}\n`;
-            for (let i = 1; i < entries.length; i++) {
-              out += `${spaces}    ${entries[i][0]} ${entries[i][1]}\n`;
-            }
-          }
-        } else {
-          out += `${spaces}  - ${item}\n`;
-        }
-      }
-    } else if (val instanceof SynxSecret) {
-      out += `${spaces}${key} ${String(val)}\n`;
-    } else if (val && typeof val === 'object') {
-      out += `${spaces}${key}\n`;
-      out += serializeObject(val as SynxObject, indent + 2);
-    } else if (typeof val === 'string' && val.includes('\n')) {
-      out += `${spaces}${key} |\n`;
-      for (const line of val.split('\n')) {
-        out += `${spaces}  ${line}\n`;
-      }
-    } else {
-      out += `${spaces}${key} ${val}\n`;
-    }
-  }
-
-  return out;
-}
-
 // ─── Canonical Formatter ──────────────────────────────────
 
 interface FmtNode {
@@ -1234,7 +1259,23 @@ interface FmtNode {
   isMultiline: boolean;
 }
 
-function fmtParse(lines: string[], start: number, base: number): [FmtNode[], number] {
+/** Same nesting cap as the Rust formatter; deeper input is dropped, not recursed into. */
+const MAX_FMT_PARSE_DEPTH = 128;
+
+function fmtParse(lines: string[], start: number, base: number, depth = 0): [FmtNode[], number] {
+  // safety: unbounded recursion overflowed the stack on a deeply nested file.
+  if (depth > MAX_FMT_PARSE_DEPTH) {
+    // The subtree is dropped but its lines are consumed: returning `start`
+    // left the caller on the same line forever, so a file nested deeper than
+    // the cap hung `format` (as it did in synx-core).
+    let i = start;
+    while (i < lines.length) {
+      const raw = lines[i];
+      if (raw.trim() && raw.search(/\S/) < base) break;
+      i++;
+    }
+    return [[], i];
+  }
   const nodes: FmtNode[] = [];
   let i = start;
   while (i < lines.length) {
@@ -1245,8 +1286,13 @@ function fmtParse(lines: string[], start: number, base: number): [FmtNode[], num
     if (ind < base) break;
     if (ind > base) { i++; continue; }
     if (t.startsWith('- ') || t.startsWith('#') || t.startsWith('//')) { i++; continue; }
-    const isMultiline = t.trimEnd().endsWith(' |') || t === '|';
+    // spec: `|+` opens a block too. Read as a header, its body lines were
+    // parsed as child keys and sorted — reordering the text of a code sample
+    // or prompt. Its lines keep their indent relative to the first.
+    const preserve = t.endsWith(' |+') || t === '|+';
+    const isMultiline = preserve || t.endsWith(' |') || t === '|';
     const node: FmtNode = { header: t, children: [], listItems: [], isMultiline };
+    let blockBase = -1;
     i++;
     while (i < lines.length) {
       const cr = lines[i];
@@ -1254,14 +1300,19 @@ function fmtParse(lines: string[], start: number, base: number): [FmtNode[], num
       if (!ct) { i++; continue; }
       const ci = cr.search(/\S/);
       if (ci <= base) break;
-      if (isMultiline || ct.startsWith('- ')) {
+      if (preserve) {
+        if (blockBase < 0) blockBase = ci;
+        node.listItems.push(cr.substring(Math.min(ci, blockBase)).trimEnd());
+        i++;
+      } else if (isMultiline || ct.startsWith('- ')) {
         node.listItems.push(ct);
         i++;
       } else if (ct.startsWith('#') || ct.startsWith('//')) {
         i++;
       } else {
-        const [subs, ni] = fmtParse(lines, i, ci);
-        node.children.push(...subs);
+        const [subs, ni] = fmtParse(lines, i, ci, depth + 1);
+        // A loop, not push(...subs): spreading 100k+ siblings overflows the stack.
+        for (const sub of subs) node.children.push(sub);
         i = ni;
       }
     }
@@ -1271,11 +1322,13 @@ function fmtParse(lines: string[], start: number, base: number): [FmtNode[], num
 }
 
 function fmtSort(nodes: FmtNode[]): void {
-  nodes.sort((a, b) => {
-    const ka = a.header.split(/[\s\[:(]/)[0].toLowerCase();
-    const kb = b.header.split(/[\s\[:(]/)[0].toLowerCase();
-    return ka.localeCompare(kb);
-  });
+  // spec: code-point order of the lowercased key, as synx-core sorts.
+  // `localeCompare` depended on the machine's locale (and ignores punctuation
+  // in most), so the "canonical" form differed between machines and
+  // implementations. perf: each key is computed once, not per comparison.
+  const keyed = nodes.map((n) => ({ n, k: n.header.split(/[\s\[:(]/)[0].toLowerCase() }));
+  keyed.sort((a, b) => compareUnicodeScalar(a.k, b.k));
+  for (let i = 0; i < nodes.length; i++) nodes[i] = keyed[i].n;
   for (const n of nodes) fmtSort(n.children);
 }
 

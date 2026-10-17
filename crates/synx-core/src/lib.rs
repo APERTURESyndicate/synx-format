@@ -25,7 +25,7 @@ pub mod wasm;
 #[cfg(feature = "signing")]
 pub mod signing;
 
-pub use value::{Value, Mode, ParseResult, Meta, MetaMap, Options, Constraints, IncludeDirective, UseDirective};
+pub use value::{Value, Map, MapHasher, Mode, ParseResult, Meta, MetaMap, Options, Constraints, IncludeDirective, UseDirective};
 pub use schema_json::{metadata_to_json_schema, value_to_json_value};
 #[cfg(feature = "jsonschema")]
 pub use schema_json::{validate_serde_json, validate_with_json_schema};
@@ -45,23 +45,23 @@ pub struct Synx;
 
 impl Synx {
     /// Parse a SYNX string into a key-value map (static mode only).
-    pub fn parse(text: &str) -> std::collections::HashMap<String, Value> {
+    pub fn parse(text: &str) -> crate::Map {
         let result = parse(text);
         match result.root {
             Value::Object(map) => map,
-            _ => std::collections::HashMap::new(),
+            _ => Map::default(),
         }
     }
 
     /// Parse with full engine resolution (!active mode).
-    pub fn parse_active(text: &str, opts: &Options) -> std::collections::HashMap<String, Value> {
+    pub fn parse_active(text: &str, opts: &Options) -> crate::Map {
         let mut result = parse(text);
         if result.mode == Mode::Active {
             resolve(&mut result, opts);
         }
         match result.root {
             Value::Object(map) => map,
-            _ => std::collections::HashMap::new(),
+            _ => Map::default(),
         }
     }
 
@@ -74,7 +74,7 @@ impl Synx {
     ///
     /// If the text is also `!active`, markers (`:env`, `:default`, etc.)
     /// are resolved before reshaping.
-    pub fn parse_tool(text: &str, opts: &Options) -> std::collections::HashMap<String, Value> {
+    pub fn parse_tool(text: &str, opts: &Options) -> crate::Map {
         let mut result = parse(text);
         if result.mode == Mode::Active {
             resolve(&mut result, opts);
@@ -82,7 +82,7 @@ impl Synx {
         let shaped = reshape_tool_output(&result.root, result.schema);
         match shaped {
             Value::Object(map) => map,
-            _ => std::collections::HashMap::new(),
+            _ => Map::default(),
         }
     }
 
@@ -151,8 +151,8 @@ impl Synx {
     ///
     /// Returns added / removed / changed / unchanged keys.
     pub fn diff(
-        a: &std::collections::HashMap<String, Value>,
-        b: &std::collections::HashMap<String, Value>,
+        a: &crate::Map,
+        b: &crate::Map,
     ) -> DiffResult {
         diff::diff(a, b)
     }
@@ -165,76 +165,21 @@ fn serialize(value: &Value, depth_lvl: usize) -> String {
     if depth_lvl > MAX_SERIALIZE_DEPTH {
         return "[synx:max-depth]\n".to_string();
     }
-    let indent = depth_lvl * 2;
     match value {
+        // spec: written so that parsing reads back the same data — the SYNXL
+        // block writer (§14.1 round-trip): strings that would cast or be cut
+        // as a comment are quoted or carried as `|+`, multi-line text keeps
+        // its relative indent, list objects lead with a key that fits the
+        // `- ` line. The previous writer quoted nothing (`"007"` came back as
+        // 7, `"true"` as a bool), wrote `|+` bodies as `|` (code lost its
+        // indent) and printed objects inside list items as `[Object]`.
         Value::Object(map) => {
             let mut out = String::new();
-            let spaces = " ".repeat(indent);
             // Sort keys for deterministic output
             let mut keys: Vec<&str> = map.keys().map(|k| k.as_str()).collect();
             keys.sort_unstable();
             for key in keys {
-                let val = &map[key];
-                match val {
-                    Value::Array(arr) => {
-                        out.push_str(&spaces);
-                        out.push_str(key);
-                        out.push('\n');
-                        for item in arr {
-                            match item {
-                                Value::Object(inner) => {
-                                    let entries: Vec<_> = inner.iter().collect();
-                                    if let Some((k, v)) = entries.first() {
-                                        out.push_str(&spaces);
-                                        out.push_str("  - ");
-                                        out.push_str(k);
-                                        out.push(' ');
-                                        out.push_str(&format_primitive(v));
-                                        out.push('\n');
-                                        for (k, v) in entries.iter().skip(1) {
-                                            out.push_str(&spaces);
-                                            out.push_str("    ");
-                                            out.push_str(k);
-                                            out.push(' ');
-                                            out.push_str(&format_primitive(v));
-                                            out.push('\n');
-                                        }
-                                    }
-                                }
-                                _ => {
-                                    out.push_str(&spaces);
-                                    out.push_str("  - ");
-                                    out.push_str(&format_primitive(item));
-                                    out.push('\n');
-                                }
-                            }
-                        }
-                    }
-                    Value::Object(_) => {
-                        out.push_str(&spaces);
-                        out.push_str(key);
-                        out.push('\n');
-                        out.push_str(&serialize(val, depth_lvl + 1));
-                    }
-                    Value::String(s) if s.contains('\n') => {
-                        out.push_str(&spaces);
-                        out.push_str(key);
-                        out.push_str(" |\n");
-                        for line in s.lines() {
-                            out.push_str(&spaces);
-                            out.push_str("  ");
-                            out.push_str(line);
-                            out.push('\n');
-                        }
-                    }
-                    _ => {
-                        out.push_str(&spaces);
-                        out.push_str(key);
-                        out.push(' ');
-                        out.push_str(&format_primitive(val));
-                        out.push('\n');
-                    }
-                }
+                synxl::write_synx_entry(&mut out, key, &map[key], depth_lvl * 2, depth_lvl);
             }
             out
         }
@@ -264,6 +209,40 @@ fn format_primitive(value: &Value) -> String {
 /// Max nesting for JSON emission (matches stringify guard).
 const MAX_JSON_DEPTH: usize = 128;
 
+/// Write `s` as a JSON string literal.
+///
+/// perf: unescaped runs are copied whole; the previous loop pushed one `char`
+/// at a time and formatted control characters through `format!`. Every byte
+/// that needs escaping is ASCII, so scanning bytes never splits a character.
+fn write_json_str(out: &mut String, s: &str) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    out.push('"');
+    let bytes = s.as_bytes();
+    let mut start = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        let esc = match b {
+            b'"' => "\\\"",
+            b'\\' => "\\\\",
+            b'\n' => "\\n",
+            b'\r' => "\\r",
+            b'\t' => "\\t",
+            0..=0x1f => "",
+            _ => continue,
+        };
+        out.push_str(&s[start..i]);
+        if esc.is_empty() {
+            out.push_str("\\u00");
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 0xf) as usize] as char);
+        } else {
+            out.push_str(esc);
+        }
+        start = i + 1;
+    }
+    out.push_str(&s[start..]);
+    out.push('"');
+}
+
 /// Write a Value as JSON string (for FFI output).
 pub fn write_json(out: &mut String, val: &Value) {
     write_json_depth(out, val, 0);
@@ -291,23 +270,7 @@ fn write_json_depth(out: &mut String, val: &Value, depth: usize) {
                 out.push_str(buf.format(*f));
             }
         }
-        Value::String(s) => {
-            out.push('"');
-            for ch in s.chars() {
-                match ch {
-                    '"' => out.push_str("\\\""),
-                    '\\' => out.push_str("\\\\"),
-                    '\n' => out.push_str("\\n"),
-                    '\r' => out.push_str("\\r"),
-                    '\t' => out.push_str("\\t"),
-                    c if (c as u32) < 0x20 => {
-                        out.push_str(&format!("\\u{:04x}", c as u32));
-                    }
-                    c => out.push(c),
-                }
-            }
-            out.push('"');
-        }
+        Value::String(s) => write_json_str(out, s),
         Value::Secret(_) => {
             // Secrets MUST never appear in JSON output. Per the README contract
             // ("`:secret` → не попадёт в логи"), we emit a fixed redaction
@@ -334,21 +297,8 @@ fn write_json_depth(out: &mut String, val: &Value, depth: usize) {
                 if !first { out.push(','); }
                 first = false;
                 // Escape the key the same way string values are escaped
-                out.push('"');
-                for ch in key.chars() {
-                    match ch {
-                        '"'  => out.push_str("\\\""),
-                        '\\' => out.push_str("\\\\"),
-                        '\n' => out.push_str("\\n"),
-                        '\r' => out.push_str("\\r"),
-                        '\t' => out.push_str("\\t"),
-                        c if (c as u32) < 0x20 => {
-                            out.push_str(&format!("\\u{:04x}", c as u32));
-                        }
-                        c => out.push(c),
-                    }
-                }
-                out.push_str("\":");
+                write_json_str(out, key);
+                out.push(':');
                 write_json_depth(out, val, depth + 1);
             }
             out.push('}');
@@ -380,7 +330,18 @@ const MAX_FMT_PARSE_DEPTH: usize = 128;
 
 fn fmt_parse(lines: &[&str], start: usize, base: usize, depth: usize) -> (Vec<FmtNode>, usize) {
     if depth > MAX_FMT_PARSE_DEPTH {
-        return (Vec::new(), start);
+        // safety: the subtree is dropped, but its lines are consumed —
+        // returning `start` left the caller on the same line forever, so a
+        // file nested deeper than the cap hung `format`.
+        let mut i = start;
+        while i < lines.len() {
+            let raw = lines[i];
+            if !raw.trim().is_empty() && fmt_indent(raw) < base {
+                break;
+            }
+            i += 1;
+        }
+        return (Vec::new(), i);
     }
     let mut nodes = Vec::new();
     let mut i = start;
@@ -392,7 +353,12 @@ fn fmt_parse(lines: &[&str], start: usize, base: usize, depth: usize) -> (Vec<Fm
         if ind < base { break; }
         if ind > base { i += 1; continue; }
         if t.starts_with("- ") || t.starts_with('#') || t.starts_with("//") { i += 1; continue; }
-        let is_multiline = t.ends_with(" |") || t == "|";
+        // spec: `|+` opens a block too. Read as a header, its body lines were
+        // parsed as child keys and sorted — reordering the text of a code
+        // sample or prompt. Its lines keep their indent relative to the first.
+        let preserve = t.ends_with(" |+") || t == "|+";
+        let is_multiline = preserve || t.ends_with(" |") || t == "|";
+        let mut block_base: Option<usize> = None;
         let mut node = FmtNode {
             header: t.to_string(),
             children: Vec::new(),
@@ -406,7 +372,13 @@ fn fmt_parse(lines: &[&str], start: usize, base: usize, depth: usize) -> (Vec<Fm
             if ct.is_empty() { i += 1; continue; }
             let ci = fmt_indent(cr);
             if ci <= base { break; }
-            if node.is_multiline || ct.starts_with("- ") {
+            if preserve {
+                let b = *block_base.get_or_insert(ci);
+                let body = cr.trim_end();
+                let cut = ws_prefix_len(body, b.min(ci));
+                node.list_items.push(body[cut..].to_string());
+                i += 1;
+            } else if node.is_multiline || ct.starts_with("- ") {
                 node.list_items.push(ct.to_string());
                 i += 1;
             } else if ct.starts_with('#') || ct.starts_with("//") {
@@ -422,13 +394,28 @@ fn fmt_parse(lines: &[&str], start: usize, base: usize, depth: usize) -> (Vec<Fm
     (nodes, i)
 }
 
+/// Byte length of at most `limit` bytes of leading whitespace, ending on a
+/// character boundary.
+fn ws_prefix_len(s: &str, limit: usize) -> usize {
+    let mut off = 0;
+    for ch in s.chars() {
+        if off >= limit || !ch.is_whitespace() {
+            break;
+        }
+        off += ch.len_utf8();
+    }
+    off
+}
+
 fn fmt_sort(nodes: &mut Vec<FmtNode>) {
-    nodes.sort_unstable_by(|a, b| {
-        let ka = a.header.split(|c: char| c.is_whitespace() || c == '[' || c == ':' || c == '(')
-            .next().unwrap_or("").to_lowercase();
-        let kb = b.header.split(|c: char| c.is_whitespace() || c == '[' || c == ':' || c == '(')
-            .next().unwrap_or("").to_lowercase();
-        ka.cmp(&kb)
+    // Stable: keys that compare equal (a repeated key) keep document order,
+    // as in the TypeScript formatter. perf: each key is lowercased once.
+    nodes.sort_by_cached_key(|n| {
+        n.header
+            .split(|c: char| c.is_whitespace() || c == '[' || c == ':' || c == '(')
+            .next()
+            .unwrap_or("")
+            .to_lowercase()
     });
     for node in nodes.iter_mut() {
         fmt_sort(&mut node.children);
@@ -495,4 +482,41 @@ fn fmt_canonical(text: &str) -> String {
     let mut result = trimmed.to_string();
     result.push('\n');
     result
+}
+
+#[cfg(test)]
+mod format_tests {
+
+    #[test]
+    fn format_finishes_past_the_depth_cap() {
+        // Past the cap the subtree is dropped; `format` used to loop forever on it.
+        let mut text = String::new();
+        for i in 0..140 {
+            text.push_str(&"  ".repeat(i));
+            text.push_str(&format!("k{}\n", i));
+        }
+        let out = crate::Synx::format(&text);
+        assert!(out.starts_with("k0"));
+        assert!(out.lines().count() < 140);
+    }
+    use super::Synx;
+
+    // `|+` bodies are text: the formatter must neither sort nor re-indent
+    // them, and formatting twice changes nothing.
+    #[test]
+    fn format_keeps_preserve_indent_block_verbatim() {
+        let src = "code |+\n  zeta()\n    alpha()\n  beta\nname x\n";
+        let out = Synx::format(src);
+        assert_eq!(out, "code |+\n  zeta()\n    alpha()\n  beta\n\nname x\n");
+        assert_eq!(Synx::parse(&out)["code"], Synx::parse(src)["code"]);
+        assert_eq!(Synx::format(&out), out);
+    }
+
+    // Equal keys keep document order (stable sort), so the last one still wins.
+    #[test]
+    fn format_sort_is_stable_for_repeated_keys() {
+        let src = "b 1\na first\nc 2\na second\n";
+        let out = Synx::format(src);
+        assert_eq!(Synx::parse(&out)["a"], Synx::parse(src)["a"]);
+    }
 }

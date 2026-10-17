@@ -2,11 +2,12 @@ package synx
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"unicode/utf8"
 )
 
@@ -19,28 +20,35 @@ const (
 	constraintErrPrefix = "CONSTRAINT_ERR:"
 	typeErrPrefix       = "TYPE_ERR:"
 	maxPatternBytes     = 256
+	maxCachedPatterns   = 256
 )
 
-func (r *resolver) failField(obj *Object, key, msg string) {
-	obj.Set(key, String(msg))
+func (r *resolver) report(msg string) {
 	if r.opts.Strict {
 		fmt.Fprintln(os.Stderr, "synx: "+msg)
 	}
 }
 
-// validateConstraints checks one key against `c`; the first failing check wins.
+// validateConstraints checks one key against its own declaration.
 func (r *resolver) validateConstraints(obj *Object, key string, c *Constraints) {
-	val, ok := obj.Get(key)
-	if !ok {
+	i := obj.find(key)
+	if i < 0 {
 		if c.Required {
-			r.failField(obj, key, fmt.Sprintf("CONSTRAINT_ERR: '%s' is required", key))
+			msg := "CONSTRAINT_ERR: '" + key + "' is required"
+			obj.Set(key, String(msg))
+			r.report(msg)
 		}
 		return
 	}
-	if val == nil {
-		val = Null
+	if msg, bad := constraintViolation(key, obj.pairs[i].Value, c); bad {
+		obj.pairs[i].Value = String(msg)
+		r.report(msg)
 	}
+}
 
+// constraintViolation is the error a value earns against its constraints;
+// the first failing check wins.
+func constraintViolation(key string, val Value, c *Constraints) (string, bool) {
 	if c.Required {
 		empty := false
 		switch x := val.(type) {
@@ -50,12 +58,25 @@ func (r *resolver) validateConstraints(obj *Object, key string, c *Constraints) 
 			empty = x.V == ""
 		}
 		if empty {
-			r.failField(obj, key, fmt.Sprintf("CONSTRAINT_ERR: '%s' is required", key))
-			return
+			return "CONSTRAINT_ERR: '" + key + "' is required", true
 		}
 	}
 
-	if c.TypeName != "" {
+	// An absent value (null) is checked against `enum` only, read as an empty
+	// string; type, range and pattern apply to values that exist.
+	if _, isNull := val.(NullValue); isNull {
+		if c.EnumValues != nil {
+			for _, e := range c.EnumValues {
+				if e == "" {
+					return "", false
+				}
+			}
+			return enumError(key, c), true
+		}
+		return "", false
+	}
+
+	if c.hasTypeName() {
 		ok := true
 		switch c.TypeName {
 		case "int":
@@ -69,6 +90,7 @@ func (r *resolver) validateConstraints(obj *Object, key string, c *Constraints) 
 		case "bool":
 			_, ok = val.(BoolValue)
 		case "string":
+			// A `:secret` is a masked string: `[type:string]:secret:env` accepts it.
 			switch val.(type) {
 			case StringValue, SecretValue:
 			default:
@@ -76,8 +98,7 @@ func (r *resolver) validateConstraints(obj *Object, key string, c *Constraints) 
 			}
 		}
 		if !ok {
-			r.failField(obj, key, fmt.Sprintf("CONSTRAINT_ERR: '%s' expected type '%s'", key, c.TypeName))
-			return
+			return "CONSTRAINT_ERR: '" + key + "' expected type '" + c.TypeName + "'", true
 		}
 	}
 
@@ -89,7 +110,7 @@ func (r *resolver) validateConstraints(obj *Object, key string, c *Constraints) 
 		case IntValue:
 			text = strconv.FormatInt(x.V, 10)
 		case FloatValue:
-			text = formatRustNumber(x.V)
+			text = rustFloatDisplay(x.V)
 		case BoolValue:
 			text = strconv.FormatBool(x.V)
 		}
@@ -101,12 +122,12 @@ func (r *resolver) validateConstraints(obj *Object, key string, c *Constraints) 
 			}
 		}
 		if !found {
-			r.failField(obj, key, fmt.Sprintf("CONSTRAINT_ERR: '%s' must be one of [%s]", key, strings.Join(c.EnumValues, "|")))
-			return
+			return enumError(key, c), true
 		}
 	}
 
-	// Numbers compare by value; a string's size is its count of Unicode scalar values.
+	// Numbers compare by value; a string's size is its count of Unicode
+	// scalar values.
 	var num float64
 	hasNum := false
 	switch x := val.(type) {
@@ -121,29 +142,50 @@ func (r *resolver) validateConstraints(obj *Object, key string, c *Constraints) 
 	}
 	if hasNum {
 		if c.Min != nil && num < *c.Min {
-			r.failField(obj, key, fmt.Sprintf("CONSTRAINT_ERR: '%s' value %s is below min %s", key, formatRustNumber(num), formatRustNumber(*c.Min)))
-			return
+			return fmt.Sprintf("CONSTRAINT_ERR: '%s' value %s is below min %s", key, rustFloatDisplay(num), rustFloatDisplay(*c.Min)), true
 		}
 		if c.Max != nil && num > *c.Max {
-			r.failField(obj, key, fmt.Sprintf("CONSTRAINT_ERR: '%s' value %s exceeds max %s", key, formatRustNumber(num), formatRustNumber(*c.Max)))
-			return
+			return fmt.Sprintf("CONSTRAINT_ERR: '%s' value %s exceeds max %s", key, rustFloatDisplay(num), rustFloatDisplay(*c.Max)), true
 		}
 	}
 
-	// Over-long, invalid and nested-quantifier patterns are skipped silently.
-	if c.Pattern != "" && len(c.Pattern) <= maxPatternBytes {
-		if s, ok := val.(StringValue); ok && !hasNestedQuantifier(c.Pattern) {
-			if re, err := regexp.Compile(c.Pattern); err == nil && !re.MatchString(s.V) {
-				r.failField(obj, key, fmt.Sprintf("CONSTRAINT_ERR: '%s' does not match pattern /%s/", key, c.Pattern))
-			}
+	// Over-long, invalid and backtracking-prone patterns never reject.
+	if c.hasPattern() && len(c.Pattern) <= maxPatternBytes {
+		if s, ok := val.(StringValue); ok && patternRejects(c.Pattern, s.V) {
+			return "CONSTRAINT_ERR: '" + key + "' does not match pattern /" + c.Pattern + "/", true
 		}
 	}
+	return "", false
 }
 
-// formatRustNumber prints like Rust's f64 `Display`: shortest round-trip digits,
-// never an exponent (`5`, `0.25`, `70000`).
-func formatRustNumber(f float64) string {
-	return strconv.FormatFloat(f, 'f', -1, 64)
+func enumError(key string, c *Constraints) string {
+	return "CONSTRAINT_ERR: '" + key + "' must be one of [" + strings.Join(c.EnumValues, "|") + "]"
+}
+
+var (
+	patternMu    sync.Mutex
+	patternCache = map[string]*regexp.Regexp{}
+)
+
+// patternRejects reports whether `s` fails `[pattern:…]`. Compiled patterns
+// are cached (bounded), so a pattern declared on a field name is compiled
+// once, not once per value checked against it.
+func patternRejects(pat, s string) bool {
+	patternMu.Lock()
+	re, ok := patternCache[pat]
+	if !ok {
+		if len(patternCache) >= maxCachedPatterns {
+			patternCache = map[string]*regexp.Regexp{}
+		}
+		if !hasNestedQuantifier(pat) {
+			if compiled, err := regexp.Compile(pat); err == nil {
+				re = compiled
+			}
+		}
+		patternCache[pat] = re
+	}
+	patternMu.Unlock()
+	return re != nil && !re.MatchString(s)
 }
 
 // hasNestedQuantifier reports a quantified group whose body also contains a
@@ -195,84 +237,111 @@ func hasNestedQuantifier(pattern string) bool {
 
 // ─── document-wide registries ───────────────────────────────────────────────
 
-func (r *resolver) sortedMetadataPaths() []string {
-	paths := make([]string, 0, len(r.result.Metadata))
-	for p := range r.result.Metadata {
-		paths = append(paths, p)
+// collectRegistries fills the type and constraint registries from one object
+// and its subtree: the object's own declarations first, then each child in
+// document order. The first type for a field name wins; constraints for one
+// name are merged.
+func (r *resolver) collectRegistries(v Value, types map[string]string, cons map[string]*Constraints, depth int) {
+	if depth > MaxResolveDepth {
+		return
 	}
-	sort.Strings(paths)
-	return paths
-}
-
-// buildConstraintRegistry maps a field NAME to its declarations merged across
-// the whole document: required/readonly OR, min is the largest, max the
-// smallest, the first type/pattern/enum wins.
-func (r *resolver) buildConstraintRegistry() map[string]*Constraints {
-	reg := map[string]*Constraints{}
-	for _, path := range r.sortedMetadataPaths() {
-		fields := r.result.Metadata[path]
-		names := make([]string, 0, len(fields))
-		for name := range fields {
-			names = append(names, name)
-		}
-		sort.Strings(names)
-		for _, name := range names {
-			c := fields[name].Constraints
-			if c == nil {
-				continue
+	obj, ok := v.(ObjectValue)
+	if !ok {
+		return
+	}
+	if mm := r.meta.levels[string(r.path)]; mm != nil {
+		for _, key := range mm.keys {
+			meta := mm.items[key]
+			if meta.hasTypeHint() {
+				if _, seen := types[key]; !seen {
+					types[key] = meta.TypeHint
+				}
 			}
-			base, ok := reg[name]
-			if !ok {
-				cp := *c
-				reg[name] = &cp
-				continue
+			if meta.Constraints != nil {
+				if existing, ok := cons[key]; ok {
+					mergeConstraints(existing, meta.Constraints)
+				} else {
+					cp := *meta.Constraints
+					cons[key] = &cp
+				}
 			}
-			mergeConstraints(base, c)
 		}
 	}
-	return reg
+	baseLen := len(r.path)
+	for _, p := range obj.V.pairs {
+		switch child := p.Value.(type) {
+		case ObjectValue:
+			r.pushKey(p.Key)
+			r.collectRegistries(child, types, cons, depth+1)
+			r.path = r.path[:baseLen]
+		case ArrayValue:
+			r.pushKey(p.Key)
+			listLen := len(r.path)
+			for idx, item := range child.V {
+				if o, ok := item.(ObjectValue); ok {
+					r.pushItem(idx)
+					r.collectRegistries(o, types, cons, depth+1)
+					r.path = r.path[:listLen]
+				}
+			}
+			r.path = r.path[:baseLen]
+		}
+	}
 }
 
+// mergeConstraints merges a repeated declaration: required/readonly OR, the
+// larger min, the smaller max, the first type/pattern/enum.
 func mergeConstraints(base, in *Constraints) {
 	base.Required = base.Required || in.Required
 	base.Readonly = base.Readonly || in.Readonly
-	if in.Min != nil && (base.Min == nil || *in.Min > *base.Min) {
+	if in.Min != nil {
 		v := *in.Min
+		if base.Min != nil {
+			v = rustMax(*base.Min, v)
+		}
 		base.Min = &v
 	}
-	if in.Max != nil && (base.Max == nil || *in.Max < *base.Max) {
+	if in.Max != nil {
 		v := *in.Max
+		if base.Max != nil {
+			v = rustMin(*base.Max, v)
+		}
 		base.Max = &v
 	}
-	if base.TypeName == "" {
-		base.TypeName = in.TypeName
+	if !base.hasTypeName() {
+		base.TypeName, base.typeNameSet = in.TypeName, in.typeNameSet
 	}
-	if base.Pattern == "" {
-		base.Pattern = in.Pattern
+	if !base.hasPattern() {
+		base.Pattern, base.patternSet = in.Pattern, in.patternSet
 	}
 	if base.EnumValues == nil {
 		base.EnumValues = in.EnumValues
 	}
 }
 
-func (r *resolver) buildTypeRegistry() map[string]string {
-	reg := map[string]string{}
-	for _, path := range r.sortedMetadataPaths() {
-		fields := r.result.Metadata[path]
-		names := make([]string, 0, len(fields))
-		for name := range fields {
-			names = append(names, name)
-		}
-		sort.Strings(names)
-		for _, name := range names {
-			if hint := fields[name].TypeHint; hint != "" {
-				if _, seen := reg[name]; !seen {
-					reg[name] = hint
-				}
-			}
-		}
+// rustMax / rustMin are f64::max / f64::min: a NaN operand loses.
+func rustMax(a, b float64) float64 {
+	switch {
+	case math.IsNaN(a):
+		return b
+	case math.IsNaN(b):
+		return a
+	case a > b:
+		return a
 	}
-	return reg
+	return b
+}
+
+func rustMin(a, b float64) float64 {
+	switch {
+	case math.IsNaN(a):
+		return b
+	case math.IsNaN(b):
+		return a
+	case a < b:
+		return a
+	}
+	return b
 }
 
 func isFieldError(v Value) bool {
@@ -280,26 +349,40 @@ func isFieldError(v Value) bool {
 	return ok && (strings.HasPrefix(s.V, constraintErrPrefix) || strings.HasPrefix(s.V, typeErrPrefix))
 }
 
-// validateFieldConstraints applies the registry to every field of that name,
-// wherever it sits, skipping values that already carry an error.
-func (r *resolver) validateFieldConstraints(obj *Object, reg map[string]*Constraints, depth int) {
-	if obj == nil || depth > MaxResolveDepth {
+// validateFields applies both registries to every field of that name,
+// wherever it sits: constraints, then type. A value that already carries an
+// error is not measured against constraints again.
+func (r *resolver) validateFields(v Value, cons map[string]*Constraints, types map[string]string) {
+	if len(cons) == 0 && len(types) == 0 {
 		return
 	}
-	for _, key := range obj.Keys() {
-		if c, ok := reg[key]; ok {
-			if v, _ := obj.Get(key); !isFieldError(v) {
-				r.validateConstraints(obj, key, c)
+	obj, ok := v.(ObjectValue)
+	if !ok {
+		return
+	}
+	for i := range obj.V.pairs {
+		key := obj.V.pairs[i].Key
+		val := obj.V.pairs[i].Value
+		if c, ok := cons[key]; ok && !isFieldError(val) {
+			if msg, bad := constraintViolation(key, val, c); bad {
+				val = String(msg)
+				obj.V.pairs[i].Value = val
+				r.report(msg)
 			}
 		}
-		child, _ := obj.Get(key)
-		switch x := child.(type) {
+		if want, ok := types[key]; ok && !valueMatchesType(val, want) {
+			msg := "TYPE_ERR: '" + key + "' expected " + want + " but got " + valueTypeName(val)
+			val = String(msg)
+			obj.V.pairs[i].Value = val
+			r.report(msg)
+		}
+		switch x := val.(type) {
 		case ObjectValue:
-			r.validateFieldConstraints(x.V, reg, depth+1)
+			r.validateFields(x, cons, types)
 		case ArrayValue:
 			for _, item := range x.V {
 				if o, ok := item.(ObjectValue); ok {
-					r.validateFieldConstraints(o.V, reg, depth+1)
+					r.validateFields(o, cons, types)
 				}
 			}
 		}
@@ -354,36 +437,4 @@ func valueTypeName(v Value) string {
 		return "object"
 	}
 	return "null"
-}
-
-func (r *resolver) validateFieldTypes(obj *Object, reg map[string]string, depth int) {
-	if obj == nil || depth > MaxResolveDepth {
-		return
-	}
-	for _, key := range obj.Keys() {
-		val, _ := obj.Get(key)
-		if val == nil {
-			val = Null
-		}
-		if want, ok := reg[key]; ok && !valueMatchesType(val, want) {
-			r.failField(obj, key, fmt.Sprintf("TYPE_ERR: '%s' expected %s but got %s", key, want, valueTypeName(val)))
-		}
-		child, _ := obj.Get(key)
-		switch x := child.(type) {
-		case ObjectValue:
-			r.validateFieldTypes(x.V, reg, depth+1)
-		case ArrayValue:
-			for _, item := range x.V {
-				if o, ok := item.(ObjectValue); ok {
-					r.validateFieldTypes(o.V, reg, depth+1)
-				}
-			}
-		}
-	}
-}
-
-func (r *resolver) validateAll() {
-	root := r.root()
-	r.validateFieldConstraints(root, r.buildConstraintRegistry(), 0)
-	r.validateFieldTypes(root, r.buildTypeRegistry(), 0)
 }
