@@ -88,25 +88,19 @@ public static partial class SynxEngine
                     map[key] = new SynxValue.Str($"INCLUDE_ERR: max include depth ({maxD}) exceeded");
                     return;
                 }
+                // `:include` with `:secret` masks the leaves of the included tree.
+                var isSecret = (mb & Mk.Secret) != 0;
                 if (path.Length == 0 && ctx.Preresolved.TryGetValue(key, out var pre) && pre.Path == fp.Value)
                 {
-                    map[key] = pre.Root;
+                    map[key] = isSecret ? MaskSecretValue(CloneValue(pre.Root)) : pre.Root;
                     return;
                 }
                 try
                 {
                     var full = JailPath(options.BasePath ?? ".", fp.Value);
                     CheckFileSize(full);
-                    var text = ReadText(full, fp.Value);
-                    var parsed = SynxParserCore.Parse(text);
-                    if (parsed.Mode == SynxMode.Active)
-                    {
-                        var child = CloneOptions(options);
-                        child.IncludeDepth = options.IncludeDepth + 1;
-                        child.BasePath = Path.GetDirectoryName(full) ?? ".";
-                        Resolve(parsed, child);
-                    }
-                    map[key] = parsed.Root;
+                    var includedRoot = ReadAndResolve(full, fp.Value, options).Root;
+                    map[key] = isSecret ? MaskSecretValue(includedRoot) : includedRoot;
                 }
                 catch (Exception e)
                 {
@@ -281,13 +275,6 @@ public static partial class SynxEngine
             }
         }
 
-        // ── :secret ── idempotent: the pre-pass may already have wrapped a literal.
-        if ((mb & Mk.Secret) != 0)
-        {
-            if (map.TryGetValue(key, out var sv) && sv is not SynxValue.Secret)
-                map[key] = new SynxValue.Secret(ValueToString(sv));
-        }
-
         // ── :unique ──
         if ((mb & Mk.Unique) != 0)
         {
@@ -393,9 +380,16 @@ public static partial class SynxEngine
             var dec = Arg(markers, "round", 1) is { } rs && SynxNum.TryParseU64(rs, uint.MaxValue, out var d) ? (uint)d : 0u;
             if (map.TryGetValue(key, out var rv) && ValueAsNumber(rv) is { } rn)
             {
-                var factor = Math.Pow(10, unchecked((int)dec));
-                var rounded = Math.Round(rn * factor, MidpointRounding.AwayFromZero) / factor;
-                map[key] = dec == 0 ? new SynxValue.Int(SynxNum.SaturatingI64(rounded)) : new SynxValue.Float(rounded);
+                // A scale past the range of f64 rounds nothing: the number stays.
+                var factor = Math.Pow(10, (int)Math.Min(dec, 400u));
+                var scaled = rn * factor;
+                var rounded = double.IsFinite(scaled) ? Math.Round(scaled, MidpointRounding.AwayFromZero) / factor : rn;
+                // safety: only a whole number that fits is an integer. The saturating cast
+                // made `:round` of 1e30 9223372036854775807 and of NaN 0 — invented values,
+                // where `:calc` and `:clamp` keep the float.
+                map[key] = dec == 0 && rounded % 1 == 0 && Math.Abs(rounded) < long.MaxValue
+                    ? new SynxValue.Int((long)rounded)
+                    : new SynxValue.Float(rounded);
             }
         }
 
@@ -445,8 +439,10 @@ public static partial class SynxEngine
             }
         }
 
-        // ── :sort / :sort:desc ── two numbers compare numerically, anything else as text by
-        // code point (never locale collation); stable.
+        // ── :sort / :sort:desc ── a total order: numbers first, by value (NaN after the
+        // rest of them), then everything else by its text, by code point (never locale
+        // collation); stable. Comparing a number with text as text made `10 < 1a < 9 < 10`
+        // a cycle, and the result depended on the sort algorithm.
         if ((mb & Mk.Sort) != 0)
         {
             if (map.TryGetValue(key, out var sov) && sov is SynxValue.Arr soa)
@@ -458,10 +454,16 @@ public static partial class SynxEngine
                 Array.Sort(keyed, (x, y) =>
                 {
                     int c;
-                    if (ValueAsNumber(x.v) is { } xn && ValueAsNumber(y.v) is { } yn)
-                        c = double.IsNaN(xn) || double.IsNaN(yn) ? 0 : xn.CompareTo(yn);
+                    var xn = ValueAsNumber(x.v);
+                    var yn = ValueAsNumber(y.v);
+                    if (xn is { } a && yn is { } b)
+                        c = double.IsNaN(a) || double.IsNaN(b) ? double.IsNaN(a).CompareTo(double.IsNaN(b)) : a.CompareTo(b);
+                    else if (xn != null)
+                        c = -1;
+                    else if (yn != null)
+                        c = 1;
                     else
-                        c = CompareCodePoints(x.text ?? ValueToString(x.v), y.text ?? ValueToString(y.v));
+                        c = CompareCodePoints(x.text!, y.text!);
                     return c != 0 ? c : x.i.CompareTo(y.i);
                 });
                 sorted = keyed.Select(k => k.v).ToList();
@@ -488,7 +490,8 @@ public static partial class SynxEngine
                             total += f.Value;
                             if (f.Value % 1 != 0) allInt = false;
                             break;
-                        case SynxValue.Str s when SynxNum.TryParseF64(s.Value, out var sf):
+                        // `inf` and `nan` are text here as everywhere (see CastPrimitive).
+                        case SynxValue.Str s when SynxNum.TryParseF64(s.Value, out var sf) && double.IsFinite(sf):
                             total += sf;
                             if (sf % 1 != 0) allInt = false;
                             break;
@@ -582,6 +585,18 @@ public static partial class SynxEngine
                     map[key] = new SynxValue.Str("WATCH_ERR: " + e.Message);
                 }
             }
+        }
+
+        // ── :secret ──
+        // Last of the markers that produce the value, so whatever they resolved is what
+        // gets masked. It used to sit after `:alias`: `t:secret:once` came out as plain
+        // text, `:secret:default:x` and `:secret:watch` masked the argument instead of the
+        // result, and `:secret:format` formatted the mask. `:prompt` and package markers
+        // below still see only the mask.
+        if ((mb & Mk.Secret) != 0)
+        {
+            if (map.TryGetValue(key, out var sv))
+                map[key] = MaskSecretValue(sv);
         }
 
         // ── :prompt ── key:prompt:LABEL subtree → fenced SYNX text

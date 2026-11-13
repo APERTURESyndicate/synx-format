@@ -25,6 +25,21 @@ constexpr uint64_t kMaxFileSize = 10ull * 1024 * 1024;
 constexpr size_t kDefaultMaxIncludeDepth = 16;
 constexpr size_t kMaxResolveDepth = 512;
 constexpr size_t kMaxScratchString = 4u * 1024 * 1024;
+/// Included documents one top-level resolve may read.
+constexpr size_t kMaxIncludeReads = 1024;
+/// Bytes one top-level resolve may read through `:include`, `!include`, `!use`
+/// and `:watch`: every file is capped at 10 MiB, but a document may name the
+/// same file from a thousand keys.
+constexpr uint64_t kMaxResolveReadBytes = 64ull * 1024 * 1024;
+/// Bytes the markers of one top-level resolve may add to the document: values
+/// copied by `:alias`, `:ref`, `:spam` and `:inherit`, text built by `{…}`,
+/// `:replace`, `:join`, `:format` and `:prompt`. synx-core's costs, so a
+/// document runs out at the same key in every implementation.
+constexpr size_t kMaxResolveExpansionBytes = 64u * 1024 * 1024;
+/// What one copied value costs against the expansion budget, text aside.
+constexpr size_t kValueCost = 128;
+inline constexpr const char* kLimitErr = "LIMIT_ERR: resolution budget exceeded";
+inline constexpr const char* kNestingErr = "NESTING_ERR: maximum object nesting depth exceeded";
 
 // Bits for the built-in markers `apply_markers` dispatches on.
 namespace mk {
@@ -102,10 +117,35 @@ std::string path_to_utf8(const std::filesystem::path& p);
 /// Parse, and resolve an `!active` file with the include depth bumped.
 Value load_synx_file(const std::string& text, const std::filesystem::path& file, const Options& options);
 
+/// Read a file for `:include`, `!include`, `!use` or `:watch` within the
+/// resolve's read budget; `error` is synx-core's portable text.
+bool read_budgeted(const std::filesystem::path& p, std::string_view shown, std::string& out, std::string& error);
+/// Read and resolve the document at `full` (`shown`: as the document wrote it),
+/// or refuse a file already being resolved (a cycle) and reads past the budget.
+bool include_file(const std::filesystem::path& full, std::string_view shown, const Options& options, Value& out,
+                  std::string& error);
+
+/// Take `bytes` from the expansion budget; false once it is spent (and it stays spent).
+bool charge_expansion(size_t bytes) noexcept;
+/// Bytes of the expansion budget not yet spent.
+size_t expansion_room() noexcept;
+/// What copying a value costs, and how many levels of objects and lists it nests.
+std::pair<size_t, size_t> value_cost(const Value& v);
+/// A copy of `v` for an object `depth` levels below the root, or the error left instead.
+Value budgeted_copy(const Value& v, size_t depth);
+/// A value read from a file for an object `depth` levels below the root.
+Value placed_document(Value v, size_t depth, bool secret);
+/// `s` is an error the engine left in place of a value.
+bool is_engine_error(std::string_view s) noexcept;
+/// Make a resolved value a secret: scalars by their text, lists and groups leaf
+/// by leaf; null, an existing secret and an engine error are left as they are.
+void mask_secret_value(Value& v);
+/// Text from outside the document as a value; under `:secret` a number or a
+/// bool keeps its text (`00123`).
+Value external_value(std::string text, bool as_string, bool secret);
+
 /// Rust `has_nested_quantifier`: `(a+)+` shapes are refused everywhere.
 bool has_nested_quantifier(std::string_view pattern);
-/// Conservative syntax check for ECMAScript `std::regex` (exceptions are off).
-bool regex_pattern_is_supported(std::string_view pattern);
 /// Does `s` fail `[pattern:…]`? Refused / invalid patterns never reject.
 bool pattern_rejects(const std::string& pattern, const std::string& s);
 
@@ -118,6 +158,13 @@ struct CalcScope {
 };
 bool is_calc_special_key(std::string_view k) noexcept;
 
+/// What the keys under `:secret` held before the pre-pass masked them, by
+/// object path and key.
+using SecretOriginals = std::unordered_map<std::string, std::unordered_map<std::string, Value>>;
+
+/// [`mask_secret_literals`] for the object or list at `path`.
+void mask_secret_subtree(Value& child, const MetadataTree& metadata, std::string& path, SecretOriginals& originals);
+
 /// State for one `resolve` call.
 struct Resolver {
     const Options& options;
@@ -129,11 +176,15 @@ struct Resolver {
     /// kept apart from `includes`, whose size `{key:include}` reads.
     const IndexMap<Value>& preresolved;
     const CalcScope& calc_scope;
+    SecretOriginals& secret_originals;
 
     void resolve_value(Value& value, std::string& path, size_t depth);
+    /// `depth`: how many levels below the root `map` sits.
     void apply_markers(Object& map, size_t index, const ObjectLookup& local, const Meta& meta,
-                       const std::string& path);
-    std::string resolve_interpolation(std::string_view tpl, const ObjectLookup& local) const;
+                       const std::string& path, size_t depth);
+    /// nullopt when the text would pass `cap` bytes.
+    std::optional<std::string> resolve_interpolation(std::string_view tpl, const ObjectLookup& local,
+                                                     size_t cap) const;
 };
 
 /// JSON text → Value (`:watch` on a `.json` file); nullopt when it is not JSON.

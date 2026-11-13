@@ -46,13 +46,9 @@ std::string format_primitive(const Value& v) {
 std::string stringify(const Value& val) {
     const Object* map = val.as_object();
     if (!map) return format_primitive(val);
-    std::vector<const Pair*> keys;
-    keys.reserve(map->size());
-    for (const auto& p : *map) keys.push_back(&p);
-    std::sort(keys.begin(), keys.end(), [](const Pair* a, const Pair* b) { return a->key < b->key; });
     std::string out;
     out.reserve(256);
-    for (const Pair* p : keys) detail::write_synx_entry(out, p->key, p->value, 0, 0);
+    detail::write_synx_object(out, *map, 0, 0);
     return out;
 }
 

@@ -1,0 +1,11 @@
+[package]
+name = "synx-pattern-tables"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+regex = { version = "=1.12.3", default-features = false, features = ["std", "perf", "unicode"] }
+regex-syntax = "=0.8.10"
+
+[workspace]

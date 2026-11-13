@@ -50,14 +50,96 @@ const MAX_DECODED_BYTES: usize = 256 * 1024 * 1024;
 /// the stack it was written to protect.
 const MAX_DECODE_DEPTH: usize = 256;
 
-/// Bound a `Vec::with_capacity` request taken from untrusted input.
+/// Most memory the tree decoded from one file may take: the index of its
+/// strings, every value, key and text it holds, and its declarations.
 ///
-/// safety: element counts are read as varints straight from the file. A crafted
-/// count of `u64::MAX` would abort the process inside `with_capacity` before a
-/// single element is read. Every element costs at least one byte on the wire, so
-/// the count can never exceed the bytes that remain; clamp to that.
-fn safe_capacity(count: usize, remaining: usize) -> usize {
-    count.min(remaining)
+/// safety: a value is one byte on the wire and 72 in memory, a string is
+/// stored once and copied by every reference, and deflate shrinks a run of
+/// either a thousandfold: unbudgeted, a file of a few kilobytes decoded to
+/// gigabytes. Everything is charged at what it occupies, and the storage of
+/// a counted list, object or table is charged before it is reserved — a
+/// count in the file is never memory the file has not paid for.
+const MAX_DECODED_TREE_BYTES: usize = 192 * 1024 * 1024;
+
+// What the pieces of a decoded tree are charged, in bytes — what they occupy
+// on a 64-bit target. They are plain numbers so that every target and every
+// port refuses a file at the same place. A copied string is charged its
+// UTF-8 bytes on top.
+/// One string of the table.
+const TABLE_ENTRY_COST: usize = 16;
+/// A list item: its slot.
+const ARRAY_SLOT_COST: usize = 64;
+/// An object entry: the value (64), the key (24), its hash and index slot (24).
+const OBJECT_ENTRY_COST: usize = 112;
+/// A marker, a marker argument or an `enum` value.
+const TEXT_ITEM_COST: usize = 24;
+/// One key's declarations, as an entry of its object's table.
+const META_ENTRY_COST: usize = 232;
+/// One object's table of declarations, as an entry of the document's.
+const META_PATH_COST: usize = 112;
+/// An `!include`.
+const INCLUDE_COST: usize = 48;
+
+/// What decoding has built so far, in bytes.
+#[derive(Default)]
+struct DecodeBudget {
+    spent: usize,
+}
+
+impl DecodeBudget {
+    fn charge(&mut self, bytes: usize) -> Result<(), String> {
+        self.spent = self.spent.saturating_add(bytes);
+        if self.spent > MAX_DECODED_TREE_BYTES {
+            return Err(format!("decoded document exceeds {} bytes — refusing to decode", MAX_DECODED_TREE_BYTES));
+        }
+        Ok(())
+    }
+
+    /// Storage for `count` items read from the file, paid for: each takes at
+    /// least `wire` of the `remaining` bytes and `cost` bytes in memory.
+    ///
+    /// safety: counts are varints straight from the file. `u64::MAX` aborted
+    /// the process inside `with_capacity`; capped at the bytes that remain,
+    /// an 8 KB file still reserved 930 MiB for an object it did not hold.
+    /// More items than the rest of the file can spell is a truncated file,
+    /// said at once; the reservation of the rest is exact and charged first.
+    fn reserve(&mut self, count: usize, remaining: usize, wire: usize, cost: usize) -> Result<usize, String> {
+        if count > remaining / wire {
+            return Err("unexpected end of data".into());
+        }
+        self.charge(count.saturating_mul(cost))?;
+        Ok(count)
+    }
+
+    /// An owned copy of a table string.
+    ///
+    /// safety: every reference copies its string, so one megabyte of text and
+    /// three thousand two-byte references were 3 GiB.
+    fn text(&mut self, s: &str) -> Result<String, String> {
+        self.charge(s.len())?;
+        Ok(s.to_string())
+    }
+
+    /// A list of table strings: `count` references of one varint each.
+    fn texts(&mut self, data: &[u8], pos: &mut usize, st: &StringTableReader, count: usize) -> Result<Vec<String>, String> {
+        let room = self.reserve(count, data.len().saturating_sub(*pos), 1, TEXT_ITEM_COST)?;
+        let mut out = Vec::with_capacity(room);
+        for _ in 0..count {
+            let idx = decode_index(data, pos)?;
+            out.push(self.text(st.get(idx)?)?);
+        }
+        Ok(out)
+    }
+}
+
+/// A count or length: a varint that must fit `usize`.
+fn decode_len(data: &[u8], pos: &mut usize) -> Result<usize, String> {
+    usize::try_from(decode_varint(data, pos)?).map_err(|_| "length does not fit this platform".to_string())
+}
+
+/// A string-table index: a varint that must fit `u32`.
+fn decode_index(data: &[u8], pos: &mut usize) -> Result<u32, String> {
+    u32::try_from(decode_varint(data, pos)?).map_err(|_| "string index out of range".to_string())
 }
 
 const FLAG_ACTIVE: u8 = 0b0000_0001;
@@ -218,38 +300,53 @@ impl StringTable {
     }
 }
 
-struct StringTableReader {
-    strings: Vec<String>,
+/// perf: the strings stay in the payload; a table of owned copies doubled
+/// every text of the file before the first value was read.
+struct StringTableReader<'a> {
+    strings: Vec<&'a str>,
 }
 
-impl StringTableReader {
-    fn decode(data: &[u8], pos: &mut usize) -> Result<Self, String> {
-        let count = decode_varint(data, pos)? as usize;
-        let mut strings = Vec::with_capacity(safe_capacity(count, data.len().saturating_sub(*pos)));
+impl<'a> StringTableReader<'a> {
+    fn decode(data: &'a [u8], pos: &mut usize, budget: &mut DecodeBudget) -> Result<Self, String> {
+        let count = decode_len(data, pos)?;
+        // safety: 64 MiB of zero bytes is sixty-four million empty strings.
+        let room = budget.reserve(count, data.len().saturating_sub(*pos), 1, TABLE_ENTRY_COST)?;
+        let mut strings = Vec::with_capacity(room);
         for _ in 0..count {
-            let len = decode_varint(data, pos)? as usize;
-            if *pos + len > data.len() {
+            let len = decode_len(data, pos)?;
+            // safety: `*pos + len` wrapped for a length near `usize::MAX`, the
+            // check passed and the slice below panicked — on a 17-byte file.
+            if len > data.len().saturating_sub(*pos) {
                 return Err("unexpected end of data in string table".into());
             }
-            let s = std::str::from_utf8(&data[*pos..*pos + len])
-                .map_err(|e| format!("invalid UTF-8 in string table: {}", e))?
-                .to_string();
-            *pos += len;
+            let end = *pos + len;
+            let s = std::str::from_utf8(&data[*pos..end])
+                .map_err(|e| format!("invalid UTF-8 in string table: {}", e))?;
+            *pos = end;
             strings.push(s);
         }
         Ok(Self { strings })
     }
 
-    fn get(&self, idx: u32) -> Result<&str, String> {
+    fn get(&self, idx: u32) -> Result<&'a str, String> {
         self.strings.get(idx as usize)
-            .map(|s| s.as_str())
+            .copied()
             .ok_or_else(|| format!("string index {} out of bounds (size {})", idx, self.strings.len()))
     }
 }
 
 // ─── Value encoding (with string table) ─────────────────────────────────────
 
-fn encode_value(out: &mut Vec<u8>, val: &Value, st: &StringTable) {
+/// `in_order` writes an object's entries as the document has them instead of
+/// sorted by key.
+///
+/// spec: a file that still carries its markers is resolved after it is read
+/// back, and markers resolve in document order. Sorted, `total:calc price +
+/// tax` could come back ahead of `tax:calc …` and fail. A decoder reads the
+/// entries in whatever order they arrive, so the layout is unchanged — and a
+/// static or resolved file, where order decides nothing, is written exactly
+/// as before.
+fn encode_value(out: &mut Vec<u8>, val: &Value, st: &StringTable, in_order: bool) {
     match val {
         Value::Null => out.push(TAG_NULL),
         Value::Bool(false) => out.push(TAG_FALSE),
@@ -270,18 +367,25 @@ fn encode_value(out: &mut Vec<u8>, val: &Value, st: &StringTable) {
             out.push(TAG_ARRAY);
             encode_varint(out, arr.len() as u64);
             for item in arr {
-                encode_value(out, item, st);
+                encode_value(out, item, st, in_order);
             }
         }
         Value::Object(map) => {
             out.push(TAG_OBJECT);
-            let mut entries: Vec<(&str, &Value)> =
-                map.iter().map(|(k, v)| (k.as_str(), v)).collect();
-            entries.sort_unstable_by_key(|(k, _)| *k);
-            encode_varint(out, entries.len() as u64);
-            for (key, val) in entries {
-                encode_varint(out, st.index[key] as u64);
-                encode_value(out, val, st);
+            encode_varint(out, map.len() as u64);
+            if in_order {
+                for (key, val) in map {
+                    encode_varint(out, st.index[key.as_str()] as u64);
+                    encode_value(out, val, st, in_order);
+                }
+            } else {
+                let mut entries: Vec<(&str, &Value)> =
+                    map.iter().map(|(k, v)| (k.as_str(), v)).collect();
+                entries.sort_unstable_by_key(|(k, _)| *k);
+                for (key, val) in entries {
+                    encode_varint(out, st.index[key] as u64);
+                    encode_value(out, val, st, in_order);
+                }
             }
         }
         Value::Secret(s) => {
@@ -291,11 +395,17 @@ fn encode_value(out: &mut Vec<u8>, val: &Value, st: &StringTable) {
     }
 }
 
-fn decode_value(data: &[u8], pos: &mut usize, st: &StringTableReader) -> Result<Value, String> {
-    decode_value_depth(data, pos, st, 0)
+fn decode_value(data: &[u8], pos: &mut usize, st: &StringTableReader, budget: &mut DecodeBudget) -> Result<Value, String> {
+    decode_value_depth(data, pos, st, budget, 0)
 }
 
-fn decode_value_depth(data: &[u8], pos: &mut usize, st: &StringTableReader, depth: usize) -> Result<Value, String> {
+fn decode_value_depth(
+    data: &[u8],
+    pos: &mut usize,
+    st: &StringTableReader,
+    budget: &mut DecodeBudget,
+    depth: usize,
+) -> Result<Value, String> {
     if depth > MAX_DECODE_DEPTH {
         return Err(format!("nesting exceeds {} — refusing to decode", MAX_DECODE_DEPTH));
     }
@@ -323,31 +433,33 @@ fn decode_value_depth(data: &[u8], pos: &mut usize, st: &StringTableReader, dept
             Ok(Value::Float(f64::from_le_bytes(bytes)))
         }
         TAG_STRING => {
-            let idx = decode_varint(data, pos)? as u32;
-            Ok(Value::String(st.get(idx)?.to_string()))
+            let idx = decode_index(data, pos)?;
+            Ok(Value::String(budget.text(st.get(idx)?)?))
         }
         TAG_ARRAY => {
-            let count = decode_varint(data, pos)? as usize;
-            let mut arr = Vec::with_capacity(safe_capacity(count, data.len().saturating_sub(*pos)));
+            let count = decode_len(data, pos)?;
+            let room = budget.reserve(count, data.len().saturating_sub(*pos), 1, ARRAY_SLOT_COST)?;
+            let mut arr = Vec::with_capacity(room);
             for _ in 0..count {
-                arr.push(decode_value_depth(data, pos, st, depth + 1)?);
+                arr.push(decode_value_depth(data, pos, st, budget, depth + 1)?);
             }
             Ok(Value::Array(arr))
         }
         TAG_OBJECT => {
-            let count = decode_varint(data, pos)? as usize;
-            let mut map = Map::with_capacity_and_hasher(safe_capacity(count, data.len().saturating_sub(*pos)), Default::default());
+            let count = decode_len(data, pos)?;
+            let room = budget.reserve(count, data.len().saturating_sub(*pos), 2, OBJECT_ENTRY_COST)?;
+            let mut map = Map::with_capacity_and_hasher(room, Default::default());
             for _ in 0..count {
-                let key_idx = decode_varint(data, pos)? as u32;
-                let key = st.get(key_idx)?.to_string();
-                let val = decode_value_depth(data, pos, st, depth + 1)?;
+                let key_idx = decode_index(data, pos)?;
+                let key = budget.text(st.get(key_idx)?)?;
+                let val = decode_value_depth(data, pos, st, budget, depth + 1)?;
                 map.insert(key, val);
             }
             Ok(Value::Object(map))
         }
         TAG_SECRET => {
-            let idx = decode_varint(data, pos)? as u32;
-            Ok(Value::Secret(st.get(idx)?.to_string()))
+            let idx = decode_index(data, pos)?;
+            Ok(Value::Secret(budget.text(st.get(idx)?)?))
         }
         _ => Err(format!("unknown type tag: 0x{:02x}", tag)),
     }
@@ -376,7 +488,7 @@ fn encode_constraints(out: &mut Vec<u8>, c: &Constraints, st: &StringTable) {
     }
 }
 
-fn decode_constraints(data: &[u8], pos: &mut usize, st: &StringTableReader) -> Result<Constraints, String> {
+fn decode_constraints(data: &[u8], pos: &mut usize, st: &StringTableReader, budget: &mut DecodeBudget) -> Result<Constraints, String> {
     if *pos >= data.len() {
         return Err("unexpected end of data in constraints".into());
     }
@@ -397,23 +509,18 @@ fn decode_constraints(data: &[u8], pos: &mut usize, st: &StringTableReader) -> R
         *pos += 8;
     }
     if bits & 0x04 != 0 {
-        let idx = decode_varint(data, pos)? as u32;
-        c.type_name = Some(st.get(idx)?.to_string());
+        let idx = decode_index(data, pos)?;
+        c.type_name = Some(budget.text(st.get(idx)?)?);
     }
     if bits & 0x08 != 0 { c.required = true; }
     if bits & 0x10 != 0 { c.readonly = true; }
     if bits & 0x20 != 0 {
-        let idx = decode_varint(data, pos)? as u32;
-        c.pattern = Some(st.get(idx)?.to_string());
+        let idx = decode_index(data, pos)?;
+        c.pattern = Some(budget.text(st.get(idx)?)?);
     }
     if bits & 0x40 != 0 {
-        let count = decode_varint(data, pos)? as usize;
-        let mut vals = Vec::with_capacity(safe_capacity(count, data.len().saturating_sub(*pos)));
-        for _ in 0..count {
-            let idx = decode_varint(data, pos)? as u32;
-            vals.push(st.get(idx)?.to_string());
-        }
-        c.enum_values = Some(vals);
+        let count = decode_len(data, pos)?;
+        c.enum_values = Some(budget.texts(data, pos, st, count)?);
     }
     Ok(c)
 }
@@ -437,66 +544,59 @@ fn encode_meta(out: &mut Vec<u8>, meta: &Meta, st: &StringTable) {
     }
 }
 
-fn decode_meta(data: &[u8], pos: &mut usize, st: &StringTableReader) -> Result<Meta, String> {
-    let marker_count = decode_varint(data, pos)? as usize;
-    let mut markers = Vec::with_capacity(safe_capacity(marker_count, data.len().saturating_sub(*pos)));
-    for _ in 0..marker_count {
-        let idx = decode_varint(data, pos)? as u32;
-        markers.push(st.get(idx)?.to_string());
-    }
+fn decode_meta(data: &[u8], pos: &mut usize, st: &StringTableReader, budget: &mut DecodeBudget) -> Result<Meta, String> {
+    let marker_count = decode_len(data, pos)?;
+    let markers = budget.texts(data, pos, st, marker_count)?;
 
-    let arg_count = decode_varint(data, pos)? as usize;
-    let mut args = Vec::with_capacity(safe_capacity(arg_count, data.len().saturating_sub(*pos)));
-    for _ in 0..arg_count {
-        let idx = decode_varint(data, pos)? as u32;
-        args.push(st.get(idx)?.to_string());
-    }
+    let arg_count = decode_len(data, pos)?;
+    let args = budget.texts(data, pos, st, arg_count)?;
 
     if *pos >= data.len() { return Err("unexpected end in meta".into()); }
     let has_th = data[*pos];
     *pos += 1;
     let type_hint = if has_th != 0 {
-        let idx = decode_varint(data, pos)? as u32;
-        Some(st.get(idx)?.to_string())
+        let idx = decode_index(data, pos)?;
+        Some(budget.text(st.get(idx)?)?)
     } else { None };
 
     if *pos >= data.len() { return Err("unexpected end in meta".into()); }
     let has_c = data[*pos];
     *pos += 1;
-    let constraints = if has_c != 0 { Some(decode_constraints(data, pos, st)?) } else { None };
+    let constraints = if has_c != 0 { Some(decode_constraints(data, pos, st, budget)?) } else { None };
 
     Ok(Meta { markers, args, type_hint, constraints })
 }
 
+/// Declarations are written in document order, like the objects they belong
+/// to (see [`encode_value`]): which of two type declarations for one field
+/// name wins, and the order `:inherit` runs in, follow it.
 fn encode_metadata(out: &mut Vec<u8>, metadata: &Map<MetaMap>, st: &StringTable) {
-    let mut outer_keys: Vec<&str> = metadata.keys().map(|k| k.as_str()).collect();
-    outer_keys.sort_unstable();
-    encode_varint(out, outer_keys.len() as u64);
-    for key_path in outer_keys {
-        encode_varint(out, st.index[key_path] as u64);
-        let meta_map = &metadata[key_path];
-        let mut inner_keys: Vec<&str> = meta_map.keys().map(|k| k.as_str()).collect();
-        inner_keys.sort_unstable();
-        encode_varint(out, inner_keys.len() as u64);
-        for field_key in inner_keys {
-            encode_varint(out, st.index[field_key] as u64);
-            encode_meta(out, &meta_map[field_key], st);
+    encode_varint(out, metadata.len() as u64);
+    for (key_path, meta_map) in metadata {
+        encode_varint(out, st.index[key_path.as_str()] as u64);
+        encode_varint(out, meta_map.len() as u64);
+        for (field_key, meta) in meta_map {
+            encode_varint(out, st.index[field_key.as_str()] as u64);
+            encode_meta(out, meta, st);
         }
     }
 }
 
-fn decode_metadata(data: &[u8], pos: &mut usize, st: &StringTableReader) -> Result<Map<MetaMap>, String> {
-    let outer_count = decode_varint(data, pos)? as usize;
-    let mut metadata = Map::with_capacity_and_hasher(safe_capacity(outer_count, data.len().saturating_sub(*pos)), Default::default());
+fn decode_metadata(data: &[u8], pos: &mut usize, st: &StringTableReader, budget: &mut DecodeBudget) -> Result<Map<MetaMap>, String> {
+    let outer_count = decode_len(data, pos)?;
+    let room = budget.reserve(outer_count, data.len().saturating_sub(*pos), 2, META_PATH_COST)?;
+    let mut metadata = Map::with_capacity_and_hasher(room, Default::default());
     for _ in 0..outer_count {
-        let path_idx = decode_varint(data, pos)? as u32;
-        let key_path = st.get(path_idx)?.to_string();
-        let inner_count = decode_varint(data, pos)? as usize;
-        let mut meta_map = Map::with_capacity_and_hasher(safe_capacity(inner_count, data.len().saturating_sub(*pos)), Default::default());
+        let path_idx = decode_index(data, pos)?;
+        let key_path = budget.text(st.get(path_idx)?)?;
+        let inner_count = decode_len(data, pos)?;
+        // An entry is a key and four bytes of declaration at the least.
+        let room = budget.reserve(inner_count, data.len().saturating_sub(*pos), 5, META_ENTRY_COST)?;
+        let mut meta_map = Map::with_capacity_and_hasher(room, Default::default());
         for _ in 0..inner_count {
-            let key_idx = decode_varint(data, pos)? as u32;
-            let field_key = st.get(key_idx)?.to_string();
-            let meta = decode_meta(data, pos, st)?;
+            let key_idx = decode_index(data, pos)?;
+            let field_key = budget.text(st.get(key_idx)?)?;
+            let meta = decode_meta(data, pos, st, budget)?;
             meta_map.insert(field_key, meta);
         }
         metadata.insert(key_path, meta_map);
@@ -512,15 +612,16 @@ fn encode_includes(out: &mut Vec<u8>, includes: &[IncludeDirective], st: &String
     }
 }
 
-fn decode_includes(data: &[u8], pos: &mut usize, st: &StringTableReader) -> Result<Vec<IncludeDirective>, String> {
-    let count = decode_varint(data, pos)? as usize;
-    let mut includes = Vec::with_capacity(safe_capacity(count, data.len().saturating_sub(*pos)));
+fn decode_includes(data: &[u8], pos: &mut usize, st: &StringTableReader, budget: &mut DecodeBudget) -> Result<Vec<IncludeDirective>, String> {
+    let count = decode_len(data, pos)?;
+    let room = budget.reserve(count, data.len().saturating_sub(*pos), 2, INCLUDE_COST)?;
+    let mut includes = Vec::with_capacity(room);
     for _ in 0..count {
-        let path_idx = decode_varint(data, pos)? as u32;
-        let alias_idx = decode_varint(data, pos)? as u32;
+        let path_idx = decode_index(data, pos)?;
+        let alias_idx = decode_index(data, pos)?;
         includes.push(IncludeDirective {
-            path: st.get(path_idx)?.to_string(),
-            alias: st.get(alias_idx)?.to_string(),
+            path: budget.text(st.get(path_idx)?)?,
+            alias: budget.text(st.get(alias_idx)?)?,
         });
     }
     Ok(includes)
@@ -546,7 +647,7 @@ pub fn compile(result: &ParseResult, resolved: bool) -> Vec<u8> {
     // Build uncompressed payload
     let mut payload = Vec::with_capacity(1024);
     st.encode(&mut payload);
-    encode_value(&mut payload, &result.root, &st);
+    encode_value(&mut payload, &result.root, &st, has_meta);
     if has_meta {
         encode_metadata(&mut payload, &result.metadata, &st);
         encode_includes(&mut payload, &result.includes, &st);
@@ -610,19 +711,23 @@ pub fn decompile(data: &[u8]) -> Result<ParseResult, String> {
     if uncomp_size > MAX_DECODED_BYTES {
         return Err(format!("declared size {} exceeds limit {}", uncomp_size, MAX_DECODED_BYTES));
     }
-    let payload = miniz_oxide::inflate::decompress_to_vec_with_limit(&data[11..], MAX_DECODED_BYTES)
-        .map_err(|e| format!("decompression failed: {:?}", e))?;
+    // safety: the stream may produce the declared size and not a byte more.
+    // Bounded only by the 256 MiB cap, a 260 KB file declaring 1 KiB still
+    // inflated to the full cap before the size check rejected it.
+    let payload = miniz_oxide::inflate::decompress_to_vec_with_limit(&data[11..], uncomp_size + 1)
+        .map_err(|e| format!("decompression failed: {:?}", e.status))?;
     if payload.len() != uncomp_size {
         return Err(format!("size mismatch: expected {}, got {}", uncomp_size, payload.len()));
     }
 
     let mut pos = 0;
+    let mut budget = DecodeBudget::default();
 
     // String table
-    let st = StringTableReader::decode(&payload, &mut pos)?;
+    let st = StringTableReader::decode(&payload, &mut pos, &mut budget)?;
 
     // Root value
-    let root = decode_value(&payload, &mut pos, &st)?;
+    let root = decode_value(&payload, &mut pos, &st, &mut budget)?;
 
     let mode = if flags & FLAG_ACTIVE != 0 { Mode::Active } else { Mode::Static };
     let locked = flags & FLAG_LOCKED != 0;
@@ -631,8 +736,8 @@ pub fn decompile(data: &[u8]) -> Result<ParseResult, String> {
     let llm = flags & FLAG_LLM != 0;
 
     let (metadata, includes) = if flags & FLAG_HAS_META != 0 {
-        let meta = decode_metadata(&payload, &mut pos, &st)?;
-        let inc = decode_includes(&payload, &mut pos, &st)?;
+        let meta = decode_metadata(&payload, &mut pos, &st, &mut budget)?;
+        let inc = decode_includes(&payload, &mut pos, &st, &mut budget)?;
         (meta, inc)
     } else {
         (Map::default(), Vec::new())
@@ -652,6 +757,11 @@ pub fn decompile(data: &[u8]) -> Result<ParseResult, String> {
         // dropped on the way back out.
         truncated: false,
     })
+}
+
+/// Whether a `.synxb` file holds an already resolved document (header flag).
+pub(crate) fn is_resolved(data: &[u8]) -> bool {
+    data.len() > 6 && data[6] & FLAG_RESOLVED != 0
 }
 
 /// Check if data starts with the `.synxb` magic bytes.
@@ -1146,5 +1256,187 @@ mod tests {
         };
         let restored = decompile(&compile(&result, false)).unwrap();
         assert_eq!(restored.root, result.root);
+    }
+}
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+    use crate::{parse, resolve, Options, Synx};
+
+    fn frame(payload: &[u8], declared: u32, flags: u8) -> Vec<u8> {
+        let mut out = MAGIC.to_vec();
+        out.push(FORMAT_VERSION);
+        out.push(flags);
+        out.extend_from_slice(&declared.to_le_bytes());
+        out.extend_from_slice(&miniz_oxide::deflate::compress_to_vec(payload, 9));
+        out
+    }
+
+    // S6-03: seventeen bytes panicked the decoder — `*pos + len` wrapped.
+    #[test]
+    fn a_string_length_near_the_end_of_usize_is_an_error() {
+        let mut p = Vec::new();
+        encode_varint(&mut p, 1);
+        encode_varint(&mut p, u64::MAX);
+        p.push(1);
+        assert_eq!(decompile(&frame(&p, p.len() as u32, 0)).unwrap_err(), "unexpected end of data in string table");
+        let mut p = Vec::new();
+        encode_varint(&mut p, 1);
+        encode_varint(&mut p, u64::MAX - 3);
+        assert!(decompile(&frame(&p, p.len() as u32, 0)).is_err());
+    }
+
+    // B-020: an index of 2^32 used to read as index 0.
+    #[test]
+    fn a_string_index_past_u32_is_an_error() {
+        let mut p = Vec::new();
+        encode_varint(&mut p, 1);
+        encode_varint(&mut p, 4);
+        p.extend_from_slice(b"zero");
+        p.push(TAG_STRING);
+        encode_varint(&mut p, 1 << 32);
+        assert_eq!(decompile(&frame(&p, p.len() as u32, 0)).unwrap_err(), "string index out of range");
+    }
+
+    // A count from the file is not an allocation request, and the tree has a budget.
+    #[test]
+    fn counts_and_copies_are_budgeted() {
+        // An array that claims 2^62 items and holds three is a truncated file.
+        // (What decoding really allocates is measured in `tests/hostile.rs`.)
+        let mut p = Vec::new();
+        encode_varint(&mut p, 0);
+        p.push(TAG_ARRAY);
+        encode_varint(&mut p, u64::MAX >> 2);
+        p.extend_from_slice(&[TAG_NULL, TAG_TRUE, TAG_FALSE]);
+        assert_eq!(decompile(&frame(&p, p.len() as u32, 0)).unwrap_err(), "unexpected end of data");
+
+        // Storage is charged before it is reserved.
+        let mut budget = DecodeBudget::default();
+        assert_eq!(budget.reserve(1000, 4096, 1, ARRAY_SLOT_COST).unwrap(), 1000);
+        assert_eq!(budget.spent, 1000 * ARRAY_SLOT_COST);
+        assert_eq!(budget.reserve(5000, 4096, 1, 1).unwrap_err(), "unexpected end of data");
+        assert_eq!(budget.reserve(3000, 6000, 2, OBJECT_ENTRY_COST).unwrap(), 3000);
+        assert_eq!(budget.reserve(3001, 6000, 2, 1).unwrap_err(), "unexpected end of data");
+        assert!(budget.reserve(MAX_DECODED_TREE_BYTES, usize::MAX, 1, 1).unwrap_err().contains("refusing to decode"));
+
+        // A list of nulls that is all there, and one item more than a tree may hold.
+        let n = MAX_DECODED_TREE_BYTES / ARRAY_SLOT_COST + 1;
+        let mut p = Vec::new();
+        encode_varint(&mut p, 0);
+        p.push(TAG_ARRAY);
+        encode_varint(&mut p, n as u64);
+        p.resize(p.len() + n, TAG_NULL);
+        let err = decompile(&frame(&p, p.len() as u32, 0)).unwrap_err();
+        assert!(err.contains("refusing to decode"), "{}", err);
+
+        // References to one string decode, each a copy.
+        let mut p = Vec::new();
+        encode_varint(&mut p, 1);
+        encode_varint(&mut p, 3);
+        p.extend_from_slice(b"abc");
+        p.push(TAG_ARRAY);
+        encode_varint(&mut p, 50_000);
+        for _ in 0..50_000 {
+            p.push(TAG_STRING);
+            p.push(0);
+        }
+        let r = decompile(&frame(&p, p.len() as u32, 0)).unwrap();
+        assert_eq!(r.root.as_array().unwrap().len(), 50_000);
+    }
+
+    // The costs are numbers shared with the ports; here they are held to what
+    // the pieces really occupy.
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn decode_costs_cover_what_the_pieces_occupy() {
+        use std::mem::size_of;
+        assert!(TABLE_ENTRY_COST >= size_of::<&str>());
+        assert!(ARRAY_SLOT_COST >= size_of::<Value>());
+        assert!(OBJECT_ENTRY_COST >= size_of::<Value>() + size_of::<String>() + 16);
+        assert!(TEXT_ITEM_COST >= size_of::<String>());
+        assert!(META_ENTRY_COST >= size_of::<Meta>() + size_of::<String>() + 16);
+        assert!(META_PATH_COST >= size_of::<MetaMap>() + size_of::<String>() + 16);
+        assert!(INCLUDE_COST >= size_of::<IncludeDirective>());
+    }
+
+    // The stream may not produce more than the header declares.
+    #[test]
+    fn a_stream_larger_than_declared_is_refused() {
+        let payload = vec![0u8; 32 * 1024 * 1024];
+        let err = decompile(&frame(&payload, 1024, 0)).unwrap_err();
+        assert!(err.starts_with("decompression failed"), "{}", err);
+        // The message names the failure, not the megabytes inflated so far.
+        assert!(err.len() < 200, "{}", err.len());
+    }
+
+    // A file that still has its markers is resolved after it is read, in
+    // document order: sorted keys put `alpha` ahead of what it reads.
+    #[test]
+    fn an_unresolved_file_keeps_document_order() {
+        let text = "!active\nprice 100\ntax:calc price * 0.2\ntotal:calc price + tax\nalpha:calc total + 1\n";
+        let mut back = decompile(&compile(&parse(text), false)).unwrap();
+        let keys: Vec<&str> = back.root.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        assert_eq!(keys, ["price", "tax", "total", "alpha"]);
+        resolve(&mut back, &Options::default());
+        assert_eq!(back.root.as_object().unwrap()["alpha"], Value::Int(121));
+
+        // A static file is written exactly as before: keys sorted.
+        let stat = decompile(&compile(&parse("zeta 1\nalpha 2\n"), false)).unwrap();
+        let keys: Vec<&str> = stat.root.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        assert_eq!(keys, ["alpha", "zeta"]);
+    }
+
+    // T3-04: the text of an unresolved file has its declarations back.
+    #[test]
+    fn decompile_writes_the_declarations() {
+        let text = "!active\n!include ./base.synx cfg\nport:env:default:8080 NOPE_UNSET_ZZ\nsecret_key:secret abc123\nmax[min:1, max:10] 5\nzip(string) 007\ntier:random 90 10\n  - gold\n  - silver\nprod:inherit base\n  debug false\nservers\n  - host:env H\n    port[type:int] 1\nnotes |\n  two\n  lines\n";
+        let out = Synx::decompile(&Synx::compile(text, false)).unwrap();
+        for line in [
+            "!active",
+            "!include ./base.synx cfg",
+            "port:env:default:8080 NOPE_UNSET_ZZ",
+            "secret_key:secret abc123",
+            "max[min:1, max:10] 5",
+            "zip(string) 007",
+            "tier:random 90 10",
+            "prod:inherit base",
+            "  - host:env H",
+            "    port[type:int] 1",
+        ] {
+            assert!(out.lines().any(|l| l == line), "missing `{}` in:\n{}", line, out);
+        }
+        // Read back, it is the same document: tree, declarations, order.
+        let a = parse(text);
+        let b = parse(&out);
+        assert_eq!(a.root, b.root);
+        assert_eq!(a.metadata, b.metadata);
+        assert_eq!(
+            a.root.as_object().unwrap().keys().collect::<Vec<_>>(),
+            b.root.as_object().unwrap().keys().collect::<Vec<_>>()
+        );
+        // And resolves to the same values.
+        let opts = Options { env: Some(Default::default()), ..Default::default() };
+        let (mut ra, mut rb) = (parse(text), parse(&out));
+        resolve(&mut ra, &opts);
+        resolve(&mut rb, &opts);
+        let pick = |r: &ParseResult, k: &str| r.root.as_object().unwrap()[k].clone();
+        for k in ["port", "secret_key", "max", "zip", "servers", "notes"] {
+            assert_eq!(pick(&ra, k), pick(&rb, k), "{}", k);
+        }
+        assert_eq!(pick(&rb, "port"), Value::Int(8080));
+        assert_eq!(pick(&rb, "secret_key"), Value::Secret("abc123".into()));
+    }
+
+    // A resolved file is a static document: its values are final.
+    #[test]
+    fn decompile_of_a_resolved_file_is_static() {
+        let text = "!active\nname Wario\ngreeting Hello, {name} and {braces}\nn:calc 2 + 3\n";
+        let out = Synx::decompile(&Synx::compile(text, true)).unwrap();
+        assert!(!out.contains("!active"), "{}", out);
+        let back = parse(&out);
+        assert_eq!(back.mode, Mode::Static);
+        assert_eq!(back.root.as_object().unwrap()["greeting"], Value::String("Hello, Wario and {braces}".into()));
+        assert_eq!(back.root.as_object().unwrap()["n"], Value::Int(5));
     }
 }

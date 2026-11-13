@@ -302,8 +302,10 @@ SYNX_TEST(v380_format_drops_subtree_past_depth_cap) {
     EXPECT_TRUE(out.find("\n    back 1\n") != std::string::npos);
 }
 
-// A file that includes itself stops at depth 16, resolving each level once.
-SYNX_TEST(v380_self_include_resolves_each_level_once) {
+// A file that includes itself stops at the first repeat: the text handed to
+// resolve has no path, the file it includes is open once, and including it
+// again from inside itself is the cycle (synx-core: `circular include`).
+SYNX_TEST(v380_self_include_stops_at_the_first_repeat) {
     TempTree t("synx-cpp-self-include");
     t.put("self.synx", "!active\nme:include self.synx\nc:tick 1\n");
     int ticks = 0;
@@ -312,10 +314,9 @@ SYNX_TEST(v380_self_include_resolves_each_level_once) {
         ++ticks;
         return v;
     };
-    std::string want = "\"INCLUDE_ERR: max include depth (16) exceeded\"";
-    for (int i = 0; i < 17; ++i) want = "{\"c\":1,\"me\":" + want + "}";
-    EXPECT_EQ(t.json(".", "!active\nme:include self.synx\nc:tick 1\n", o), want);
-    EXPECT_EQ(ticks, 17);
+    EXPECT_EQ(t.json(".", "!active\nme:include self.synx\nc:tick 1\n", o),
+              std::string("{\"c\":1,\"me\":{\"c\":1,\"me\":\"INCLUDE_ERR: circular include: 'self.synx'\"}}"));
+    EXPECT_EQ(ticks, 2);
     // `{key:include}` still reads the only include when the pre-pass resolved it.
     t.put("common.synx", "name Common\n");
     EXPECT_EQ(t.json(".", "!active\ndb:include common.synx\ng {name:include} {name:db}\n"),

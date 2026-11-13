@@ -31,7 +31,7 @@ contexts:
       scope: comment.line.number-sign.synx
     - match: ^(\s*)//[^\n]*$
       scope: comment.line.double-slash.synx
-    - match: ^(\s*)-\s+(.*?)(?:\s+(//|#)(.*))?$
+    - match: ^(\s*)-\s+((?:\S|\s+(?!\s|//|#))*)(?:\s+(//|#)(.*))?$
       captures:
         1: punctuation.whitespace.synx
         2: string.unquoted.synx
@@ -40,7 +40,7 @@ contexts:
     - match: ^(\s*)(###)\s*$
       scope: punctuation.definition.comment.block.synx
       push: block_comment
-    - match: ^(\s*)([a-zA-Z_][a-zA-Z0-9_.]*(?:\([^)]*\))?(?:\[[^\]]+\])?(?::[a-zA-Z_][a-zA-Z0-9_]*)*)(?:\s+(.*?))?(?:\s+(//|#)(.*))?$
+    - match: ^(\s*)([a-zA-Z_][a-zA-Z0-9_.]*(?:\([^)]*\))?(?:\[[^\]]+\])?(?::[a-zA-Z_][a-zA-Z0-9_]*)*)(?:\s+((?:\S|\s+(?!\s|//|#))*))?(?:\s+(//|#)(.*))?$
       captures:
         1: punctuation.whitespace.synx
         2: entity.name.tag.key.synx

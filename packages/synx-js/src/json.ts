@@ -2,8 +2,7 @@
  * Canonical JSON writer — @aperturesyndicate/synx-format
  *
  * SYNX §10 / SYNXL §12: object keys sorted lexicographically at every nesting
- * level, arrays in order, internal `__synx` metadata hidden, and — in compact
- * mode — no insignificant whitespace.
+ * level, arrays in order, and — in compact mode — no insignificant whitespace.
  *
  * This lives in its own module so that the SYNX facade (`index.ts`, Node-only)
  * and the SYNXL reader (`synxl.ts`, runtime-agnostic) share one implementation
@@ -18,25 +17,9 @@
  */
 
 import type { SynxObject } from './types';
+import { compareUnicodeScalar } from './parser';
 
-/**
- * Compare by Unicode **scalar** order, which is what SYNX §10 / SYNXL §12.1
- * specify — not JavaScript's default UTF-16 code-unit order. The two disagree
- * only for astral characters, which a naive `<` sorts below U+E000..U+FFFF.
- * (Rust compares `String`s by UTF-8 bytes, i.e. scalar order.)
- */
-export function compareUnicodeScalar(a: string, b: string): number {
-  const n = Math.min(a.length, b.length);
-  for (let i = 0; i < n; i++) {
-    const ca = a.charCodeAt(i);
-    const cb = b.charCodeAt(i);
-    if (ca === cb) continue;
-    const sa = ca >= 0xd800 && ca <= 0xdbff ? (a.codePointAt(i) as number) : ca;
-    const sb = cb >= 0xd800 && cb <= 0xdbff ? (b.codePointAt(i) as number) : cb;
-    return sa < sb ? -1 : 1;
-  }
-  return a.length - b.length;
-}
+export { compareUnicodeScalar };
 
 /** Characters that need escaping: `"`, `\`, and the C0 controls. */
 const NEEDS_ESCAPE = /["\\\u0000-\u001f]/;
@@ -77,11 +60,44 @@ function escapeString(s: string): string {
 function formatNumber(n: number): string {
   if (!Number.isFinite(n)) return 'null';
   if (Object.is(n, -0)) return '-0.0';
-  const s = String(n);
-  return s.includes('e+') ? s.replace('e+', 'e') : s;
+  // A whole number an integer can hold exactly is written as one.
+  if (Number.isSafeInteger(n)) return String(n);
+  return floatText(n);
 }
 
+/**
+ * A float as the reference implementation writes it (the `ryu` crate): the
+ * shortest digits that read back as the same number, in plain decimal while
+ * the point falls within 16 digits to the left and 5 zeros to the right, and
+ * with an exponent beyond that.
+ *
+ * spec: `String(n)` draws those lines elsewhere — `0.000001` and
+ * `12345678901234567000` here were `1e-6` and `1.2345678901234567e19` in
+ * synx-core, so the two wrote different bytes for the same number.
+ */
+function floatText(n: number): string {
+  // `toExponential()` gives the same shortest digits: `d.ddde±x`.
+  const exp = n.toExponential();
+  const e = exp.indexOf('e');
+  const negative = exp.charCodeAt(0) === 45;
+  const mantissa = exp.substring(negative ? 1 : 0, e);
+  const digits = mantissa.length > 1 ? mantissa.charAt(0) + mantissa.substring(2) : mantissa;
+  // Digits before the decimal point.
+  const point = Number(exp.substring(e + 1)) + 1;
+  const sign = negative ? '-' : '';
+  if (point >= digits.length && point <= 16) return sign + digits + '0'.repeat(point - digits.length) + '.0';
+  if (point > 0 && point <= 16) return sign + digits.substring(0, point) + '.' + digits.substring(point);
+  if (point > -5 && point <= 0) return sign + '0.' + '0'.repeat(-point) + digits;
+  return sign + (digits.length === 1 ? digits : digits.charAt(0) + '.' + digits.substring(1)) + 'e' + (point - 1);
+}
+
+/** Deepest nesting written; anything below is `null`, as in the reference implementation. */
+const MAX_JSON_DEPTH = 128;
+
 function writeValue(v: unknown, hideMeta: boolean, indent: number, depth: number): string {
+  // safety: also the end of a tree that loops back on itself — the recursion
+  // had none, and such a value overflowed the stack.
+  if (depth > MAX_JSON_DEPTH) return 'null';
   if (v === null || v === undefined) return 'null';
   const t = typeof v;
   if (t === 'boolean') return v ? 'true' : 'false';
@@ -111,9 +127,7 @@ function writeValue(v: unknown, hideMeta: boolean, indent: number, depth: number
   // `Object.keys` plus a descriptor read, so an own `__proto__` property —
   // which `obj[k]` would resolve through the prototype getter — is read as the
   // data it is.
-  const keys = Object.keys(obj)
-    .filter(k => !(hideMeta && k === '__synx'))
-    .sort(compareUnicodeScalar);
+  const keys = Object.keys(obj).sort(compareUnicodeScalar);
   if (keys.length === 0) return '{}';
   const entries = keys.map(k => {
     // perf: only `__proto__` needs the descriptor; every other key reads directly.
@@ -132,9 +146,9 @@ function writeValue(v: unknown, hideMeta: boolean, indent: number, depth: number
 /**
  * Serialize a parsed SYNX/SYNXL value as canonical JSON.
  *
- * `hideMeta` drops the engine's `__synx` metadata key, which is a SYNX-side
- * implementation detail. SYNXL disables metadata capture entirely (§9.5), so
- * a `__synx` key in a record is caller data and is kept.
+ * Every key of the object is data. (`hideMeta` used to drop a key named
+ * `__synx`, where the engine once kept its declarations; they live beside the
+ * tree now, and a document key of that name is written like any other.)
  */
 export function toCanonicalJSONString(obj: SynxObject, pretty = true, hideMeta = true): string {
   return writeValue(obj, hideMeta, pretty ? 2 : 0, 0);

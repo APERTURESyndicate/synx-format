@@ -80,3 +80,9 @@ integrations/**/node_modules/
 
 # Dart tooling (`pub get`, `dart test`) — regenerated, never commit
 parsers/**/.dart_tool/
+
+# Private cargo target dirs and scratch of the hardening suite (never commit)
+target-*/
+tests/adversarial/tmp/
+tests/adversarial/local.json
+parsers/swift/.build/

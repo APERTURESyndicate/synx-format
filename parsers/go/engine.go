@@ -5,6 +5,7 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -21,7 +22,60 @@ const (
 	maxFileSize            = 10 * 1024 * 1024
 	defaultMaxIncludeDepth = 16
 	maxEngineScratch       = 4 * 1024 * 1024
+	// maxIncludeReads: included documents one top-level Resolve may read.
+	maxIncludeReads = 1024
+	// maxResolveReadBytes: bytes one top-level Resolve may read from disk
+	// through `:include`, `!include`, `!use` and `:watch`. Every file is capped
+	// at maxFileSize, but a document may name the same file from a thousand
+	// keys; each read is parsed and kept.
+	maxResolveReadBytes = 64 * 1024 * 1024
 )
+
+// runtimeErrorPrefixes: the prefixes of the strings the engine leaves in place
+// of a value it could not produce.
+var runtimeErrorPrefixes = []string{
+	"INCLUDE_ERR:", "WATCH_ERR:", "CALC_ERR:", "SPAM_ERR:", "CONSTRAINT_ERR:",
+	"ALIAS_ERR:", "NESTING_ERR:", "LIMIT_ERR:", "TYPE_ERR:", "WASM_ERR:",
+}
+
+// resolveShared is what a top-level Resolve shares with the resolves it starts
+// for included documents and packages.
+type resolveShared struct {
+	// open: files whose resolution is in progress, outermost first.
+	open []string
+	// reads: documents read so far.
+	reads int
+	// readBytes: bytes read so far.
+	readBytes int64
+}
+
+// enter opens `full` for resolution, or returns why not: the file is already
+// being resolved (a cycle), or the document has read its budget. A successful
+// enter is paired with leave.
+//
+// safety: the depth cap alone let `a:include self.synx` / `b:include
+// self.synx` resolve 2^16 times — minutes for a three-line file, and a third
+// key made it hang. A cycle now stops at its first repeat, and the budget
+// bounds an acyclic fan-out.
+func (s *resolveShared) enter(full, shown string) string {
+	for _, p := range s.open {
+		if p == full || (runtime.GOOS == "windows" && strings.EqualFold(p, full)) {
+			return fmt.Sprintf("circular include: '%s'", shown)
+		}
+	}
+	if s.reads >= maxIncludeReads {
+		return fmt.Sprintf("include budget (%d files) exceeded", maxIncludeReads)
+	}
+	s.reads++
+	s.open = append(s.open, full)
+	return ""
+}
+
+func (s *resolveShared) leave() {
+	if n := len(s.open); n > 0 {
+		s.open = s.open[:n-1]
+	}
+}
 
 // builtinMarkers — names a custom marker (Options.MarkerFns) cannot take.
 var builtinMarkers = map[string]struct{}{
@@ -164,6 +218,9 @@ type resolver struct {
 	// It is kept apart from the `{key:alias}` map, so `{x:include}` still
 	// sees exactly the includes the document declares.
 	preIncludes map[string]preInclude
+	// secretOriginals: what the keys under `:secret` held before the pre-pass
+	// masked them, by object path and key (see maskSecretLiterals).
+	secretOriginals map[string]map[string]Value
 }
 
 type preInclude struct {
@@ -185,6 +242,9 @@ func Resolve(result *ParseResult, opts Options) {
 	meta := result.Metadata
 	if meta == nil {
 		meta = NewMetadataTree()
+	}
+	if opts.shared == nil {
+		opts.shared = &resolveShared{}
 	}
 	r := &resolver{opts: opts, meta: meta, rootValue: result.Root, preIncludes: map[string]preInclude{}}
 	r.root, _ = AsObject(result.Root)
@@ -215,16 +275,22 @@ func Resolve(result *ParseResult, opts Options) {
 				if errText != "" || checkFileSize(full) != "" {
 					continue
 				}
-				text, err := readUTF8(full)
-				if err != nil {
+				included, errText := r.includeFile(full, full, path.V)
+				if errText != "" {
 					continue
 				}
-				included := r.parseIncluded(text, full)
 				// The key's `:include` marker takes this result instead of reading
 				// and resolving the file a second time (2^depth for a chain).
 				r.preIncludes[key] = preInclude{path: path.V, root: included}
 				if !r.includes.Contains(key) {
-					r.includes.Set(key, included)
+					// safety: the tree is also what `{leaf:key}` reads. Under
+					// `:secret` that scope gets the masked tree, or
+					// `x {password:db}` printed what `db:secret:include` hid.
+					alias := included
+					if hasMarker(m.Markers, "secret") {
+						alias = maskSecretValue(CloneValue(included))
+					}
+					r.includes.Set(key, alias)
 				}
 			}
 		}
@@ -246,7 +312,7 @@ func Resolve(result *ParseResult, opts Options) {
 		r.root.retain(func(k string) bool { return !strings.HasPrefix(k, "_") })
 	}
 
-	// Literal `:secret` values are masked before anything can interpolate them.
+	// Every value under `:secret` is masked before anything can read it.
 	r.path = r.path[:0]
 	r.maskSecretLiterals(result.Root)
 
@@ -295,6 +361,53 @@ func (r *resolver) maxIncludeDepth() int {
 	return r.opts.MaxIncludeDepth
 }
 
+// includeFile reads the document at `path` and resolves it. `opened` is the
+// file's canonical path, by which a cycle is known; `shown` is the path as the
+// document wrote it. The second result is the reason the file was refused: it
+// is already being resolved, or the document has read its budget.
+func (r *resolver) includeFile(opened, path, shown string) (Value, string) {
+	shared := r.opts.shared
+	if errText := shared.enter(opened, shown); errText != "" {
+		return nil, errText
+	}
+	defer shared.leave()
+	text, errText := r.readBudgeted(path, shown)
+	if errText != "" {
+		return nil, errText
+	}
+	return r.parseIncluded(text, path), ""
+}
+
+// readBudgeted reads a file for `:include`, `!include`, `!use` or `:watch`,
+// counting its size against maxResolveReadBytes. The error text never carries
+// the operating system's wording or the absolute path, so the same document
+// resolves to the same string on every machine.
+func (r *resolver) readBudgeted(full, shown string) (string, string) {
+	shared := r.opts.shared
+	var size int64
+	fi, statErr := os.Stat(full)
+	if statErr == nil {
+		size = fi.Size()
+	}
+	if shared.readBytes+size > maxResolveReadBytes {
+		return "", fmt.Sprintf("read budget (%d bytes) exceeded", maxResolveReadBytes)
+	}
+	// A directory reads as "permission denied" on Windows and "is a directory"
+	// elsewhere; it is neither.
+	if statErr == nil && fi.IsDir() {
+		return "", "not a file: " + shown
+	}
+	data, err := os.ReadFile(full)
+	if err != nil {
+		return "", ioErrText(err, shown)
+	}
+	if !utf8.Valid(data) {
+		return "", "file is not valid UTF-8: " + shown
+	}
+	shared.readBytes += int64(len(data))
+	return string(data), ""
+}
+
 // parseIncluded parses an included file and resolves it when it is active.
 func (r *resolver) parseIncluded(text, full string) Value {
 	included := Parse(text)
@@ -337,10 +450,28 @@ func (r *resolver) resolveObject(obj *Object, depth int) {
 	}
 	mm := r.meta.levels[string(r.path)]
 	baseLen := len(r.path)
+	// What this object's `:secret` keys held before the pre-pass.
+	var originals map[string]Value
+	if len(r.secretOriginals) > 0 {
+		if o, ok := r.secretOriginals[string(r.path)]; ok {
+			originals = o
+			delete(r.secretOriginals, string(r.path))
+		}
+	}
 	n := len(obj.pairs)
 	for i := 0; i < n; i++ {
 		if i >= len(obj.pairs) {
 			break
+		}
+		if original, ok := originals[obj.pairs[i].Key]; ok {
+			delete(originals, obj.pairs[i].Key)
+			obj.pairs[i].Value = original
+			if isContainer(original) {
+				// Secrets nested in it stay masked until their own turn.
+				r.pushKey(obj.pairs[i].Key)
+				r.maskSecretSubtree(original)
+				r.path = r.path[:baseLen]
+			}
 		}
 		switch child := obj.pairs[i].Value.(type) {
 		case ObjectValue:
@@ -446,9 +577,16 @@ func (r *resolver) applyMarkers(obj *Object, key string, meta *Meta, path string
 					set(String(fmt.Sprintf("INCLUDE_ERR: max include depth (%d) exceeded", maxDepth)))
 					return
 				}
+				// `:include` with `:secret` masks the leaves of the included tree.
+				place := func(root Value) {
+					if mb&mkSecret != 0 {
+						root = maskSecretValue(root)
+					}
+					set(root)
+				}
 				if path == "" {
 					if pre, ok := r.preIncludes[key]; ok && pre.path == filePath.V {
-						set(CloneValue(pre.root))
+						place(CloneValue(pre.root))
 						return
 					}
 				}
@@ -461,12 +599,12 @@ func (r *resolver) applyMarkers(obj *Object, key string, meta *Meta, path string
 					set(String("INCLUDE_ERR: " + errText))
 					return
 				}
-				text, err := readUTF8(full)
-				if err != nil {
-					set(String("INCLUDE_ERR: " + ioErrText(err, filePath.V)))
+				included, errText := r.includeFile(full, full, filePath.V)
+				if errText != "" {
+					set(String("INCLUDE_ERR: " + errText))
 					return
 				}
-				set(r.parseIncluded(text, full))
+				place(included)
 			}
 		}
 		return
@@ -690,15 +828,6 @@ func (r *resolver) applyMarkers(obj *Object, key string, meta *Meta, path string
 		}
 	}
 
-	// ── :secret (idempotent: the pre-pass may have masked it already) ──
-	if mb&mkSecret != 0 {
-		if v, ok := get(); ok {
-			if _, isSecret := v.(SecretValue); !isSecret {
-				set(Secret(valueToString(v)))
-			}
-		}
-	}
-
 	// ── :unique ──
 	if mb&mkUnique != 0 {
 		if v, ok := get(); ok {
@@ -843,9 +972,21 @@ func (r *resolver) applyMarkers(obj *Object, key string, meta *Meta, path string
 		}
 		if v, ok := get(); ok {
 			if n, ok := valueAsNumber(v); ok {
-				factor := powi(10, int32(uint32(decimals)))
-				rounded := math.Round(n*factor) / factor
-				if decimals == 0 {
+				// A scale past the range of f64 rounds nothing: the number stays.
+				scale := decimals
+				if scale > 400 {
+					scale = 400
+				}
+				factor := powi(10, int32(scale))
+				rounded := n
+				if scaled := n * factor; isFinite(scaled) {
+					rounded = math.Round(scaled) / factor
+				}
+				// safety: only a whole number that fits is an integer. The cast
+				// alone saturates: `:round` of 1e30 was 9223372036854775807 and
+				// of NaN was 0 — invented values, where `:calc` and `:clamp`
+				// keep the float.
+				if decimals == 0 && isWhole(rounded) && math.Abs(rounded) < i64MaxF {
 					set(Int(f64ToI64(rounded)))
 				} else {
 					set(Float(rounded))
@@ -908,7 +1049,11 @@ func (r *resolver) applyMarkers(obj *Object, key string, meta *Meta, path string
 		}
 	}
 
-	// ── :sort / :sort:desc — numbers numerically, anything else by code point ──
+	// ── :sort / :sort:desc ──
+	// A total order: numbers first, by value (NaN after the rest of them), then
+	// everything else by its text, by code point. Comparing a number with text
+	// as text made `10 < 1a < 9 < 10` a cycle, and the result depended on the
+	// sort algorithm.
 	if mb&mkSort != 0 {
 		if v, ok := get(); ok {
 			if arr, ok := v.(ArrayValue); ok {
@@ -921,8 +1066,16 @@ func (r *resolver) applyMarkers(obj *Object, key string, meta *Meta, path string
 				sort.SliceStable(sorted, func(a, b int) bool {
 					an, aok := valueAsNumber(sorted[a])
 					bn, bok := valueAsNumber(sorted[b])
-					if aok && bok {
+					switch {
+					case aok && bok:
+						if an != an || bn != bn {
+							return an == an && bn != bn
+						}
 						return an < bn
+					case aok:
+						return true
+					case bok:
+						return false
 					}
 					return valueToString(sorted[a]) < valueToString(sorted[b])
 				})
@@ -952,7 +1105,8 @@ func (r *resolver) applyMarkers(obj *Object, key string, meta *Meta, path string
 							allInt = false
 						}
 					case StringValue:
-						if f, ok := parseRustFloat(x.V); ok {
+						// `inf` and `nan` are text here as everywhere (see castPrimitive).
+						if f, ok := parseRustFloat(x.V); ok && isFinite(f) {
 							total += f
 							if !isWhole(f) {
 								allInt = false
@@ -1045,9 +1199,9 @@ func (r *resolver) applyMarkers(obj *Object, key string, meta *Meta, path string
 					return
 				}
 				keyPath, hasKeyPath := markerArg(markers, markerIndex(markers, "watch"), 1)
-				content, err := readUTF8(full)
-				if err != nil {
-					set(String("WATCH_ERR: " + ioErrText(err, filePath.V)))
+				content, errText := r.readBudgeted(full, filePath.V)
+				if errText != "" {
+					set(String("WATCH_ERR: " + errText))
 				} else if hasKeyPath {
 					if val, ok := extractFromFileContent(content, keyPath, fileExtension(full)); ok {
 						set(val)
@@ -1058,6 +1212,18 @@ func (r *resolver) applyMarkers(obj *Object, key string, meta *Meta, path string
 					set(String(strings.TrimSpace(content)))
 				}
 			}
+		}
+	}
+
+	// ── :secret ──
+	// Last of the markers that produce the value, so whatever they resolved is
+	// what gets masked. It used to sit after `:alias`: `t:secret:once` came out
+	// as plain text, `:secret:default:x` and `:secret:watch` masked the
+	// argument instead of the result, and `:secret:format` formatted the mask.
+	// `:prompt` and custom markers below still see only the mask.
+	if mb&mkSecret != 0 {
+		if v, ok := get(); ok {
+			set(maskSecretValue(v))
 		}
 	}
 
@@ -1562,59 +1728,120 @@ func applyInheritance(rootV Value, md *MetadataTree) {
 	}
 }
 
-// needsResolutionBeforeSecret: markers whose value must be resolved before it
-// becomes a secret; those are masked by `:secret` in place.
-func needsResolutionBeforeSecret(markers []string) bool {
-	for _, m := range markers {
-		switch m {
-		case "env", "include", "import", "watch", "ref", "alias", "calc", "map", "i18n", "default",
-			"fallback", "once", "split", "join", "format", "replace":
+// maskSecretLiterals is the `:secret` pre-pass: every value under `:secret` is
+// masked before any resolution, so no field that names it — `{that_key}`,
+// `:alias`, `:map` — reads the plain text, wherever in the document it stands.
+// What the key held is kept in r.secretOriginals and comes back for the key's
+// own turn (its subtree and its marker chain); what that produces is masked
+// again by the `:secret` marker.
+//
+// safety: a literal next to `:default`, `:replace`, `:format`, `:split`, … was
+// left in the clear until its own turn, and the fields of a group under
+// `:secret` were never masked here: `leak:alias password` above
+// `password:secret:default:x hunter2` read `hunter2`.
+func (r *resolver) maskSecretLiterals(v Value) {
+	obj, ok := v.(ObjectValue)
+	if !ok || obj.V == nil {
+		return
+	}
+	if mm := r.meta.levels[string(r.path)]; mm != nil {
+		for _, key := range mm.keys {
+			meta := mm.items[key]
+			if !hasMarker(meta.Markers, "secret") {
+				continue
+			}
+			i := obj.V.find(key)
+			if i < 0 {
+				continue
+			}
+			original := obj.V.pairs[i].Value
+			switch original.(type) {
+			case SecretValue, NullValue:
+				continue
+			}
+			obj.V.pairs[i].Value = maskSecretValue(CloneValue(original))
+			path := string(r.path)
+			if r.secretOriginals == nil {
+				r.secretOriginals = map[string]map[string]Value{}
+			}
+			if r.secretOriginals[path] == nil {
+				r.secretOriginals[path] = map[string]Value{}
+			}
+			r.secretOriginals[path][key] = original
+		}
+	}
+	baseLen := len(r.path)
+	for _, p := range obj.V.pairs {
+		if !isContainer(p.Value) {
+			continue
+		}
+		r.pushKey(p.Key)
+		r.maskSecretSubtree(p.Value)
+		r.path = r.path[:baseLen]
+	}
+}
+
+// maskSecretSubtree is maskSecretLiterals for the object or list at r.path.
+func (r *resolver) maskSecretSubtree(child Value) {
+	switch x := child.(type) {
+	case ObjectValue:
+		r.maskSecretLiterals(x)
+	case ArrayValue:
+		listLen := len(r.path)
+		for idx, item := range x.V {
+			if o, ok := item.(ObjectValue); ok {
+				r.pushItem(idx)
+				r.maskSecretLiterals(o)
+				r.path = r.path[:listLen]
+			}
+		}
+	}
+}
+
+// isEngineError: `s` is an error the engine left in place of a value.
+func isEngineError(s string) bool {
+	if s == "" || s[0] < 'A' || s[0] > 'Z' {
+		return false
+	}
+	for _, p := range runtimeErrorPrefixes {
+		if strings.HasPrefix(s, p) {
 			return true
 		}
 	}
 	return false
 }
 
-func (r *resolver) maskSecretLiterals(v Value) {
-	obj, ok := v.(ObjectValue)
-	if !ok {
-		return
-	}
-	if mm := r.meta.levels[string(r.path)]; mm != nil {
-		for _, key := range mm.keys {
-			meta := mm.items[key]
-			if !hasMarker(meta.Markers, "secret") || needsResolutionBeforeSecret(meta.Markers) {
-				continue
-			}
-			if i := obj.V.find(key); i >= 0 {
-				switch val := obj.V.pairs[i].Value.(type) {
-				case SecretValue, ObjectValue, ArrayValue:
-				default:
-					obj.V.pairs[i].Value = Secret(valueToString(val))
-				}
+// maskSecretValue makes a resolved value a secret. A scalar becomes the secret
+// of its text; a list or a group keeps its shape and every scalar in it is
+// masked (in place). An absent value (null) stays null — wrapping it made the
+// secret the text "null", which `[required]` read as a present value — an
+// existing secret is kept, and an engine error stays readable:
+// `:secret:watch missing.txt` is a failure to report, not a value to hide.
+func maskSecretValue(v Value) Value {
+	switch x := v.(type) {
+	case SecretValue, NullValue:
+		return v
+	case ArrayValue:
+		for i := range x.V {
+			x.V[i] = maskSecretValue(x.V[i])
+		}
+		return x
+	case ObjectValue:
+		if x.V != nil {
+			for i := range x.V.pairs {
+				x.V.pairs[i].Value = maskSecretValue(x.V.pairs[i].Value)
 			}
 		}
-	}
-	baseLen := len(r.path)
-	for _, p := range obj.V.pairs {
-		switch child := p.Value.(type) {
-		case ObjectValue:
-			r.pushKey(p.Key)
-			r.maskSecretLiterals(child)
-			r.path = r.path[:baseLen]
-		case ArrayValue:
-			r.pushKey(p.Key)
-			listLen := len(r.path)
-			for idx, item := range child.V {
-				if o, ok := item.(ObjectValue); ok {
-					r.pushItem(idx)
-					r.maskSecretLiterals(o)
-					r.path = r.path[:listLen]
-				}
-			}
-			r.path = r.path[:baseLen]
+		return x
+	case StringValue:
+		if isEngineError(x.V) {
+			return v
 		}
 	}
+	if v == nil {
+		return Null
+	}
+	return Secret(valueToString(v))
 }
 
 // ─── shared helpers ─────────────────────────────────────────────────────────
@@ -1657,7 +1884,9 @@ func castPrimitive(val string) Value {
 	if n, err := strconv.ParseInt(val, 10, 64); err == nil {
 		return Int(n)
 	}
-	if f, ok := parseRustFloat(val); ok {
+	// spec: `inf`, `NaN` and `1e400` are text. Read as floats they became `null`
+	// in JSON: a host named `inf` lost its value.
+	if f, ok := parseRustFloat(val); ok && isFinite(f) {
 		return Float(f)
 	}
 	return String(val)

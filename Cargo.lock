@@ -89,7 +89,7 @@ dependencies = [
 
 [[package]]
 name = "as-cli"
-version = "3.8.0"
+version = "3.8.1"
 dependencies = [
  "clap",
  "dirs",
@@ -2024,7 +2024,7 @@ dependencies = [
 
 [[package]]
 name = "synx-bench"
-version = "3.8.0"
+version = "3.8.1"
 dependencies = [
  "criterion",
  "synx-core",
@@ -2032,7 +2032,7 @@ dependencies = [
 
 [[package]]
 name = "synx-c"
-version = "3.8.0"
+version = "3.8.1"
 dependencies = [
  "serde_json",
  "synx-core",
@@ -2040,7 +2040,7 @@ dependencies = [
 
 [[package]]
 name = "synx-cli"
-version = "3.8.0"
+version = "3.8.1"
 dependencies = [
  "clap",
  "dirs",
@@ -2055,7 +2055,7 @@ dependencies = [
 
 [[package]]
 name = "synx-core"
-version = "3.8.0"
+version = "3.8.1"
 dependencies = [
  "ed25519-dalek",
  "foldhash",
@@ -2075,14 +2075,14 @@ dependencies = [
 
 [[package]]
 name = "synx-format"
-version = "3.8.0"
+version = "3.8.1"
 dependencies = [
  "synx-core",
 ]
 
 [[package]]
 name = "synx-lsp"
-version = "3.8.0"
+version = "3.8.1"
 dependencies = [
  "serde_json",
  "synx-core",
@@ -2092,7 +2092,7 @@ dependencies = [
 
 [[package]]
 name = "synx-node"
-version = "3.8.0"
+version = "3.8.1"
 dependencies = [
  "mimalloc",
  "napi",
@@ -2103,7 +2103,7 @@ dependencies = [
 
 [[package]]
 name = "synx-python"
-version = "3.8.0"
+version = "3.8.1"
 dependencies = [
  "mimalloc",
  "pyo3",
@@ -2113,7 +2113,7 @@ dependencies = [
 
 [[package]]
 name = "synx-wasm"
-version = "3.8.0"
+version = "3.8.1"
 dependencies = [
  "serde-wasm-bindgen",
  "serde_json",

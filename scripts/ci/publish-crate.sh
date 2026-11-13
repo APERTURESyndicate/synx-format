@@ -11,8 +11,21 @@ crate="$1"
 version="$(cargo pkgid | sed 's/.*[#@]//')"
 
 if [ "${IS_DRY_RUN:-false}" = "true" ]; then
-  cargo publish --dry-run --allow-dirty
-  exit 0
+  # A crate that depends on a sibling of this same release cannot be packaged
+  # before that sibling is on the index: the dry run then checks what it can —
+  # the file list of the package and a build against the sibling in the tree.
+  if cargo publish --dry-run --allow-dirty 2> dry-run.err; then
+    exit 0
+  fi
+  cat dry-run.err >&2
+  if grep -q "failed to select a version for the requirement \`synx-core" dry-run.err; then
+    echo "::notice title=Dry run::${crate} ${version} needs synx-core ${version} on crates.io — checked the file list and the build instead"
+    rm -f dry-run.err
+    cargo package --list --allow-dirty
+    cargo build --release
+    exit 0
+  fi
+  exit 1
 fi
 
 published="$(curl -sS --max-time 30 \

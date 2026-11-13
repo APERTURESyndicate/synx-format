@@ -248,7 +248,7 @@ func TestReleaseUseStaysInsidePackages(t *testing.T) {
 
 // A file that includes itself stops at the include depth cap, and each level
 // is resolved once: the `:include` marker reuses the pre-pass result.
-func TestReleaseSelfIncludeResolvesOncePerLevel(t *testing.T) {
+func TestReleaseSelfIncludeStopsAtTheFirstRepeat(t *testing.T) {
 	dir := t.TempDir()
 	writeFiles(t, dir, map[string]string{"self.synx": "!active\nme:include self.synx\nn:tick 1\n"})
 	text, _ := os.ReadFile(filepath.Join(dir, "self.synx"))
@@ -257,13 +257,15 @@ func TestReleaseSelfIncludeResolvesOncePerLevel(t *testing.T) {
 	Resolve(&r, Options{BasePath: dir, Env: map[string]string{}, MarkerFns: map[string]MarkerFn{
 		"tick": func(key string, args []string, v Value) Value { calls++; return v },
 	}})
+	// The text handed to Resolve has no path; the file it includes is open
+	// once, and including it again from inside itself is the cycle.
 	got := ToJSON(r.Root)
-	want := strings.Repeat(`{"me":`, 16) + `{"me":"INCLUDE_ERR: max include depth (16) exceeded","n":1}` + strings.Repeat(`,"n":1}`, 16)
+	want := `{"me":{"me":"INCLUDE_ERR: circular include: 'self.synx'","n":1},"n":1}`
 	if got != want {
 		t.Fatalf("\n got: %s\nwant: %s", got, want)
 	}
-	if calls != 17 {
-		t.Fatalf("resolved %d documents, want 17 (one per level)", calls)
+	if calls != 2 {
+		t.Fatalf("resolved %d documents, want 2", calls)
 	}
 }
 

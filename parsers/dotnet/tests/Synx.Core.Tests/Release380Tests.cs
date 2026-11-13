@@ -119,7 +119,7 @@ public class Release380Tests
     [Fact]
     public void List_items_get_the_right_parent()
     {
-        Assert.Equal("{\"after\":1,\"items\":[{\"name\":\"a\",\"sub\":{\"k\":1}},{\"name\":\"b\",\"v\":2,\"w\":3}],\"lst\":5,\"objs\":[\"one\",{\"three\":3,\"two\":2},4],\"x\":[{\"k\":\"v\",\"y\":2}],\"x_1\":{}}",
+        Assert.Equal("{\"after\":1,\"items\":[{\"name\":\"a\",\"sub\":{\"k\":1}},{\"name\":\"b\",\"v\":2,\"w\":3}],\"lst\":5,\"objs\":[\"one\",{\"three\":3,\"two\":2},4],\"x\":[],\"x_1\":[{\"k\":\"v\",\"y\":2}]}",
             Static("items\n  - name a\n    sub\n      k 1\n  - name b\n    v 2\n    w 3\nafter 1\nx:join\n x_1\n # c\n  - k v\n   y 2\nlst\n  - a\n  lst 5\n  - b\nobjs\n  - one\n  - two 2\n    three 3\n  - 4\n"));
     }
 
@@ -158,7 +158,7 @@ public class Release380Tests
     }
 
     [Fact]
-    public void Self_include_nests_to_the_depth_cap_once_per_level()
+    public void Self_include_stops_at_the_first_repeat()
     {
         var dir = Directory.CreateTempSubdirectory("synx-self-").FullName;
         try
@@ -168,12 +168,9 @@ public class Release380Tests
             var json = SynxFormat.ToJson(SynxFormat.ParseActive(
                 File.ReadAllText(Path.Combine(dir, "self.synx")), new SynxOptions { BasePath = dir }));
             sw.Stop();
-            var expected = new StringBuilder();
-            for (var i = 0; i < 16; i++) expected.Append("{\"me\":");
-            expected.Append("{\"me\":\"INCLUDE_ERR: max include depth (16) exceeded\",\"v\":1}");
-            for (var i = 0; i < 16; i++) expected.Append(",\"v\":1}");
-            Assert.Equal(expected.ToString(), json);
-            // Resolving every level twice is 2^16 resolutions; once per level is 16.
+            // The text handed to ParseActive has no path; the file it includes is open once,
+            // and including it again from inside itself is the cycle.
+            Assert.Equal("{\"me\":{\"me\":\"INCLUDE_ERR: circular include: './self.synx'\",\"v\":1},\"v\":1}", json);
             Assert.True(sw.ElapsedMilliseconds < 3000, $"took {sw.ElapsedMilliseconds} ms");
 
             // The pre-pass result is no extra include: `{x:include}` still sees exactly one.

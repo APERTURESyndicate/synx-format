@@ -10,7 +10,8 @@ public enum SynxStringify {
     public static func stringify(_ value: SynxValue) -> String {
         guard case .object(let map) = value else { return formatPrimitive(value) }
         var w = Writer()
-        for e in sortedEntries(map) { w.entry(e.key, e.value, 0, 0) }
+        let names = KeyNames(map)
+        for e in sortedEntries(map) { w.entry(names.name(e.key), e.value, 0, 0) }
         return String(decoding: w.out, as: UTF8.self)
     }
 
@@ -33,6 +34,73 @@ public enum SynxStringify {
     }
 }
 
+/// The names the keys of one object are written under: a key that reads back as
+/// itself keeps its name; any other has every character that would end it or
+/// start something else written as `_`, and two keys never share a name — one
+/// already taken gets a number (`a_b`, `a_b_2`, …, in the order of the keys).
+///
+/// safety: SYNX has no quoting for keys, and a key was written as it came.
+/// `port:env` gave the next reader a marker, `!active` on a line of its own
+/// switched the document to active mode, a line break began new lines — a map
+/// with caller-chosen keys, saved and loaded, could read the environment.
+struct KeyNames {
+    private var renamed: [String: String] = [:]
+
+    init(_ map: SynxObject) {
+        let keys = map.entries.map { $0.key }
+        if keys.allSatisfy(KeyNames.readsBack) { return }
+        let present = Set(keys)
+        var taken = Set<String>()
+        var next: [String: Int] = [:]
+        for key in keys where !KeyNames.readsBack(key) {
+            let base = KeyNames.writable(key)
+            var name = base
+            while present.contains(name) || taken.contains(name) {
+                let n = next[base] ?? 2
+                name = base + "_" + String(n)
+                next[base] = n + 1
+            }
+            taken.insert(name)
+            renamed[key] = name
+        }
+    }
+
+    func name(_ key: String) -> String { renamed[key] ?? key }
+
+    static func isReserved(_ k: String) -> Bool { k == "__proto__" || k == "constructor" || k == "prototype" }
+
+    static func isControl(_ c: UInt32) -> Bool { c < 0x20 || (c >= 0x7F && c <= 0x9F) }
+
+    /// Whether `key`, written at the start of a line, reads back as that key and nothing else.
+    static func readsBack(_ key: String) -> Bool {
+        guard let first = key.utf8.first else { return false }
+        if [0x2D, 0x23, 0x2F, 0x5B, 0x3A, 0x28].contains(first) { return false }
+        // Lines the parser takes for directives, and keys it drops with what hangs under them.
+        if ["!active", "!lock", "!tool", "!schema", "!llm", "!include", "!use"].contains(key) || isReserved(key) { return false }
+        // Whitespace at an edge is trimmed away with the line; inside, only a space
+        // or a tab ends a key (U+00A0 is a letter like any other).
+        if key.rustTrimmed.utf8.count != key.utf8.count { return false }
+        return !key.unicodeScalars.contains { isControl($0.value) || $0 == " " || $0 == "[" || $0 == ":" || $0 == "(" }
+    }
+
+    static func writable(_ key: String) -> String {
+        let scalars = Array(key.unicodeScalars)
+        var out = String.UnicodeScalarView()
+        for (i, c) in scalars.enumerated() {
+            let edge = i == 0 || i == scalars.count - 1
+            let breaks = isControl(c.value) || c == " " || c == "[" || c == ":" || c == "("
+                || (edge && String(c).rustTrimmed.isEmpty)
+                || (i == 0 && (c == "-" || c == "#" || c == "/" || c == "!"))
+            out.append(breaks ? "_" : c)
+        }
+        var name = out.isEmpty ? "_" : String(out)
+        // safety: `constructor`, `prototype` and `__proto__` are keys the reader
+        // refuses with what hangs under them; such a key gets a `_` after it.
+        if isReserved(name) { name += "_" }
+        return name
+    }
+}
+
 // MARK: - §14 writer
 
 private struct Writer {
@@ -50,7 +118,8 @@ private struct Writer {
             indent(ind)
             put(key)
             out.append(0x0A)
-            for e in SynxStringify.sortedEntries(map) { entry(e.key, e.value, ind + 2, depth + 1) }
+            let names = KeyNames(map)
+            for e in SynxStringify.sortedEntries(map) { entry(names.name(e.key), e.value, ind + 2, depth + 1) }
         case .array(let items):
             indent(ind)
             put(key)
@@ -79,7 +148,10 @@ private struct Writer {
         guard case .object(let map) = item else {
             indent(ind)
             put("- ")
-            put(Writer.scalar(item) ?? Writer.strOf(item))
+            // safety: a list item is one line and SYNX has no block form for it,
+            // so a line break is written as a space; written as it was, the rest
+            // of the text became lines of their own.
+            put(Writer.scalar(item) ?? String(decoding: Writer.strOf(item).utf8.map { $0 == 0x0A || $0 == 0x0D ? 0x20 : $0 }, as: UTF8.self))
             out.append(0x0A)
             return
         }
@@ -95,16 +167,17 @@ private struct Writer {
         let headSafe = keys.firstIndex { Writer.dashLineSafe($0.value) }
         let head = headSafe ?? 0
         let repeatHead = headSafe == nil || keys.count == 1
+        let names = KeyNames(map)
         indent(ind)
         put("- ")
-        put(keys[head].key)
+        put(names.name(keys[head].key))
         if let text = Writer.scalar(keys[head].value), !text.isEmpty {
             out.append(0x20)
             put(text)
         }
         out.append(0x0A)
         for (i, e) in keys.enumerated() where !(i == head && !repeatHead) {
-            entry(e.key, e.value, ind + 2, depth + 1)
+            entry(names.name(e.key), e.value, ind + 2, depth + 1)
         }
     }
 

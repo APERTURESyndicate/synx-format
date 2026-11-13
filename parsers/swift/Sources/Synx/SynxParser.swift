@@ -174,8 +174,10 @@ enum SynxCast {
                 let k = kRaw.rustTrimmed
                 let v = vRaw.rustTrimmed
                 switch k {
-                case "min": c.min = RustNumber.parseF64(v)
-                case "max": c.max = RustNumber.parseF64(v)
+                // A bound is a finite number: `inf` and `nan` bound nothing
+                // sensible (`[max:-inf]` rejected every value).
+                case "min": c.min = RustNumber.parseF64(v).flatMap { $0.isFinite ? $0 : nil }
+                case "max": c.max = RustNumber.parseF64(v).flatMap { $0.isFinite ? $0 : nil }
                 case "type": c.typeName = v
                 case "pattern": c.pattern = v
                 case "enum": c.enumValues = Array(splitBytes(v, 0x7C).prefix(SynxParser.maxEnumParts))
@@ -230,7 +232,13 @@ private struct Parser {
     var result: SynxParseResult
     var stack: [Frame]
     var block: BlockState? = nil
-    var list: ListState? = nil
+    /// Open lists, outermost first.
+    ///
+    /// spec: a list inside a list item ends at the next item of the outer list
+    /// (§8.5). One variable held "the" open list, so a nested `tags` replaced its
+    /// parent: `- name b` after it matched no list and was dropped without a
+    /// word, and the keys under it landed in the item before.
+    var lists: [ListState] = []
     var metaPath = ""
     var metaPathValid = false
 
@@ -359,7 +367,9 @@ private struct Parser {
                     if n != 0 { i += n; continue }
                     let s = i
                     while i < e && wsLen(b, i, e) == 0 { i += utf8Len(b[i]) }
-                    if RustNumber.parseF64(UnsafeBufferPointer(rebasing: b[s..<i])) != nil { nums.append(str(s..<i)) }
+                    // spec: a weight is `digits[.digits]`. Anything a float parser
+                    // read counted, so `a:random inf`, `-5` or `nan` lost its value.
+                    if Parser.isWeight(b[s..<i]) { nums.append(str(s..<i)) }
                 }
                 if !nums.isEmpty {
                     out.markerArgs = nums
@@ -417,14 +427,26 @@ private struct Parser {
         return metaPath
     }
 
-    /// The first non-blank line at or after `from`, CR excluded.
+    /// The first line at or after `from` that is content — not blank, not a
+    /// comment, not inside a `###` block — CR excluded.
+    ///
+    /// spec: a comment line is ignored (§5), so it cannot stand between a key
+    /// and its list or between a `- ` line and the keys of its item. Only blank
+    /// lines were skipped here: `items` / `# note` / `- a` read as an empty
+    /// object and lost every item.
     func nextContentLine(_ from: Int) -> Range<Int>? {
         var p = from
+        var inBlockComment = false
         while p <= b.count {
             var nl = p
             while nl < b.count && b[nl] != 0x0A { nl += 1 }
             let end = (nl > p && b[nl - 1] == 0x0D) ? nl - 1 : nl
-            if !trimRange(b, p, end).isEmpty { return p..<end }
+            let t = trimRange(b, p, end)
+            if eq(t, "###") {
+                inBlockComment.toggle()
+            } else if !inBlockComment && !t.isEmpty && b[t.lowerBound] != 0x23 && !startsWith(t, "//") {
+                return p..<end
+            }
             p = nl + 1
         }
         return nil
@@ -432,19 +454,32 @@ private struct Parser {
 
     static func isReserved(_ k: String) -> Bool { k == "__proto__" || k == "constructor" || k == "prototype" }
 
+    /// `digits[.digits]` — a `:random` weight.
+    static func isWeight(_ s: Slice<UnsafeBufferPointer<UInt8>>) -> Bool {
+        func digits(_ t: Slice<UnsafeBufferPointer<UInt8>>) -> Bool {
+            !t.isEmpty && t.allSatisfy { $0 >= 0x30 && $0 <= 0x39 }
+        }
+        if let dot = s.firstIndex(of: 0x2E) {
+            return digits(s[s.startIndex..<dot]) && digits(s[(dot + 1)..<s.endIndex])
+        }
+        return digits(s)
+    }
+
     mutating func handleListItem(_ t: Range<Int>, _ indent: Int, _ pos: Int) {
         // Pop every frame of the previous item — its own and any object nested in it.
         while stack.count > 1 && stack[stack.count - 1].indent >= indent { popFrame() }
         let inner = trimRange(b, t.lowerBound + 2, t.upperBound)
         let valStr = stripComment(inner)
-        // A more deeply indented, non-item next line makes this item an object.
+        // A more deeply indented next line of content that is not an item
+        // makes this item an object.
         var nested = false
         if let peek = nextContentLine(pos) {
             let pt = trimRange(b, peek.lowerBound, peek.upperBound)
             let pi = indentLen(b, peek.lowerBound, peek.upperBound)
-            if pi > indent && !startsWith(pt, "- ") && b[pt.lowerBound] != 0x23 && !startsWith(pt, "//") { nested = true }
+            if pi > indent && !startsWith(pt, "- ") { nested = true }
         }
-        let ls = list!
+        let ls = lists[lists.count - 1]
+        guard ls.stackIdx < stack.count else { return }
         let parent = stack[ls.stackIdx].obj
         let arr: MArray
         if let at = parent.find(ls.key) {
@@ -455,14 +490,29 @@ private struct Parser {
             parent.keys.append(ls.key)
             parent.values.append(.array(arr))
         }
-        if arr.items.count >= SynxParser.maxListItems { return }
+        if arr.items.count >= SynxParser.maxListItems {
+            // The cap dropped an item: say so, like every other cap.
+            result.truncated = true
+            return
+        }
         if nested {
             let item = MObject()
+            var head: (String, SynxMeta)? = nil
             if let p = parseLine(valStr) {
                 let v: MValue = p.typeHint.map { SynxCast.castTyped(ArraySlice(UnsafeBufferPointer(rebasing: b[p.value])), hint: str($0)) }
                     ?? (p.value.isEmpty ? .object(MObject()) : SynxCast.cast(UnsafeBufferPointer(rebasing: b[p.value])))
                 let k = str(p.key)
-                if !Parser.isReserved(k) { item.set(k, v) }
+                if !Parser.isReserved(k) {
+                    item.set(k, v)
+                    if result.mode == .active && (!p.markers.isEmpty || p.constraints != nil || p.typeHint != nil) {
+                        var m = SynxMeta()
+                        m.markers = p.markers.map(str)
+                        m.args = p.markerArgs
+                        m.typeHint = p.typeHint.map(str)
+                        m.constraints = p.constraints
+                        head = (k, m)
+                    }
+                }
             } else {
                 item.set("_value", SynxCast.cast(UnsafeBufferPointer(rebasing: b[valStr])))
             }
@@ -470,6 +520,14 @@ private struct Parser {
             arr.items.append(.object(item))
             if stack.count < SynxParser.maxNestingDepth {
                 pushFrame(Frame(indent: indent, kind: .listItem, key: ls.key, itemIdx: itemIdx, parent: ls.stackIdx, obj: item))
+                // spec: the key on the `- ` line is a key line like the ones under
+                // it. Its markers and constraints were read and thrown away:
+                // `- token:secret abc` stayed in the clear and `- host:env H` kept
+                // the variable's name.
+                if let (k, m) = head {
+                    let path = currentMetaPath()
+                    result.metadata.update(path, default: SynxMetaMap()) { $0[k] = m }
+                }
             }
         } else {
             arr.items.append(SynxCast.cast(UnsafeBufferPointer(rebasing: b[valStr])))
@@ -511,11 +569,11 @@ private struct Parser {
         } else if isListMarker && p.value.isEmpty {
             // The key exists even when the list stays empty.
             parent.set(key, .array(MArray()))
-            list = ListState(indent: indent, key: key, stackIdx: parentIdx)
+            lists.append(ListState(indent: indent, key: key, stackIdx: parentIdx))
         } else if p.value.isEmpty {
             if let peek = nextContentLine(pos), startsWith(trimRange(b, peek.lowerBound, peek.upperBound), "- ") {
                 parent.set(key, .array(MArray()))
-                list = ListState(indent: indent, key: key, stackIdx: parentIdx)
+                lists.append(ListState(indent: indent, key: key, stackIdx: parentIdx))
                 return
             }
             let child = MObject()
@@ -539,6 +597,8 @@ private struct Parser {
 
     mutating func run() {
         var inBlockComment = false
+        // Indent of a refused key whose block is being dropped.
+        var droppedBelow: Int? = nil
         let total = b.count
         var pos = 0
         while pos <= total {
@@ -551,6 +611,11 @@ private struct Parser {
             // A blank line is never structural and never body (§8.4.1).
             if t.isEmpty { continue }
             let indent = indentLen(b, start, end)
+
+            if let limit = droppedBelow {
+                if indent > limit { continue }
+                droppedBelow = nil
+            }
 
             // Multiline body first: `#`, `//`, `###` and `!…` are content there.
             if block != nil {
@@ -638,22 +703,43 @@ private struct Parser {
             if b[t.lowerBound] == 0x23 || startsWith(t, "//") { continue }
 
             if startsWith(t, "- ") {
-                if let l = list, indent > l.indent {
+                // The list this item belongs to: the innermost open one whose key
+                // sits to the left of the dash. Lists nested deeper than the dash
+                // end here — but only when a list does take the line; a dash no
+                // list accepts is skipped and closes nothing, as it always was.
+                var accepting = lists.count
+                while accepting > 0 && indent < lists[accepting - 1].indent { accepting -= 1 }
+                if accepting > 0 && indent > lists[accepting - 1].indent { lists.removeSubrange(accepting...) }
+                if let l = lists.last, indent > l.indent {
                     handleListItem(t, indent, pos)
                     continue
                 }
-            } else if let l = list, indent <= l.indent {
-                // A non-item line at or above the list's indent closes it.
-                list = nil
-                while stack.count > 1 && stack[stack.count - 1].kind == .listItem && stack[stack.count - 1].indent >= indent {
-                    popFrame()
+            } else {
+                // A non-item line closes every list it is at or below the indent of.
+                var closed = false
+                while let l = lists.last, indent <= l.indent {
+                    lists.removeLast()
+                    closed = true
+                }
+                if closed {
+                    while stack.count > 1 && stack[stack.count - 1].kind == .listItem && stack[stack.count - 1].indent >= indent {
+                        popFrame()
+                    }
                 }
             }
 
             guard let parsed = parseLine(t) else { continue }
             let key = str(parsed.key)
             // `__proto__` / `constructor` / `prototype` never reach a JS consumer.
-            if Parser.isReserved(key) { continue }
+            //
+            // safety: the lines under such a key go with it. Only the key line was
+            // skipped, so its block fell to whatever was open above it — `profile`
+            // / `__proto__` / `  role admin` gave `profile` the role — and under
+            // `prototype |` each line of the text was read as a line of the document.
+            if Parser.isReserved(key) {
+                droppedBelow = indent
+                continue
+            }
             handleKeyLine(parsed, key, indent, pos)
         }
         flushBlock()

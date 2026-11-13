@@ -4,151 +4,171 @@
  * Evaluates arithmetic expressions WITHOUT eval() or new Function().
  * Supports: +, -, *, /, %, parentheses, and numeric literals.
  * Variable references are resolved before this stage.
+ *
+ * A port of `calc.rs` in synx-core: the same tokens, the same order of
+ * evaluation, the same error for the same expression.
  */
 
-type Token =
-  | { type: 'number'; value: number }
-  | { type: 'op'; value: string }
-  | { type: 'paren'; value: '(' | ')' };
+import { trimSpace } from './parser';
 
-/** A number literal as Rust's `f64::from_str` reads the tokenizer's run. */
-const NUMBER_RE = /^-?(?:\d+\.?\d*|\.\d+)$/;
+/** Token kinds: a number, or the character code of an operator or parenthesis. */
+const NUMBER = 0;
+const PLUS = 43;
+const MINUS = 45;
+const STAR = 42;
+const SLASH = 47;
+const PERCENT = 37;
+const LPAREN = 40;
+const RPAREN = 41;
+/** No operator is waiting. */
+const NONE = -1;
 
 /**
- * Tokenize an arithmetic expression string.
+ * Tokenize an arithmetic expression into `kinds` and, for numbers, `values`.
  */
-function tokenize(expr: string): Token[] {
-  const tokens: Token[] = [];
+function tokenize(expr: string, kinds: number[], values: number[]): void {
+  const len = expr.length;
   let i = 0;
 
-  while (i < expr.length) {
-    const ch = expr[i];
+  while (i < len) {
+    const ch = expr.charCodeAt(i);
 
     // Skip whitespace
-    if (ch === ' ' || ch === '\t') {
+    if (ch === 32 || ch === 9) {
       i++;
       continue;
     }
 
-    // Number (integer or float, including negative after operator/start)
+    // Number (integer or float, including negative after operator/start/lparen)
+    let negative = false;
+    if (ch === MINUS) {
+      const last = kinds.length === 0 ? PLUS : kinds[kinds.length - 1];
+      negative = last !== NUMBER && last !== RPAREN;
+    }
     if (
-      (ch >= '0' && ch <= '9') ||
-      (ch === '.' && i + 1 < expr.length && expr[i + 1] >= '0' && expr[i + 1] <= '9') ||
-      (ch === '-' && (tokens.length === 0 || tokens[tokens.length - 1].type === 'op' || (tokens[tokens.length - 1].type === 'paren' && tokens[tokens.length - 1].value === '(')))
+      (ch >= 48 && ch <= 57) ||
+      (ch === 46 && i + 1 < len && expr.charCodeAt(i + 1) >= 48 && expr.charCodeAt(i + 1) <= 57) ||
+      negative
     ) {
-      let num = '';
-      if (ch === '-') {
-        num += '-';
+      const start = i;
+      if (ch === MINUS) i++;
+      let digits = 0;
+      let dots = 0;
+      while (i < len) {
+        const c = expr.charCodeAt(i);
+        if (c >= 48 && c <= 57) digits++;
+        else if (c === 46) dots++;
+        else break;
         i++;
       }
-      while (i < expr.length && ((expr[i] >= '0' && expr[i] <= '9') || expr[i] === '.')) {
-        num += expr[i];
-        i++;
-      }
+      const text = expr.substring(start, i);
       // spec: a malformed literal is an error, as in synx-core — `parseFloat`
       // read a lone `-` as NaN and `1.2.3` as 1.2 without a word.
-      if (!NUMBER_RE.test(num)) throw new Error(`SYNX :calc — invalid number: '${num}'`);
-      tokens.push({ type: 'number', value: parseFloat(num) });
+      // safety: counted, not matched. The pattern this replaces
+      // (`\d+\.?\d*`) split a run of digits in two at every position, so a
+      // long run ahead of a second dot cost the square of its length.
+      if (digits === 0 || dots > 1) throw new Error(`SYNX :calc — invalid number: '${text}'`);
+      kinds.push(NUMBER);
+      values.push(parseFloat(text));
       continue;
     }
 
-    // Operators
-    if ('+-*/%'.includes(ch)) {
-      tokens.push({ type: 'op', value: ch });
-      i++;
-      continue;
-    }
-
-    // Parentheses
-    if (ch === '(' || ch === ')') {
-      tokens.push({ type: 'paren', value: ch });
+    // Operators and parentheses
+    if (ch === PLUS || ch === MINUS || ch === STAR || ch === SLASH || ch === PERCENT || ch === LPAREN || ch === RPAREN) {
+      kinds.push(ch);
+      values.push(0);
       i++;
       continue;
     }
 
     throw new Error(`SYNX :calc — unexpected character: '${String.fromCodePoint(expr.codePointAt(i)!)}' in expression`);
   }
-
-  return tokens;
 }
 
 /**
- * Recursive descent parser for arithmetic.
+ * Evaluate a token stream.
+ *
  * Grammar:
- *   expr       → term (('+' | '-') term)*
- *   term       → factor (('*' | '/' | '%') factor)*
- *   factor     → NUMBER | '(' expr ')'
+ *   expr   → term (('+' | '-') term)*
+ *   term   → factor (('*' | '/' | '%') factor)*
+ *   factor → NUMBER | '(' expr ')'
+ *
+ * safety: parentheses used to recurse through `expr → term → factor`, so
+ * `x:calc ((((…` ended in "Maximum call stack size exceeded" — an error of the
+ * runtime, at a depth that differs between Node and Bun, where synx-core
+ * computes the value. Open parentheses now live in arrays: one frame per `(`
+ * holds the sum so far with the `+` / `-` waiting for its term, and the
+ * product so far with the `*` / `/` / `%` waiting for its factor.
  */
-class ExprParser {
-  private tokens: Token[];
-  private pos: number;
+function evaluate(kinds: number[], values: number[]): number {
+  const count = kinds.length;
+  const exprLeft: number[] = [0];
+  const exprOp: number[] = [NONE];
+  const termLeft: number[] = [0];
+  const termOp: number[] = [NONE];
+  let top = 0;
+  let pos = 0;
 
-  constructor(tokens: Token[]) {
-    this.tokens = tokens;
-    this.pos = 0;
-  }
-
-  parse(): number {
-    const result = this.expr();
-    if (this.pos < this.tokens.length) {
-      throw new Error(`SYNX :calc — unexpected token at position ${this.pos}`);
+  for (;;) {
+    // A factor is expected here.
+    if (pos >= count) throw new Error('SYNX :calc — unexpected end of expression');
+    const kind = kinds[pos];
+    if (kind === LPAREN) {
+      pos++;
+      top++;
+      exprLeft[top] = 0;
+      exprOp[top] = NONE;
+      termLeft[top] = 0;
+      termOp[top] = NONE;
+      continue;
     }
-    return result;
-  }
-
-  private expr(): number {
-    let left = this.term();
-    while (this.pos < this.tokens.length && this.tokens[this.pos].type === 'op' && (this.tokens[this.pos].value === '+' || this.tokens[this.pos].value === '-')) {
-      const op = this.tokens[this.pos].value;
-      this.pos++;
-      const right = this.term();
-      left = op === '+' ? left + right : left - right;
+    if (kind !== NUMBER) {
+      throw new Error(`SYNX :calc — unexpected token: '${String.fromCharCode(kind)}'`);
     }
-    return left;
-  }
+    let value = values[pos];
+    pos++;
 
-  private term(): number {
-    let left = this.factor();
-    while (this.pos < this.tokens.length && this.tokens[this.pos].type === 'op' && ('*/%'.includes(this.tokens[this.pos].value as string))) {
-      const op = this.tokens[this.pos].value;
-      this.pos++;
-      const right = this.factor();
-      if (op === '*') left = left * right;
-      else if (op === '/') {
-        if (right === 0) throw new Error('SYNX :calc — division by zero');
-        left = left / right;
-      }
+    // Fold the factor into its term, the term into its expr, and close every
+    // pair of parentheses that ends here.
+    for (;;) {
+      const op = termOp[top];
+      termOp[top] = NONE;
+      if (op === NONE) termLeft[top] = value;
+      else if (op === STAR) termLeft[top] *= value;
       else {
-        if (right === 0) throw new Error('SYNX :calc — division by zero');
-        left = left % right;
+        if (value === 0) throw new Error('SYNX :calc — division by zero');
+        if (op === SLASH) termLeft[top] /= value;
+        else termLeft[top] %= value;
       }
-    }
-    return left;
-  }
-
-  private factor(): number {
-    const tok = this.tokens[this.pos];
-
-    if (!tok) {
-      throw new Error('SYNX :calc — unexpected end of expression');
-    }
-
-    if (tok.type === 'number') {
-      this.pos++;
-      return tok.value;
-    }
-
-    if (tok.type === 'paren' && tok.value === '(') {
-      this.pos++; // skip '('
-      const val = this.expr();
-      if (!this.tokens[this.pos] || this.tokens[this.pos].type !== 'paren' || this.tokens[this.pos].value !== ')') {
-        throw new Error('SYNX :calc — missing closing parenthesis');
+      const next = pos < count ? kinds[pos] : NONE;
+      if (next === STAR || next === SLASH || next === PERCENT) {
+        termOp[top] = next;
+        pos++;
+        break;
       }
-      this.pos++; // skip ')'
-      return val;
-    }
 
-    throw new Error(`SYNX :calc — unexpected token: '${tok.value}'`);
+      const sign = exprOp[top];
+      exprOp[top] = NONE;
+      if (sign === NONE) exprLeft[top] = termLeft[top];
+      else if (sign === PLUS) exprLeft[top] += termLeft[top];
+      else exprLeft[top] -= termLeft[top];
+      if (next === PLUS || next === MINUS) {
+        exprOp[top] = next;
+        pos++;
+        break;
+      }
+
+      // This expr is complete.
+      const result = exprLeft[top];
+      if (top === 0) {
+        if (pos < count) throw new Error(`SYNX :calc — unexpected token at position ${pos}`);
+        return result;
+      }
+      top--;
+      if (next !== RPAREN) throw new Error('SYNX :calc — missing closing parenthesis');
+      pos++;
+      value = result;
+    }
   }
 }
 
@@ -160,7 +180,9 @@ class ExprParser {
  * @returns The computed number
  */
 export function safeCalc(expr: string): number {
-  const tokens = tokenize(expr.trim());
-  if (tokens.length === 0) return 0;
-  return new ExprParser(tokens).parse();
+  const kinds: number[] = [];
+  const values: number[] = [];
+  tokenize(trimSpace(expr), kinds, values);
+  if (kinds.length === 0) return 0;
+  return evaluate(kinds, values);
 }

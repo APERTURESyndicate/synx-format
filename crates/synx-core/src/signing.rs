@@ -3,7 +3,7 @@
 //! Each package tarball is hashed with SHA-256, then signed with an Ed25519 key.
 //! The signature is stored alongside the package as `<name>.sig`.
 
-use ed25519_dalek::{Signer, Verifier};
+use ed25519_dalek::Signer;
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
@@ -123,7 +123,10 @@ impl VerifyKey {
         let hash = sha256(data);
         let sig = ed25519_dalek::Signature::from_slice(signature)
             .map_err(|e| format!("invalid signature: {}", e))?;
-        Ok(self.pubkey.verify(&hash, &sig).is_ok())
+        // safety: strict verification. The plain one accepts keys and nonces
+        // of small order: with the identity point as the key and a zero
+        // scalar, one fixed 96-byte "signature" verified for every message.
+        Ok(self.pubkey.verify_strict(&hash, &sig).is_ok())
     }
 
     /// Verify a file signature.
@@ -176,15 +179,30 @@ fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
+/// Decode a string of hex digit pairs.
+///
+/// safety: by byte, digits only. Slicing the text two bytes at a time
+/// panicked inside a multi-byte character (`"aé1"`), and `from_str_radix`
+/// took a sign, so `+1` was a byte and one key had many spellings.
 fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
-    if s.len() % 2 != 0 {
+    fn nibble(c: u8) -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = s.as_bytes();
+    if bytes.len() % 2 != 0 {
         return Err("odd-length hex string".to_string());
     }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| {
-            u8::from_str_radix(&s[i..i + 2], 16)
-                .map_err(|_| format!("invalid hex at position {}", i))
+    bytes
+        .chunks_exact(2)
+        .enumerate()
+        .map(|(i, pair)| match (nibble(pair[0]), nibble(pair[1])) {
+            (Some(hi), Some(lo)) => Ok(hi << 4 | lo),
+            _ => Err(format!("invalid hex at position {}", i * 2)),
         })
         .collect()
 }
@@ -276,5 +294,31 @@ mod tests {
     fn test_invalid_hex() {
         assert!(hex_decode("xyz").is_err());
         assert!(hex_decode("a").is_err()); // odd length
+    }
+
+    // Neither panics nor reads a sign as a digit.
+    #[test]
+    fn test_hex_is_digits_only() {
+        assert!(hex_decode("a\u{e9}1").is_err());
+        assert!(hex_decode("\u{e9}\u{e9}").is_err());
+        assert!(hex_decode("+1").is_err());
+        assert!(hex_decode("-1").is_err());
+        assert!(VerifyKey::from_hex("a\u{e9}b").is_err());
+        assert!(VerifyKey::from_hex(&"+1".repeat(32)).is_err());
+        assert!(PackageSignature::from_hex("a\u{e9}b:00").is_err());
+        assert_eq!(hex_decode("00fFAa").unwrap(), vec![0x00, 0xff, 0xaa]);
+    }
+
+    // The identity point as the key and a zero scalar made one signature
+    // that passed for any data.
+    #[test]
+    fn test_degenerate_signature_is_refused() {
+        let mut sig = vec![0u8; 64];
+        sig[0] = 1;
+        let mut key = vec![0u8; 32];
+        key[0] = 1;
+        let forged = PackageSignature { signature: sig, public_key: key };
+        assert!(!forged.verify(b"any data").unwrap_or(false));
+        assert!(!forged.verify(b"other data").unwrap_or(false));
     }
 }

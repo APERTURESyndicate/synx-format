@@ -82,8 +82,15 @@ internal static class SynxParserCore
         var llm = false;
 
         BlockState? block = null;
-        ListState? list = null;
+        // Open lists, outermost first.
+        // spec: a list inside a list item ends at the next item of the outer list (§8.5).
+        // One variable held "the" open list, so a nested `tags` replaced its parent:
+        // `- name b` after it matched no list and was dropped without a word, and the keys
+        // under it landed in the item before.
+        var lists = new List<ListState>();
         var inBlockComment = false;
+        // Indent of a rejected key whose block is being dropped (-1: none).
+        var droppedBelow = -1;
 
         var len = text.Length;
         var pos = 0;
@@ -107,6 +114,15 @@ internal static class SynxParserCore
             // Indentation is the UTF-8 byte length of the leading whitespace (SYNX §4).
             var indent = 0;
             for (var k = start; k < ts; k++) indent += SynxNum.Utf8Len(text[k]);
+
+            // safety: the lines under a rejected key go with it; skipping only the key line
+            // handed its block to whatever was open above it (B-076, as synx-core).
+            if (droppedBelow >= 0)
+            {
+                if (indent > droppedBelow)
+                    continue;
+                droppedBelow = -1;
+            }
 
             // Block continuation runs before every line-class rule below: a `|` / `|+`
             // body is raw text, so `#`, `//`, `###` and `!…` are ordinary content there.
@@ -234,8 +250,17 @@ internal static class SynxParserCore
 
             if (trimmed.StartsWith("- "))
             {
-                if (list is { } lst && indent > lst.Indent)
+                // The list this item belongs to: the innermost open one whose key sits to the
+                // left of the dash. Lists nested deeper than the dash end here — but only when
+                // a list does take the line; a dash no list accepts is skipped and closes
+                // nothing, as it always was.
+                var accepting = lists.Count;
+                while (accepting > 0 && indent < lists[accepting - 1].Indent) accepting--;
+                if (accepting > 0 && indent > lists[accepting - 1].Indent)
+                    lists.RemoveRange(accepting, lists.Count - accepting);
+                if (lists.Count > 0 && indent > lists[^1].Indent)
                 {
+                    var lst = lists[^1];
                     // Pop every frame of the previous item — its own frame and any object
                     // nested inside it; popping only item frames stopped at a nested object,
                     // so the next item's keys were looked up through it and dropped.
@@ -244,16 +269,15 @@ internal static class SynxParserCore
 
                     var valStr = StripComment(TrimWs(trimmed[2..]));
 
-                    // The item is an object when the next content line is deeper and not
-                    // another item or a comment.
+                    // The item is an object when the next line of content is deeper and is
+                    // not another item.
                     var nested = false;
                     if (NextContentLine(text, pos) is var (ps, pe) && ps >= 0)
                     {
                         var pts = ps;
                         var pi = 0;
                         while (pts < pe && IsWs(text[pts])) { pi += SynxNum.Utf8Len(text[pts]); pts++; }
-                        var pt = text.AsSpan(pts, pe - pts);
-                        if (pi > indent && !pt.StartsWith("- ") && pt[0] != '#' && !pt.StartsWith("//"))
+                        if (pi > indent && !text.AsSpan(pts, pe - pts).StartsWith("- "))
                             nested = true;
                     }
 
@@ -265,43 +289,89 @@ internal static class SynxParserCore
                     }
                     // A key re-declared under the open list as something else takes the items
                     // no more: they are dropped, never written into a detached array.
-                    if (existing is SynxValue.Arr items && items.Items.Count < MaxListItems)
+                    if (existing is not SynxValue.Arr items)
+                        continue;
+                    if (items.Items.Count >= MaxListItems)
                     {
-                        if (nested)
+                        // The cap dropped an item: say so, like every other cap.
+                        truncated = true;
+                        continue;
+                    }
+                    if (nested)
+                    {
+                        var itemObj = new Dictionary<string, SynxValue>(StringComparer.Ordinal);
+                        string? headKey = null;
+                        SynxMeta? headMeta = null;
+                        if (ParseLine(valStr, out var itemLine))
                         {
-                            var itemObj = new Dictionary<string, SynxValue>(StringComparer.Ordinal);
-                            if (ParseLine(valStr, out var itemLine))
+                            SynxValue itemVal = itemLine.TypeHint is { } ih
+                                ? CastTyped(itemLine.Value, ih)
+                                : itemLine.Value.Length > 0
+                                    ? Cast(itemLine.Value)
+                                    : new SynxValue.Obj(new Dictionary<string, SynxValue>(StringComparer.Ordinal));
+                            if (!IsReservedJsKey(itemLine.Key))
                             {
-                                SynxValue itemVal = itemLine.TypeHint is { } ih
-                                    ? CastTyped(itemLine.Value, ih)
-                                    : itemLine.Value.Length > 0
-                                        ? Cast(itemLine.Value)
-                                        : new SynxValue.Obj(new Dictionary<string, SynxValue>(StringComparer.Ordinal));
-                                if (!IsReservedJsKey(itemLine.Key))
-                                    itemObj[itemLine.Key] = itemVal;
+                                itemObj[itemLine.Key] = itemVal;
+                                if (mode == SynxMode.Active
+                                    && (itemLine.Markers.Count > 0 || itemLine.Constraints != null || itemLine.TypeHint != null))
+                                {
+                                    headKey = itemLine.Key;
+                                    headMeta = new SynxMeta
+                                    {
+                                        Markers = ReferenceEquals(itemLine.Markers, s_noMarkers) ? [] : itemLine.Markers,
+                                        Args = ReferenceEquals(itemLine.MarkerArgs, s_noMarkers) ? [] : itemLine.MarkerArgs,
+                                        TypeHint = itemLine.TypeHint,
+                                        Constraints = itemLine.Constraints,
+                                    };
+                                }
                             }
-                            else
-                            {
-                                itemObj["_value"] = Cast(valStr);
-                            }
-                            var itemIdx = items.Items.Count;
-                            items.Items.Add(new SynxValue.Obj(itemObj));
-                            if (stack.Count < MaxParseNestingDepth)
-                                stack.Add(new Frame(indent, FrameKind.ListItem, lst.Key, itemIdx, lst.StackIdx, itemObj));
                         }
                         else
                         {
-                            items.Items.Add(Cast(valStr));
+                            itemObj["_value"] = Cast(valStr);
                         }
+                        var itemIdx = items.Items.Count;
+                        items.Items.Add(new SynxValue.Obj(itemObj));
+                        if (stack.Count < MaxParseNestingDepth)
+                        {
+                            stack.Add(new Frame(indent, FrameKind.ListItem, lst.Key, itemIdx, lst.StackIdx, itemObj));
+                            // spec: the key on the `- ` line is a key line like the ones under
+                            // it. Its markers and constraints were read and thrown away:
+                            // `- token:secret abc` stayed in the clear and `- host:env H` kept
+                            // the variable's name.
+                            if (headMeta != null)
+                            {
+                                var itemPath = PathOf(stack, stack.Count - 1);
+                                if (!metadata.TryGetValue(itemPath, out var itemMeta))
+                                {
+                                    itemMeta = new Dictionary<string, SynxMeta>(StringComparer.Ordinal);
+                                    metadata[itemPath] = itemMeta;
+                                }
+                                itemMeta[headKey!] = headMeta;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        items.Items.Add(Cast(valStr));
                     }
                     continue;
                 }
             }
-            else if (list is { } lst1 && indent <= lst1.Indent)
+            else
             {
-                list = null;
-                while (stack.Count > 1 && stack[^1].Kind == FrameKind.ListItem && stack[^1].Indent >= indent)
-                    stack.RemoveAt(stack.Count - 1);
+                // A non-item line closes every list it is at or below the indent of.
+                var closed = false;
+                while (lists.Count > 0 && indent <= lists[^1].Indent)
+                {
+                    lists.RemoveAt(lists.Count - 1);
+                    closed = true;
+                }
+                if (closed)
+                {
+                    while (stack.Count > 1 && stack[^1].Kind == FrameKind.ListItem && stack[^1].Indent >= indent)
+                        stack.RemoveAt(stack.Count - 1);
+                }
             }
 
             if (!ParseLine(trimmed, out var parsed))
@@ -310,7 +380,10 @@ internal static class SynxParserCore
             // Reject prototype-polluting keys so JSON consumers (notably JS) are never
             // exposed to __proto__ / constructor / prototype injection.
             if (IsReservedJsKey(parsed.Key))
+            {
+                droppedBelow = indent;
                 continue;
+            }
 
             while (stack.Count > 1 && stack[^1].Indent >= indent)
                 stack.RemoveAt(stack.Count - 1);
@@ -381,14 +454,14 @@ internal static class SynxParserCore
             {
                 // Insert an empty array now so the key exists even if the list stays empty.
                 parentMap[parsed.Key] = new SynxValue.Arr([]);
-                list = new ListState { Indent = indent, Key = parsed.Key, StackIdx = parentIdx };
+                lists.Add(new ListState { Indent = indent, Key = parsed.Key, StackIdx = parentIdx });
             }
             else if (parsed.Value.Length == 0)
             {
                 if (NextContentLine(text, pos) is var (ps, pe) && ps >= 0 && TrimWs(text.AsSpan(ps, pe - ps)).StartsWith("- "))
                 {
                     parentMap[parsed.Key] = new SynxValue.Arr([]);
-                    list = new ListState { Indent = indent, Key = parsed.Key, StackIdx = parentIdx };
+                    lists.Add(new ListState { Indent = indent, Key = parsed.Key, StackIdx = parentIdx });
                     continue;
                 }
 
@@ -430,20 +503,28 @@ internal static class SynxParserCore
             stack[idx].Map[key] = value;
     }
 
-    /// <summary>The first non-blank line at or after <paramref name="from"/>, CR excluded; (-1, -1) when none.</summary>
+    /// <summary>
+    /// The first line at or after <paramref name="from"/> that is content — not blank and not
+    /// a comment — CR excluded; (-1, -1) when none.
+    /// spec: a comment line is ignored (§5), so it cannot stand between a key and its list or
+    /// between a `- ` line and the keys of its item. Only blank lines were skipped here:
+    /// `items` / `# note` / `- a` read as an empty object and lost every item, and a comment
+    /// after `- name a` turned the item into the text `name a` and sent its keys to the parent.
+    /// </summary>
     private static (int Start, int End) NextContentLine(string text, int from)
     {
         var p = from;
+        var inComment = false;
         while (p <= text.Length)
         {
             var nlIdx = p < text.Length ? text.IndexOf('\n', p) : -1;
             var nl = nlIdx < 0 ? text.Length : nlIdx;
             var end = nl > p && text[nl - 1] == '\r' ? nl - 1 : nl;
-            for (var k = p; k < end; k++)
-            {
-                if (!IsWs(text[k]))
-                    return (p, end);
-            }
+            var t = TrimWs(text.AsSpan(p, end - p));
+            if (t.SequenceEqual("###"))
+                inComment = !inComment;
+            else if (!inComment && !t.IsEmpty && t[0] != '#' && !t.StartsWith("//"))
+                return (p, end);
             p = nl + 1;
         }
         return (-1, -1);
@@ -701,7 +782,9 @@ internal static class SynxParserCore
                     if (rest.IsEmpty) break;
                     var w = 0;
                     while (w < rest.Length && !IsWs(rest[w])) w++;
-                    if (SynxNum.TryParseF64(rest[..w], out _))
+                    // spec: a weight is `digits[.digits]`. Anything a float parser reads
+                    // counted, so `a:random inf`, `-5` or `nan` lost its value to a weight list.
+                    if (IsWeight(rest[..w]))
                         (nums ??= []).Add(rest[..w].ToString());
                     rest = rest[w..];
                 }
@@ -757,11 +840,13 @@ internal static class SynxParserCore
                 var v = TrimWs(part[(colon + 1)..]);
                 switch (k)
                 {
+                    // A bound is a finite number: `inf` and `nan` bound nothing sensible
+                    // (`[max:-inf]` rejected every value).
                     case "min":
-                        c.Min = SynxNum.TryParseF64(v, out var mn) ? mn : null;
+                        c.Min = SynxNum.TryParseF64(v, out var mn) && double.IsFinite(mn) ? mn : null;
                         break;
                     case "max":
-                        c.Max = SynxNum.TryParseF64(v, out var mx) ? mx : null;
+                        c.Max = SynxNum.TryParseF64(v, out var mx) && double.IsFinite(mx) ? mx : null;
                         break;
                     case "type":
                         c.TypeName = v.ToString();
@@ -785,6 +870,23 @@ internal static class SynxParserCore
             if (comma < 0) break;
         }
         return c;
+    }
+
+    /// <summary><c>digits[.digits]</c> — a <c>:random</c> weight.</summary>
+    private static bool IsWeight(ReadOnlySpan<char> s)
+    {
+        var dot = s.IndexOf('.');
+        var whole = dot < 0 ? s : s[..dot];
+        if (!IsDigits(whole)) return false;
+        return dot < 0 || IsDigits(s[(dot + 1)..]);
+
+        static bool IsDigits(ReadOnlySpan<char> t)
+        {
+            if (t.IsEmpty) return false;
+            foreach (var ch in t)
+                if (!char.IsAsciiDigit(ch)) return false;
+            return true;
+        }
     }
 
     /// <summary>Cut an inline <c> //</c> or <c> #</c> comment and trailing whitespace off a value.</summary>
@@ -859,8 +961,6 @@ internal static class SynxParserCore
         return new SynxValue.Str(val.ToString());
     }
 
-    private static readonly Random s_rng = new(42);
-
     /// <summary>SYNX §8.3 typed casting.</summary>
     private static SynxValue CastTyped(ReadOnlySpan<char> val, string hint) => hint switch
     {
@@ -869,9 +969,12 @@ internal static class SynxParserCore
         "bool" => new SynxValue.Bool(TrimWs(val).SequenceEqual("true")),
         "string" => new SynxValue.Str(val.ToString()),
         // Full signed 64-bit range, as Rust `rng::random_i64()`.
-        "random" or "random:int" => new SynxValue.Int(s_rng.NextInt64(long.MinValue, long.MaxValue)),
-        "random:float" => new SynxValue.Float(s_rng.NextDouble()),
-        "random:bool" => new SynxValue.Bool(s_rng.Next(2) == 1),
+        // safety: one `new Random(42)` was shared by every thread. A seeded Random is not
+        // thread-safe: under parallel parsing its state broke for good and every later
+        // `(random)` returned long.MinValue; and each process started with the same values.
+        "random" or "random:int" => new SynxValue.Int(Random.Shared.NextInt64(long.MinValue, long.MaxValue)),
+        "random:float" => new SynxValue.Float(Random.Shared.NextDouble()),
+        "random:bool" => new SynxValue.Bool(Random.Shared.Next(2) == 1),
         _ => Cast(val),
     };
 

@@ -87,113 +87,100 @@ bool tokenize(std::string_view expr, std::vector<Token>& out, std::string& err) 
     return true;
 }
 
-class ExprParser {
-public:
-    explicit ExprParser(std::vector<Token> toks) : tokens_(std::move(toks)) {}
+// `expr -> term (('+'|'-') term)*`, `term -> factor (('*'|'/'|'%') factor)*`,
+// `factor -> NUMBER | '(' expr ')'`, one frame per open parenthesis.
+//
+// safety: parentheses used to recurse through expr -> term -> factor, one group
+// of stack frames per `(`; 20 000 of them through `:ref:calc` overflowed the
+// stack and took the process down. Open parentheses now live in a vector; the
+// order of evaluation, and so every result and error, is the one the recursive
+// parser produced (synx-core `calc.rs evaluate`).
+struct Frame {
+    double expr_left = 0.0;
+    unsigned char expr_op = 0;
+    double term_left = 0.0;
+    unsigned char term_op = 0;
+};
 
-    bool parse(double& result, std::string& err) {
-        if (!expr(result, err)) return false;
-        if (pos_ < tokens_.size()) {
-            err = std::string(kPrefix) + "unexpected token at position " + std::to_string(pos_);
-            return false;
-        }
-        return true;
-    }
-
-private:
-    bool is_op(unsigned char c) const {
-        return tokens_[pos_].kind == TokenKind::Op && tokens_[pos_].op == c;
-    }
-
-    bool expr(double& out, std::string& err) {
-        double left = 0.0;
-        if (!term(left, err)) return false;
-        while (pos_ < tokens_.size()) {
-            if (is_op('+')) {
-                ++pos_;
-                double right = 0.0;
-                if (!term(right, err)) return false;
-                left += right;
-            } else if (is_op('-')) {
-                ++pos_;
-                double right = 0.0;
-                if (!term(right, err)) return false;
-                left -= right;
-            } else {
-                break;
-            }
-        }
-        out = left;
-        return true;
-    }
-
-    bool term(double& out, std::string& err) {
-        double left = 0.0;
-        if (!factor(left, err)) return false;
-        while (pos_ < tokens_.size()) {
-            if (is_op('*')) {
-                ++pos_;
-                double right = 0.0;
-                if (!factor(right, err)) return false;
-                left *= right;
-            } else if (is_op('/')) {
-                ++pos_;
-                double right = 0.0;
-                if (!factor(right, err)) return false;
-                if (right == 0.0) {
-                    err = std::string(kPrefix) + "division by zero";
-                    return false;
-                }
-                left /= right;
-            } else if (is_op('%')) {
-                ++pos_;
-                double right = 0.0;
-                if (!factor(right, err)) return false;
-                if (right == 0.0) {
-                    err = std::string(kPrefix) + "division by zero";
-                    return false;
-                }
-                left = std::fmod(left, right);
-            } else {
-                break;
-            }
-        }
-        out = left;
-        return true;
-    }
-
-    bool factor(double& out, std::string& err) {
-        if (pos_ >= tokens_.size()) {
+bool evaluate(const std::vector<Token>& tokens, double& result, std::string& err) {
+    std::vector<Frame> stack(1);
+    size_t pos = 0;
+    while (true) {
+        // A factor is expected here.
+        if (pos >= tokens.size()) {
             err = std::string(kPrefix) + "unexpected end of expression";
             return false;
         }
-        const Token& t = tokens_[pos_];
+        const Token& t = tokens[pos];
+        double value = 0.0;
         if (t.kind == TokenKind::Number) {
-            out = t.number;
-            ++pos_;
-            return true;
+            value = t.number;
+            ++pos;
+        } else if (t.kind == TokenKind::LParen) {
+            ++pos;
+            stack.emplace_back();
+            continue;
+        } else {
+            // The token as written (Rust `token_text`).
+            std::string text = t.kind == TokenKind::Op ? std::string(1, static_cast<char>(t.op)) : std::string(")");
+            err = std::string(kPrefix) + "unexpected token: '" + text + "'";
+            return false;
         }
-        if (t.kind == TokenKind::LParen) {
-            ++pos_;
-            double v = 0.0;
-            if (!expr(v, err)) return false;
-            if (pos_ >= tokens_.size() || tokens_[pos_].kind != TokenKind::RParen) {
+        // Fold the factor into its term, the term into its expr, and close every
+        // pair of parentheses that ends here.
+        while (true) {
+            Frame& f = stack.back();
+            const unsigned char top = f.term_op;
+            f.term_op = 0;
+            if (top == 0) {
+                f.term_left = value;
+            } else if (top == '*') {
+                f.term_left *= value;
+            } else {
+                if (value == 0.0) {
+                    err = std::string(kPrefix) + "division by zero";
+                    return false;
+                }
+                f.term_left = top == '/' ? f.term_left / value : std::fmod(f.term_left, value);
+            }
+            if (pos < tokens.size() && tokens[pos].kind == TokenKind::Op
+                && (tokens[pos].op == '*' || tokens[pos].op == '/' || tokens[pos].op == '%')) {
+                f.term_op = tokens[pos].op;
+                ++pos;
+                break;
+            }
+            const unsigned char eop = f.expr_op;
+            f.expr_op = 0;
+            if (eop == 0) f.expr_left = f.term_left;
+            else if (eop == '+') f.expr_left += f.term_left;
+            else f.expr_left -= f.term_left;
+            if (pos < tokens.size() && tokens[pos].kind == TokenKind::Op
+                && (tokens[pos].op == '+' || tokens[pos].op == '-')) {
+                f.expr_op = tokens[pos].op;
+                ++pos;
+                break;
+            }
+            // This expr is complete.
+            const double done = f.expr_left;
+            if (stack.size() == 1) {
+                if (pos < tokens.size()) {
+                    err = std::string(kPrefix) + "unexpected token at position " + std::to_string(pos);
+                    return false;
+                }
+                result = done;
+                return true;
+            }
+            stack.pop_back();
+            if (pos < tokens.size() && tokens[pos].kind == TokenKind::RParen) {
+                ++pos;
+            } else {
                 err = std::string(kPrefix) + "missing closing parenthesis";
                 return false;
             }
-            ++pos_;
-            out = v;
-            return true;
+            value = done;
         }
-        // The token as written (Rust `token_text`).
-        std::string text = t.kind == TokenKind::Op ? std::string(1, static_cast<char>(t.op)) : std::string(")");
-        err = std::string(kPrefix) + "unexpected token: '" + text + "'";
-        return false;
     }
-
-    std::vector<Token> tokens_;
-    size_t pos_ = 0;
-};
+}
 
 } // namespace
 
@@ -212,9 +199,8 @@ CalcResult safe_calc(std::string_view expr) {
     if (tokens.empty()) {
         return CalcResult::success(0.0);
     }
-    ExprParser parser(std::move(tokens));
     double v = 0.0;
-    if (!parser.parse(v, err)) {
+    if (!evaluate(tokens, v, err)) {
         return CalcResult::failure(std::move(err));
     }
     return CalcResult::success(v);

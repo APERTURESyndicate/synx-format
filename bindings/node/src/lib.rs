@@ -8,11 +8,34 @@ use synx_core::{self, Value, Options, Mode};
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+/// Deepest JS value `stringify` and `diff` follow — the nesting cap of the
+/// parser. A value that contains itself reaches it too.
+const MAX_JS_VALUE_DEPTH: usize = 128;
+
+/// Longest JS array taken in — the parser's cap on the items of one list.
+const MAX_JS_ARRAY_LEN: u32 = 1_048_576;
+
+/// Largest integer a JS number holds exactly (2^53 - 1).
+const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
+
+/// A key as a JS string.
+///
+/// safety: `set_named_property` passes the key as a C string, so a key with
+/// U+0000 in it failed the whole document (`nul byte found in provided data`).
+fn js_key(env: &Env, key: &str) -> Result<napi::JsString> {
+    env.create_string(key)
+}
+
 /// Convert a synx_core::Value into a napi JsUnknown for zero-copy return to JS.
 fn value_to_js(env: &Env, val: &Value) -> Result<JsUnknown> {
     match val {
         Value::Null => env.get_null().map(|v| v.into_unknown()),
         Value::Bool(b) => env.get_boolean(*b).map(|v| v.into_unknown()),
+        // spec: an integer beyond 2^53 is a `bigint`, as the pure TypeScript
+        // engine gives it. A double changed 9007199254740993 into ...992.
+        Value::Int(n) if *n > MAX_SAFE_INTEGER || *n < -MAX_SAFE_INTEGER => {
+            env.create_bigint_from_i64(*n)?.into_unknown()
+        }
         Value::Int(n) => env.create_int64(*n).map(|v| v.into_unknown()),
         Value::Float(f) => env.create_double(*f).map(|v| v.into_unknown()),
         Value::String(s) => env.create_string(s).map(|v| v.into_unknown()),
@@ -29,7 +52,7 @@ fn value_to_js(env: &Env, val: &Value) -> Result<JsUnknown> {
             let mut obj = env.create_object()?;
             for (key, val) in map {
                 let js_val = value_to_js(env, val)?;
-                obj.set_named_property(key, js_val)?;
+                obj.set_property(js_key(env, key)?, js_val)?;
             }
             Ok(obj.into_unknown())
         }
@@ -37,7 +60,12 @@ fn value_to_js(env: &Env, val: &Value) -> Result<JsUnknown> {
 }
 
 /// Convert a JS value back to synx_core::Value.
-fn js_to_value(env: &Env, val: JsUnknown) -> Result<Value> {
+///
+/// safety: the value comes from the caller and may be anything. It was walked
+/// without a depth limit (24 KB of nested arrays overflowed the native stack,
+/// a value that contains itself aborted the process) and an array reserved
+/// its declared length (`length = 2^32 - 1` asked for 256 GiB and aborted).
+fn js_to_value(env: &Env, val: JsUnknown, depth: usize) -> Result<Value> {
     match val.get_type()? {
         napi::ValueType::Null | napi::ValueType::Undefined => Ok(Value::Null),
         napi::ValueType::Boolean => {
@@ -47,39 +75,87 @@ fn js_to_value(env: &Env, val: JsUnknown) -> Result<Value> {
         napi::ValueType::Number => {
             let n: napi::JsNumber = val.try_into()?;
             let f = n.get_double()?;
-            if f.fract() == 0.0 && f >= i64::MIN as f64 && f <= i64::MAX as f64 {
+            // spec: as the pure TypeScript writer — a whole number is an int
+            // only within 2^53; beyond it the double is all there is, and 2^63
+            // was cast to 2^63 - 1.
+            if f.fract() == 0.0 && f.abs() <= MAX_SAFE_INTEGER as f64 {
                 Ok(Value::Int(f as i64))
             } else {
                 Ok(Value::Float(f))
             }
         }
+        napi::ValueType::BigInt => {
+            // spec: a `bigint` is the integer it holds; beyond i64 its digits
+            // are text, as SYNX reads such a literal back. It was `null`.
+            // why: napi 2 has no checked conversion from `JsUnknown` to
+            // `JsBigInt`; the decimal text says the same and needs no `unsafe`.
+            let digits = val.coerce_to_string()?.into_utf8()?;
+            let digits = digits.as_str()?;
+            match digits.parse::<i64>() {
+                Ok(n) => Ok(Value::Int(n)),
+                Err(_) => Ok(Value::String(digits.to_string())),
+            }
+        }
         napi::ValueType::String => {
             let s: napi::JsString = val.try_into()?;
-            Ok(Value::String(s.into_utf8()?.as_str()?.to_string()))
+            Ok(Value::String(js_string_text(s)?))
         }
         napi::ValueType::Object => {
-            // Check if it's an array
+            if depth >= MAX_JS_VALUE_DEPTH {
+                return Err(napi::Error::from_reason(format!(
+                    "SYNX: value nested deeper than {} levels, or it contains itself",
+                    MAX_JS_VALUE_DEPTH
+                )));
+            }
             let obj: napi::JsObject = val.try_into()?;
             if obj.is_array()? {
                 let len = obj.get_array_length()?;
+                if len > MAX_JS_ARRAY_LEN {
+                    return Err(napi::Error::from_reason(format!(
+                        "SYNX: array of {} items, the limit is {}",
+                        len, MAX_JS_ARRAY_LEN
+                    )));
+                }
                 let mut arr = Vec::with_capacity(len as usize);
                 for i in 0..len {
                     let item: JsUnknown = obj.get_element(i)?;
-                    arr.push(js_to_value(env, item)?);
+                    arr.push(js_to_value(env, item, depth + 1)?);
                 }
                 Ok(Value::Array(arr))
             } else {
-                let keys = napi::JsObject::keys(&obj)?;
+                // The value is fetched by the key as JS has it: a key with a
+                // lone surrogate has no UTF-8 spelling, and fetched by its
+                // replaced name it came back `null`.
+                let names = obj.get_property_names()?;
+                let count = names.get_array_length()?;
                 let mut map = synx_core::Map::default();
-                for key in keys {
-                    let v: JsUnknown = obj.get_named_property(&key)?;
-                    map.insert(key, js_to_value(env, v)?);
+                for i in 0..count {
+                    let key: napi::JsString = names.get_element(i)?;
+                    let v: JsUnknown = obj.get_property(key)?;
+                    map.insert(js_string_text(key)?, js_to_value(env, v, depth + 1)?);
                 }
                 Ok(Value::Object(map))
             }
         }
         _ => Ok(Value::Null),
     }
+}
+
+/// The text of a JS string; a lone surrogate becomes U+FFFD.
+fn js_string_text(s: napi::JsString) -> Result<String> {
+    // perf: UTF-8 straight from the engine, which writes U+FFFD for a lone
+    // surrogate itself. The UTF-16 road is for a runtime that does not.
+    if let Ok(utf8) = s.into_utf8() {
+        if let Ok(text) = utf8.as_str() {
+            return Ok(text.to_owned());
+        }
+    }
+    let len = s.utf16_len()?;
+    let utf16 = s.into_utf16()?;
+    let units = utf16.as_slice();
+    // napi counts the NUL that ends its buffer as part of the slice: taken
+    // whole, every key and every string came back one U+0000 longer.
+    Ok(String::from_utf16_lossy(&units[..len.min(units.len())]))
 }
 
 /// Parse a SYNX string. Returns a JS object.
@@ -160,7 +236,7 @@ pub fn parse_tool(env: Env, text: String, options: Option<napi::JsObject>) -> Re
 /// Convert a JS object back to a SYNX string.
 #[napi]
 pub fn stringify(env: Env, obj: JsUnknown) -> Result<String> {
-    let val = js_to_value(&env, obj)?;
+    let val = js_to_value(&env, obj, 0)?;
     Ok(synx_core::Synx::stringify(&val))
 }
 
@@ -195,8 +271,8 @@ pub fn is_synxb(data: Buffer) -> bool {
 /// Returns `{ added, removed, changed, unchanged }`.
 #[napi]
 pub fn diff(env: Env, a: JsUnknown, b: JsUnknown) -> Result<JsUnknown> {
-    let val_a = js_to_value(&env, a)?;
-    let val_b = js_to_value(&env, b)?;
+    let val_a = js_to_value(&env, a, 0)?;
+    let val_b = js_to_value(&env, b, 0)?;
     let map_a = match val_a { Value::Object(m) => m, _ => synx_core::Map::default() };
     let map_b = match val_b { Value::Object(m) => m, _ => synx_core::Map::default() };
     let result = synx_core::Synx::diff(&map_a, &map_b);

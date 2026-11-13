@@ -77,8 +77,16 @@ SynxParseResult parse(String rawText) {
   final stack = <_Frame>[_Frame(-1, _Kind.root, '', 0, 0, root)..path = ''];
 
   _BlockState? block;
-  _ListState? list;
+  // Open lists, outermost first.
+  //
+  // spec: a list inside a list item ends at the next item of the outer list
+  // (§8.5). One variable held "the" open list, so a nested `tags` replaced its
+  // parent: `- name b` after it matched no list and was dropped without a
+  // word, and the keys under it landed in the item before.
+  final lists = <_ListState>[];
   var inBlockComment = false;
+  // Indent of a rejected key whose block is being dropped.
+  int? droppedBelow;
 
   final len = text.length;
   var pos = 0;
@@ -104,6 +112,12 @@ SynxParseResult parse(String rawText) {
     var indent = 0;
     for (var k = start; k < ts; k++) {
       indent += utf8LenUnit(text.codeUnitAt(k));
+    }
+
+    final dropLimit = droppedBelow;
+    if (dropLimit != null) {
+      if (indent > dropLimit) continue;
+      droppedBelow = null;
     }
 
     // Block continuation runs before every line-class rule below: a `|` / `|+`
@@ -227,8 +241,19 @@ SynxParseResult parse(String rawText) {
 
     if (first == 0x23 /* # */ || _startsAt(text, ts, te, '//')) continue;
 
-    final lst = list;
     if (_startsAt(text, ts, te, '- ')) {
+      // The list this item belongs to: the innermost open one whose key sits
+      // to the left of the dash. Lists nested deeper than the dash end here —
+      // but only when a list does take the line; a dash no list accepts is
+      // skipped and closes nothing, as it always was.
+      var accepting = lists.length;
+      while (accepting > 0 && indent < lists[accepting - 1].indent) {
+        accepting--;
+      }
+      if (accepting > 0 && indent > lists[accepting - 1].indent) {
+        lists.removeRange(accepting, lists.length);
+      }
+      final lst = lists.isEmpty ? null : lists.last;
       if (lst != null && indent > lst.indent) {
         // Pop every frame of the previous item — its own frame and any object
         // nested inside it; popping only item frames stopped at a nested object,
@@ -239,8 +264,8 @@ SynxParseResult parse(String rawText) {
 
         final valStr = _stripComment(trimWs(text.substring(ts + 2, te)));
 
-        // The item is an object when the next content line is deeper and not
-        // another item or a comment.
+        // The item is an object when the next line of content is deeper and
+        // is not another item.
         var nested = false;
         final next = _nextContentLine(text, pos);
         if (next != null) {
@@ -250,15 +275,11 @@ SynxParseResult parse(String rawText) {
             pi += utf8LenUnit(text.codeUnitAt(pts));
             pts++;
           }
-          if (pi > indent &&
-              !_startsAt(text, pts, next.$2, '- ') &&
-              text.codeUnitAt(pts) != 0x23 &&
-              !_startsAt(text, pts, next.$2, '//')) {
-            nested = true;
-          }
+          if (pi > indent && !_startsAt(text, pts, next.$2, '- ')) nested = true;
         }
 
-        final listParent = stack[lst.stackIdx].map;
+        final listParent = lst.stackIdx < stack.length ? stack[lst.stackIdx].map : null;
+        if (listParent == null) continue;
         var existing = listParent[lst.key];
         if (existing == null) {
           existing = synxArray();
@@ -266,36 +287,67 @@ SynxParseResult parse(String rawText) {
         }
         // A key re-declared under the open list as something else takes the
         // items no more: they are dropped, never written into a detached array.
-        if (existing is SynxArr && existing.values.length < maxListItems) {
-          final items = existing.values;
-          if (nested) {
-            final itemObj = SynxObject();
-            final parsed = _parseLine(valStr);
-            if (parsed != null) {
-              final SynxValue v = parsed.typeHint != null
-                  ? _castTyped(parsed.value, parsed.typeHint!)
-                  : parsed.value.isNotEmpty
-                      ? castValue(parsed.value)
-                      : synxObject();
-              if (!_isReservedJsKey(parsed.key)) itemObj[parsed.key] = v;
-            } else {
-              itemObj['_value'] = castValue(valStr);
-            }
-            final itemIdx = items.length;
-            items.add(SynxObj(itemObj));
-            if (stack.length < maxNestingDepth) {
-              stack.add(_Frame(indent, _Kind.listItem, lst.key, itemIdx, lst.stackIdx, itemObj));
+        if (existing is! SynxArr) continue;
+        final items = existing.values;
+        if (items.length >= maxListItems) {
+          // The cap dropped an item: say so, like every other cap.
+          truncated = true;
+          continue;
+        }
+        if (nested) {
+          final itemObj = SynxObject();
+          final parsed = _parseLine(valStr);
+          String? headKey;
+          SynxMeta? headMeta;
+          if (parsed != null) {
+            final SynxValue v = parsed.typeHint != null
+                ? _castTyped(parsed.value, parsed.typeHint!)
+                : parsed.value.isNotEmpty
+                    ? castValue(parsed.value)
+                    : synxObject();
+            if (!_isReservedJsKey(parsed.key)) {
+              itemObj[parsed.key] = v;
+              if (result.mode == SynxMode.active &&
+                  (parsed.markers.isNotEmpty || parsed.constraints != null || parsed.typeHint != null)) {
+                headKey = parsed.key;
+                headMeta = SynxMeta()
+                  ..markers = parsed.markers
+                  ..args = parsed.markerArgs
+                  ..typeHint = parsed.typeHint
+                  ..constraints = parsed.constraints;
+              }
             }
           } else {
-            items.add(castValue(valStr));
+            itemObj['_value'] = castValue(valStr);
           }
+          final itemIdx = items.length;
+          items.add(SynxObj(itemObj));
+          if (stack.length < maxNestingDepth) {
+            stack.add(_Frame(indent, _Kind.listItem, lst.key, itemIdx, lst.stackIdx, itemObj));
+            // spec: the key on the `- ` line is a key line like the ones under
+            // it. Its markers and constraints were read and thrown away:
+            // `- token:secret abc` stayed in the clear and `- host:env H` kept
+            // the variable's name.
+            if (headMeta != null) {
+              metadata.putIfAbsent(_pathOf(stack, stack.length - 1), () => <String, SynxMeta>{})[headKey!] = headMeta;
+            }
+          }
+        } else {
+          items.add(castValue(valStr));
         }
         continue;
       }
-    } else if (lst != null && indent <= lst.indent) {
-      list = null;
-      while (stack.length > 1 && stack.last.kind == _Kind.listItem && stack.last.indent >= indent) {
-        stack.removeLast();
+    } else {
+      // A non-item line closes every list it is at or below the indent of.
+      var closed = false;
+      while (lists.isNotEmpty && indent <= lists.last.indent) {
+        lists.removeLast();
+        closed = true;
+      }
+      if (closed) {
+        while (stack.length > 1 && stack.last.kind == _Kind.listItem && stack.last.indent >= indent) {
+          stack.removeLast();
+        }
       }
     }
 
@@ -304,7 +356,15 @@ SynxParseResult parse(String rawText) {
 
     // Reject prototype-polluting keys so JSON consumers (notably JS) are never
     // exposed to __proto__ / constructor / prototype injection.
-    if (_isReservedJsKey(parsed.key)) continue;
+    //
+    // safety: the lines under such a key go with it. Only the key line was
+    // skipped, so its block fell to whatever was open above it — `profile` /
+    // `__proto__` / `  role admin` gave `profile` the role — and under
+    // `prototype |` each line of the text was read as a line of the document.
+    if (_isReservedJsKey(parsed.key)) {
+      droppedBelow = indent;
+      continue;
+    }
 
     while (stack.length > 1 && stack.last.indent >= indent) {
       stack.removeLast();
@@ -347,12 +407,12 @@ SynxParseResult parse(String rawText) {
     } else if (isListMarker && parsed.value.isEmpty) {
       // Insert an empty array now so the key exists even if the list stays empty.
       parentMap[parsed.key] = synxArray();
-      list = _ListState(indent, parsed.key, parentIdx);
+      lists.add(_ListState(indent, parsed.key, parentIdx));
     } else if (parsed.value.isEmpty) {
       final next = _nextContentLine(text, pos);
       if (next != null && trimWs(text.substring(next.$1, next.$2)).startsWith('- ')) {
         parentMap[parsed.key] = synxArray();
-        list = _ListState(indent, parsed.key, parentIdx);
+        lists.add(_ListState(indent, parsed.key, parentIdx));
         continue;
       }
       final obj = SynxObject();
@@ -379,15 +439,32 @@ void _insert(List<_Frame> stack, int idx, String key, SynxValue value) {
   if (idx < stack.length) stack[idx].map[key] = value;
 }
 
-/// The first non-blank line at or after [from], CR excluded.
+/// The first line at or after [from] that is content — not blank, not a
+/// comment, not inside a `###` block — CR excluded.
+///
+/// spec: a comment line is ignored (§5), so it cannot stand between a key and
+/// its list or between a `- ` line and the keys of its item. Only blank lines
+/// were skipped here: `items` / `# note` / `- a` read as an empty object and
+/// lost every item.
 (int, int)? _nextContentLine(String text, int from) {
   var p = from;
+  var inBlockComment = false;
   while (p <= text.length) {
     final nlIdx = p < text.length ? text.indexOf('\n', p) : -1;
     final nl = nlIdx < 0 ? text.length : nlIdx;
     final end = nl > p && text.codeUnitAt(nl - 1) == 0x0D ? nl - 1 : nl;
-    for (var k = p; k < end; k++) {
-      if (!isWs(text.codeUnitAt(k))) return (p, end);
+    var ts = p;
+    while (ts < end && isWs(text.codeUnitAt(ts))) {
+      ts++;
+    }
+    var te = end;
+    while (te > ts && isWs(text.codeUnitAt(te - 1))) {
+      te--;
+    }
+    if (_eqAt(text, ts, te, '###')) {
+      inBlockComment = !inBlockComment;
+    } else if (!inBlockComment && ts < te && text.codeUnitAt(ts) != 0x23 && !_startsAt(text, ts, te, '//')) {
+      return (p, end);
     }
     p = nl + 1;
   }
@@ -659,7 +736,9 @@ _ParsedLine? _parseLine(String trimmed) {
         }
         if (i > s) {
           final tok = value.substring(s, i);
-          if (parseF64(tok) != null) nums.add(tok);
+          // spec: a weight is `digits[.digits]`. Anything a float parser read
+          // counted, so `a:random inf`, `-5` or `nan` lost its value.
+          if (_isWeight(tok)) nums.add(tok);
         }
       }
       if (nums.isNotEmpty) {
@@ -674,6 +753,21 @@ _ParsedLine? _parseLine(String trimmed) {
     }
   }
   return _ParsedLine(key, typeHint, value, markers, args, constraints);
+}
+
+/// `digits[.digits]` — a `:random` weight.
+bool _isWeight(String s) {
+  bool digits(int from, int to) {
+    if (from >= to) return false;
+    for (var i = from; i < to; i++) {
+      final c = s.codeUnitAt(i);
+      if (c < 0x30 || c > 0x39) return false;
+    }
+    return true;
+  }
+
+  final dot = s.indexOf('.');
+  return dot < 0 ? digits(0, s.length) : digits(0, dot) && digits(dot + 1, s.length);
 }
 
 /// The body of a `[…]` block; present even when nothing in it is recognised.
@@ -695,10 +789,14 @@ SynxConstraints parseConstraints(String raw) {
     final k = trimWs(part.substring(0, colon));
     final v = trimWs(part.substring(colon + 1));
     switch (k) {
+      // A bound is a finite number: `inf` and `nan` bound nothing sensible
+      // (`[max:-inf]` rejected every value).
       case 'min':
-        c.min = parseF64(v);
+        final d = parseF64(v);
+        c.min = d != null && d.isFinite ? d : null;
       case 'max':
-        c.max = parseF64(v);
+        final d = parseF64(v);
+        c.max = d != null && d.isFinite ? d : null;
       case 'type':
         c.typeName = v;
       case 'pattern':

@@ -4,7 +4,7 @@ import Foundation
 public enum Synx {
 
     /// The SYNX release this port implements.
-    public static let version = "3.8.0"
+    public static let version = "3.8.1"
 
     /// Parse SYNX text and return its top-level object (static mode only).
     public static func parse(_ text: String) -> SynxObject {

@@ -25,12 +25,7 @@ SynxCalcResult safeCalc(String expr) {
   try {
     final tokens = _tokenize(t);
     if (tokens.isEmpty) return const SynxCalcResult.success(0);
-    final p = _ExprParser(tokens);
-    final v = p.expr();
-    if (p.pos < tokens.length) {
-      throw _CalcError('SYNX :calc — unexpected token at position ${p.pos}');
-    }
-    return SynxCalcResult.success(v);
+    return SynxCalcResult.success(_evaluate(tokens));
   } on _CalcError catch (e) {
     return SynxCalcResult.failure(e.message);
   }
@@ -100,59 +95,86 @@ String _tokenText(_Tok t) => switch (t.kind) {
       _Kind.rParen => ')',
     };
 
-/// Recursive descent: `expr → term (('+'|'-') term)*`,
-/// `term → factor (('*'|'/'|'%') factor)*`, `factor → NUMBER | '(' expr ')'`.
-class _ExprParser {
-  final List<_Tok> tokens;
-  int pos = 0;
-  _ExprParser(this.tokens);
+/// `expr → term (('+'|'-') term)*`, `term → factor (('*'|'/'|'%') factor)*`,
+/// `factor → NUMBER | '(' expr ')'`, one frame per open parenthesis.
+///
+/// safety: parentheses used to recurse through expr → term → factor; 20 000 of
+/// them through `:ref:calc` overflowed the stack. Open parentheses now live in
+/// a list; the order of evaluation, and so every result and error, is the one
+/// the recursive parser produced (synx-core `calc.rs evaluate`).
+class _Frame {
+  double exprLeft = 0;
+  String? exprOp;
+  double termLeft = 0;
+  String? termOp;
+}
 
-  double expr() {
-    var left = term();
-    while (pos < tokens.length && tokens[pos].kind == _Kind.op && (tokens[pos].op == '+' || tokens[pos].op == '-')) {
-      final op = tokens[pos].op;
-      pos++;
-      final r = term();
-      left = op == '+' ? left + r : left - r;
-    }
-    return left;
-  }
-
-  double term() {
-    var left = factor();
-    while (pos < tokens.length &&
-        tokens[pos].kind == _Kind.op &&
-        (tokens[pos].op == '*' || tokens[pos].op == '/' || tokens[pos].op == '%')) {
-      final op = tokens[pos].op;
-      pos++;
-      final r = factor();
-      if (op == '*') {
-        left *= r;
-        continue;
-      }
-      if (r == 0) throw const _CalcError('SYNX :calc — division by zero');
-      // Truncated remainder, as Rust's `%` (Dart's `%` is Euclidean).
-      left = op == '/' ? left / r : left.remainder(r);
-    }
-    return left;
-  }
-
-  double factor() {
+double _evaluate(List<_Tok> tokens) {
+  final stack = <_Frame>[_Frame()];
+  var pos = 0;
+  while (true) {
+    // A factor is expected here.
     if (pos >= tokens.length) throw const _CalcError('SYNX :calc — unexpected end of expression');
     final t = tokens[pos];
+    double value;
     if (t.kind == _Kind.number) {
       pos++;
-      return t.number;
-    }
-    if (t.kind == _Kind.lParen) {
+      value = t.number;
+    } else if (t.kind == _Kind.lParen) {
       pos++;
-      final v = expr();
-      if (pos >= tokens.length || tokens[pos].kind != _Kind.rParen) {
+      stack.add(_Frame());
+      continue;
+    } else {
+      throw _CalcError("SYNX :calc — unexpected token: '${_tokenText(t)}'");
+    }
+
+    // Fold the factor into its term, the term into its expr, and close every
+    // pair of parentheses that ends here.
+    while (true) {
+      final frame = stack.last;
+      final top = frame.termOp;
+      frame.termOp = null;
+      if (top == null) {
+        frame.termLeft = value;
+      } else if (top == '*') {
+        frame.termLeft *= value;
+      } else {
+        if (value == 0) throw const _CalcError('SYNX :calc — division by zero');
+        // Truncated remainder, as Rust's `%` (Dart's `%` is Euclidean).
+        frame.termLeft = top == '/' ? frame.termLeft / value : frame.termLeft.remainder(value);
+      }
+      if (pos < tokens.length && tokens[pos].kind == _Kind.op && '*/%'.contains(tokens[pos].op)) {
+        frame.termOp = tokens[pos].op;
+        pos++;
+        break;
+      }
+      final eop = frame.exprOp;
+      frame.exprOp = null;
+      if (eop == null) {
+        frame.exprLeft = frame.termLeft;
+      } else if (eop == '+') {
+        frame.exprLeft += frame.termLeft;
+      } else {
+        frame.exprLeft -= frame.termLeft;
+      }
+      if (pos < tokens.length && tokens[pos].kind == _Kind.op && (tokens[pos].op == '+' || tokens[pos].op == '-')) {
+        frame.exprOp = tokens[pos].op;
+        pos++;
+        break;
+      }
+      // This expr is complete.
+      final result = frame.exprLeft;
+      if (stack.length == 1) {
+        if (pos < tokens.length) throw _CalcError('SYNX :calc — unexpected token at position $pos');
+        return result;
+      }
+      stack.removeLast();
+      if (pos < tokens.length && tokens[pos].kind == _Kind.rParen) {
+        pos++;
+      } else {
         throw const _CalcError('SYNX :calc — missing closing parenthesis');
       }
-      pos++;
-      return v;
+      value = result;
     }
-    throw _CalcError("SYNX :calc — unexpected token: '${_tokenText(t)}'");
   }
 }

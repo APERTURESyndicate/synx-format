@@ -27,6 +27,8 @@ public struct SynxOptions: Sendable {
     public var markerFns: [String: SynxMarkerFn]
     /// Internal include-recursion counter — do not set manually.
     public var includeDepth: Int
+    /// What the top-level resolve shares with the resolves it starts.
+    var state: ResolveState? = nil
 
     public init(env: [String: String]? = nil,
                 region: String? = nil,

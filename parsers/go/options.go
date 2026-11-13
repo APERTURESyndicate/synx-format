@@ -21,4 +21,6 @@ type Options struct {
 	MarkerFns       map[string]MarkerFn
 	// IncludeDepth is internal; do not set manually.
 	IncludeDepth int
+	// shared is the state of the top-level Resolve this one runs under.
+	shared *resolveShared
 }

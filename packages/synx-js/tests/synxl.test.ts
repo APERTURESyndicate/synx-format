@@ -126,11 +126,14 @@ describe('SYNXL — field list', () => {
 
   test('any marker in a declaration is a hard error — chain or single', () => {
     // §5.2 covers a chain (`:a:b`) and a lone marker (`:custom`) alike.
-    for (const decl of ['a:env:default', 'a[type:int]:env', 'a:custom', ':custom']) {
+    for (const decl of ['a:env:default', 'a[type:int]:env', 'a:custom']) {
       const src = `${PROLOGUE}\n!fields ${decl}\n1\n`;
       expect(() => parseSynxl(src)).toThrow(/marker/);
       expect(conditionOf(src)).toBe('MarkerChainInFieldDecl');
     }
+    // A declaration with no name is malformed before anything else, as in
+    // synx-core (B-064).
+    expect(conditionOf(`${PROLOGUE}\n!fields :custom\n1\n`)).toBe('MalformedFieldList');
   });
 
   test('a field list with arity 0 is a hard error', () => {

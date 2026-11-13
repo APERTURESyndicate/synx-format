@@ -25,4 +25,16 @@ final class SynxValueTests: XCTestCase {
         XCTAssertEqual(SynxValue.float(3.14).asDouble, 3.14)
         XCTAssertNil(SynxValue.string("x").intValue)
     }
+
+    // The default string forms reflected the enum and printed the secret's text.
+    func test_default_string_forms_mask_a_secret() {
+        let result = Synx.parseFullActive("!active\npassword:secret hunter2\nname x\n", options: SynxOptions(env: [:]))
+        var dumped = ""
+        dump(result.root, to: &dumped)
+        for shown in ["\(result.root)", String(describing: result.root), String(reflecting: result.root), dumped,
+                      "\(SynxValue.secret("hunter2"))", String(reflecting: SynxValue.array([.secret("hunter2")]))] {
+            XCTAssertFalse(shown.contains("hunter2"), shown)
+        }
+        XCTAssertTrue("\(result.root)".contains("[SECRET]"))
+    }
 }

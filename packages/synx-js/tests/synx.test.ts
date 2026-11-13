@@ -656,6 +656,9 @@ describe('3.8.0 — hostile documents end cleanly', () => {
     for (let i = 0; i < 140; i++) text += '  '.repeat(i) + `k${i}\n`;
     const out = Synx.format(text);
     expect(out.startsWith('k0')).toBe(true);
-    expect(out.split('\n').filter(Boolean).length).toBeLessThan(140);
+    // Past the cap the parser stops nesting; the formatter follows it, so the
+    // keys below the cap are still there (they used to be dropped).
+    expect(Synx.parse(out)).toEqual(Synx.parse(text));
+    expect(Synx.format(out)).toBe(out);
   });
 });

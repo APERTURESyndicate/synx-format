@@ -128,7 +128,7 @@ pub fn run(command: SynxlCommand) {
     if let Some(path) = diagnostics_out {
         if let Err(e) = open_diagnostics(&path) {
             eprintln!("error: {}", e.message());
-            process::exit(e.code());
+            exit(e.code());
         }
     }
 
@@ -145,7 +145,7 @@ pub fn run(command: SynxlCommand) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("error: {}", e.message());
-                process::exit(e.code());
+                exit(e.code());
             }
         }
     };
@@ -230,7 +230,7 @@ fn fail(label: &str, err: CmdError, cleanup: &[&PathBuf]) -> ! {
     }
     flush_diagnostics();
     eprintln!("error: {}: {}", label, err.message());
-    process::exit(err.code());
+    exit(err.code());
 }
 
 // ─── synx synxl parse ────────────────────────────────────────
@@ -241,7 +241,7 @@ fn cmd_parse(file: PathBuf, format: &str, output: Option<PathBuf>, validate: boo
         "ndjson" | "jsonl" => true,
         other => {
             eprintln!("error: unsupported projection '{}' (use json or ndjson)", other);
-            process::exit(1);
+            exit(1);
         }
     };
     let label = file.display().to_string();
@@ -297,7 +297,7 @@ fn cmd_validate(file: PathBuf, constraints: bool, strict: bool) {
 
     if strict && diagnostics > 0 {
         eprintln!("error: {}: {} diagnostic(s) with --strict", label, diagnostics);
-        process::exit(1);
+        exit(1);
     }
     println!("ok: {} ({} records, {} diagnostics)", label, records, diagnostics);
 }
@@ -327,7 +327,7 @@ fn cmd_convert(
                     "error: cannot infer source format from {} (pass --from synxl|jsonl|csv)",
                     file.display()
                 );
-                process::exit(1);
+                exit(1);
             }
         },
     };
@@ -349,7 +349,7 @@ fn cmd_convert(
             (Some(c), None) => c,
             _ => {
                 eprintln!("error: --delimiter must be a single character");
-                process::exit(1);
+                exit(1);
             }
         }
     };
@@ -382,7 +382,7 @@ fn cmd_convert(
                     "error: unsupported conversion '{}' → '{}' (supported: jsonl→synxl, csv→synxl, synxl→jsonl, synxl→csv)",
                     f, t
                 );
-                process::exit(1);
+                exit(1);
             }
         };
         out.commit()?;
@@ -399,7 +399,7 @@ fn cmd_convert(
 fn cmd_split(file: PathBuf, records: usize, output_dir: Option<PathBuf>, prefix: Option<String>) {
     if records == 0 {
         eprintln!("error: --records must be at least 1");
-        process::exit(1);
+        exit(1);
     }
     let label = file.display().to_string();
 
@@ -409,7 +409,7 @@ fn cmd_split(file: PathBuf, records: usize, output_dir: Option<PathBuf>, prefix:
     });
     if let Err(e) = fs::create_dir_all(&dir) {
         eprintln!("error: cannot create {}: {}", dir.display(), e);
-        process::exit(2);
+        exit(2);
     }
     let prefix = prefix.unwrap_or_else(|| {
         file.file_stem()
@@ -430,7 +430,7 @@ fn cmd_split(file: PathBuf, records: usize, output_dir: Option<PathBuf>, prefix:
         eprintln!(
             "error: --prefix must be a plain file-name prefix (no `/`, `\\`, `:`, and not `.` or `..`)"
         );
-        process::exit(1);
+        exit(1);
     }
     let shard_path = |index: usize| dir.join(format!("{}-{:05}.synxl", prefix, index));
 
@@ -1308,16 +1308,68 @@ struct StdinSpool {
     path: PathBuf,
 }
 
+/// The spool of the running command, for [`exit`] to remove.
+static SPOOL_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// Ends the process, removing the stdin spool first.
+///
+/// why: `process::exit` runs no destructors, so every failed
+/// `synx synxl … -` left the piped dataset behind in the temp directory.
+fn exit(code: i32) -> ! {
+    remove_spool();
+    process::exit(code)
+}
+
+fn remove_spool() {
+    if let Ok(mut guard) = SPOOL_PATH.lock() {
+        if let Some(path) = guard.take() {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+/// Creates the spool file: a new file under a name nobody could have
+/// prepared, readable by its owner only.
+///
+/// safety: the name was `synxl-stdin-<pid>.synxl` opened with `File::create`.
+/// On a shared temp directory another user could put a link there in advance
+/// and have the piped dataset written over any file of the caller, and the
+/// spool itself was readable by everyone.
+fn create_spool() -> io::Result<(PathBuf, File)> {
+    let dir = std::env::temp_dir();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    for attempt in 0..64u32 {
+        let tag = nanos.wrapping_mul(2_654_435_761).wrapping_add(attempt);
+        let path = dir.join(format!("synxl-stdin-{}-{:08x}.synxl", process::id(), tag));
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(io::ErrorKind::AlreadyExists, "no free spool name"))
+}
+
 impl StdinSpool {
     fn take(file: &Path) -> Result<Option<Self>, CmdError> {
         if file.as_os_str() != "-" {
             return Ok(None);
         }
-        let path = std::env::temp_dir().join(format!("synxl-stdin-{}.synxl", process::id()));
-        let mut sink = BufWriter::new(
-            File::create(&path)
-                .map_err(|e| CmdError::Io(format!("cannot spool stdin: {}", e)))?,
-        );
+        let (path, file) =
+            create_spool().map_err(|e| CmdError::Io(format!("cannot spool stdin: {}", e)))?;
+        if let Ok(mut guard) = SPOOL_PATH.lock() {
+            *guard = Some(path.clone());
+        }
+        let mut sink = BufWriter::new(file);
         io::copy(&mut io::stdin().lock(), &mut sink)
             .map_err(|e| CmdError::Io(format!("cannot read stdin: {}", e)))?;
         sink.flush().map_err(write_err)?;
@@ -1327,6 +1379,7 @@ impl StdinSpool {
 
 impl Drop for StdinSpool {
     fn drop(&mut self) {
+        remove_spool();
         let _ = fs::remove_file(&self.path);
     }
 }
@@ -1493,6 +1546,27 @@ fn precheck(reopen: Reopen<'_>) -> Result<(), CmdError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_stdin_spool_is_a_new_private_file() {
+        let (first, _a) = create_spool().expect("spool");
+        let (second, _b) = create_spool().expect("spool");
+        assert_ne!(first, second);
+        assert!(first.is_file() && second.is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&first).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        // An existing file is never opened: the name is taken, another is used.
+        fs::write(&first, "someone else's file").unwrap();
+        let (third, _c) = create_spool().expect("spool");
+        assert_ne!(third, first);
+        assert_eq!(fs::read_to_string(&first).unwrap(), "someone else's file");
+        for path in [first, second, third] {
+            let _ = fs::remove_file(path);
+        }
+    }
     use std::io::{Cursor, Read};
     use synx_core::synxl::parse_lines;
 

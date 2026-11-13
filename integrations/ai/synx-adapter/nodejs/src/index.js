@@ -1,4 +1,5 @@
 import { Synx } from '@aperturesyndicate/synx-format';
+import { fencedSynxBlock } from './guards.js';
 
 const ROOT_KEY_LINE = /^([A-Za-z_][\w.-]*)(?:\s|$)/;
 
@@ -108,8 +109,7 @@ export function packForLlm(data, options = {}) {
   if (!wrapFence) {
     body = text;
   } else {
-    const trimmed = text.trim();
-    body = `${label} (SYNX):\n\`\`\`synx\n${trimmed}\n\`\`\``;
+    body = fencedSynxBlock(text, label);
   }
   if (wrapXml) {
     body = wrapSynxInXml(body, { tag: xmlTag, cdata: xmlCdata });

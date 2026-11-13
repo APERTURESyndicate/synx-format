@@ -62,12 +62,73 @@ public static partial class SynxEngine
         public required List<string> RootSpecial { get; init; }
         /// <summary>One key buffer per depth: an object's keys are fixed during its pass.</summary>
         public readonly List<string[]> KeyBuffers = [];
+        /// <summary>
+        /// What the keys under <c>:secret</c> held before the pre-pass masked them, by object
+        /// path and key (see <see cref="MaskSecretLiterals"/>).
+        /// </summary>
+        public required Dictionary<string, Dictionary<string, SynxValue>> SecretOriginals { get; init; }
+    }
+
+    /// <summary>Most included documents one top-level resolve may read and resolve.</summary>
+    private const int MaxIncludeReads = 1024;
+
+    /// <summary>Files whose resolution is in progress, outermost first.</summary>
+    [ThreadStatic]
+    private static List<string>? t_openIncludes;
+
+    /// <summary>Included documents the current top-level resolve has read.</summary>
+    [ThreadStatic]
+    private static int t_includeReads;
+
+    /// <summary>
+    /// Most bytes one top-level resolve may read from disk through <c>:include</c>,
+    /// <c>!include</c>, <c>!use</c> and <c>:watch</c>.
+    /// safety: every file is capped at <see cref="MaxFileSize"/>, but a document may name
+    /// the same file from a thousand keys; each read is parsed and kept.
+    /// </summary>
+    private const long MaxResolveReadBytes = 64 * 1024 * 1024;
+
+    /// <summary>Bytes the current top-level resolve has read.</summary>
+    [ThreadStatic]
+    private static long t_readBytes;
+
+    /// <summary>
+    /// Opens <paramref name="full"/> for resolution, or throws: the file is already being
+    /// resolved (a cycle), or the document has read its budget. A successful call is paired
+    /// with <see cref="IncludeLeave"/>.
+    /// safety: the depth cap alone let <c>a:include self.synx</c> / <c>b:include self.synx</c>
+    /// resolve 2^16 times — minutes for a three-line file, and a third key made it hang. A
+    /// cycle now stops at its first repeat, and the budget bounds an acyclic fan-out.
+    /// </summary>
+    private static void IncludeEnter(string full, string shown)
+    {
+        var open = t_openIncludes ??= [];
+        var cmp = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+        foreach (var path in open)
+        {
+            if (string.Equals(path, full, cmp))
+                throw new InvalidOperationException($"circular include: '{shown}'");
+        }
+        if (t_includeReads >= MaxIncludeReads)
+            throw new InvalidOperationException($"include budget ({MaxIncludeReads} files) exceeded");
+        t_includeReads++;
+        open.Add(full);
+    }
+
+    private static void IncludeLeave()
+    {
+        if (t_openIncludes is { Count: > 0 } open) open.RemoveAt(open.Count - 1);
     }
 
     public static void Resolve(SynxParseResult result, SynxOptions options)
     {
         if (result.Mode != SynxMode.Active)
             return;
+        if (options.IncludeDepth == 0 && t_openIncludes is not { Count: > 0 })
+        {
+            t_includeReads = 0;
+            t_readBytes = 0;
+        }
 
         var metadata = result.Metadata;
         var useDirectives = result.Uses;
@@ -104,9 +165,14 @@ public static partial class SynxEngine
                 {
                     var full = JailPath(options.BasePath ?? ".", pathVal.Value);
                     CheckFileSize(full);
-                    var included = ReadAndResolve(full, options);
+                    var included = ReadAndResolve(full, pathVal.Value, options);
                     preresolved[key] = (pathVal.Value, included.Root);
-                    includesMap.TryAdd(key, included.Root);
+                    // safety: the tree is also what `{leaf:key}` reads. Under `:secret` that
+                    // scope gets the masked tree, or `x {password:db}` printed what
+                    // `db:secret:include` hid.
+                    includesMap.TryAdd(key, meta.Markers.Contains("secret")
+                        ? MaskSecretValue(CloneValue(included.Root))
+                        : included.Root);
                 }
                 catch
                 {
@@ -140,9 +206,12 @@ public static partial class SynxEngine
                 foreach (var k in rm) privateRoot.Map.Remove(k);
         }
 
-        // safety: mask literal `:secret` values before any resolution, so a field that
-        // interpolates `{that_key}` can never observe the plaintext.
-        MaskSecretLiterals(result.Root, metadata, "");
+        // safety: every value under `:secret` is masked before any resolution, so no field
+        // that names it — `{that_key}`, `:alias`, `:map` — can read the plain text, wherever
+        // in the document it stands. The value comes back for the key's own turn (its
+        // subtree and its marker chain), and what that produces is masked again.
+        var secretOriginals = new Dictionary<string, Dictionary<string, SynxValue>>(StringComparer.Ordinal);
+        MaskSecretLiterals(result.Root, metadata, "", secretOriginals);
 
         if (result.Root is SynxValue.Obj resolveRoot)
         {
@@ -158,6 +227,7 @@ public static partial class SynxEngine
                 Includes = includesMap,
                 Preresolved = preresolved,
                 RootSpecial = rootSpecial,
+                SecretOriginals = secretOriginals,
             };
             ResolveValue(ctx, resolveRoot.Map, metadata.Count > 0 ? "" : null, 0);
         }
@@ -195,11 +265,22 @@ public static partial class SynxEngine
 
         Dictionary<string, SynxMeta>? mm = null;
         if (path != null) ctx.Metadata.TryGetValue(path, out mm);
+        // What this object's `:secret` keys held before the pre-pass.
+        Dictionary<string, SynxValue>? originals = null;
+        if (path != null && ctx.SecretOriginals.Count > 0 && ctx.SecretOriginals.Remove(path, out var originalsHere))
+            originals = originalsHere;
 
         var hasBrace = false;
         for (var i = 0; i < count; i++)
         {
             var key = keys[i];
+            if (originals != null && originals.Remove(key, out var original))
+            {
+                map[key] = original;
+                // Secrets nested in it stay masked until their own turn.
+                if (original is SynxValue.Obj or SynxValue.Arr)
+                    MaskSecretSubtree(original, ctx.Metadata, ChildPath(path, key)!, ctx.SecretOriginals);
+            }
             var child = map[key];
             switch (child)
             {
@@ -258,6 +339,44 @@ public static partial class SynxEngine
         return c.StartsWith(r + Path.DirectorySeparatorChar, cmp);
     }
 
+    /// <summary>
+    /// <paramref name="path"/> with every link in it followed (Rust <c>canonicalize</c>).
+    /// safety: <c>Path.GetFullPath</c> works on the text and never asks the disk, so a
+    /// symlink or junction inside the base that leads out of it passed the jail:
+    /// <c>x:include link/secret.synx</c> read the file outside.
+    /// </summary>
+    private static string RealPath(string path)
+    {
+        var full = Path.GetFullPath(path);
+        var root = Path.GetPathRoot(full) ?? "";
+        var current = root;
+        foreach (var segment in full[root.Length..].Split(
+                     [Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar], StringSplitOptions.RemoveEmptyEntries))
+        {
+            current = Path.Combine(current, segment);
+            FileSystemInfo info = Directory.Exists(current) ? new DirectoryInfo(current) : new FileInfo(current);
+            if (info.LinkTarget != null && info.ResolveLinkTarget(returnFinalTarget: true) is { } target)
+                current = target.FullName;
+        }
+        return current;
+    }
+
+    /// <summary>Whether a component of <paramref name="filePath"/> is a DOS device name, with or without an extension.</summary>
+    internal static bool HasDeviceName(string filePath)
+    {
+        foreach (var part in filePath.Split('/', '\\'))
+        {
+            // The name ends at an extension or a stream: `con.txt`, `nul:x`.
+            var dot = part.IndexOfAny(['.', ':']);
+            var stem = (dot < 0 ? part : part[..dot]).TrimEnd(' ').ToUpperInvariant();
+            if (stem is "CON" or "PRN" or "AUX" or "NUL" or "CONIN$" or "CONOUT$") return true;
+            if (stem.Length == 4 && (stem.StartsWith("COM", StringComparison.Ordinal) || stem.StartsWith("LPT", StringComparison.Ordinal))
+                && (char.IsAsciiDigit(stem[3]) || stem[3] is '\u00b9' or '\u00b2' or '\u00b3'))
+                return true;
+        }
+        return false;
+    }
+
     /// <summary>Resolve <paramref name="filePath"/> inside <paramref name="baseDir"/> or throw (Rust <c>jail_path</c>).</summary>
     private static string JailPath(string baseDir, string filePath)
     {
@@ -265,17 +384,27 @@ public static partial class SynxEngine
             throw new InvalidOperationException($"SECURITY: rooted paths are not allowed: '{filePath}'");
         if (Path.IsPathFullyQualified(filePath))
             throw new InvalidOperationException($"SECURITY: absolute paths are not allowed: '{filePath}'");
-        var baseCanon = Path.GetFullPath(baseDir);
+        // safety: `NUL`, `con.txt` or `COM1` in any directory opens a device on Windows;
+        // synx-core reaches the disk through a verbatim path, where these are missing files.
+        if (OperatingSystem.IsWindows() && HasDeviceName(filePath))
+            throw new InvalidOperationException($"file not found: {filePath}");
+        if (baseDir.Length == 0) baseDir = ".";
+        // A base that cannot be resolved refuses instead of jailing nothing.
+        if (!Directory.Exists(baseDir))
+            throw new InvalidOperationException($"SECURITY: base directory not found: '{baseDir}'");
+        var baseCanon = RealPath(baseDir);
         var joined = Path.Combine(baseCanon, filePath);
         if (File.Exists(joined) || Directory.Exists(joined))
         {
-            var full = Path.GetFullPath(joined);
+            var full = RealPath(joined);
             if (!IsSubPath(baseCanon, full))
                 throw new InvalidOperationException($"SECURITY: path escapes base directory: '{filePath}'");
             return full;
         }
-        // The file may not exist yet — at least verify no `..` escapes.
-        if (joined.Contains("..", StringComparison.Ordinal))
+        // The file may not exist yet — at least verify no `..` escapes. Judged by the path
+        // as the document wrote it, segment by segment: a base directory named `a..b`
+        // is no traversal.
+        if (Array.IndexOf(filePath.Split('/', '\\'), "..") >= 0)
             throw new InvalidOperationException($"SECURITY: path traversal detected: '{filePath}'");
         if (!IsSubPath(baseCanon, joined))
             throw new InvalidOperationException($"SECURITY: path escapes base directory: '{filePath}'");
@@ -289,34 +418,91 @@ public static partial class SynxEngine
             throw new InvalidOperationException($"SECURITY: file too large ({fi.Length} bytes, max {MaxFileSize})");
     }
 
-    /// <summary>Read a file as text, with Rust's portable not-found / permission messages.</summary>
+    private static readonly UTF8Encoding s_strictUtf8 = new(false, true);
+
+    /// <summary>
+    /// Read a file for <c>:include</c>, <c>!include</c>, <c>!use</c> or <c>:watch</c>, counting
+    /// its size against <see cref="MaxResolveReadBytes"/>. <paramref name="shownPath"/> is the
+    /// path as the document wrote it, for the error text.
+    /// spec: the text never carries the operating system's wording or the absolute path, so
+    /// the same document resolves to the same string on every machine (synx-core
+    /// <c>read_budgeted</c> / <c>fmt_io_err</c>).
+    /// </summary>
     private static string ReadText(string full, string shownPath)
     {
+        long size = 0;
         try
         {
-            return File.ReadAllText(full);
+            var info = new FileInfo(full);
+            if (info.Exists) size = info.Length;
         }
-        catch (Exception e) when (e is FileNotFoundException or DirectoryNotFoundException)
+        catch (Exception e) when (e is IOException or ArgumentException or NotSupportedException or UnauthorizedAccessException)
         {
-            throw new InvalidOperationException($"file not found: {shownPath}");
+            size = 0;
+        }
+        if (t_readBytes + size > MaxResolveReadBytes)
+            throw new InvalidOperationException($"read budget ({MaxResolveReadBytes} bytes) exceeded");
+        // A directory reads as "permission denied" on Windows and "is a directory"
+        // elsewhere; it is neither.
+        if (Directory.Exists(full))
+            throw new InvalidOperationException($"not a file: {shownPath}");
+        byte[] bytes;
+        try
+        {
+            bytes = File.ReadAllBytes(full);
         }
         catch (UnauthorizedAccessException)
         {
             throw new InvalidOperationException($"permission denied: {shownPath}");
         }
+        catch (Exception e) when (e is FileNotFoundException or DirectoryNotFoundException or PathTooLongException
+                                      or ArgumentException or NotSupportedException)
+        {
+            // A name the platform cannot hold at all is a file that is not there.
+            throw new InvalidOperationException($"file not found: {shownPath}");
+        }
+        catch (IOException e)
+        {
+            // ERROR_INVALID_NAME (123), ERROR_FILENAME_EXCED_RANGE (206): the same.
+            var code = e.HResult & 0xFFFF;
+            throw new InvalidOperationException(OperatingSystem.IsWindows() && code is 123 or 206
+                ? $"file not found: {shownPath}"
+                : $"cannot read file: {shownPath}");
+        }
+        string text;
+        try
+        {
+            text = s_strictUtf8.GetString(bytes);
+        }
+        catch (DecoderFallbackException)
+        {
+            throw new InvalidOperationException($"file is not valid UTF-8: {shownPath}");
+        }
+        t_readBytes += bytes.Length;
+        // As File.ReadAllText did: a leading byte order mark is not part of the text.
+        return text.Length > 0 && text[0] == (char)0xFEFF ? text[1..] : text;
     }
 
-    private static SynxParseResult ReadAndResolve(string full, SynxOptions options)
+    /// <summary>Reads an included document and resolves it, refusing a cycle (<see cref="IncludeEnter"/>).</summary>
+    private static SynxParseResult ReadAndResolve(string full, string shownPath, SynxOptions options)
     {
-        var parsed = SynxParserCore.Parse(File.ReadAllText(full));
-        if (parsed.Mode == SynxMode.Active)
+        IncludeEnter(full, shownPath);
+        try
         {
-            var child = CloneOptions(options);
-            child.IncludeDepth = options.IncludeDepth + 1;
-            child.BasePath = Path.GetDirectoryName(full) ?? ".";
-            Resolve(parsed, child);
+            var parsed = SynxParserCore.Parse(ReadText(full, shownPath));
+            if (parsed.Mode == SynxMode.Active)
+            {
+                var child = CloneOptions(options);
+                child.IncludeDepth = options.IncludeDepth + 1;
+                child.BasePath = Path.GetDirectoryName(full) ?? ".";
+                Resolve(parsed, child);
+            }
+            return parsed;
         }
-        return parsed;
+        finally
+        {
+            IncludeLeave();
+        }
     }
 
     private static Dictionary<string, SynxValue> LoadIncludes(List<SynxIncludeDirective> directives, SynxOptions options)
@@ -332,7 +518,7 @@ public static partial class SynxEngine
             {
                 var full = JailPath(baseDir, inc.Path);
                 CheckFileSize(full);
-                map[inc.Alias] = ReadAndResolve(full, options).Root;
+                map[inc.Alias] = ReadAndResolve(full, inc.Path, options).Root;
             }
             catch
             {
@@ -367,6 +553,11 @@ public static partial class SynxEngine
         var pkgBase = options.PackagesPath ?? "./synx_packages";
         var baseDir = options.BasePath ?? ".";
         var pkgRoot = Path.Combine(baseDir, pkgBase);
+        // safety: a package may `!use` another. The depth was counted but never checked,
+        // and nothing noticed a package reaching itself: packages using one another
+        // overflowed the stack — which ends a .NET process outright.
+        if (directives.Count == 0 || options.IncludeDepth >= (options.MaxIncludeDepth ?? DefaultMaxIncludeDepth))
+            return map;
 
         foreach (var ud in directives)
         {
@@ -401,10 +592,13 @@ public static partial class SynxEngine
                 ?? Path.Combine(pkgDir, "src", "main.synx");
 
             if (!File.Exists(entry)) continue;
+            var isOpen = false;
             try
             {
                 CheckFileSize(entry);
-                var parsed = SynxParserCore.Parse(File.ReadAllText(entry));
+                IncludeEnter(RealPath(entry), ud.Package);
+                isOpen = true;
+                var parsed = SynxParserCore.Parse(ReadText(entry, ud.Package));
                 if (parsed.Mode == SynxMode.Active)
                 {
                     var child = CloneOptions(options);
@@ -414,7 +608,14 @@ public static partial class SynxEngine
                 }
                 map[ud.Alias] = parsed.Root;
             }
-            catch { /* skip failed packages */ }
+            catch
+            {
+                /* skip failed packages */
+            }
+            finally
+            {
+                if (isOpen) IncludeLeave();
+            }
         }
         return map;
     }
@@ -764,7 +965,12 @@ public static partial class SynxEngine
     /// <summary>The error a value earns against its constraints, or null when it passes.</summary>
     private static string? ConstraintViolation(string key, SynxValue val, SynxConstraints c)
     {
-        if (c.Required && (val is SynxValue.Null || (val is SynxValue.Str s0 && s0.Value.Length == 0)))
+        // A key written without a value parses as an empty group; for `[required]` that is
+        // the missing value, not a present object.
+        var isMissing = val is SynxValue.Null
+            || (val is SynxValue.Str s0 && s0.Value.Length == 0)
+            || (val is SynxValue.Obj o0 && o0.Map.Count == 0);
+        if (c.Required && isMissing)
             return $"CONSTRAINT_ERR: '{key}' is required";
 
         // spec: an absent value (null) is checked against `enum` only, read as an empty
@@ -843,8 +1049,13 @@ public static partial class SynxEngine
 
     /// <summary>
     /// Whether <paramref name="value"/> fails <c>[pattern:…]</c> (unanchored, like Rust <c>is_match</c>).
-    /// Invalid, refused (ReDoS-shaped) and timed-out patterns never reject.
+    /// Invalid and refused (ReDoS-shaped) patterns never reject, and neither does a pattern the
+    /// linear engine does not support (look-around, back-references).
     /// perf: compiled patterns are cached per thread, at most 256.
+    /// safety: the backtracking engine with a one-second timeout answered "matches" when the
+    /// time ran out — <c>(.*)(.*)(.*)(.*)(.*)(.*)(.*)x</c> accepted a value synx-core rejects, two
+    /// seconds per field. <c>RegexOptions.NonBacktracking</c> runs in time linear in the value,
+    /// as the reference's engine does, so there is nothing to time out.
     /// </summary>
     internal static bool PatternRejects(string pattern, string value)
     {
@@ -855,14 +1066,12 @@ public static partial class SynxEngine
             re = null;
             if (!HasNestedQuantifier(pattern))
             {
-                try { re = new Regex(pattern, RegexOptions.None, TimeSpan.FromSeconds(1)); }
-                catch (ArgumentException) { re = null; }
+                try { re = new Regex(pattern, RegexOptions.NonBacktracking | RegexOptions.CultureInvariant); }
+                catch (Exception e) when (e is ArgumentException or NotSupportedException) { re = null; }
             }
             cache[pattern] = re;
         }
-        if (re == null) return false;
-        try { return !re.IsMatch(value); }
-        catch (RegexMatchTimeoutException) { return false; }
+        return re != null && !re.IsMatch(value);
     }
 
     /// <summary>
@@ -925,46 +1134,106 @@ public static partial class SynxEngine
 
     // ── :secret pre-pass ──
 
-    private static readonly HashSet<string> s_resolvingBeforeSecret = new(StringComparer.Ordinal)
+    /// <summary>The prefixes of the strings the engine leaves in place of a value it could not produce.</summary>
+    private static readonly string[] s_runtimeErrorPrefixes =
+    [
+        "INCLUDE_ERR:", "WATCH_ERR:", "CALC_ERR:", "SPAM_ERR:", "CONSTRAINT_ERR:",
+        "ALIAS_ERR:", "NESTING_ERR:", "LIMIT_ERR:", "TYPE_ERR:", "WASM_ERR:",
+    ];
+
+    /// <summary>Whether <paramref name="s"/> is an error the engine left in place of a value.</summary>
+    private static bool IsEngineError(string s)
     {
-        "env", "include", "import", "watch", "ref", "alias", "calc", "map", "i18n", "default",
-        "fallback", "once", "split", "join", "format", "replace",
-    };
+        if (s.Length == 0 || !char.IsAsciiLetterUpper(s[0])) return false;
+        foreach (var prefix in s_runtimeErrorPrefixes)
+            if (s.StartsWith(prefix, StringComparison.Ordinal)) return true;
+        return false;
+    }
 
     /// <summary>
-    /// Wrap every literal <c>:secret</c> value before resolution, so no later interpolation can
-    /// read the plaintext. A secret that itself needs resolving (<c>:env:secret</c>, …) is left
-    /// for its own marker to mask in place.
+    /// Make a resolved value a secret. A scalar becomes the secret of its text; a list or a
+    /// group keeps its shape and every scalar in it is masked (in place). An absent value
+    /// (null) stays null — wrapping it made the secret the text "null", which
+    /// <c>[required]</c> read as a present value — an existing secret is kept, and an engine
+    /// error stays readable: <c>:secret:watch missing.txt</c> is a failure to report, not a
+    /// value to hide.
     /// </summary>
-    private static void MaskSecretLiterals(SynxValue value, Dictionary<string, Dictionary<string, SynxMeta>> metadata, string path)
+    private static SynxValue MaskSecretValue(SynxValue v)
+    {
+        switch (v)
+        {
+            case SynxValue.Secret or SynxValue.Null:
+                return v;
+            case SynxValue.Arr a:
+                for (var i = 0; i < a.Items.Count; i++) a.Items[i] = MaskSecretValue(a.Items[i]);
+                return v;
+            case SynxValue.Obj o:
+                foreach (var k in o.Map.Keys.ToArray()) o.Map[k] = MaskSecretValue(o.Map[k]);
+                return v;
+            case SynxValue.Str s when IsEngineError(s.Value):
+                return v;
+            default:
+                return new SynxValue.Secret(ValueToString(v));
+        }
+    }
+
+    /// <summary>
+    /// The <c>:secret</c> pre-pass: every value under <c>:secret</c> is masked before any
+    /// resolution, and what the key held is kept in <paramref name="originals"/> for the
+    /// key's own turn.
+    /// safety: a literal next to <c>:default</c>, <c>:replace</c>, <c>:format</c>,
+    /// <c>:split</c>, … was left in the clear until its own turn, and the fields of a group
+    /// under <c>:secret</c> were never masked here: <c>leak:alias password</c> above
+    /// <c>password:secret:default:x hunter2</c> read <c>hunter2</c>.
+    /// </summary>
+    private static void MaskSecretLiterals(
+        SynxValue value,
+        Dictionary<string, Dictionary<string, SynxMeta>> metadata,
+        string path,
+        Dictionary<string, Dictionary<string, SynxValue>> originals)
     {
         if (value is not SynxValue.Obj o || metadata.Count == 0) return;
         if (metadata.TryGetValue(path, out var mm))
         {
             foreach (var (key, meta) in mm)
             {
-                if (!meta.Markers.Contains("secret") || meta.Markers.Any(s_resolvingBeforeSecret.Contains))
-                    continue;
-                if (o.Map.TryGetValue(key, out var v) && v is not (SynxValue.Secret or SynxValue.Obj or SynxValue.Arr))
-                    o.Map[key] = new SynxValue.Secret(ValueToString(v));
+                if (!meta.Markers.Contains("secret")) continue;
+                if (!o.Map.TryGetValue(key, out var v) || v is SynxValue.Secret or SynxValue.Null) continue;
+                o.Map[key] = MaskSecretValue(CloneValue(v));
+                if (!originals.TryGetValue(path, out var here))
+                {
+                    here = new Dictionary<string, SynxValue>(StringComparer.Ordinal);
+                    originals[path] = here;
+                }
+                here[key] = v;
             }
         }
         foreach (var (key, child) in o.Map)
         {
-            switch (child)
-            {
-                case SynxValue.Obj:
-                    MaskSecretLiterals(child, metadata, ChildPath(path, key)!);
-                    break;
-                case SynxValue.Arr arr:
-                    var listPath = ChildPath(path, key)!;
-                    for (var idx = 0; idx < arr.Items.Count; idx++)
-                    {
-                        if (arr.Items[idx] is SynxValue.Obj)
-                            MaskSecretLiterals(arr.Items[idx], metadata, ItemPath(listPath, idx));
-                    }
-                    break;
-            }
+            if (child is SynxValue.Obj or SynxValue.Arr)
+                MaskSecretSubtree(child, metadata, ChildPath(path, key)!, originals);
+        }
+    }
+
+    /// <summary><see cref="MaskSecretLiterals"/> for the object or list at <paramref name="path"/>.</summary>
+    private static void MaskSecretSubtree(
+        SynxValue child,
+        Dictionary<string, Dictionary<string, SynxMeta>> metadata,
+        string path,
+        Dictionary<string, Dictionary<string, SynxValue>> originals)
+    {
+        switch (child)
+        {
+            case SynxValue.Obj:
+                MaskSecretLiterals(child, metadata, path, originals);
+                break;
+            case SynxValue.Arr arr:
+                for (var idx = 0; idx < arr.Items.Count; idx++)
+                {
+                    if (arr.Items[idx] is SynxValue.Obj)
+                        MaskSecretLiterals(arr.Items[idx], metadata, ItemPath(path, idx), originals);
+                }
+                break;
         }
     }
 
@@ -1026,7 +1295,9 @@ public static partial class SynxEngine
             case "null": return new SynxValue.Null();
         }
         if (SynxNum.TryParseI64(val, out var i)) return new SynxValue.Int(i);
-        if (SynxNum.TryParseF64(val, out var d)) return new SynxValue.Float(d);
+        // spec: `inf`, `NaN` and `1e400` are text. Read as floats they became `null` in
+        // JSON: a host named `inf` lost its value.
+        if (SynxNum.TryParseF64(val, out var d) && double.IsFinite(d)) return new SynxValue.Float(d);
         return new SynxValue.Str(val);
     }
 
@@ -1135,7 +1406,11 @@ public static partial class SynxEngine
 
     private static bool AllowSpam(string bucketKey, ulong maxCalls, ulong windowSec)
     {
-        var window = TimeSpan.FromSeconds(Math.Max(1, (double)windowSec));
+        // safety: `TimeSpan.FromSeconds` throws OverflowException past about 29 000 years —
+        // `key:spam:1:18446744073709551615` threw it out of ParseActive.
+        var window = windowSec >= (ulong)TimeSpan.MaxValue.TotalSeconds
+            ? TimeSpan.MaxValue
+            : TimeSpan.FromSeconds(Math.Max(1, (double)windowSec));
         lock (SpamLock)
         {
             if (!SpamBuckets.TryGetValue(bucketKey, out var calls))

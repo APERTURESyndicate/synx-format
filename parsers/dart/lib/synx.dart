@@ -1,4 +1,4 @@
-/// SYNX — native Dart parser. Parity with crates/synx-core 3.8.0.
+/// SYNX — native Dart parser. Parity with crates/synx-core 3.8.1.
 library synx;
 
 import 'src/binary.dart' as binmod;
@@ -87,12 +87,23 @@ String? decompileToText(List<int> bytes) {
   final res = binmod.decompile(bytes);
   if (!res.ok) return null;
   final pr = res.result!;
+  // safety: a document is an object, and the compiler writes no other root. A
+  // file whose root was a string came back as that string — text of its
+  // author's choosing, `!active` lines included, out of a file flagged static.
+  // Such a root has no text form.
+  if (pr.root is! SynxObj) return null;
   final sb = StringBuffer();
   if (pr.tool) sb.write('!tool\n');
   if (pr.schema) sb.write('!schema\n');
   if (pr.llm) sb.write('!llm\n');
-  if (pr.mode == SynxMode.active) sb.write('!active\n');
+  // A resolved file is the static document it now is: its values are final,
+  // and `!active` would interpolate `{braces}` in them a second time.
+  final resolved = bytes.length > 6 && (bytes[6] & 0x08) != 0;
+  if (pr.mode == SynxMode.active && !resolved) sb.write('!active\n');
   if (pr.locked) sb.write('!lock\n');
+  for (final inc in pr.includes) {
+    sb.write('!include ${inc.path} ${inc.alias}\n');
+  }
   if (sb.length > 0) sb.write('\n');
   sb.write(stringmod.stringify(pr.root));
   return sb.toString();

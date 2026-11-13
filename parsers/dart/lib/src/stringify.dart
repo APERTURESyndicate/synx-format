@@ -13,10 +13,93 @@ const int maxSerializeDepth = 128;
 String stringify(SynxValue v) {
   if (v is! SynxObj) return formatPrimitive(v);
   final out = StringBuffer();
-  for (final k in _sortedKeys(v.map)) {
-    _writeEntry(out, k, v.map[k]!, 0, 0);
-  }
+  _writeObject(out, v.map, 0, 0);
   return out.toString();
+}
+
+/// The entries of one object at [indent] columns, sorted by key.
+void _writeObject(StringBuffer out, SynxObject m, int indent, int depth) {
+  final names = _keyNames(m);
+  for (final k in _sortedKeys(m)) {
+    _writeEntry(out, names?[k] ?? k, m[k]!, indent, depth);
+  }
+}
+
+/// Does [key], written at the start of a line, read back as itself?
+bool keyReadsBack(String key) {
+  if (key.isEmpty) return false;
+  final first = key.codeUnitAt(0);
+  // - # / [ : (
+  if (first == 0x2D || first == 0x23 || first == 0x2F || first == 0x5B || first == 0x3A || first == 0x28) return false;
+  // Lines the parser takes for directives.
+  if (const {'!active', '!lock', '!tool', '!schema', '!llm', '!include', '!use'}.contains(key)) return false;
+  // Keys the parser drops, with everything under them.
+  if (key == '__proto__' || key == 'constructor' || key == 'prototype') return false;
+  // Whitespace at an edge is trimmed away with the line; inside, only a space
+  // or a tab ends a key (U+00A0 is a letter like any other).
+  if (isWs(first) || isWs(key.codeUnitAt(key.length - 1))) return false;
+  for (final c in key.runes) {
+    if (_isControl(c) || c == 0x20 || c == 0x5B || c == 0x3A || c == 0x28) return false;
+  }
+  return true;
+}
+
+bool _isControl(int c) => c < 0x20 || (c >= 0x7F && c <= 0x9F);
+
+/// [key] with every character that would end it or start something else
+/// written as `_`.
+///
+/// safety: SYNX has no quoting for keys, and a key was written as it came.
+/// `port:env` gave the next reader a marker, `!active` on a line of its own
+/// switched the document to active mode, a line break began new lines — a map
+/// with caller-chosen keys, saved and loaded, could read the environment.
+String _writableKey(String key) {
+  final cps = key.runes.toList();
+  final sb = StringBuffer();
+  final last = cps.length - 1;
+  for (var i = 0; i < cps.length; i++) {
+    final c = cps[i];
+    final edge = i == 0 || i == last;
+    final breaks = _isControl(c) ||
+        c == 0x20 ||
+        c == 0x5B ||
+        c == 0x3A ||
+        c == 0x28 ||
+        (edge && c <= 0xFFFF && isWs(c)) ||
+        (i == 0 && (c == 0x2D || c == 0x23 || c == 0x2F || c == 0x21));
+    if (breaks) {
+      sb.write('_');
+    } else {
+      sb.writeCharCode(c);
+    }
+  }
+  final out = sb.isEmpty ? '_' : sb.toString();
+  // safety: `constructor`, `prototype` and `__proto__` are keys the reader
+  // refuses with what hangs under them; such a key gets a `_` after it.
+  return out == '__proto__' || out == 'constructor' || out == 'prototype' ? '${out}_' : out;
+}
+
+/// The names the keys of [m] are written under, or null when every key reads
+/// back as itself. Two keys never share a name: one already taken in the
+/// object gets a number — `a_b`, `a_b_2`, `a_b_3`, in the order of its keys.
+Map<String, String>? _keyNames(SynxObject m) {
+  if (m.keyView.every(keyReadsBack)) return null;
+  final renamed = <String, String>{};
+  final taken = <String>{};
+  final next = <String, int>{};
+  for (final key in m.keyView) {
+    if (keyReadsBack(key)) continue;
+    final base = _writableKey(key);
+    var name = base;
+    while (m.contains(name) || taken.contains(name)) {
+      final n = next[base] ?? 2;
+      name = '${base}_$n';
+      next[base] = n + 1;
+    }
+    taken.add(name);
+    renamed[key] = name;
+  }
+  return renamed;
 }
 
 List<String> _sortedKeys(SynxObject m) => sortCodePoints(m.keys);
@@ -36,9 +119,7 @@ void _writeEntry(StringBuffer out, String key, SynxValue value, int indent, int 
       out
         ..write(key)
         ..write('\n');
-      for (final k in _sortedKeys(m)) {
-        _writeEntry(out, k, m[k]!, indent + 2, depth + 1);
-      }
+      _writeObject(out, m, indent + 2, depth + 1);
     case SynxArr(values: var items):
       _indent(out, indent);
       out.write(key);
@@ -89,10 +170,11 @@ void _writeItem(StringBuffer out, SynxValue item, int indent, int depth) {
     // the last one wins).
     final repeatHead = headSafe < 0 || keys.length == 1;
     final headKey = keys[head];
+    final names = _keyNames(m);
     _indent(out, indent);
     out
       ..write('- ')
-      ..write(headKey);
+      ..write(names?[headKey] ?? headKey);
     final text = _scalar(m[headKey]!);
     if (text != null && text.isNotEmpty) {
       out
@@ -102,14 +184,17 @@ void _writeItem(StringBuffer out, SynxValue item, int indent, int depth) {
     out.write('\n');
     for (var i = 0; i < keys.length; i++) {
       if (i == head && !repeatHead) continue;
-      _writeEntry(out, keys[i], m[keys[i]]!, indent + 2, depth + 1);
+      _writeEntry(out, names?[keys[i]] ?? keys[i], m[keys[i]]!, indent + 2, depth + 1);
     }
     return;
   }
   _indent(out, indent);
+  // safety: a list item is one line and SYNX has no block form for it, so a
+  // line break is written as a space; written as it was, the rest of the text
+  // became lines of their own.
   out
     ..write('- ')
-    ..write(_scalar(item) ?? (item is SynxStr ? item.value : ''))
+    ..write(_scalar(item) ?? (item is SynxStr ? item.value.replaceAll('\n', ' ').replaceAll('\r', ' ') : ''))
     ..write('\n');
 }
 

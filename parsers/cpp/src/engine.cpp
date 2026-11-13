@@ -6,14 +6,15 @@
 #include "internal.hpp"
 #include "numfmt.hpp"
 #include "paths.hpp"
+#include "pattern.hpp"
 #include "synx/parser.hpp"
 #include "unicode.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <fstream>
 #include <memory>
-#include <regex>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -72,9 +73,19 @@ Value cast_primitive(std::string_view val) {
     if (val == "null") return Value::make_null();
     int64_t n = 0;
     if (parse_i64(val, n)) return Value::make_int(n);
+    // spec: `inf`, `NaN` and `1e400` are text. Read as floats they became
+    // `null` in JSON: a host named `inf` lost its value.
     double f = 0.0;
-    if (parse_f64(val, f)) return Value::make_float(f);
+    if (parse_f64(val, f) && std::isfinite(f)) return Value::make_float(f);
     return Value::make_string(std::string(val));
+}
+
+Value external_value(std::string text, bool as_string, bool secret) {
+    if (as_string) return Value::make_string(std::move(text));
+    Value cast = cast_primitive(text);
+    // spec: a secret is its text. Cast first, `00123` became the secret `123`.
+    if (secret && (cast.is_int() || cast.is_float() || cast.is_bool())) return Value::make_string(std::move(text));
+    return cast;
 }
 
 bool wants_string(const Meta& m) {
@@ -182,7 +193,159 @@ bool path_starts_with(const fs::path& full, const fs::path& base) {
     return true;
 }
 
+// The components of a path as the document wrote it, split at `/` and `\`.
+template <typename F>
+void each_segment(std::string_view p, F&& f) {
+    size_t start = 0;
+    while (true) {
+        size_t sep = p.find_first_of("/\\", start);
+        f(p.substr(start, (sep == std::string_view::npos ? p.size() : sep) - start));
+        if (sep == std::string_view::npos) return;
+        start = sep + 1;
+    }
+}
+
+#if defined(_WIN32)
+// A path component that names a DOS device, with or without an extension or a
+// stream: `NUL`, `con.txt`, `sub/COM1`, `aux:x`.
+bool has_device_name(std::string_view p) {
+    bool found = false;
+    each_segment(p, [&](std::string_view part) {
+        size_t cut = part.find_first_of(".:");
+        std::string stem(part.substr(0, cut));
+        while (!stem.empty() && stem.back() == ' ') stem.pop_back();
+        for (char& ch : stem) {
+            if (ch >= 'a' && ch <= 'z') ch = static_cast<char>(ch - 'a' + 'A');
+        }
+        if (stem == "CON" || stem == "PRN" || stem == "AUX" || stem == "NUL" || stem == "CONIN$" || stem == "CONOUT$") {
+            found = true;
+        }
+        if (stem.size() >= 4 && (stem.compare(0, 3, "COM") == 0 || stem.compare(0, 3, "LPT") == 0)) {
+            std::string_view rest = std::string_view(stem).substr(3);
+            if ((rest.size() == 1 && rest[0] >= '0' && rest[0] <= '9') || rest == "\xC2\xB9" || rest == "\xC2\xB2"
+                || rest == "\xC2\xB3") {
+                found = true;
+            }
+        }
+    });
+    return found;
+}
+#endif
+
+/// What a top-level resolve shares with the resolves it starts for included
+/// documents and packages (synx-core keeps the same state per thread).
+struct ResolveState {
+    size_t depth = 0;
+    std::vector<fs::path> chain;
+    size_t reads = 0;
+    uint64_t read_bytes = 0;
+    size_t expansion = 0;
+};
+
+ResolveState& state() {
+    thread_local ResolveState s;
+    return s;
+}
+
+/// Held for one `resolve` call; the outermost one starts the budgets afresh.
+struct ResolveScope {
+    ResolveScope() {
+        ResolveState& s = state();
+        if (s.depth == 0) {
+            s.chain.clear();
+            s.reads = 0;
+            s.read_bytes = 0;
+            s.expansion = 0;
+        }
+        ++s.depth;
+    }
+    ~ResolveScope() { --state().depth; }
+    ResolveScope(const ResolveScope&) = delete;
+    ResolveScope& operator=(const ResolveScope&) = delete;
+};
+
 } // namespace
+
+bool charge_expansion(size_t bytes) noexcept {
+    ResolveState& s = state();
+    if (bytes <= kMaxResolveExpansionBytes - std::min(s.expansion, kMaxResolveExpansionBytes)) {
+        s.expansion += bytes;
+        return true;
+    }
+    s.expansion = kMaxResolveExpansionBytes;
+    return false;
+}
+
+size_t expansion_room() noexcept {
+    return kMaxResolveExpansionBytes - std::min(state().expansion, kMaxResolveExpansionBytes);
+}
+
+std::pair<size_t, size_t> value_cost(const Value& v) {
+    if (const std::string* s = v.as_string()) return {kValueCost + s->size(), 0};
+    if (v.is_secret()) return {kValueCost + v.as_secret()->size(), 0};
+    if (const Array* a = v.as_array()) {
+        size_t cost = kValueCost;
+        size_t depth = 0;
+        for (const auto& item : *a) {
+            auto [c, d] = value_cost(item);
+            cost += c;
+            depth = std::max(depth, d);
+        }
+        return {cost, depth + 1};
+    }
+    if (const Object* o = v.as_object()) {
+        size_t cost = kValueCost;
+        size_t depth = 0;
+        for (const auto& p : *o) {
+            auto [c, d] = value_cost(p.value);
+            cost += c + p.key.size();
+            depth = std::max(depth, d);
+        }
+        return {cost, depth + 1};
+    }
+    return {kValueCost, 0};
+}
+
+Value budgeted_copy(const Value& v, size_t depth) {
+    auto [cost, nesting] = value_cost(v);
+    if (depth + nesting >= kMaxResolveDepth) return Value::make_string(kNestingErr);
+    if (!charge_expansion(cost)) return Value::make_string(kLimitErr);
+    return Value(v);
+}
+
+Value placed_document(Value v, size_t depth, bool secret) {
+    if (depth + value_cost(v).second >= kMaxResolveDepth) return Value::make_string(kNestingErr);
+    if (secret) mask_secret_value(v);
+    return v;
+}
+
+bool is_engine_error(std::string_view s) noexcept {
+    static constexpr std::string_view kPrefixes[] = {
+        "INCLUDE_ERR:", "WATCH_ERR:", "CALC_ERR:", "SPAM_ERR:", "CONSTRAINT_ERR:",
+        "ALIAS_ERR:", "NESTING_ERR:", "LIMIT_ERR:", "TYPE_ERR:", "WASM_ERR:",
+    };
+    if (s.empty() || s[0] < 'A' || s[0] > 'Z') return false;
+    for (std::string_view p : kPrefixes) {
+        if (s.substr(0, p.size()) == p) return true;
+    }
+    return false;
+}
+
+void mask_secret_value(Value& v) {
+    if (v.is_secret() || v.is_null()) return;
+    if (Array* a = v.as_array_mut()) {
+        for (auto& item : *a) mask_secret_value(item);
+        return;
+    }
+    if (Object* o = v.as_object_mut()) {
+        for (auto& p : *o) mask_secret_value(p.value);
+        return;
+    }
+    if (const std::string* s = v.as_string()) {
+        if (is_engine_error(*s)) return;
+    }
+    v = Value::make_secret(value_to_string(v));
+}
 
 JailResult jail_path(std::string_view base, std::string_view file_path) {
     JailResult r;
@@ -196,11 +359,25 @@ JailResult jail_path(std::string_view base, std::string_view file_path) {
         r.error = "SECURITY: absolute paths are not allowed: " + quoted;
         return r;
     }
+#if defined(_WIN32)
+    // safety: `NUL`, `con.txt` or `COM1` in any directory opens a device on
+    // Windows; synx-core reaches the disk through a verbatim path, where these
+    // are ordinary missing files.
+    if (has_device_name(file_path)) {
+        r.error = "file not found: " + std::string(file_path);
+        return r;
+    }
+#endif
     std::error_code ec;
+    // safety: a base that cannot be resolved refuses instead of jailing nothing.
+    if (base.empty()) base = ".";
     fs::path base_path = path_from_utf8(base);
     fs::path base_canonical = fs::canonical(base_path, ec);
-    const bool canonical_base = !ec;
-    if (ec) base_canonical = base_path;
+    if (ec) {
+        r.error = "SECURITY: base directory not found: '" + std::string(base) + "'";
+        return r;
+    }
+    const bool canonical_base = true;
     fs::path full = base_canonical / fp;
 #if defined(_WIN32)
     // Rust's canonical path on Windows is verbatim (`\\?\C:\…`), and pushing
@@ -213,8 +390,12 @@ JailResult jail_path(std::string_view base, std::string_view file_path) {
     ec.clear();
     fs::path full_canonical = fs::canonical(full, ec);
     if (ec) {
-        // The file may not exist yet — at least verify no `..` escapes.
-        if (path_to_utf8(full).find("..") != std::string::npos) {
+        // The file may not exist yet — at least verify no `..` escapes, judged
+        // by the path as the document wrote it: a base named `a..b` is no
+        // traversal.
+        bool traversal = false;
+        each_segment(file_path, [&](std::string_view seg) { traversal = traversal || seg == ".."; });
+        if (traversal) {
             r.error = "SECURITY: path traversal detected: " + quoted;
             return r;
         }
@@ -245,25 +426,73 @@ std::string check_file_size(const fs::path& p) {
     return std::string();
 }
 
+// spec: the error text never carries the operating system's wording or the
+// absolute path, so the same document resolves to the same string everywhere.
 bool read_text(const fs::path& p, std::string_view ctx, std::string& out, std::string& error) {
     std::error_code ec;
-    if (!fs::exists(p, ec)) {
+    fs::file_status st = fs::status(p, ec);
+    if (ec || !fs::exists(st)) {
         error = "file not found: " + std::string(ctx);
         return false;
     }
+    // A directory reads as "permission denied" on Windows and "is a directory"
+    // elsewhere; it is neither.
+    if (fs::is_directory(st)) {
+        error = "not a file: " + std::string(ctx);
+        return false;
+    }
     std::ifstream in(p, std::ios::binary);
-    if (!in.good() || fs::is_directory(p, ec)) {
+    if (!in.good()) {
         error = "permission denied: " + std::string(ctx);
         return false;
     }
     std::ostringstream ss;
     ss << in.rdbuf();
+    if (in.bad()) {
+        error = "cannot read file: " + std::string(ctx);
+        return false;
+    }
     out = ss.str();
     if (!valid_utf8(out)) {
-        error = "stream did not contain valid UTF-8";
+        error = "file is not valid UTF-8: " + std::string(ctx);
         return false;
     }
     return true;
+}
+
+bool read_budgeted(const fs::path& p, std::string_view shown, std::string& out, std::string& error) {
+    std::error_code ec;
+    uintmax_t size = fs::is_regular_file(p, ec) ? fs::file_size(p, ec) : 0;
+    if (ec) size = 0;
+    if (state().read_bytes + size > kMaxResolveReadBytes) {
+        error = "read budget (" + std::to_string(kMaxResolveReadBytes) + " bytes) exceeded";
+        return false;
+    }
+    if (!read_text(p, shown, out, error)) return false;
+    state().read_bytes += out.size();
+    return true;
+}
+
+bool include_file(const fs::path& full, std::string_view shown, const Options& options, Value& out,
+                  std::string& error) {
+    ResolveState& s = state();
+    for (const auto& open : s.chain) {
+        if (open == full) {
+            error = "circular include: '" + std::string(shown) + "'";
+            return false;
+        }
+    }
+    if (s.reads >= kMaxIncludeReads) {
+        error = "include budget (" + std::to_string(kMaxIncludeReads) + " files) exceeded";
+        return false;
+    }
+    ++s.reads;
+    s.chain.push_back(full);
+    std::string text;
+    bool ok = read_budgeted(full, shown, text, error);
+    if (ok) out = load_synx_file(text, full, options);
+    state().chain.pop_back();
+    return ok;
 }
 
 Value load_synx_file(const std::string& text, const fs::path& file, const Options& options) {
@@ -328,240 +557,21 @@ bool has_nested_quantifier(std::string_view p) {
     return false;
 }
 
-bool regex_pattern_is_supported(std::string_view p) {
-    enum class Prev { None, Atom, Assertion, Quant };
-    constexpr size_t kMaxGroupDepth = 32;
-    constexpr unsigned kMaxRepeat = 1000;
-
-    auto is_hex = [](char c) {
-        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
-    };
-    auto is_ascii_alpha = [](char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); };
-
-    // Escape at p[i] == '\\'. Returns the index after it, or npos if unsupported.
-    // `class_escape` reports \d \w \s \D \W \S (valid atoms but not range endpoints).
-    auto escape_end = [&](size_t i, bool& class_escape) -> size_t {
-        class_escape = false;
-        if (i + 1 >= p.size()) return std::string_view::npos;
-        char e = p[i + 1];
-        if (e == 'd' || e == 'D' || e == 'w' || e == 'W' || e == 's' || e == 'S') {
-            class_escape = true;
-            return i + 2;
-        }
-        if (e == 'n' || e == 'r' || e == 't' || e == 'f' || e == 'v') return i + 2;
-        if (e == 'x' || e == 'u') {
-            size_t digits = e == 'x' ? 2 : 4;
-            if (i + 2 + digits > p.size()) return std::string_view::npos;
-            for (size_t k = 0; k < digits; ++k) {
-                if (!is_hex(p[i + 2 + k])) return std::string_view::npos;
-            }
-            return i + 2 + digits;
-        }
-        // Back-references, \0, \c, \k, \p, unknown letters: not worth the risk.
-        if (is_ascii_alpha(e) || (e >= '0' && e <= '9')) return std::string_view::npos;
-        if (static_cast<unsigned char>(e) >= 0x80) return std::string_view::npos;
-        return i + 2;  // identity escape of punctuation
-    };
-
-    Prev prev = Prev::None;
-    bool lazy_ok = false;
-    std::vector<bool> lookahead;  // one entry per open group
-    size_t i = 0;
-    const size_t n = p.size();
-    while (i < n) {
-        char c = p[i];
-        switch (c) {
-            case '\\': {
-                if (i + 1 < n && (p[i + 1] == 'b' || p[i + 1] == 'B')) {
-                    prev = Prev::Assertion;
-                    i += 2;
-                    break;
-                }
-                bool cls = false;
-                size_t next = escape_end(i, cls);
-                if (next == std::string_view::npos) return false;
-                prev = Prev::Atom;
-                i = next;
-                break;
-            }
-            case '(': {
-                bool look = false;
-                size_t skip = 1;
-                if (i + 1 < n && p[i + 1] == '?') {
-                    if (i + 2 >= n) return false;
-                    char k = p[i + 2];
-                    if (k == ':') { skip = 3; }
-                    else if (k == '=' || k == '!') { skip = 3; look = true; }
-                    else return false;  // lookbehind, named groups, inline flags
-                }
-                if (lookahead.size() >= kMaxGroupDepth) return false;
-                lookahead.push_back(look);
-                prev = Prev::None;
-                i += skip;
-                break;
-            }
-            case ')':
-                if (lookahead.empty()) return false;
-                prev = lookahead.back() ? Prev::Assertion : Prev::Atom;
-                lookahead.pop_back();
-                ++i;
-                break;
-            case '|':
-                prev = Prev::None;
-                ++i;
-                break;
-            case '^':
-            case '$':
-                prev = Prev::Assertion;
-                ++i;
-                break;
-            case '*':
-            case '+':
-            case '?':
-                if (prev == Prev::Quant) {
-                    // `?` right after a quantifier makes it lazy, once.
-                    if (c == '?' && lazy_ok) { lazy_ok = false; ++i; break; }
-                    return false;
-                }
-                if (prev != Prev::Atom) return false;  // nothing to repeat
-                prev = Prev::Quant;
-                lazy_ok = true;
-                ++i;
-                break;
-            case '{': {
-                if (prev != Prev::Atom) return false;
-                size_t k = i + 1;
-                unsigned lo = 0, hi = 0;
-                bool have_lo = false, have_hi = false, comma = false;
-                while (k < n && p[k] >= '0' && p[k] <= '9') {
-                    lo = lo * 10 + static_cast<unsigned>(p[k] - '0');
-                    if (lo > kMaxRepeat) return false;
-                    have_lo = true;
-                    ++k;
-                }
-                if (!have_lo) return false;
-                if (k < n && p[k] == ',') {
-                    comma = true;
-                    ++k;
-                    while (k < n && p[k] >= '0' && p[k] <= '9') {
-                        hi = hi * 10 + static_cast<unsigned>(p[k] - '0');
-                        if (hi > kMaxRepeat) return false;
-                        have_hi = true;
-                        ++k;
-                    }
-                }
-                if (k >= n || p[k] != '}') return false;
-                if (comma && have_hi && lo > hi) return false;
-                prev = Prev::Quant;
-                lazy_ok = true;
-                i = k + 1;
-                break;
-            }
-            case '}':
-                return false;
-            case '[': {
-                ++i;
-                if (i < n && p[i] == '^') ++i;
-                if (i >= n || p[i] == ']') return false;  // unclosed or empty class
-                // last: -1 none, otherwise the single-character code of the previous
-                // item (0x100 marks a class escape / posix class that cannot start a range).
-                int last = -1;
-                bool dash_pending = false;
-                bool closed = false;
-                while (i < n) {
-                    char k = p[i];
-                    if (k == ']') {
-                        if (dash_pending) return false;
-                        closed = true;
-                        ++i;
-                        break;
-                    }
-                    int item = 0;
-                    if (k == '\\') {
-                        bool cls = false;
-                        size_t next = escape_end(i, cls);
-                        if (next == std::string_view::npos) return false;
-                        item = cls ? 0x100 : (next == i + 2 ? static_cast<unsigned char>(p[i + 1]) : 0x100);
-                        i = next;
-                    } else if (k == '[') {
-                        if (i + 1 >= n || p[i + 1] != ':') return false;  // only `[:name:]`
-                        size_t close = p.find(":]", i + 2);
-                        if (close == std::string_view::npos) return false;
-                        std::string_view name = p.substr(i + 2, close - (i + 2));
-                        static const char* const kNames[] = {
-                            "alpha", "digit", "alnum", "upper", "lower", "space", "punct",
-                            "print", "graph", "cntrl", "xdigit", "blank", "w", "d", "s",
-                        };
-                        bool known = false;
-                        for (const char* nm : kNames) {
-                            if (name == nm) { known = true; break; }
-                        }
-                        if (!known) return false;
-                        item = 0x100;
-                        i = close + 2;
-                    } else if (k == '-') {
-                        bool at_end = i + 1 < n && p[i + 1] == ']';
-                        if (last == -1 || at_end) {
-                            item = '-';
-                            ++i;
-                        } else {
-                            if (last == 0x100 || dash_pending) return false;
-                            dash_pending = true;
-                            ++i;
-                            continue;
-                        }
-                    } else {
-                        item = static_cast<unsigned char>(k);
-                        ++i;
-                    }
-                    if (dash_pending) {
-                        if (item == 0x100 || last < 0 || last >= 0x80 || item >= 0x80 || last > item) return false;
-                        dash_pending = false;
-                        last = -1;  // a finished range cannot chain into another
-                    } else {
-                        last = item;
-                    }
-                }
-                if (!closed) return false;
-                prev = Prev::Atom;
-                break;
-            }
-            default:
-                prev = Prev::Atom;
-                ++i;
-                break;
-        }
-    }
-    return lookahead.empty();
-}
-
 bool pattern_rejects(const std::string& pattern, const std::string& s) {
     // perf: compiled patterns are cached per thread — a pattern declared on a
     // field name was compiled again for every value checked against it.
     // safety: bounded, so a document of distinct patterns cannot grow it forever.
     constexpr size_t kMaxCachedPatterns = 256;
-    thread_local std::unordered_map<std::string, std::unique_ptr<std::regex>> cache;
+    thread_local std::unordered_map<std::string, std::unique_ptr<Pattern>> cache;
     auto it = cache.find(pattern);
     if (it == cache.end()) {
         if (cache.size() >= kMaxCachedPatterns) cache.clear();
-        std::unique_ptr<std::regex> compiled;
-        // A refused or unsupported pattern is never handed to std::regex, which
-        // aborts the process on a bad pattern when exceptions are off.
-        if (!has_nested_quantifier(pattern) && regex_pattern_is_supported(pattern)) {
-#if defined(__cpp_exceptions) && __cpp_exceptions
-            try {
-                compiled = std::make_unique<std::regex>(pattern);
-            } catch (...) {
-                compiled.reset();
-            }
-#else
-            compiled = std::make_unique<std::regex>(pattern);
-#endif
-        }
+        // A backtracking-prone shape is refused everywhere, as in synx-core.
+        std::unique_ptr<Pattern> compiled = has_nested_quantifier(pattern) ? nullptr : Pattern::compile(pattern);
         it = cache.emplace(pattern, std::move(compiled)).first;
     }
     if (!it->second) return false;
-    return !std::regex_search(s, *it->second);
+    return !it->second->is_match(s);
 }
 
 // ─── constraints ────────────────────────────────────────────────────────────
@@ -576,9 +586,14 @@ std::optional<std::string> constraint_violation(std::string_view key_sv, const V
         }
         return joined;
     };
-    if (c.required && (val.is_null() || (val.is_string() && val.as_string()->empty()))) {
+    // A key written without a value parses as an empty group; for `[required]`
+    // that is the missing value, not a present object.
+    if (c.required && (val.is_null() || (val.is_string() && val.as_string()->empty())
+                       || (val.is_object() && val.as_object()->empty()))) {
         return "CONSTRAINT_ERR: '" + key + "' is required";
     }
+    // A secret is checked by its text; no message quotes the value.
+    const std::string* text_of = val.is_secret() ? val.as_secret() : val.as_string();
     // An absent value (null) is checked against `enum` only, read as an empty
     // string; type, range and pattern apply to values that exist.
     if (val.is_null()) {
@@ -600,7 +615,7 @@ std::optional<std::string> constraint_violation(std::string_view key_sv, const V
     }
     if (c.enum_values) {
         std::string text;
-        if (val.is_string()) text = *val.as_string();
+        if (text_of) text = *text_of;
         else if (val.is_int()) text = i64_to_string(*val.as_int());
         else if (val.is_float()) text = display_f64(*val.as_float());
         else if (val.is_bool()) text = *val.as_bool() ? "true" : "false";
@@ -615,7 +630,7 @@ std::optional<std::string> constraint_violation(std::string_view key_sv, const V
     double n = 0.0;
     if (val.is_int()) { n = static_cast<double>(*val.as_int()); have_n = true; }
     else if (val.is_float()) { n = *val.as_float(); have_n = true; }
-    else if (val.is_string() && (c.min || c.max)) { n = static_cast<double>(char_count(*val.as_string())); have_n = true; }
+    else if (text_of && (c.min || c.max)) { n = static_cast<double>(char_count(*text_of)); have_n = true; }
     if (have_n) {
         if (c.min && n < *c.min) {
             return "CONSTRAINT_ERR: '" + key + "' value " + display_f64(n) + " is below min " + display_f64(*c.min);
@@ -624,8 +639,8 @@ std::optional<std::string> constraint_violation(std::string_view key_sv, const V
             return "CONSTRAINT_ERR: '" + key + "' value " + display_f64(n) + " exceeds max " + display_f64(*c.max);
         }
     }
-    if (c.pattern && c.pattern->size() <= 256 && val.is_string()) {
-        if (pattern_rejects(*c.pattern, *val.as_string())) {
+    if (c.pattern && c.pattern->size() <= 256 && text_of) {
+        if (pattern_rejects(*c.pattern, *text_of)) {
             return "CONSTRAINT_ERR: '" + key + "' does not match pattern /" + *c.pattern + "/";
         }
     }
@@ -638,7 +653,7 @@ void Resolver::resolve_value(Value& value, std::string& path, size_t depth) {
     Object* map = value.as_object_mut();
     if (!map) return;
     if (depth >= kMaxResolveDepth) {
-        for (auto& p : *map) p.value = Value::make_string("NESTING_ERR: maximum object nesting depth exceeded");
+        for (auto& p : *map) p.value = Value::make_string(kNestingErr);
         return;
     }
     // One pass in document order: each key's subtree, then the key's own
@@ -648,8 +663,31 @@ void Resolver::resolve_value(Value& value, std::string& path, size_t depth) {
     const ObjectLookup& local = map == root.as_object() ? root_lookup : own;
     const size_t base_len = path.size();
     const size_t count = map->size();
+    // What this object's `:secret` keys held before the pre-pass.
+    std::unordered_map<std::string, Value> originals;
+    if (!secret_originals.empty()) {
+        auto it = secret_originals.find(path);
+        if (it != secret_originals.end()) {
+            originals = std::move(it->second);
+            secret_originals.erase(it);
+        }
+    }
     for (size_t i = 0; i < count; ++i) {
         Value& child = (*map)[i].value;
+        if (!originals.empty()) {
+            auto it = originals.find((*map)[i].key);
+            if (it != originals.end()) {
+                child = std::move(it->second);
+                originals.erase(it);
+                if (child.is_object() || child.is_array()) {
+                    // Secrets nested in it stay masked until their own turn.
+                    if (base_len > 0) path.push_back('.');
+                    push_key_segment(path, (*map)[i].key);
+                    mask_secret_subtree(child, metadata, path, secret_originals);
+                    path.resize(base_len);
+                }
+            }
+        }
         if (child.is_object() || child.is_array()) {
             if (base_len > 0) path.push_back('.');
             push_key_segment(path, (*map)[i].key);
@@ -670,18 +708,28 @@ void Resolver::resolve_value(Value& value, std::string& path, size_t depth) {
         if (!mm) continue;
         const Meta* meta = mm->get((*map)[i].key);
         if (!meta) continue;
-        apply_markers(*map, i, local, *meta, path);
+        apply_markers(*map, i, local, *meta, path, depth);
     }
     // Then `{…}` interpolation over the object's strings.
     for (size_t i = 0; i < count; ++i) {
         const std::string* s = (*map)[i].value.as_string();
         if (!s || s->find('{') == std::string::npos) continue;
-        std::string result = resolve_interpolation(*s, local);
-        if (result != *s) (*map)[i].value = Value::make_string(std::move(result));
+        // safety: the text may grow by what is left of the budget and no
+        // further — one 4 MiB value named from 600 keys was 2.4 GiB.
+        const size_t before = s->size();
+        std::optional<std::string> result = resolve_interpolation(*s, local, before + expansion_room());
+        if (!result) {
+            charge_expansion(static_cast<size_t>(-1));
+            (*map)[i].value = Value::make_string(kLimitErr);
+        } else if (*result != *s) {
+            charge_expansion(result->size() > before ? result->size() - before : 0);
+            (*map)[i].value = Value::make_string(std::move(*result));
+        }
     }
 }
 
-std::string Resolver::resolve_interpolation(std::string_view tpl, const ObjectLookup& local) const {
+std::optional<std::string> Resolver::resolve_interpolation(std::string_view tpl, const ObjectLookup& local,
+                                                           size_t cap) const {
     std::string result;
     result.reserve(std::min(tpl.size(), kMaxScratchString));
     auto push_capped = [&](std::string_view s) {
@@ -731,6 +779,7 @@ std::string Resolver::resolve_interpolation(std::string_view tpl, const ObjectLo
                         if (val) push_capped(value_to_string(*val));
                         else push_literal(ref);
                     }
+                    if (result.size() > cap) return std::nullopt;
                     i = close + 1;
                     continue;
                 }
@@ -741,6 +790,7 @@ std::string Resolver::resolve_interpolation(std::string_view tpl, const ObjectLo
         if (result.size() < kMaxScratchString) result.append(tpl.substr(i, len));
         i += len;
     }
+    if (result.size() > cap) return std::nullopt;
     return result;
 }
 
@@ -808,9 +858,50 @@ void set_in(Object& obj, std::string_view key, Value v) {
     else obj.push_back(Pair{std::string(key), std::move(v)});
 }
 
+// What copying one key's declarations costs against the budget (synx-core `meta_cost`).
+size_t meta_cost(std::string_view key, const Meta& meta) {
+    size_t cost = 2 * kValueCost + key.size();
+    for (const auto& s : meta.markers) cost += 24 + s.size();
+    for (const auto& s : meta.args) cost += 24 + s.size();
+    if (meta.type_hint) cost += meta.type_hint->size();
+    if (meta.constraints) {
+        const Constraints& c = *meta.constraints;
+        if (c.type_name) cost += 24 + c.type_name->size();
+        if (c.pattern) cost += 24 + c.pattern->size();
+        if (c.enum_values) {
+            for (const auto& s : *c.enum_values) cost += 24 + s.size();
+        }
+    }
+    return cost;
+}
+
+size_t meta_map_cost(const MetaMap& mm) {
+    size_t cost = kValueCost;
+    for (const auto& e : mm) cost += meta_cost(e.first, e.second);
+    return cost;
+}
+
+// The first two segments of a metadata path (`parent.field`), or empty for a
+// path of one segment. A `.` escaped with `\` is part of its segment.
+std::string_view two_segment_head(std::string_view path) {
+    size_t dots = 0;
+    for (size_t i = 0; i < path.size(); ++i) {
+        if (path[i] == '\\') {
+            ++i;
+        } else if (path[i] == '.') {
+            if (++dots == 2) return path.substr(0, i);
+        }
+    }
+    return dots == 1 ? path : std::string_view();
+}
+
 // `:inherit` — several parents merged left to right, the child overrides; each
 // field keeps the declaration of the object its value came from; inherited
 // nested subtrees are copies carrying their own declarations.
+//
+// safety: every inherited field and declaration is a copy, charged to the
+// document's budget — 3 000 children of a 3 000-field parent are nine million
+// fields from a 130 KB file.
 void apply_inheritance(Value& root, MetadataTree& metadata) {
     const MetaMap* root_meta = metadata.get("");
     if (!root_meta) return;
@@ -824,7 +915,13 @@ void apply_inheritance(Value& root, MetadataTree& metadata) {
         if (!parents.empty()) inherits.emplace_back(e.first, std::move(parents));
     }
     Object* map = root.as_object_mut();
-    if (!map) return;
+    if (!map || inherits.empty()) return;
+    // perf: the declarations nested under each `object.field`, found once.
+    std::unordered_map<std::string, std::vector<std::string>> nested_index;
+    for (const auto& me : metadata) {
+        std::string_view head = two_segment_head(me.first);
+        if (!head.empty()) nested_index[std::string(head)].push_back(me.first);
+    }
     for (const auto& inh : inherits) {
         const std::string& child_key = inh.first;
         Value* child_val = find_in(*map, child_key);
@@ -832,14 +929,25 @@ void apply_inheritance(Value& root, MetadataTree& metadata) {
         if (!child_val || !child_val->is_object()) continue;
         IndexMap<Value> merged;
         IndexMap<const std::string*> source;  // nullptr = the child itself
+        bool within_budget = true;
         for (const std::string& parent_name : inh.second) {
             const Value* pv = find_in(*map, parent_name);
             if (!pv || !pv->is_object()) continue;
             for (const auto& p : *pv->as_object()) {
+                if (!charge_expansion(value_cost(p.value).first + p.key.size())) {
+                    within_budget = false;
+                    break;
+                }
                 merged.insert_or_assign(p.key, p.value);
                 source.insert_or_assign(p.key, &parent_name);
             }
+            if (!within_budget) break;
         }
+        if (!within_budget) {
+            set_in(*map, child_key, Value::make_string(kLimitErr));
+            continue;
+        }
+        child_val = find_in(*map, child_key);
         for (const auto& p : *child_val->as_object()) {
             merged.insert_or_assign(p.key, p.value);
             source.insert_or_assign(p.key, nullptr);
@@ -850,19 +958,35 @@ void apply_inheritance(Value& root, MetadataTree& metadata) {
             const std::string& k = s.first;
             const std::string& from = s.second ? *s.second : child_key;
             if (const MetaMap* mm = metadata.get(key_segment(from))) {
-                if (const Meta* m = mm->get(k)) top.insert_or_assign(k, *m);
+                if (const Meta* m = mm->get(k)) {
+                    if (s.second && !charge_expansion(meta_cost(k, *m))) {
+                        within_budget = false;
+                        break;
+                    }
+                    top.insert_or_assign(k, *m);
+                }
             }
             if (s.second) {
                 // The inherited subtree is a copy; its nested markers move with it.
                 std::string prefix = key_segment(*s.second) + "." + key_segment(k);
-                for (const auto& me : metadata) {
-                    const std::string& p = me.first;
-                    if (p.compare(0, prefix.size(), prefix) != 0 || p.size() < prefix.size()) continue;
+                auto found = nested_index.find(prefix);
+                if (found == nested_index.end()) continue;
+                for (const std::string& p : found->second) {
+                    const MetaMap* mm = metadata.get(p);
+                    if (!mm) continue;
+                    if (!charge_expansion(meta_map_cost(*mm) + p.size())) {
+                        within_budget = false;
+                        break;
+                    }
                     std::string_view rest = std::string_view(p).substr(prefix.size());
-                    if (!rest.empty() && rest[0] != '.') continue;
-                    nested.emplace_back(key_segment(child_key) + "." + key_segment(k) + std::string(rest), me.second);
+                    nested.emplace_back(key_segment(child_key) + "." + key_segment(k) + std::string(rest), *mm);
                 }
+                if (!within_budget) break;
             }
+        }
+        if (!within_budget) {
+            set_in(*map, child_key, Value::make_string(kLimitErr));
+            continue;
         }
         Object merged_obj;
         merged_obj.reserve(merged.size());
@@ -870,36 +994,40 @@ void apply_inheritance(Value& root, MetadataTree& metadata) {
         set_in(*map, child_key, Value::make_object(std::move(merged_obj)));
         if (top.empty()) metadata.erase(key_segment(child_key));
         else metadata.insert_or_assign(key_segment(child_key), std::move(top));
-        for (auto& n : nested) metadata.insert_or_assign(std::move(n.first), std::move(n.second));
-    }
-}
-
-// Markers whose value must be resolved before it becomes a secret.
-bool needs_resolution_before_secret(const Meta& m) {
-    static const char* const kResolving[] = {
-        "env", "include", "import", "watch", "ref", "alias", "calc", "map", "i18n", "default",
-        "fallback", "once", "split", "join", "format", "replace",
-    };
-    for (const auto& marker : m.markers) {
-        for (const char* r : kResolving) {
-            if (marker == r) return true;
+        for (auto& n : nested) {
+            // A later child may inherit from this one: its copies are indexed too.
+            if (!metadata.contains(n.first)) {
+                std::string_view head = two_segment_head(n.first);
+                if (!head.empty()) nested_index[std::string(head)].push_back(n.first);
+            }
+            metadata.insert_or_assign(std::move(n.first), std::move(n.second));
         }
     }
-    return false;
 }
 
-// safety: literal `:secret` values are masked before any resolution, so no
-// `{interpolation}` can ever read the plaintext.
-void mask_secret_literals(Value& value, const MetadataTree& metadata, std::string& path) {
+} // namespace
+
+// The `:secret` pre-pass: every value under `:secret` is masked before any
+// resolution. What the key held is kept in `originals` and comes back for the
+// key's own turn (its subtree and its marker chain); what that produces is
+// masked again by the `:secret` marker.
+//
+// safety: a literal next to `:default`, `:replace`, `:format`, `:split`, … was
+// left in the clear until its own turn, and the fields of a group under
+// `:secret` were never masked here: `leak:alias password` above
+// `password:secret:default:x hunter2` read `hunter2`.
+void mask_secret_literals(Value& value, const MetadataTree& metadata, std::string& path, SecretOriginals& originals) {
     Object* map = value.as_object_mut();
     if (!map) return;
     if (const MetaMap* mm = metadata.get(path)) {
         for (const auto& e : *mm) {
-            if (!e.second.has_marker("secret") || needs_resolution_before_secret(e.second)) continue;
+            if (!e.second.has_marker("secret")) continue;
             if (Value* v = find_in(*map, e.first)) {
-                if (!v->is_secret() && !v->is_object() && !v->is_array()) {
-                    *v = Value::make_secret(value_to_string(*v));
-                }
+                if (v->is_secret() || v->is_null()) continue;
+                Value masked = *v;
+                mask_secret_value(masked);
+                originals[path][e.first] = std::move(*v);
+                *v = std::move(masked);
             }
         }
     }
@@ -908,21 +1036,26 @@ void mask_secret_literals(Value& value, const MetadataTree& metadata, std::strin
         if (!p.value.is_object() && !p.value.is_array()) continue;
         if (base_len > 0) path.push_back('.');
         push_key_segment(path, p.key);
-        if (p.value.is_object()) {
-            mask_secret_literals(p.value, metadata, path);
-        } else {
-            Array& arr = *p.value.as_array_mut();
-            const size_t list_len = path.size();
-            for (size_t idx = 0; idx < arr.size(); ++idx) {
-                if (!arr[idx].is_object()) continue;
-                push_item_segment(path, idx);
-                mask_secret_literals(arr[idx], metadata, path);
-                path.resize(list_len);
-            }
-        }
+        mask_secret_subtree(p.value, metadata, path, originals);
         path.resize(base_len);
     }
 }
+
+void mask_secret_subtree(Value& child, const MetadataTree& metadata, std::string& path, SecretOriginals& originals) {
+    if (child.is_object()) {
+        mask_secret_literals(child, metadata, path, originals);
+    } else if (Array* arr = child.as_array_mut()) {
+        const size_t list_len = path.size();
+        for (size_t idx = 0; idx < arr->size(); ++idx) {
+            if (!(*arr)[idx].is_object()) continue;
+            push_item_segment(path, idx);
+            mask_secret_literals((*arr)[idx], metadata, path, originals);
+            path.resize(list_len);
+        }
+    }
+}
+
+namespace {
 
 bool value_matches_type(const Value& v, const std::string& t) {
     if (t == "int") return v.is_int();
@@ -982,9 +1115,9 @@ IndexMap<Value> load_includes(const std::vector<IncludeDirective>& directives, c
     for (const auto& inc : directives) {
         JailResult j = jail_path(base, inc.path);
         if (!j.ok || !check_file_size(j.path).empty()) continue;
-        std::string text, err;
-        if (!read_text(j.path, inc.path, text, err)) continue;
-        map.insert_or_assign(inc.alias, load_synx_file(text, j.path, options));
+        Value included;
+        std::string err;
+        if (include_file(j.path, inc.path, options, included, err)) map.insert_or_assign(inc.alias, std::move(included));
     }
     return map;
 }
@@ -1031,6 +1164,11 @@ std::optional<fs::path> read_manifest_main(const fs::path& pkg_dir) {
 // `<base>/<packages_path>/@scope/name` → its manifest's entry or `src/main.synx`.
 IndexMap<Value> load_packages(const std::vector<UseDirective>& directives, const Options& options) {
     IndexMap<Value> map;
+    // safety: a package may `!use` another; packages using one another recursed
+    // until the process ran out of stack.
+    if (directives.empty() || options._include_depth >= options.max_include_depth.value_or(kDefaultMaxIncludeDepth)) {
+        return map;
+    }
     const fs::path pkg_root = path_from_utf8(options.base_path.value_or("."))
                             / path_from_utf8(options.packages_path.value_or("./synx_packages"));
     for (const auto& ud : directives) {
@@ -1039,17 +1177,11 @@ IndexMap<Value> load_packages(const std::vector<UseDirective>& directives, const
         fs::path entry = read_manifest_main(pkg_dir).value_or(pkg_dir / "src" / "main.synx");
         std::error_code ec;
         if (!fs::is_regular_file(entry, ec) || !check_file_size(entry).empty()) continue;
-        std::string text, err;
-        if (!read_text(entry, "", text, err)) continue;
-        ParseResult parsed = parse(text);
-        if (parsed.mode == Mode::Active) {
-            Options child = options;
-            child._include_depth += 1;
-            fs::path parent = entry.parent_path();
-            child.base_path = path_to_utf8(parent.empty() ? pkg_dir : parent);
-            resolve(parsed, child);
-        }
-        map.insert_or_assign(ud.alias, std::move(parsed.root));
+        fs::path opened = fs::canonical(entry, ec);
+        if (ec) opened = entry;
+        Value included;
+        std::string err;
+        if (include_file(opened, ud.package, options, included, err)) map.insert_or_assign(ud.alias, std::move(included));
     }
     return map;
 }
@@ -1062,6 +1194,7 @@ IndexMap<Value> load_packages(const std::vector<UseDirective>& directives, const
 void resolve(ParseResult& result, const Options& options) {
     using namespace detail;
     if (result.mode != Mode::Active) return;
+    ResolveScope scope_guard;
     MetadataTree metadata = std::move(result.metadata);
     result.metadata.clear();
     std::vector<IncludeDirective> include_directives = std::move(result.includes);
@@ -1095,15 +1228,19 @@ void resolve(ParseResult& result, const Options& options) {
                 if (!file) continue;
                 JailResult j = jail_path(base, *file);
                 if (!j.ok || !check_file_size(j.path).empty()) continue;
-                std::string text, err;
-                if (!read_text(j.path, *file, text, err)) continue;
-                Value included = load_synx_file(text, j.path, options);
+                Value included;
+                std::string err;
+                if (!include_file(j.path, *file, options, included, err)) continue;
                 // perf: the key's `:include` marker takes this result instead of
                 // resolving the file again (each level twice cost 2^depth).
                 Array pre;
                 pre.push_back(Value::make_string(*file));
                 pre.push_back(included);
                 preresolved.insert_or_assign(p.key, Value::make_array(std::move(pre)));
+                // safety: the tree is also what `{leaf:key}` reads. Under
+                // `:secret` that scope gets the masked tree, or `x {password:db}`
+                // printed what `db:secret:include` hid.
+                if (meta->has_marker("secret")) mask_secret_value(included);
                 includes.emplace(p.key, std::move(included));
             }
         }
@@ -1125,9 +1262,10 @@ void resolve(ParseResult& result, const Options& options) {
                                        [](const Pair& p) { return !p.key.empty() && p.key[0] == '_'; }),
                         root_map->end());
     }
+    SecretOriginals secret_originals;
     {
         std::string path;
-        mask_secret_literals(result.root, metadata, path);
+        mask_secret_literals(result.root, metadata, path, secret_originals);
     }
 
     if (Object* root_map = result.root.as_object_mut()) {
@@ -1138,7 +1276,7 @@ void resolve(ParseResult& result, const Options& options) {
         for (const auto& p : *root_map) {
             if (is_calc_special_key(p.key)) scope.root_special.push_back(p.key);
         }
-        Resolver r{options, result.root, root_lookup, metadata, includes, preresolved, scope};
+        Resolver r{options, result.root, root_lookup, metadata, includes, preresolved, scope, secret_originals};
         std::string path;
         r.resolve_value(result.root, path, 0);
     }

@@ -374,3 +374,18 @@ public struct SynxParseResult: Sendable {
         self.truncated = truncated
     }
 }
+
+// safety: the default string forms (`"\(value)"`, `print`, `String(reflecting:)`,
+// `dump`, an `XCTAssertEqual` failure) reflected the enum and printed the text of
+// `.secret`. Every form is now the canonical JSON, where a secret is `[SECRET]`.
+extension SynxValue: CustomStringConvertible, CustomDebugStringConvertible, CustomReflectable {
+    public var description: String { SynxJSON.encode(self) }
+    public var debugDescription: String { "SynxValue(\(SynxJSON.encode(self)))" }
+    public var customMirror: Mirror { Mirror(self, children: ["json": SynxJSON.encode(self)]) }
+}
+
+extension SynxObject: CustomStringConvertible, CustomDebugStringConvertible, CustomReflectable {
+    public var description: String { SynxJSON.encode(.object(self)) }
+    public var debugDescription: String { "SynxObject(\(SynxJSON.encode(.object(self))))" }
+    public var customMirror: Mirror { Mirror(self, children: ["json": SynxJSON.encode(.object(self))]) }
+}

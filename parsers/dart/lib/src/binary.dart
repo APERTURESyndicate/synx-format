@@ -132,10 +132,14 @@ SynxDecompileResult decompile(List<int> data) {
     return SynxDecompileResult.failure('declared size $uncomp exceeds limit $_maxDecodedBytes');
   }
 
+  // safety: the stream is inflated at most one byte past what the header
+  // declares. Decoded whole, a few kilobytes of file could expand to
+  // gigabytes before the size check below ran.
   late Uint8List payload;
   try {
-    payload = Uint8List.fromList(
-        ZLibCodec(raw: true).decode(data.sublist(11)));
+    payload = _inflateRaw(data, 11, uncomp);
+  } on SynxBinaryError catch (e) {
+    return SynxDecompileResult.failure(e.message);
   } on Exception catch (e) {
     return SynxDecompileResult.failure('decompression failed: $e');
   }
@@ -227,7 +231,57 @@ double _readF64LE(_Cursor cur) {
 class _Cursor {
   final Uint8List data;
   int pos = 0;
+
+  /// What decoding has built so far, in bytes.
+  int spent = 0;
   _Cursor(this.data);
+
+  /// safety: a value is one byte on the wire and tens of bytes in memory, a
+  /// string is stored once and referenced any number of times, and deflate
+  /// shrinks a run of either a thousandfold. The tree shares the payload's
+  /// limit: every value at a fixed cost, plus the bytes of each text it uses.
+  void charge(int n) {
+    spent += n;
+    if (spent > _maxDecodedBytes) {
+      throw const SynxBinaryError('decoded document exceeds $_maxDecodedBytes bytes — refusing to decode');
+    }
+  }
+}
+
+/// What one decoded value costs against [_maxDecodedBytes], text aside.
+const int _decodedValueCost = 64;
+
+/// What one string table entry costs, text aside.
+const int _stringEntryCost = 16;
+
+/// Inflate the raw deflate stream at [data] from [start], refusing to produce
+/// more than [expected] + 1 bytes.
+Uint8List _inflateRaw(List<int> data, int start, int expected) {
+  final sink = _LimitedSink(expected + 1);
+  final conv = ZLibCodec(raw: true).decoder.startChunkedConversion(sink);
+  const step = 16 * 1024;
+  for (var i = start; i < data.length; i += step) {
+    final end = i + step < data.length ? i + step : data.length;
+    conv.add(data is Uint8List ? Uint8List.sublistView(data, i, end) : data.sublist(i, end));
+  }
+  conv.close();
+  return sink.bytes.takeBytes();
+}
+
+class _LimitedSink implements Sink<List<int>> {
+  final int limit;
+  final BytesBuilder bytes = BytesBuilder(copy: false);
+  _LimitedSink(this.limit);
+  @override
+  void add(List<int> chunk) {
+    if (bytes.length + chunk.length > limit) {
+      throw const SynxBinaryError('size mismatch in decompressed payload');
+    }
+    bytes.add(chunk);
+  }
+
+  @override
+  void close() {}
 }
 
 // ─── String table ───────────────────────────────────────────────────────────
@@ -284,26 +338,36 @@ class _StringTable {
 
 class _StringTableReader {
   final List<String> strings;
-  _StringTableReader(this.strings);
+
+  /// UTF-8 length of each string: what a reference to it costs.
+  final List<int> sizes;
+  final _Cursor cur;
+  _StringTableReader(this.strings, this.sizes, this.cur);
 
   static _StringTableReader decode(_Cursor cur) {
     final count = _readVarint(cur);
     final list = <String>[];
+    final sizes = <int>[];
     for (var i = 0; i < count; i++) {
       final len = _readVarint(cur);
-      if (cur.pos + len > cur.data.length) {
+      // A length past 2^63 reads as negative here.
+      if (len < 0 || len > cur.data.length - cur.pos) {
         throw const SynxBinaryError('unexpected end of data in string table');
       }
-      list.add(_decodeUtf8(cur.data.sublist(cur.pos, cur.pos + len)));
+      cur.charge(_stringEntryCost + len);
+      list.add(_decodeUtf8(Uint8List.sublistView(cur.data, cur.pos, cur.pos + len)));
+      sizes.add(len);
       cur.pos += len;
     }
-    return _StringTableReader(list);
+    return _StringTableReader(list, sizes, cur);
   }
 
+  /// The string at [idx], charged to the decoding budget.
   String get(int idx) {
     if (idx < 0 || idx >= strings.length) {
       throw const SynxBinaryError('string index out of bounds');
     }
+    cur.charge(sizes[idx]);
     return strings[idx];
   }
 }
@@ -430,6 +494,7 @@ SynxValue _decodeValue(_Cursor cur, _StringTableReader t, [int depth = 0]) {
   if (depth > _maxDecodeDepth) {
     throw const SynxBinaryError('nesting exceeds $_maxDecodeDepth — refusing to decode');
   }
+  cur.charge(_decodedValueCost);
   if (cur.pos >= cur.data.length) {
     throw const SynxBinaryError('unexpected end of data');
   }
@@ -508,6 +573,7 @@ SynxConstraints _decodeConstraints(_Cursor cur, _StringTableReader t) {
     final count = _readVarint(cur);
     final vals = <String>[];
     for (var i = 0; i < count; i++) {
+      cur.charge(_decodedValueCost);
       vals.add(t.get(_readVarint(cur)));
     }
     c.enumValues = vals;
@@ -554,18 +620,22 @@ SynxMetadataTree _decodeMetadata(_Cursor cur, _StringTableReader t) {
   final outer = _readVarint(cur);
   final tree = <String, SynxMetaMap>{};
   for (var i = 0; i < outer; i++) {
+    cur.charge(_decodedValueCost);
     final path = t.get(_readVarint(cur));
     final inner = _readVarint(cur);
     final m = <String, SynxMeta>{};
     for (var j = 0; j < inner; j++) {
       final fk = t.get(_readVarint(cur));
+      cur.charge(_decodedValueCost);
       final meta = SynxMeta();
       final mc = _readVarint(cur);
       for (var k = 0; k < mc; k++) {
+        cur.charge(_decodedValueCost);
         meta.markers.add(t.get(_readVarint(cur)));
       }
       final ac = _readVarint(cur);
       for (var k = 0; k < ac; k++) {
+        cur.charge(_decodedValueCost);
         meta.args.add(t.get(_readVarint(cur)));
       }
       if (cur.pos >= cur.data.length) {
@@ -599,6 +669,7 @@ List<SynxIncludeDirective> _decodeIncludes(
   final count = _readVarint(cur);
   final out = <SynxIncludeDirective>[];
   for (var i = 0; i < count; i++) {
+    cur.charge(_decodedValueCost);
     final p = t.get(_readVarint(cur));
     final a = t.get(_readVarint(cur));
     out.add(SynxIncludeDirective(p, a));

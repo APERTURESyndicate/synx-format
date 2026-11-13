@@ -9,6 +9,7 @@
 #include "unicode.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <optional>
@@ -102,10 +103,12 @@ Constraints parse_constraints(std::string_view raw) {
             std::string_view k = trim_view(part.substr(0, colon));
             std::string_view v = trim_view(part.substr(colon + 1));
             double d = 0.0;
+            // A bound is a finite number: `inf` and `nan` bound nothing sensible
+            // (`[max:-inf]` rejected every value).
             if (k == "min") {
-                c.min = parse_f64(v, d) ? std::optional<double>(d) : std::nullopt;
+                c.min = parse_f64(v, d) && std::isfinite(d) ? std::optional<double>(d) : std::nullopt;
             } else if (k == "max") {
-                c.max = parse_f64(v, d) ? std::optional<double>(d) : std::nullopt;
+                c.max = parse_f64(v, d) && std::isfinite(d) ? std::optional<double>(d) : std::nullopt;
             } else if (k == "type") {
                 c.type_name = std::string(v);
             } else if (k == "pattern") {
@@ -163,6 +166,19 @@ using detail::ws_len_at;
 /// Keys that would reach a JS consumer's prototype chain instead of its data.
 inline bool is_reserved_js_key(std::string_view key) noexcept {
     return key == "__proto__" || key == "constructor" || key == "prototype";
+}
+
+/// `digits[.digits]` — a `:random` weight.
+bool is_weight(std::string_view s) noexcept {
+    auto digits = [](std::string_view t) {
+        if (t.empty()) return false;
+        for (char ch : t) {
+            if (ch < '0' || ch > '9') return false;
+        }
+        return true;
+    };
+    size_t dot = s.find('.');
+    return dot == std::string_view::npos ? digits(s) : digits(s.substr(0, dot)) && digits(s.substr(dot + 1));
 }
 
 // ─── one key line, borrowed from the source text ────────────────────────────
@@ -263,9 +279,10 @@ bool parse_line(std::string_view t, ParsedLine& out) {
         // `:random` — the value carries the weight percentages.
         if (has("random")) {
             std::vector<std::string> nums;
+            // spec: a weight is `digits[.digits]`. Anything a float parser read
+            // counted, so `a:random inf`, `-5` or `nan` lost its value.
             split_whitespace(out.value, [&](std::string_view tok) {
-                double d = 0.0;
-                if (parse_f64(tok, d)) nums.emplace_back(tok);
+                if (is_weight(tok)) nums.emplace_back(tok);
             });
             if (!nums.empty()) {
                 out.marker_args = std::move(nums);
@@ -431,15 +448,25 @@ private:
         return meta_path_;
     }
 
-    // The first non-blank line at or after byte `from`, CR excluded.
+    // The first line at or after byte `from` that is content — not blank, not
+    // a comment, not inside a `###` block — CR excluded.
+    //
+    // spec: a comment line is ignored (§5), so it cannot stand between a key
+    // and its list or between a `- ` line and the keys of its item. Only blank
+    // lines were skipped here: `items` / `# note` / `- a` read as an empty
+    // object and lost every item.
     bool next_content_line(size_t from, std::string_view& line) const {
         size_t p = from;
+        bool in_block_comment = false;
         while (p <= text_.size()) {
             const void* hit = p < text_.size() ? std::memchr(text_.data() + p, '\n', text_.size() - p) : nullptr;
             size_t nl = hit ? static_cast<size_t>(static_cast<const char*>(hit) - text_.data()) : text_.size();
             size_t end = (nl > p && text_[nl - 1] == '\r') ? nl - 1 : nl;
             std::string_view l = text_.substr(p, end - p);
-            if (!trim_view(l).empty()) {
+            std::string_view t = trim_view(l);
+            if (t == "###") {
+                in_block_comment = !in_block_comment;
+            } else if (!in_block_comment && !t.empty() && t[0] != '#' && !starts_with(t, "//")) {
                 line = l;
                 return true;
             }
@@ -460,7 +487,13 @@ private:
     std::string meta_path_;
     bool meta_path_valid_ = false;
     std::optional<BlockState> block_;
-    std::optional<ListState> list_;
+    // Open lists, outermost first.
+    //
+    // spec: a list inside a list item ends at the next item of the outer list
+    // (§8.5). One slot held "the" open list, so a nested `tags` replaced its
+    // parent: `- name b` after it matched no list and was dropped without a
+    // word, and the keys under it landed in the item before.
+    std::vector<ListState> lists_;
 };
 
 void Parser::handle_list_item(std::string_view t, int indent, size_t pos) {
@@ -469,17 +502,18 @@ void Parser::handle_list_item(std::string_view t, int indent, size_t pos) {
 
     std::string_view val_str = strip_comment(trim_view(t.substr(2)));
 
-    // A more deeply indented, non-item next line makes this item an object.
+    // A more deeply indented next line of content that is not an item makes
+    // this item an object.
     bool nested = false;
     std::string_view peek;
     if (next_content_line(pos, peek)) {
         std::string_view pt = trim_view(peek);
         int pi = static_cast<int>(indent_len(peek));
-        if (pi > indent && !starts_with(pt, "- ") && pt[0] != '#' && !starts_with(pt, "//")) nested = true;
+        if (pi > indent && !starts_with(pt, "- ")) nested = true;
     }
 
-    const std::string_view list_key = list_->key;
-    const size_t list_stack_idx = list_->stack_idx;
+    const std::string_view list_key = lists_.back().key;
+    const size_t list_stack_idx = lists_.back().stack_idx;
     Object* parent = navigate(list_stack_idx);
     if (!parent) return;
     size_t at = find_key(*parent, stack_[list_stack_idx].index, list_key);
@@ -488,15 +522,33 @@ void Parser::handle_list_item(std::string_view t, int indent, size_t pos) {
         at = parent->size() - 1;
     }
     Array* arr = (*parent)[at].value.as_array_mut();
-    if (!arr || arr->size() >= kMaxListItems) return;
+    if (!arr) return;
+    if (arr->size() >= kMaxListItems) {
+        // The cap dropped an item: say so, like every other cap.
+        r_.truncated = true;
+        return;
+    }
     if (nested) {
         Object item;
         ParsedLine p;
+        bool head_declares = false;
+        Meta head_meta;
+        std::string_view head_key;
         if (parse_line(val_str, p)) {
             Value v = p.type_hint ? cast_typed(p.value, *p.type_hint)
                     : !p.value.empty() ? cast_value(p.value)
                     : Value::make_object();
-            if (!is_reserved_js_key(p.key)) item.push_back(Pair{std::string(p.key), std::move(v)});
+            if (!is_reserved_js_key(p.key)) {
+                item.push_back(Pair{std::string(p.key), std::move(v)});
+                if (r_.mode == Mode::Active && (!p.markers.empty() || p.constraints || p.type_hint)) {
+                    head_declares = true;
+                    head_key = p.key;
+                    for (std::string_view mk : p.markers) head_meta.markers.emplace_back(mk);
+                    head_meta.args = std::move(p.marker_args);
+                    if (p.type_hint) head_meta.type_hint = std::string(*p.type_hint);
+                    head_meta.constraints = std::move(p.constraints);
+                }
+            }
         } else {
             item.push_back(Pair{"_value", cast_value(val_str)});
         }
@@ -504,6 +556,11 @@ void Parser::handle_list_item(std::string_view t, int indent, size_t pos) {
         arr->push_back(Value::make_object(std::move(item)));
         if (stack_.size() < kMaxParseNestingDepth) {
             push_frame(Frame{indent, FrameKind::ListItem, list_key, item_idx, list_stack_idx, {}});
+            // spec: the key on the `- ` line is a key line like the ones under
+            // it. Its markers and constraints were read and thrown away:
+            // `- token:secret abc` stayed in the clear and `- host:env H` kept
+            // the variable's name.
+            if (head_declares) r_.metadata[meta_path()].insert_or_assign(std::string(head_key), std::move(head_meta));
         }
     } else {
         arr->push_back(cast_value(val_str));
@@ -562,12 +619,12 @@ void Parser::handle_key_line(ParsedLine& p, int indent, size_t pos) {
     } else if (is_list_marker && p.value.empty()) {
         // The key exists even when the list stays empty.
         insert_value(parent_idx, p.key, Value::make_array());
-        list_ = ListState{indent, p.key, parent_idx};
+        lists_.push_back(ListState{indent, p.key, parent_idx});
     } else if (p.value.empty()) {
         std::string_view peek;
         if (next_content_line(pos, peek) && starts_with(trim_view(peek), "- ")) {
             insert_value(parent_idx, p.key, Value::make_array());
-            list_ = ListState{indent, p.key, parent_idx};
+            lists_.push_back(ListState{indent, p.key, parent_idx});
             return;
         }
         insert_value(parent_idx, p.key, Value::make_object());
@@ -583,6 +640,8 @@ void Parser::handle_key_line(ParsedLine& p, int indent, size_t pos) {
 
 void Parser::run() {
     bool in_block_comment = false;
+    // Indent of a refused key whose block is being dropped, or -1.
+    int dropped_below = -1;
     ParsedLine parsed;
     const size_t total = text_.size();
     size_t pos = 0;
@@ -598,6 +657,11 @@ void Parser::run() {
         // A blank line is never structural and never body (§8.4.1).
         if (t.empty()) continue;
         const int indent = static_cast<int>(indent_len(raw));
+
+        if (dropped_below >= 0) {
+            if (indent > dropped_below) continue;
+            dropped_below = -1;
+        }
 
         // Multiline body first: `#`, `//`, `###` and `!…` are content there.
         if (block_) {
@@ -697,22 +761,43 @@ void Parser::run() {
         if (t[0] == '#' || starts_with(t, "//")) continue;
 
         if (starts_with(t, "- ")) {
-            if (list_ && indent > list_->indent) {
+            // The list this item belongs to: the innermost open one whose key
+            // sits to the left of the dash. Lists nested deeper than the dash
+            // end here — but only when a list does take the line; a dash no
+            // list accepts is skipped and closes nothing, as it always was.
+            size_t accepting = lists_.size();
+            while (accepting > 0 && indent < lists_[accepting - 1].indent) --accepting;
+            if (accepting > 0 && indent > lists_[accepting - 1].indent) lists_.resize(accepting);
+            if (!lists_.empty() && indent > lists_.back().indent) {
                 handle_list_item(t, indent, pos);
                 continue;
             }
-        } else if (list_ && indent <= list_->indent) {
-            // A non-item line at or above the list's indent closes it.
-            list_.reset();
-            while (stack_.size() > 1 && stack_.back().kind == FrameKind::ListItem
-                   && stack_.back().indent >= indent) {
-                pop_frame();
+        } else {
+            // A non-item line closes every list it is at or below the indent of.
+            bool closed = false;
+            while (!lists_.empty() && indent <= lists_.back().indent) {
+                lists_.pop_back();
+                closed = true;
+            }
+            if (closed) {
+                while (stack_.size() > 1 && stack_.back().kind == FrameKind::ListItem
+                       && stack_.back().indent >= indent) {
+                    pop_frame();
+                }
             }
         }
 
         if (!parse_line(t, parsed)) continue;
         // `__proto__` / `constructor` / `prototype` never reach a JS consumer.
-        if (is_reserved_js_key(parsed.key)) continue;
+        //
+        // safety: the lines under such a key go with it. Only the key line was
+        // skipped, so its block fell to whatever was open above it — `profile`
+        // / `__proto__` / `  role admin` gave `profile` the role — and under
+        // `prototype |` each line of the text was read as a line of the document.
+        if (is_reserved_js_key(parsed.key)) {
+            dropped_below = indent;
+            continue;
+        }
         handle_key_line(parsed, indent, pos);
     }
 

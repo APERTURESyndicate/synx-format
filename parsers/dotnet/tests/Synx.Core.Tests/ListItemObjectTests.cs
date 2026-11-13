@@ -12,14 +12,14 @@ public class ListItemObjectTests
     private static string Json(string text) => SynxFormat.ToJson(SynxFormat.ParseActive(text));
 
     [Theory]
-    // item key line with a constraint, followed by a sibling field
-    [InlineData("!active\nlist\n  - port[type:int] x\n    n 1\n", "{\"list\":[{\"n\":1,\"port\":\"x\"}]}")]
+    // item key line with a constraint, followed by a sibling field: the constraint is checked
+    [InlineData("!active\nlist\n  - port[type:int] x\n    n 1\n", "{\"list\":[{\"n\":1,\"port\":\"CONSTRAINT_ERR: 'port' expected type 'int'\"}]}")]
     // objects, scalars and a one-field object mixed in one list
     [InlineData("items\n  - name a\n    n 1\n  - name b\n    n 2\n  - scalar\n  - c 3\n    d 4\n",
         "{\"items\":[{\"n\":1,\"name\":\"a\"},{\"n\":2,\"name\":\"b\"},\"scalar\",{\"c\":3,\"d\":4}]}")]
-    // nested list inside an item
+    // nested list inside an item: it ends at the next item of the outer list
     [InlineData("items\n  - name a\n    tags\n      - x\n      - y\n    n 1\n  - name b\n",
-        "{\"items\":[{\"n\":1,\"name\":\"a\",\"tags\":[\"x\",\"y\"]}]}")]
+        "{\"items\":[{\"n\":1,\"name\":\"a\",\"tags\":[\"x\",\"y\"]},\"name b\"]}")]
     // nested object inside an item
     [InlineData("items\n  - name a\n    sub\n      k 1\n      j 2\n    z 9\n  - name b\n    sub\n      k 3\n",
         "{\"items\":[{\"name\":\"a\",\"sub\":{\"j\":2,\"k\":1},\"z\":9},{\"name\":\"b\",\"sub\":{\"k\":3}}]}")]
@@ -37,7 +37,7 @@ public class ListItemObjectTests
         "{\"a\":{\"items\":[{\"k\":\"v\",\"z\":1},\"k w\"],\"other\":1},\"b\":[\"x\"]}")]
     // list nested in an item, with fields after it
     [InlineData("items\n  - k v\n    z 1\n    sub\n      - p\n      - q\n    after 2\n  - k w\n",
-        "{\"items\":[{\"after\":2,\"k\":\"v\",\"sub\":[\"p\",\"q\"],\"z\":1}]}")]
+        "{\"items\":[{\"after\":2,\"k\":\"v\",\"sub\":[\"p\",\"q\"],\"z\":1},\"k w\"]}")]
     // multiline block inside an item
     [InlineData("items\n  - k v\n    text |\n      line1\n      line2\n    z 1\n",
         "{\"items\":[{\"k\":\"v\",\"text\":\"line1\\nline2\",\"z\":1}]}")]

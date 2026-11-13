@@ -12,6 +12,8 @@ except ImportError as e:  # pragma: no cover
         "pip install synx-format"
     ) from e
 
+from synx_adapter.guards import fenced_synx_block
+
 
 def to_synx_string(data: Any, *, active: bool = False) -> str:
     """Serialize dict/list/scalars to SYNX; pass str through.
@@ -119,7 +121,9 @@ def pack_for_llm(
     if anchor_index and not isinstance(data, str) and isinstance(data, dict):
         text = make_anchor_index(data, prefix=anchor_prefix) + "\n" + text
     if wrap_fence:
-        body = _synx.to_prompt_block(text, label)
+        # why: built here, not by `synx_native.to_prompt_block` — the fence
+        # has to hold with every synx-format version this package allows.
+        body = fenced_synx_block(text, label)
     else:
         body = text
     if wrap_xml:

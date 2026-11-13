@@ -1,4 +1,4 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use synx_core::{Synx, parse, to_json};
 
 // ── Config text constants ─────────────────────────────────────────────────────
@@ -7,7 +7,6 @@ const SYNX_SMALL: &str = "name TotalWario\nversion 3.0.0\nport 8080\ndebug false
 
 const SYNX_CONFIG: &str = include_str!("../../config.synx");
 
-const JSON_CONFIG: &str = include_str!("../../config.json");
 
 // ── Benchmarks ────────────────────────────────────────────────────────────────
 

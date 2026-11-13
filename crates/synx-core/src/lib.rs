@@ -11,9 +11,14 @@
 //! assert_eq!(data["age"], Value::Int(30));
 //! ```
 
+// safety: the crate reads documents it has no reason to trust, and has no
+// `unsafe` of its own — the compiler keeps it that way.
+#![forbid(unsafe_code)]
+
 mod value;
 mod parser;
 mod engine;
+mod format;
 mod calc;
 pub(crate) mod rng;
 pub mod binary;
@@ -36,7 +41,7 @@ pub use synxl::{
     SynxlErrorKind, SynxlOptions, SynxlReader, SynxlReaderOwned, SynxlRecord, SynxlStreamError,
     SynxlStreamReader,
 };
-pub use engine::resolve;
+pub use engine::{resolve, resolve_read_only, RUNTIME_ERROR_PREFIXES};
 pub use calc::safe_calc;
 pub use diff::{diff as diff_objects, DiffResult, DiffChange, diff_to_value};
 
@@ -92,33 +97,67 @@ impl Synx {
     }
 
     /// Reformat a .synx string into canonical form:
-    /// - Keys sorted alphabetically at every nesting level
     /// - Exactly 2 spaces per indentation level
+    /// - Keys sorted alphabetically at every nesting level of a static
+    ///   document; list items, and the fields inside one, keep their order
+    /// - An `!active` document keeps its key order — markers resolve in it
     /// - One blank line between top-level blocks (objects / lists)
-    /// - Comments stripped — canonical form is comment-free
-    /// - Directive lines (`!active`, `!lock`) preserved at the top
+    /// - Comment lines stripped
+    /// - Directive lines (`!active`, `!lock`, `!include …`) moved to the top
     ///
-    /// The same data always produces byte-for-byte identical output,
-    /// making `.synx` files deterministic and noise-free in `git diff`.
+    /// The result always reads back as the same data: it is parsed and
+    /// compared with the input before it is returned, and a document the
+    /// formatter cannot reproduce — or one cut by a parser limit — is
+    /// returned unchanged.
     pub fn format(text: &str) -> String {
-        fmt_canonical(text)
+        format::format(text)
     }
 
     /// Compile a `.synx` string into compact binary `.synxb` format.
     ///
     /// If `resolved` is true, active markers are resolved first (requires
     /// `!active` mode) and metadata is stripped from the output.
+    ///
+    /// Resolving reads the process environment and the current directory;
+    /// a host compiling a document it did not write uses [`Synx::compile_with`].
     pub fn compile(text: &str, resolved: bool) -> Vec<u8> {
+        Self::compile_with(text, resolved, &Options::default())
+    }
+
+    /// [`Synx::compile`] with the options `resolved` resolves under: `env`
+    /// replaces the process environment, `base_path` is the folder files are
+    /// read from. Without `resolved` the options are not used.
+    pub fn compile_with(text: &str, resolved: bool, opts: &Options) -> Vec<u8> {
         let mut result = parse(text);
         if resolved && result.mode == Mode::Active {
-            resolve(&mut result, &Options::default());
+            resolve(&mut result, opts);
         }
         binary::compile(&result, resolved)
     }
 
     /// Decompile a `.synxb` binary back into a human-readable `.synx` string.
+    ///
+    /// A file compiled without `resolved` carries its declarations, and they
+    /// are written back: `port:env:default:8080 PORT`, `name[required] x`,
+    /// `!include` lines, keys in the order the file holds them. Until 3.8.1
+    /// the text kept `!active` and dropped every marker, so reading it gave
+    /// the variable's *name* as the port and the secret as plain text.
+    ///
+    /// A resolved file is written as the static document it now is — its
+    /// values are final, and `!active` would have `{braces}` in them
+    /// interpolated a second time. `!use` lines are not stored in `.synxb`
+    /// and cannot be restored.
     pub fn decompile(data: &[u8]) -> Result<String, String> {
         let result = binary::decompile(data)?;
+        // safety: a document is an object, and the compiler writes no other
+        // root. A file whose root was a string came back as that string —
+        // text of its author's choosing, `!active` and `!include` lines
+        // included, out of a file flagged static; a list or a scalar came
+        // back as a different document. Such a root has no text form.
+        if !matches!(result.root, Value::Object(_)) {
+            return Err("the root of this .synxb file is not an object; it has no text form".to_string());
+        }
+        let resolved = binary::is_resolved(data);
         let mut out = String::new();
         if result.tool {
             out.push_str("!tool\n");
@@ -129,16 +168,30 @@ impl Synx {
         if result.llm {
             out.push_str("!llm\n");
         }
-        if result.mode == Mode::Active {
+        if result.mode == Mode::Active && !resolved {
             out.push_str("!active\n");
         }
         if result.locked {
             out.push_str("!lock\n");
         }
+        for inc in &result.includes {
+            out.push_str("!include ");
+            out.push_str(&inc.path);
+            out.push(' ');
+            out.push_str(&inc.alias);
+            out.push('\n');
+        }
         if !out.is_empty() {
             out.push('\n');
         }
-        out.push_str(&serialize(&result.root, 0));
+        // An unresolved active document goes through the declared writer even
+        // without declarations: the plain one writes an empty list as
+        // `key:join`, a marker the next `resolve` would apply.
+        if result.metadata.is_empty() && !(result.mode == Mode::Active && !resolved) {
+            out.push_str(&serialize(&result.root, 0));
+        } else {
+            synxl::write_synx_declared(&mut out, &result.root, &result.metadata);
+        }
         Ok(out)
     }
 
@@ -174,13 +227,9 @@ fn serialize(value: &Value, depth_lvl: usize) -> String {
         // 7, `"true"` as a bool), wrote `|+` bodies as `|` (code lost its
         // indent) and printed objects inside list items as `[Object]`.
         Value::Object(map) => {
+            // Keys sorted, for an output that does not depend on insertion order.
             let mut out = String::new();
-            // Sort keys for deterministic output
-            let mut keys: Vec<&str> = map.keys().map(|k| k.as_str()).collect();
-            keys.sort_unstable();
-            for key in keys {
-                synxl::write_synx_entry(&mut out, key, &map[key], depth_lvl * 2, depth_lvl);
-            }
+            synxl::write_synx_object(&mut out, map, depth_lvl * 2, depth_lvl);
             out
         }
         _ => format_primitive(value),
@@ -209,35 +258,75 @@ fn format_primitive(value: &Value) -> String {
 /// Max nesting for JSON emission (matches stringify guard).
 const MAX_JSON_DEPTH: usize = 128;
 
+/// What a byte is written as inside a JSON string: `0` as itself, `b'u'` as
+/// `\u00XX`, anything else as a backslash and that character.
+const JSON_ESCAPE: [u8; 256] = {
+    let mut table = [0u8; 256];
+    let mut b = 0;
+    while b < 0x20 {
+        table[b] = b'u';
+        b += 1;
+    }
+    table[b'\n' as usize] = b'n';
+    table[b'\r' as usize] = b'r';
+    table[b'\t' as usize] = b't';
+    table[b'"' as usize] = b'"';
+    table[b'\\' as usize] = b'\\';
+    table
+};
+
+/// Nonzero when one of the eight bytes of `word` has to be escaped in a JSON
+/// string: a control character, `"` or `\`.
+#[inline]
+fn json_escape_in(word: u64) -> u64 {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    // Each term is nonzero exactly when some byte is below 0x20, equal to
+    // `"`, equal to `\`: a byte with its top bit set never counts.
+    let control = word.wrapping_sub(ONES * 0x20) & !word;
+    let quote = word ^ (ONES * b'"' as u64);
+    let backslash = word ^ (ONES * b'\\' as u64);
+    (control | (quote.wrapping_sub(ONES) & !quote) | (backslash.wrapping_sub(ONES) & !backslash)) & HIGH
+}
+
 /// Write `s` as a JSON string literal.
 ///
-/// perf: unescaped runs are copied whole; the previous loop pushed one `char`
-/// at a time and formatted control characters through `format!`. Every byte
-/// that needs escaping is ASCII, so scanning bytes never splits a character.
+/// perf: unescaped runs are copied whole, and the run is found eight bytes
+/// at a time — text rarely needs an escape at all. The loop before this one
+/// examined every byte through a five-way match. Every byte that needs
+/// escaping is ASCII, so scanning bytes never splits a character.
 fn write_json_str(out: &mut String, s: &str) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     out.push('"');
     let bytes = s.as_bytes();
     let mut start = 0;
-    for (i, &b) in bytes.iter().enumerate() {
-        let esc = match b {
-            b'"' => "\\\"",
-            b'\\' => "\\\\",
-            b'\n' => "\\n",
-            b'\r' => "\\r",
-            b'\t' => "\\t",
-            0..=0x1f => "",
-            _ => continue,
-        };
-        out.push_str(&s[start..i]);
-        if esc.is_empty() {
-            out.push_str("\\u00");
-            out.push(HEX[(b >> 4) as usize] as char);
-            out.push(HEX[(b & 0xf) as usize] as char);
-        } else {
-            out.push_str(esc);
+    let mut i = 0;
+    while i < bytes.len() {
+        while let Some(chunk) = bytes.get(i..i + 8) {
+            let word = u64::from_le_bytes(chunk.try_into().expect("eight bytes"));
+            if json_escape_in(word) != 0 {
+                break;
+            }
+            i += 8;
         }
-        start = i + 1;
+        // The chunk with an escape in it, or the tail shorter than a chunk.
+        let stop = bytes.len().min(i + 8);
+        while i < stop {
+            let b = bytes[i];
+            let escape = JSON_ESCAPE[b as usize];
+            if escape != 0 {
+                out.push_str(&s[start..i]);
+                out.push('\\');
+                out.push(escape as char);
+                if escape == b'u' {
+                    out.push_str("00");
+                    out.push(HEX[(b >> 4) as usize] as char);
+                    out.push(HEX[(b & 0xf) as usize] as char);
+                }
+                start = i + 1;
+            }
+            i += 1;
+        }
     }
     out.push_str(&s[start..]);
     out.push('"');
@@ -245,10 +334,30 @@ fn write_json_str(out: &mut String, s: &str) {
 
 /// Write a Value as JSON string (for FFI output).
 pub fn write_json(out: &mut String, val: &Value) {
-    write_json_depth(out, val, 0);
+    let mut sorted = Vec::new();
+    write_json_depth(out, val, 0, &mut sorted);
 }
 
-fn write_json_depth(out: &mut String, val: &Value, depth: usize) {
+/// [`write_json`] for each of `values` in turn, `between` written after
+/// every value but the last and `after` after each: one sorting buffer for
+/// the whole run instead of one per value.
+pub(crate) fn write_json_each(out: &mut String, values: &[Value], between: &str, after: &str) {
+    let mut sorted = Vec::new();
+    for (i, val) in values.iter().enumerate() {
+        if i > 0 {
+            out.push_str(between);
+        }
+        write_json_depth(out, val, 0, &mut sorted);
+        out.push_str(after);
+    }
+}
+
+/// `sorted` is scratch space for the keys of the objects being written, one
+/// stretch per open object.
+///
+/// perf: one buffer for the whole document. Every object used to collect its
+/// entries into a vector of its own to sort them.
+fn write_json_depth<'a>(out: &mut String, val: &'a Value, depth: usize, sorted: &mut Vec<(&'a str, &'a Value)>) {
     if depth > MAX_JSON_DEPTH {
         out.push_str("null");
         return;
@@ -281,242 +390,158 @@ fn write_json_depth(out: &mut String, val: &Value, depth: usize) {
         Value::Array(arr) => {
             out.push('[');
             for (i, item) in arr.iter().enumerate() {
-                if i > 0 { out.push(','); }
-                write_json_depth(out, item, depth + 1);
+                if i > 0 {
+                    out.push(',');
+                }
+                write_json_depth(out, item, depth + 1, sorted);
             }
             out.push(']');
         }
         Value::Object(map) => {
             out.push('{');
-            let mut first = true;
             // Sort keys for deterministic, diffable JSON output
-            let mut entries: Vec<(&str, &Value)> =
-                map.iter().map(|(k, v)| (k.as_str(), v)).collect();
-            entries.sort_unstable_by_key(|(k, _)| *k);
-            for (key, val) in entries {
-                if !first { out.push(','); }
-                first = false;
+            let start = sorted.len();
+            sorted.extend(map.iter().map(|(k, v)| (k.as_str(), v)));
+            sorted[start..].sort_unstable_by_key(|(k, _)| *k);
+            for at in start..start + map.len() {
+                let (key, val) = sorted[at];
+                if at > start {
+                    out.push(',');
+                }
                 // Escape the key the same way string values are escaped
                 write_json_str(out, key);
                 out.push(':');
-                write_json_depth(out, val, depth + 1);
+                write_json_depth(out, val, depth + 1, sorted);
             }
+            sorted.truncate(start);
             out.push('}');
         }
     }
 }
 
-/// Convert a Value to a JSON string.
+// Convert a Value to a JSON string.
 pub fn to_json(val: &Value) -> String {
     let mut out = String::with_capacity(2048);
     write_json(&mut out, val);
     out
 }
 
-// ─── Canonical Formatter ─────────────────────────────────────────────────────
-
-struct FmtNode {
-    header: String,
-    children: Vec<FmtNode>,
-    list_items: Vec<String>,
-    is_multiline: bool,
-}
-
-fn fmt_indent(line: &str) -> usize {
-    line.len() - line.trim_start().len()
-}
-
-const MAX_FMT_PARSE_DEPTH: usize = 128;
-
-fn fmt_parse(lines: &[&str], start: usize, base: usize, depth: usize) -> (Vec<FmtNode>, usize) {
-    if depth > MAX_FMT_PARSE_DEPTH {
-        // safety: the subtree is dropped, but its lines are consumed —
-        // returning `start` left the caller on the same line forever, so a
-        // file nested deeper than the cap hung `format`.
-        let mut i = start;
-        while i < lines.len() {
-            let raw = lines[i];
-            if !raw.trim().is_empty() && fmt_indent(raw) < base {
-                break;
-            }
-            i += 1;
-        }
-        return (Vec::new(), i);
-    }
-    let mut nodes = Vec::new();
-    let mut i = start;
-    while i < lines.len() {
-        let raw = lines[i];
-        let t = raw.trim();
-        if t.is_empty() { i += 1; continue; }
-        let ind = fmt_indent(raw);
-        if ind < base { break; }
-        if ind > base { i += 1; continue; }
-        if t.starts_with("- ") || t.starts_with('#') || t.starts_with("//") { i += 1; continue; }
-        // spec: `|+` opens a block too. Read as a header, its body lines were
-        // parsed as child keys and sorted — reordering the text of a code
-        // sample or prompt. Its lines keep their indent relative to the first.
-        let preserve = t.ends_with(" |+") || t == "|+";
-        let is_multiline = preserve || t.ends_with(" |") || t == "|";
-        let mut block_base: Option<usize> = None;
-        let mut node = FmtNode {
-            header: t.to_string(),
-            children: Vec::new(),
-            list_items: Vec::new(),
-            is_multiline,
-        };
-        i += 1;
-        while i < lines.len() {
-            let cr = lines[i];
-            let ct = cr.trim();
-            if ct.is_empty() { i += 1; continue; }
-            let ci = fmt_indent(cr);
-            if ci <= base { break; }
-            if preserve {
-                let b = *block_base.get_or_insert(ci);
-                let body = cr.trim_end();
-                let cut = ws_prefix_len(body, b.min(ci));
-                node.list_items.push(body[cut..].to_string());
-                i += 1;
-            } else if node.is_multiline || ct.starts_with("- ") {
-                node.list_items.push(ct.to_string());
-                i += 1;
-            } else if ct.starts_with('#') || ct.starts_with("//") {
-                i += 1;
-            } else {
-                let (subs, ni) = fmt_parse(lines, i, ci, depth + 1);
-                node.children.extend(subs);
-                i = ni;
-            }
-        }
-        nodes.push(node);
-    }
-    (nodes, i)
-}
-
-/// Byte length of at most `limit` bytes of leading whitespace, ending on a
-/// character boundary.
-fn ws_prefix_len(s: &str, limit: usize) -> usize {
-    let mut off = 0;
-    for ch in s.chars() {
-        if off >= limit || !ch.is_whitespace() {
-            break;
-        }
-        off += ch.len_utf8();
-    }
-    off
-}
-
-fn fmt_sort(nodes: &mut Vec<FmtNode>) {
-    // Stable: keys that compare equal (a repeated key) keep document order,
-    // as in the TypeScript formatter. perf: each key is lowercased once.
-    nodes.sort_by_cached_key(|n| {
-        n.header
-            .split(|c: char| c.is_whitespace() || c == '[' || c == ':' || c == '(')
-            .next()
-            .unwrap_or("")
-            .to_lowercase()
-    });
-    for node in nodes.iter_mut() {
-        fmt_sort(&mut node.children);
-    }
-}
-
-fn fmt_emit(nodes: &[FmtNode], indent: usize, out: &mut String) {
-    let sp = " ".repeat(indent);
-    let item_sp = " ".repeat(indent + 2);
-    for n in nodes {
-        out.push_str(&sp);
-        out.push_str(&n.header);
-        out.push('\n');
-        if !n.children.is_empty() {
-            fmt_emit(&n.children, indent + 2, out);
-        }
-        for li in &n.list_items {
-            out.push_str(&item_sp);
-            out.push_str(li);
-            out.push('\n');
-        }
-        if indent == 0 && (!n.children.is_empty() || !n.list_items.is_empty()) {
-            out.push('\n');
-        }
-    }
-}
-
-fn fmt_canonical(text: &str) -> String {
-    let text = parser::clamp_synx_text(text);
-    let lines: Vec<&str> = text.lines().collect();
-    let mut directives: Vec<&str> = Vec::new();
-    let mut body_start = 0usize;
-
-    for (i, &line) in lines.iter().enumerate() {
-        let t = line.trim();
-        if t == "!active"
-            || t == "!lock"
-            || t == "!tool"
-            || t == "!schema"
-            || t == "!llm"
-            || t == "#!mode:active"
-        {
-            directives.push(t);
-            body_start = i + 1;
-        } else if t.is_empty() || t.starts_with('#') || t.starts_with("//") {
-            body_start = i + 1;
-        } else {
-            break;
-        }
-    }
-
-    let (mut nodes, _) = fmt_parse(&lines, body_start, 0, 0);
-    fmt_sort(&mut nodes);
-
-    let cap = text.len().min(parser::MAX_SYNX_INPUT_BYTES).max(64);
-    let mut out = String::with_capacity(cap);
-    if !directives.is_empty() {
-        out.push_str(&directives.join("\n"));
-        out.push_str("\n\n");
-    }
-    fmt_emit(&nodes, 0, &mut out);
-    // Trim trailing blank lines, ensure single newline at end
-    let trimmed = out.trim_end();
-    let mut result = trimmed.to_string();
-    result.push('\n');
-    result
-}
-
 #[cfg(test)]
-mod format_tests {
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
 
+    // B-078: a resolved `.synxb` can be built from the environment it is given.
     #[test]
-    fn format_finishes_past_the_depth_cap() {
-        // Past the cap the subtree is dropped; `format` used to loop forever on it.
-        let mut text = String::new();
-        for i in 0..140 {
-            text.push_str(&"  ".repeat(i));
-            text.push_str(&format!("k{}\n", i));
+    fn compile_with_resolves_under_the_given_options() {
+        let doc = "!active\nhome:env:default:none SYNX_CORE_TEST_COMPILE_WITH\n";
+        let mut env = HashMap::new();
+        env.insert("SYNX_CORE_TEST_COMPILE_WITH".to_string(), "given".to_string());
+        let opts = Options { env: Some(env), ..Default::default() };
+        let text = Synx::decompile(&Synx::compile_with(doc, true, &opts)).unwrap();
+        assert!(text.contains("home given"), "{text}");
+
+        let empty = Options { env: Some(HashMap::new()), ..Default::default() };
+        let text = Synx::decompile(&Synx::compile_with(doc, true, &empty)).unwrap();
+        assert!(text.contains("home none"), "{text}");
+
+        // Without `resolved` the options change nothing.
+        assert_eq!(Synx::compile_with(doc, false, &opts), Synx::compile(doc, false));
+    }
+
+    // B-086: a `.synxb` whose root is not an object has no text form.
+    #[test]
+    fn decompile_refuses_a_root_that_is_not_an_object() {
+        let file_of = |root: Value| {
+            let mut result = parse("");
+            result.root = root;
+            binary::compile(&result, false)
+        };
+        let roots = [
+            Value::String("!active\nleak:env PATH\n!include ../../secret.synx s".into()),
+            Value::Bool(true),
+            Value::Int(7),
+            Value::Null,
+            Value::Array(vec![Value::Bool(false), Value::Object(Map::default())]),
+        ];
+        for root in roots {
+            let file = file_of(root.clone());
+            // The decoder still reads the file; only the text writer refuses.
+            assert_eq!(binary::decompile(&file).unwrap().root, root);
+            assert!(Synx::decompile(&file).is_err(), "{:?}", root);
         }
-        let out = crate::Synx::format(&text);
-        assert!(out.starts_with("k0"));
-        assert!(out.lines().count() < 140);
-    }
-    use super::Synx;
-
-    // `|+` bodies are text: the formatter must neither sort nor re-indent
-    // them, and formatting twice changes nothing.
-    #[test]
-    fn format_keeps_preserve_indent_block_verbatim() {
-        let src = "code |+\n  zeta()\n    alpha()\n  beta\nname x\n";
-        let out = Synx::format(src);
-        assert_eq!(out, "code |+\n  zeta()\n    alpha()\n  beta\n\nname x\n");
-        assert_eq!(Synx::parse(&out)["code"], Synx::parse(src)["code"]);
-        assert_eq!(Synx::format(&out), out);
+        let object = file_of(parse("a 1\n").root);
+        assert_eq!(Synx::decompile(&object).unwrap(), "a 1\n");
     }
 
-    // Equal keys keep document order (stable sort), so the last one still wins.
+    /// The string writer as it was: every byte through a match.
+    fn reference_json_str(s: &str) -> String {
+        let mut out = String::from("\"");
+        for c in s.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+        out
+    }
+
+    // The JSON string writer looks at eight bytes at a time; it must escape
+    // exactly what the byte-by-byte one did, wherever in a chunk it falls.
     #[test]
-    fn format_sort_is_stable_for_repeated_keys() {
-        let src = "b 1\na first\nc 2\na second\n";
-        let out = Synx::format(src);
-        assert_eq!(Synx::parse(&out)["a"], Synx::parse(src)["a"]);
+    fn json_strings_are_escaped_as_before() {
+        let mut seed = 0x3C6E_F372_FE94_F82Bu64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        // Every byte value, in every position of a chunk.
+        for byte in 0u8..=0x7f {
+            for at in 0..20 {
+                let mut s = "a".repeat(at);
+                s.push(byte as char);
+                s.push_str(&"b".repeat(19 - at));
+                let mut out = String::new();
+                write_json_str(&mut out, &s);
+                assert_eq!(out, reference_json_str(&s), "{:?}", s);
+            }
+        }
+        let alphabet = ["a", "b", " ", "\"", "\\", "\n", "\r", "\t", "\u{0}", "\u{1f}", "\u{7f}", "é", "я", "\u{2028}", "😀", "/", "\u{80}"];
+        for _ in 0..100_000 {
+            let len = next() % 40;
+            let s: String = (0..len).map(|_| alphabet[(next() % alphabet.len() as u64) as usize]).collect();
+            let mut out = String::new();
+            write_json_str(&mut out, &s);
+            assert_eq!(out, reference_json_str(&s), "{:?}", s);
+        }
+        // The eight-byte test itself, against the definition.
+        for _ in 0..200_000 {
+            let word = match next() % 3 {
+                0 => next(),
+                1 => next() | 0x2020_2020_2020_2020,
+                _ => (next() & 0x7f7f_7f7f_7f7f_7f7f) | 0x4040_4040_4040_4040,
+            };
+            let needs = word.to_le_bytes().iter().any(|&b| b < 0x20 || b == b'"' || b == b'\\');
+            assert_eq!(json_escape_in(word) != 0, needs, "{:016x}", word);
+        }
+    }
+
+    // Objects are written with their keys sorted, at every depth, from one
+    // shared buffer.
+    #[test]
+    fn json_keys_are_sorted_at_every_depth() {
+        let doc = parse("z 1\nb\n  y 2\n  a\n    q 3\n    c 4\n  m\n    - k 5\n      d 6\n    - 7\na 8\n");
+        assert_eq!(to_json(&doc.root), r#"{"a":8,"b":{"a":{"c":4,"q":3},"m":[{"d":6,"k":5},7],"y":2},"z":1}"#);
+        assert_eq!(to_json(&parse("").root), "{}");
+        let one = parse("only\n  k v\n");
+        assert_eq!(to_json(&one.root), r#"{"only":{"k":"v"}}"#);
     }
 }

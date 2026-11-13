@@ -88,6 +88,13 @@ public:
         Result<ParseResult> r = ::synx::decompile(bytes);
         if (!r.ok()) return Result<std::string>::from_error(r.error().message);
         const ParseResult& pr = r.value();
+        // safety: a document is an object, and the compiler writes no other
+        // root. A file whose root was a string came back as that string — text
+        // of its author's choosing, `!active` lines included, out of a file
+        // flagged static. Such a root has no text form.
+        if (!pr.root.is_object()) {
+            return Result<std::string>::from_error("the root of this .synxb file is not an object; it has no text form");
+        }
         std::string out;
         if (pr.tool)            out += "!tool\n";
         if (pr.schema)          out += "!schema\n";

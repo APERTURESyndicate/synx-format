@@ -1,6 +1,6 @@
 // swift-tools-version: 5.9
 //
-// SYNX — native Swift parser. Parity with crates/synx-core 3.8.0 (`Synx.version`).
+// SYNX — native Swift parser. Parity with crates/synx-core 3.8.1 (`Synx.version`).
 //
 // Targets: macOS 12+, iOS 15+, watchOS 8+, tvOS 15+, Linux (5.9+ toolchain).
 // No FFI to synx-c; the entire engine is pure Swift.

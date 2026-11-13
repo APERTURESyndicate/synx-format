@@ -6,7 +6,7 @@
  *   - a decompression bomb / oversized declared size is rejected;
  *   - a __proto__ key in the payload does not poison Object.prototype.
  */
-import Synx from '../src/index';
+import Synx, { SynxError } from '../src/index';
 
 describe('synxb — integer fidelity', () => {
   const cases: Array<[string, number]> = [
@@ -96,9 +96,16 @@ describe('synxb — malformed payloads are rejected, never hang or crash', () =>
     const p = [...varint(0), 0x04, 0x01, 0x02];
     expect(() => Synx.decompile(framed(p))).toThrow();
   });
-  test('null root decompiles to a primitive line, not a crash', () => {
-    const p = [...varint(0), 0x00];
-    expect(() => Synx.decompile(framed(p))).not.toThrow();
+  test('a root that is not an object has no text form (B-086)', () => {
+    // null, true, a list of two strings, and a string that reads as directives.
+    const refusal = 'the root of this .synxb file is not an object; it has no text form';
+    expect(() => Synx.decompile(framed([...varint(0), 0x00]))).toThrow(refusal);
+    expect(() => Synx.decompile(framed([...varint(0), 0x02]))).toThrow(refusal);
+    const text = (s: string): number[] => { const b = [...Buffer.from(s, 'utf-8')]; return [...varint(b.length), ...b]; };
+    expect(() => Synx.decompile(framed([...varint(2), ...text('a'), ...text('b'), 0x06, ...varint(2), 0x05, ...varint(0), 0x05, ...varint(1)]))).toThrow(refusal);
+    const hostile = framed([...varint(1), ...text('!active\nleak:env HOME\n!include ../secret.synx s'), 0x05, ...varint(0)]);
+    expect(() => Synx.decompile(hostile)).toThrow(SynxError);
+    expect(() => Synx.decompile(hostile)).toThrow(refusal);
   });
 });
 

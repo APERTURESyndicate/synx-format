@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 
 use clap::{Parser, Subcommand};
@@ -9,6 +9,7 @@ use synx_core::{
 };
 
 mod pkg;
+mod pkg_guard;
 mod synxl;
 
 #[derive(Parser)]
@@ -171,6 +172,9 @@ Exit codes: 0 = ok, 1 = the document violates the SYNXL specification, 2 = I/O f
         /// Package directory (default: current dir)
         #[arg(default_value = ".")]
         dir: PathBuf,
+        /// Publish even if a packed .synx file holds a literal :secret value
+        #[arg(long)]
+        allow_secret_literals: bool,
     },
 
     /// Search the package registry
@@ -239,8 +243,25 @@ fn read_file(path: &PathBuf) -> String {
     })
 }
 
+/// The directory `:include`, `:watch` and `!use` of `file` resolve in and are
+/// jailed to.
+///
+/// safety: the parent of a bare file name is `""`. An empty base does not
+/// canonicalize, and every path `starts_with("")`, so `synx parse app.synx`
+/// read `../../outside.synx` while `synx parse ./app.synx` refused it.
+fn base_dir(file: &Path) -> Option<String> {
+    let dir = file
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    Some(dir.to_string_lossy().into_owned())
+}
+
 fn parse_file(text: &str, active: bool, base_path: Option<String>) -> Value {
     let mut result = synx_core::parse(text);
+    if result.truncated {
+        eprintln!("warning: the document exceeds the parser limits; input past them was dropped");
+    }
     if active && result.mode == Mode::Active {
         let opts = Options {
             base_path,
@@ -249,6 +270,87 @@ fn parse_file(text: &str, active: bool, base_path: Option<String>) -> Value {
         synx_core::resolve(&mut result, &opts);
     }
     result.root
+}
+
+/// Prefixes of the error strings the engine leaves in place of a value.
+const RUNTIME_ERROR_PREFIXES: &[&str] = &[
+    "INCLUDE_ERR:", "WATCH_ERR:", "CALC_ERR:", "SPAM_ERR:", "CONSTRAINT_ERR:", "ALIAS_ERR:",
+    "NESTING_ERR:", "TYPE_ERR:", "WASM_ERR:",
+];
+
+/// Collects every engine error in the tree as `path: message`.
+///
+/// why: only the root keys were looked at, so `server.port[max:10] 99` passed
+/// `validate --strict` — and configs are nested.
+fn collect_runtime_errors(val: &Value, path: &str, out: &mut Vec<String>) {
+    match val {
+        Value::Object(map) => {
+            for (key, child) in map {
+                let child_path = if path.is_empty() { key.clone() } else { format!("{}.{}", path, key) };
+                collect_runtime_errors(child, &child_path, out);
+            }
+        }
+        Value::Array(items) => {
+            for (i, child) in items.iter().enumerate() {
+                collect_runtime_errors(child, &format!("{}.{}", path, i), out);
+            }
+        }
+        Value::String(s) if RUNTIME_ERROR_PREFIXES.iter().any(|p| s.starts_with(p)) => {
+            out.push(format!("{}: {}", path, s));
+        }
+        _ => {}
+    }
+}
+
+/// Why writing `formatted` over `text` would lose something, if it would.
+///
+/// safety: the formatter works on lines and the parser on the result; where
+/// they disagree (a list of objects, a uniformly indented file) the rewrite
+/// reads back as different data, and `format -w` put it on disk.
+fn format_loss(text: &str, formatted: &str) -> Option<&'static str> {
+    let before = synx_core::parse(text);
+    if before.truncated {
+        return Some("the document exceeds the parser limits");
+    }
+    let after = synx_core::parse(formatted);
+    let is_same_tree = before.root == after.root
+        && before.mode == after.mode
+        && before.locked == after.locked
+        && before.tool == after.tool
+        && before.schema == after.schema
+        && before.llm == after.llm
+        && before.metadata == after.metadata;
+    let is_same_includes = before.includes.len() == after.includes.len()
+        && before.includes.iter().zip(&after.includes).all(|(a, b)| a.path == b.path && a.alias == b.alias);
+    let is_same_uses = before.uses.len() == after.uses.len()
+        && before.uses.iter().zip(&after.uses).all(|(a, b)| a.package == b.package && a.alias == b.alias);
+    if is_same_tree && is_same_includes && is_same_uses {
+        None
+    } else {
+        Some("the formatted text does not read back as the same data")
+    }
+}
+
+/// Replaces `target` with `text` through a sibling temporary file.
+///
+/// why: `fs::write` empties the file first; a full disk or a killed process
+/// then leaves an empty config. A link is followed to the file it names, and
+/// where the swap is refused (the file is open elsewhere on Windows) the
+/// plain write is used as before.
+fn write_replacing(target: &Path, text: &str) -> std::io::Result<()> {
+    let real = fs::canonicalize(target)?;
+    let name = real.file_name().unwrap_or_default().to_string_lossy().into_owned();
+    let temp = real.with_file_name(format!(".{}.{}.tmp", name, process::id()));
+    let swapped = (|| {
+        fs::write(&temp, text)?;
+        fs::set_permissions(&temp, fs::metadata(&real)?.permissions())?;
+        fs::rename(&temp, &real)
+    })();
+    if swapped.is_err() {
+        let _ = fs::remove_file(&temp);
+        return fs::write(&real, text);
+    }
+    Ok(())
 }
 
 fn parse_to_map(text: &str, active: bool, base_path: Option<String>) -> synx_core::Map {
@@ -297,7 +399,7 @@ fn main() {
     match cli.command {
         Commands::Parse { file, active } => {
             let text = read_file(&file);
-            let base = file.parent().map(|p| p.to_string_lossy().into_owned());
+            let base = base_dir(&file);
             // An `!active` document is always resolved; `--active` is kept for
             // compatibility. The parser's own mode flag decides — a hand-rolled
             // line scan here missed `!active` behind a BOM (`str::trim` keeps
@@ -314,15 +416,22 @@ fn main() {
             self_schema,
         } => {
             let text = read_file(&file);
-            let base = file.parent().map(|p| p.to_string_lossy().into_owned());
+            let base = base_dir(&file);
             let mut result = synx_core::parse(&text);
 
             let has_active = result.mode == Mode::Active;
             let mut errors: Vec<String> = Vec::new();
 
-            for line in text.lines() {
-                if line.contains('\t') {
-                    errors.push("tab character found (SYNX uses spaces)".into());
+            if result.truncated {
+                errors.push("the document exceeds the parser limits; input past them was dropped".into());
+            }
+
+            // spec: a tab is refused in indentation only; the parser reads
+            // one inside a value as part of the value.
+            for (i, line) in text.lines().enumerate() {
+                let indent = &line[..line.len() - line.trim_start().len()];
+                if indent.contains('\t') {
+                    errors.push(format!("line {}: tab in indentation (SYNX uses spaces)", i + 1));
                 }
             }
 
@@ -332,19 +441,8 @@ fn main() {
                     ..Default::default()
                 };
                 synx_core::resolve(&mut result, &opts);
-                if let Value::Object(map) = &result.root {
-                    for (key, val) in map {
-                        if let Value::String(s) = val {
-                            if s.ends_with("_ERR")
-                                || s.contains("_ERR:")
-                                || s.contains("CONSTRAINT_ERR:")
-                            {
-                                if strict {
-                                    errors.push(format!("{}: {}", key, s));
-                                }
-                            }
-                        }
-                    }
+                if strict {
+                    collect_runtime_errors(&result.root, "", &mut errors);
                 }
             }
 
@@ -421,7 +519,7 @@ fn main() {
 
         Commands::Convert { file, format, output, active } => {
             let text = read_file(&file);
-            let base = file.parent().map(|p| p.to_string_lossy().into_owned());
+            let base = base_dir(&file);
 
             match format.as_str() {
                 "json" => {
@@ -449,7 +547,7 @@ fn main() {
 
         Commands::Tool { file } => {
             let text = read_file(&file);
-            let base = file.parent().map(|p| p.to_string_lossy().into_owned());
+            let base = base_dir(&file);
             let opts = Options { base_path: base, ..Default::default() };
             let map = Synx::parse_tool(&text, &opts);
             let val = Value::Object(map);
@@ -484,8 +582,8 @@ fn main() {
         Commands::Diff { file_a, file_b } => {
             let text_a = read_file(&file_a);
             let text_b = read_file(&file_b);
-            let map_a = parse_to_map(&text_a, true, file_a.parent().map(|p| p.to_string_lossy().into_owned()));
-            let map_b = parse_to_map(&text_b, true, file_b.parent().map(|p| p.to_string_lossy().into_owned()));
+            let map_a = parse_to_map(&text_a, true, base_dir(&file_a));
+            let map_b = parse_to_map(&text_b, true, base_dir(&file_b));
             let result = Synx::diff(&map_a, &map_b);
             let val = synx_core::diff_to_value(&result);
             println!("{}", value_to_json(&val));
@@ -493,7 +591,7 @@ fn main() {
 
         Commands::Query { path, file, active } => {
             let text = read_file(&file);
-            let base = file.parent().map(|p| p.to_string_lossy().into_owned());
+            let base = base_dir(&file);
             let root = parse_file(&text, active, base);
             match query_value(&root, &path) {
                 Some(val) => println!("{}", value_to_json(val)),
@@ -511,8 +609,12 @@ fn main() {
         Commands::Format { file, write } => {
             let text = read_file(&file);
             let formatted = Synx::format(&text);
+            if let Some(why) = format_loss(&text, &formatted) {
+                eprintln!("error: {}: {}; nothing was written", file.display(), why);
+                process::exit(1);
+            }
             if write {
-                fs::write(&file, &formatted).unwrap_or_else(|e| {
+                write_replacing(&file, &formatted).unwrap_or_else(|e| {
                     eprintln!("error: cannot write {}: {}", file.display(), e);
                     process::exit(1);
                 });
@@ -564,9 +666,10 @@ fn main() {
         }
 
         Commands::Pack { dir } => {
-            match pkg::pack(&dir) {
-                Ok((path, integrity)) => {
-                    println!("{} ({})", path.display(), integrity);
+            match pkg::pack_report(&dir) {
+                Ok(report) => {
+                    pkg::print_pack_report(&report);
+                    println!("{} ({})", report.tarball.display(), report.integrity);
                 }
                 Err(e) => {
                     eprintln!("error: {}", e);
@@ -575,8 +678,8 @@ fn main() {
             }
         }
 
-        Commands::Publish { dir } => {
-            if let Err(e) = pkg::publish(&dir) {
+        Commands::Publish { dir, allow_secret_literals } => {
+            if let Err(e) = pkg::publish(&dir, allow_secret_literals) {
                 eprintln!("error: {}", e);
                 process::exit(1);
             }

@@ -58,9 +58,11 @@ extension Resolver {
         RustNumber.isWhole(r) && abs(r) < 9223372036854775807.0 ? .int(Int64(r)) : .float(r)
     }
 
-    func applyMarkers(_ map: MObject, _ index: Int, _ meta: SynxMeta, _ path: String) {
+    /// `depth`: how many levels below the root `map` sits.
+    func applyMarkers(_ map: MObject, _ index: Int, _ meta: SynxMeta, _ path: String, _ depth: Int) {
         let markers = meta.markers
         let mb = MK(markers)
+        let secret = mb.contains(.secret)
         let key = map.keys[index]
         func cur() -> MValue { map.values[index] }
         func set(_ v: MValue) { map.values[index] = v }
@@ -79,7 +81,7 @@ extension Resolver {
                 set(.string("SPAM_ERR: '\(target)' exceeded \(maxCalls) calls per \(windowSec)s"))
                 return
             }
-            if let resolved = deepGet(rootValue, target) ?? map.get(target) { set(resolved.deepCopy()) }
+            if let resolved = deepGet(rootValue, target) ?? map.get(target) { set(budgetedCopy(resolved, depth)) }
         }
 
         // ── :include / :import ──
@@ -93,7 +95,7 @@ extension Resolver {
                 // A root key the pre-pass already resolved for the same path.
                 if path.isEmpty, let pre = preresolved[key]?.array, pre.items.count == 2,
                    pre.items[0].string == file {
-                    set(pre.items[1].deepCopy())
+                    set(placedDocument(pre.items[1].deepCopy(), depth, secret: secret))
                     return
                 }
                 switch Files.jail(options.basePath ?? ".", file) {
@@ -105,12 +107,15 @@ extension Resolver {
                         set(.string("INCLUDE_ERR: \(e)"))
                         return
                     }
-                    switch Files.read(path, ctx: file) {
-                    case .ok(let text): set(Files.loadSynx(text, path, options))
+                    switch Files.include(path, file, options) {
+                    case .ok(let included): set(placedDocument(included, depth, secret: secret))
                     case .err(let e): set(.string("INCLUDE_ERR: \(e)"))
                     }
                 }
             }
+            // safety: the chain ends here, so `:secret` is applied here — a value
+            // that was not a path (`k:secret:include 5`) stayed in the clear.
+            if secret { set(maskSecretValue(cur())) }
             return
         }
 
@@ -120,11 +125,11 @@ extension Resolver {
             let forceString = wantsString(meta)
             let di = markers.firstIndex(of: "default")
             if let v = envVal, !v.isEmpty {
-                set(forceString ? .string(v) : castPrimitive(v))
+                set(externalValue(v, asString: forceString, secret: secret))
             } else if let d = di, markers.count > d + 1 {
                 // Every part after `default`, rejoined with ':' (IPs, compound values).
                 let fallback = markers[(d + 1)...].joined(separator: ":")
-                set(forceString ? .string(fallback) : castPrimitive(fallback))
+                set(externalValue(fallback, asString: forceString, secret: secret))
             } else {
                 set(.null)
             }
@@ -147,7 +152,7 @@ extension Resolver {
         // ── :ref — like :alias, feeding the value into the next markers;
         //    `:ref:calc:*2 base` applies `VALUE * 2` ──
         if mb.contains(.ref), let target = cur().string {
-            let resolved = (deepGet(rootValue, target) ?? map.get(target))?.deepCopy() ?? .null
+            let resolved = (deepGet(rootValue, target) ?? map.get(target)).map { budgetedCopy($0, depth) } ?? .null
             if mb.contains(.calc), let n = resolved.number, let expr = after(markers, "calc") {
                 let first = expr.unicodeScalars.first ?? " "
                 if "+-*/%".unicodeScalars.contains(first) {
@@ -246,14 +251,9 @@ extension Resolver {
                     let (a, b) = !target.bytesLess(currentPath) ? (currentPath, target) : (target, currentPath)
                     set(.string("ALIAS_ERR: circular alias detected: \(a) \u{2192} \(b)"))
                 } else {
-                    set(tv?.deepCopy() ?? .null)
+                    set(tv.map { budgetedCopy($0, depth) } ?? .null)
                 }
             }
-        }
-
-        // ── :secret — idempotent: the pre-pass may already have masked it ──
-        if mb.contains(.secret), !cur().isSecret {
-            set(.secret(cur().text))
         }
 
         // ── :unique ──
@@ -309,7 +309,15 @@ extension Resolver {
         // ── :join[:SEP] ──
         if mb.contains(.join), let arr = cur().array {
             let sep = after(markers, "join").map(Resolver.delimiter) ?? ","
-            set(.string(arr.items.map { $0.text }.joined(separator: sep)))
+            // safety: the separator is as long as the document likes and is
+            // written once per item.
+            let n = arr.items.count
+            let separators = sep.utf8.count * max(0, n - 1)
+            if separators > n && !state.charge(separators) {
+                set(.string(ResolveState.limitErr))
+            } else {
+                set(.string(arr.items.map { $0.text }.joined(separator: sep)))
+            }
         }
 
         // ── :default (without :env) ──
@@ -322,7 +330,7 @@ extension Resolver {
             }
             if empty, let d = markers.firstIndex(of: "default"), markers.count > d + 1 {
                 let fallback = markers[(d + 1)...].joined(separator: ":")
-                set(wantsString(meta) ? .string(fallback) : castPrimitive(fallback))
+                set(externalValue(fallback, asString: wantsString(meta), secret: secret))
             }
         }
 
@@ -342,9 +350,18 @@ extension Resolver {
             var decimals: UInt64 = 0
             if let d = after(markers, "round"), let v = RustNumber.parseU64(d), v <= UInt64(UInt32.max) { decimals = v }
             if let n = cur().number {
-                let factor = RustNumber.powi(10, Int32(truncatingIfNeeded: UInt32(decimals)))
-                let rounded = (n * factor).rounded(.toNearestOrAwayFromZero) / factor
-                set(decimals == 0 ? .int(RustNumber.saturatingI64(rounded)) : .float(rounded))
+                // A scale past the range of f64 rounds nothing: the number stays.
+                let factor = RustNumber.powi(10, Int32(min(decimals, 400)))
+                let scaled = n * factor
+                let rounded = scaled.isFinite ? scaled.rounded(.toNearestOrAwayFromZero) / factor : n
+                // safety: only a whole number that fits is an integer. The cast
+                // alone saturated: `:round` of 1e30 was 9223372036854775807 and of
+                // NaN was 0 — invented values.
+                if decimals == 0 && rounded.isFinite && RustNumber.isWhole(rounded) && abs(rounded) < 9223372036854775807.0 {
+                    set(.int(Int64(rounded)))
+                } else {
+                    set(.float(rounded))
+                }
             }
         }
 
@@ -369,21 +386,40 @@ extension Resolver {
 
         // ── :format:PATTERN — printf-style %.2f, %d, %05d, %e ──
         if mb.contains(.format) {
-            set(.string(Resolver.applyFormat(after(markers, "format") ?? "%s", cur())))
+            var formatted = Resolver.applyFormat(after(markers, "format") ?? "%s", cur())
+            // safety: a width of 4096 on a twenty-byte line is a 200-fold growth.
+            if cur().number != nil && !state.charge(formatted.utf8.count) { formatted = ResolveState.limitErr }
+            set(.string(formatted))
         }
 
         // ── :replace:FROM:TO ──
         if mb.contains(.replace), let s = cur().string, let from = after(markers, "replace"), !from.isEmpty {
-            set(.string(s.bytesReplacing(from, with: after(markers, "replace", 2) ?? "")))
+            let to = after(markers, "replace", 2) ?? ""
+            // safety: `:replace:a:<long>` on a run of `a` multiplies the two
+            // lengths; the growth is known before a byte is written.
+            let grown = to.utf8.count > from.utf8.count ? countMatches(s, from) * (to.utf8.count - from.utf8.count) : 0
+            if grown > 0 && !state.charge(grown) {
+                set(.string(ResolveState.limitErr))
+            } else {
+                set(.string(s.bytesReplacing(from, with: to)))
+            }
         }
 
-        // ── :sort[:desc] — numbers numerically, anything else by code point; stable ──
+        // ── :sort[:desc] ── a total order: numbers first, by value (NaN after the
+        // rest of them), then everything else by its text, by code point; stable.
+        // Comparing a number with text as text made `10 < 1a < 9 < 10` a cycle.
         if mb.contains(.sort), let arr = cur().array {
             let desc = after(markers, "sort") == "desc"
             let keyed = arr.items.map { (v: $0, n: $0.number, t: Array($0.text.utf8)) }
             var sorted = Resolver.mergeSort(keyed) { a, b in
-                if let x = a.n, let y = b.n { return x < y }  // NaN compares equal
-                return a.t.lexicographicallyPrecedes(b.t)
+                switch (a.n, b.n) {
+                case let (x?, y?):
+                    if x.isNaN || y.isNaN { return !x.isNaN && y.isNaN }
+                    return x < y
+                case (.some, nil): return true
+                case (nil, .some): return false
+                default: return a.t.lexicographicallyPrecedes(b.t)
+                }
             }.map { $0.v }
             if desc { sorted.reverse() }
             set(.array(MArray(sorted)))
@@ -400,7 +436,8 @@ extension Resolver {
                     total += f
                     if !RustNumber.isWhole(f) { allInt = false }
                 case .string(let s):
-                    if let f = RustNumber.parseF64(s) {
+                    // `inf` and `nan` are text here as everywhere (see castPrimitive).
+                    if let f = RustNumber.parseF64(s), f.isFinite {
                         total += f
                         if !RustNumber.isWhole(f) { allInt = false }
                     }
@@ -469,10 +506,10 @@ extension Resolver {
                     return
                 }
                 let keyPath = after(markers, "watch")
-                switch Files.read(p, ctx: file) {
+                switch Files.readBudgeted(p, ctx: file, state) {
                 case .ok(let content):
                     if let kp = keyPath {
-                        set(Resolver.extract(content, kp, ext: p.pathExtension) ?? .null)
+                        set(Resolver.extract(content, kp, ext: p.pathExtension).map { placedDocument($0, depth, secret: false) } ?? .null)
                     } else {
                         set(.string(content.rustTrimmed))
                     }
@@ -482,10 +519,18 @@ extension Resolver {
             }
         }
 
+        // ── :secret ──
+        // Last of the markers that produce the value, so whatever they resolved
+        // is what gets masked. It used to sit after `:alias`: `t:secret:once` came
+        // out as plain text and `:secret:format` formatted the mask. `:prompt`
+        // and custom markers below still see only the mask.
+        if secret { set(maskSecretValue(cur())) }
+
         // ── :prompt[:LABEL] — the subtree as SYNX in a labelled code fence ──
         if mb.contains(.prompt) {
             let label = after(markers, "prompt") ?? key
-            set(.string("\(label) (SYNX):\n```synx\n\(Resolver.promptText(cur(), 0))```"))
+            let block = "\(label) (SYNX):\n```synx\n\(Resolver.promptText(cur(), 0))```"
+            set(.string(state.charge(block.utf8.count) ? block : ResolveState.limitErr))
         }
 
         // ── custom markers: the first registered non-builtin one, with the parts after it ──
@@ -737,9 +782,36 @@ func castPrimitive(_ s: String) -> MValue {
     case "null": return .null
     default:
         if let i = RustNumber.parseI64(u) { return .int(i) }
-        if let f = RustNumber.parseF64(u) { return .float(f) }
+        // spec: `inf`, `NaN` and `1e400` are text. Read as floats they became
+        // `null` in JSON: a host named `inf` lost its value.
+        if let f = RustNumber.parseF64(u), f.isFinite { return .float(f) }
         return .string(s)
     }
+}
+
+/// Text from outside the document as a value. Under `:secret` a cast that gave
+/// a number or a bool keeps the text instead: `00123` stays `00123`.
+func externalValue(_ text: String, asString: Bool, secret: Bool) -> MValue {
+    if asString { return .string(text) }
+    let cast = castPrimitive(text)
+    if secret {
+        switch cast {
+        case .int, .float, .bool: return .string(text)
+        default: break
+        }
+    }
+    return cast
+}
+
+/// Non-overlapping occurrences of `needle` in `hay`, left to right.
+func countMatches(_ hay: String, _ needle: String) -> Int {
+    let h = Array(hay.utf8), n = Array(needle.utf8)
+    var count = 0, pos = 0
+    while let hit = findBytes(h, n, from: pos) {
+        count += 1
+        pos = hit + n.count
+    }
+    return count
 }
 
 /// One environment variable as UTF-8 (Rust `std::env::var`; case-insensitive on

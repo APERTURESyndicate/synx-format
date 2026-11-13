@@ -17,6 +17,38 @@ internal static class SynxBinary
     private const int MaxDecodedBytes = 256 * 1024 * 1024;
     /// <summary>Depth limit for the recursive value decoder (twice the parser's nesting cap).</summary>
     private const int MaxDecodeDepth = 256;
+    /// <summary>What one decoded value costs against <see cref="MaxDecodedBytes"/>, text aside.</summary>
+    private const int DecodedValueCost = 64;
+    /// <summary>Elements reserved up front for a count read from the file.</summary>
+    private const int MaxPreallocItems = 1024;
+
+    /// <summary>
+    /// What decoding has built so far, in bytes.
+    /// safety: a value is one byte on the wire and tens of bytes in memory, a string is stored
+    /// once and referenced any number of times, and deflate shrinks a run of either a
+    /// thousandfold: unbudgeted, 171 bytes of file decoded to 11 GiB. The tree shares the
+    /// payload's limit — every value at a fixed cost, plus the bytes of each key and string it
+    /// refers to. Same accounting as synx-core, so both refuse the same files.
+    /// </summary>
+    private sealed class Budget
+    {
+        private long _spent;
+
+        internal void Charge(long bytes)
+        {
+            _spent += bytes;
+            if (_spent > MaxDecodedBytes)
+                throw new InvalidDataException($"decoded document exceeds {MaxDecodedBytes} bytes — refusing to decode");
+        }
+
+        internal void Value() => Charge(DecodedValueCost);
+
+        internal string Text(string s)
+        {
+            Charge(Encoding.UTF8.GetByteCount(s));
+            return s;
+        }
+    }
 
     private const byte FlagActive   = 0b0000_0001;
     private const byte FlagLocked   = 0b0000_0010;
@@ -96,13 +128,16 @@ internal static class SynxBinary
         if (uncompSize > MaxDecodedBytes)
             throw new InvalidDataException($"declared size {uncompSize} exceeds limit {MaxDecodedBytes}");
 
-        var payload = Inflate(data[11..].ToArray(), (int)uncompSize);
+        byte[] payload;
+        try { payload = Inflate(data[11..].ToArray(), (int)uncompSize); }
+        catch (InvalidDataException e) { throw new InvalidDataException($"decompression failed: {e.Message}"); }
         if (payload.Length != (int)uncompSize)
             throw new InvalidDataException($"size mismatch: expected {uncompSize}, got {payload.Length}");
 
         var pos = 0;
+        var budget = new Budget();
         var st = StringTableReader.Decode(payload, ref pos);
-        var root = DecodeValue(payload, ref pos, st, 0);
+        var root = DecodeValue(payload, ref pos, st, budget, 0);
 
         var result = new SynxParseResult
         {
@@ -115,8 +150,8 @@ internal static class SynxBinary
         };
         if ((flags & FlagHasMeta) != 0)
         {
-            result.Metadata = DecodeMetadata(payload, ref pos, st);
-            result.Includes = DecodeIncludes(payload, ref pos, st);
+            result.Metadata = DecodeMetadata(payload, ref pos, st, budget);
+            result.Includes = DecodeIncludes(payload, ref pos, st, budget);
         }
         return result;
     }
@@ -131,20 +166,27 @@ internal static class SynxBinary
         return output.ToArray();
     }
 
+    /// <summary>
+    /// Inflates at most <paramref name="expectedSize"/> + 1 bytes: one more than declared, to
+    /// notice a stream that inflates past it.
+    /// safety: the buffer was allocated from the declared size before a byte was inflated —
+    /// 13 bytes of file declaring 256 MiB cost 256 MiB each (20 such files: 5 GiB). It now
+    /// grows with what the stream actually produces.
+    /// </summary>
     private static byte[] Inflate(byte[] compressed, int expectedSize)
     {
         using var input = new MemoryStream(compressed);
         using var deflate = new DeflateStream(input, CompressionMode.Decompress);
-        // One byte more than declared, to notice a stream that inflates past it.
-        var buffer = new byte[expectedSize + 1];
-        var totalRead = 0;
-        while (totalRead < buffer.Length)
+        var limit = (long)expectedSize + 1;
+        using var output = new MemoryStream((int)Math.Min(limit, 64 * 1024));
+        var chunk = new byte[64 * 1024];
+        while (output.Length < limit)
         {
-            var read = deflate.Read(buffer, totalRead, buffer.Length - totalRead);
+            var read = deflate.Read(chunk, 0, (int)Math.Min(chunk.Length, limit - output.Length));
             if (read == 0) break;
-            totalRead += read;
+            output.Write(chunk, 0, read);
         }
-        return buffer[..totalRead];
+        return output.ToArray();
     }
 
     // ── Byte writer ──
@@ -335,23 +377,30 @@ internal static class SynxBinary
         internal static StringTableReader Decode(byte[] data, ref int pos)
         {
             var count = ReadCount(data, ref pos);
-            var strings = new string[count];
+            var strings = new List<string>(Math.Min(count, MaxPreallocItems));
             var utf8 = new UTF8Encoding(false, true);
             for (var i = 0; i < count; i++)
             {
                 var len = ReadVarint(data, ref pos);
-                if ((ulong)pos + len > (ulong)data.Length)
+                // safety: `pos + len` wraps for a length near 2^64; the check passed and the
+                // cast to int below threw ArgumentOutOfRangeException instead of the format error.
+                if (len > (ulong)(data.Length - pos))
                     throw new InvalidDataException("unexpected end of data in string table");
-                try { strings[i] = utf8.GetString(data, pos, (int)len); }
-                catch (DecoderFallbackException e) { throw new InvalidDataException($"invalid UTF-8 in string table: {e.Message}"); }
+                try { strings.Add(utf8.GetString(data, pos, (int)len)); }
+                catch (DecoderFallbackException) { throw new InvalidDataException("invalid UTF-8 in string table"); }
                 pos += (int)len;
             }
-            return new StringTableReader(strings);
+            return new StringTableReader(strings.ToArray());
         }
 
-        internal string Get(ulong idx) => idx < (ulong)strings.Length
-            ? strings[idx]
-            : throw new InvalidDataException($"string index {idx} out of bounds (size {strings.Length})");
+        internal string Get(ulong idx)
+        {
+            // An index is a u32 on the wire of synx-core; anything larger is not an index.
+            if (idx > uint.MaxValue) throw new InvalidDataException("string index out of range");
+            return idx < (ulong)strings.Length
+                ? strings[idx]
+                : throw new InvalidDataException($"string index {idx} out of bounds (size {strings.Length})");
+        }
     }
 
     // ── Values ──
@@ -402,10 +451,11 @@ internal static class SynxBinary
         }
     }
 
-    private static SynxValue DecodeValue(byte[] data, ref int pos, StringTableReader st, int depth)
+    private static SynxValue DecodeValue(byte[] data, ref int pos, StringTableReader st, Budget budget, int depth)
     {
         if (depth > MaxDecodeDepth)
             throw new InvalidDataException($"nesting exceeds {MaxDecodeDepth} — refusing to decode");
+        budget.Value();
         if (pos >= data.Length) throw new InvalidDataException("unexpected end of data");
         var tag = data[pos++];
         switch (tag)
@@ -415,24 +465,24 @@ internal static class SynxBinary
             case TagTrue: return new SynxValue.Bool(true);
             case TagInt: return new SynxValue.Int(ZigzagDecode(ReadVarint(data, ref pos)));
             case TagFloat: return new SynxValue.Float(ReadF64(data, ref pos, "unexpected end of data in float"));
-            case TagString: return new SynxValue.Str(st.Get(ReadVarint(data, ref pos)));
-            case TagSecret: return new SynxValue.Secret(st.Get(ReadVarint(data, ref pos)));
+            case TagString: return new SynxValue.Str(budget.Text(st.Get(ReadVarint(data, ref pos))));
+            case TagSecret: return new SynxValue.Secret(budget.Text(st.Get(ReadVarint(data, ref pos))));
             case TagArray:
             {
                 var count = ReadCount(data, ref pos);
-                var items = new List<SynxValue>(count);
+                var items = new List<SynxValue>(Math.Min(count, MaxPreallocItems));
                 for (var i = 0; i < count; i++)
-                    items.Add(DecodeValue(data, ref pos, st, depth + 1));
+                    items.Add(DecodeValue(data, ref pos, st, budget, depth + 1));
                 return new SynxValue.Arr(items);
             }
             case TagObject:
             {
                 var count = ReadCount(data, ref pos);
-                var map = new Dictionary<string, SynxValue>(count, StringComparer.Ordinal);
+                var map = new Dictionary<string, SynxValue>(Math.Min(count, MaxPreallocItems), StringComparer.Ordinal);
                 for (var i = 0; i < count; i++)
                 {
-                    var key = st.Get(ReadVarint(data, ref pos));
-                    map[key] = DecodeValue(data, ref pos, st, depth + 1);
+                    var key = budget.Text(st.Get(ReadVarint(data, ref pos)));
+                    map[key] = DecodeValue(data, ref pos, st, budget, depth + 1);
                 }
                 return new SynxValue.Obj(map);
             }
@@ -465,22 +515,26 @@ internal static class SynxBinary
         }
     }
 
-    private static SynxConstraints DecodeConstraints(byte[] data, ref int pos, StringTableReader st)
+    private static SynxConstraints DecodeConstraints(byte[] data, ref int pos, StringTableReader st, Budget budget)
     {
         if (pos >= data.Length) throw new InvalidDataException("unexpected end of data in constraints");
         var bits = data[pos++];
         var c = new SynxConstraints();
         if ((bits & 0x01) != 0) c.Min = ReadF64(data, ref pos, "truncated min");
         if ((bits & 0x02) != 0) c.Max = ReadF64(data, ref pos, "truncated max");
-        if ((bits & 0x04) != 0) c.TypeName = st.Get(ReadVarint(data, ref pos));
+        if ((bits & 0x04) != 0) c.TypeName = budget.Text(st.Get(ReadVarint(data, ref pos)));
         if ((bits & 0x08) != 0) c.Required = true;
         if ((bits & 0x10) != 0) c.Readonly = true;
-        if ((bits & 0x20) != 0) c.Pattern = st.Get(ReadVarint(data, ref pos));
+        if ((bits & 0x20) != 0) c.Pattern = budget.Text(st.Get(ReadVarint(data, ref pos)));
         if ((bits & 0x40) != 0)
         {
             var count = ReadCount(data, ref pos);
-            var vals = new List<string>(count);
-            for (var i = 0; i < count; i++) vals.Add(st.Get(ReadVarint(data, ref pos)));
+            var vals = new List<string>(Math.Min(count, MaxPreallocItems));
+            for (var i = 0; i < count; i++)
+            {
+                budget.Value();
+                vals.Add(budget.Text(st.Get(ReadVarint(data, ref pos))));
+            }
             c.EnumValues = vals;
         }
         return c;
@@ -522,27 +576,37 @@ internal static class SynxBinary
         }
     }
 
-    private static Dictionary<string, Dictionary<string, SynxMeta>> DecodeMetadata(byte[] data, ref int pos, StringTableReader st)
+    private static Dictionary<string, Dictionary<string, SynxMeta>> DecodeMetadata(byte[] data, ref int pos, StringTableReader st, Budget budget)
     {
         var outerCount = ReadCount(data, ref pos);
-        var metadata = new Dictionary<string, Dictionary<string, SynxMeta>>(outerCount, StringComparer.Ordinal);
+        var metadata = new Dictionary<string, Dictionary<string, SynxMeta>>(Math.Min(outerCount, MaxPreallocItems), StringComparer.Ordinal);
         for (var i = 0; i < outerCount; i++)
         {
-            var path = st.Get(ReadVarint(data, ref pos));
+            budget.Value();
+            var path = budget.Text(st.Get(ReadVarint(data, ref pos)));
             var innerCount = ReadCount(data, ref pos);
-            var metaMap = new Dictionary<string, SynxMeta>(innerCount, StringComparer.Ordinal);
+            var metaMap = new Dictionary<string, SynxMeta>(Math.Min(innerCount, MaxPreallocItems), StringComparer.Ordinal);
             for (var j = 0; j < innerCount; j++)
             {
-                var key = st.Get(ReadVarint(data, ref pos));
+                var key = budget.Text(st.Get(ReadVarint(data, ref pos)));
+                budget.Value();
                 var meta = new SynxMeta();
                 var mc = ReadCount(data, ref pos);
-                for (var k = 0; k < mc; k++) meta.Markers.Add(st.Get(ReadVarint(data, ref pos)));
+                for (var k = 0; k < mc; k++)
+                {
+                    budget.Value();
+                    meta.Markers.Add(budget.Text(st.Get(ReadVarint(data, ref pos))));
+                }
                 var ac = ReadCount(data, ref pos);
-                for (var k = 0; k < ac; k++) meta.Args.Add(st.Get(ReadVarint(data, ref pos)));
+                for (var k = 0; k < ac; k++)
+                {
+                    budget.Value();
+                    meta.Args.Add(budget.Text(st.Get(ReadVarint(data, ref pos))));
+                }
                 if (pos >= data.Length) throw new InvalidDataException("unexpected end in meta");
-                if (data[pos++] != 0) meta.TypeHint = st.Get(ReadVarint(data, ref pos));
+                if (data[pos++] != 0) meta.TypeHint = budget.Text(st.Get(ReadVarint(data, ref pos)));
                 if (pos >= data.Length) throw new InvalidDataException("unexpected end in meta");
-                if (data[pos++] != 0) meta.Constraints = DecodeConstraints(data, ref pos, st);
+                if (data[pos++] != 0) meta.Constraints = DecodeConstraints(data, ref pos, st, budget);
                 metaMap[key] = meta;
             }
             metadata[path] = metaMap;
@@ -560,14 +624,15 @@ internal static class SynxBinary
         }
     }
 
-    private static List<SynxIncludeDirective> DecodeIncludes(byte[] data, ref int pos, StringTableReader st)
+    private static List<SynxIncludeDirective> DecodeIncludes(byte[] data, ref int pos, StringTableReader st, Budget budget)
     {
         var count = ReadCount(data, ref pos);
-        var includes = new List<SynxIncludeDirective>(count);
+        var includes = new List<SynxIncludeDirective>(Math.Min(count, MaxPreallocItems));
         for (var i = 0; i < count; i++)
         {
-            var path = st.Get(ReadVarint(data, ref pos));
-            var alias = st.Get(ReadVarint(data, ref pos));
+            budget.Value();
+            var path = budget.Text(st.Get(ReadVarint(data, ref pos)));
+            var alias = budget.Text(st.Get(ReadVarint(data, ref pos)));
             includes.Add(new SynxIncludeDirective { Path = path, Alias = alias });
         }
         return includes;

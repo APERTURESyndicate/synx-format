@@ -87,7 +87,7 @@ class ConstraintTest {
     }
 
     @Test
-    void env_nan_and_inf_parse_as_floats_like_rust() {
+    void env_nan_and_inf_stay_text_like_rust() {
         SynxOptions opts = new SynxOptions();
         Map<String, String> env = new HashMap<>();
         env.put("A", "nan");
@@ -99,12 +99,11 @@ class ConstraintTest {
         opts.env = env;
         SynxObject o = Synx.parseActive(
             "!active\na:env A\nb:env B\nc:env C\nd:env D\ne:env E\nf:env F\n", opts);
-        assertTrue(o.get("a").isFloat() && Double.isNaN(o.get("a").asFloat()));
-        assertEquals(Double.POSITIVE_INFINITY, o.get("b").asFloat());
-        assertEquals(Double.NEGATIVE_INFINITY, o.get("c").asFloat());
-        assertTrue(Double.isNaN(o.get("d").asFloat()));
-        assertEquals(Double.POSITIVE_INFINITY, o.get("e").asFloat());
+        // A number from outside the document is a finite one: read as floats these became
+        // `null` in JSON, and a host named `inf` lost its value.
+        assertEquals(SynxValue.ofString("nan"), o.get("a"));
+        assertEquals(SynxValue.ofString("inf"), o.get("b"));
         assertEquals(SynxValue.ofString("infx"), o.get("f"));
-        assertEquals("{\"a\":null,\"b\":null,\"c\":null,\"d\":null,\"e\":null,\"f\":\"infx\"}", Synx.toJson(o));
+        assertEquals("{\"a\":\"nan\",\"b\":\"inf\",\"c\":\"-Infinity\",\"d\":\"+NaN\",\"e\":\"1e400\",\"f\":\"infx\"}", Synx.toJson(o));
     }
 }

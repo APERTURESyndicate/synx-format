@@ -447,15 +447,31 @@ func jailPath(base, file string) (string, string) {
 	if filepath.IsAbs(file) {
 		return "", fmt.Sprintf("SECURITY: absolute paths are not allowed: '%s'", file)
 	}
+	// safety: `NUL`, `con.txt` or `COM1` in any directory opens a device on
+	// Windows — `:include NUL` read it as an empty document, and a console or
+	// a serial port blocks the read. synx-core reaches the disk through a
+	// verbatim path, where these are ordinary missing files.
+	if runtime.GOOS == "windows" && hasDeviceName(file) {
+		return "", "file not found: " + file
+	}
+	// A base that cannot be resolved refuses instead of jailing nothing.
+	if base == "" {
+		base = "."
+	}
 	baseCanon, err := canonicalize(base)
 	if err != nil {
-		baseCanon = base
+		return "", fmt.Sprintf("SECURITY: base directory not found: '%s'", base)
 	}
 	full := joinPath(baseCanon, file)
 	fullCanon, err := canonicalize(full)
 	if err != nil {
-		if strings.Contains(full, "..") {
-			return "", fmt.Sprintf("SECURITY: path traversal detected: '%s'", file)
+		// The file may not exist yet — at least verify no `..` escapes. Judged
+		// by the path as the document wrote it, segment by segment: a base
+		// directory named `a..b` is no traversal.
+		for _, seg := range strings.FieldsFunc(file, func(r rune) bool { return r == '/' || r == '\\' }) {
+			if seg == ".." {
+				return "", fmt.Sprintf("SECURITY: path traversal detected: '%s'", file)
+			}
 		}
 		if !pathHasPrefix(full, baseCanon) {
 			return "", fmt.Sprintf("SECURITY: path escapes base directory: '%s'", file)
@@ -466,6 +482,29 @@ func jailPath(base, file string) (string, string) {
 		return "", fmt.Sprintf("SECURITY: path escapes base directory: '%s'", file)
 	}
 	return fullCanon, ""
+}
+
+// hasDeviceName reports a path component that names a DOS device, with or
+// without an extension or a stream: `NUL`, `con.txt`, `sub/COM1`, `aux:x`.
+func hasDeviceName(file string) bool {
+	for _, part := range strings.FieldsFunc(file, func(r rune) bool { return r == '/' || r == '\\' }) {
+		stem := part
+		if i := strings.IndexAny(stem, ".:"); i >= 0 {
+			stem = stem[:i]
+		}
+		stem = strings.ToUpper(strings.TrimRight(stem, " "))
+		switch stem {
+		case "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$":
+			return true
+		}
+		if strings.HasPrefix(stem, "COM") || strings.HasPrefix(stem, "LPT") {
+			switch stem[3:] {
+			case "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "\u00b9", "\u00b2", "\u00b3":
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // canonicalize is `fs::canonicalize`: absolute, symlinks resolved, and an
@@ -481,7 +520,8 @@ func canonicalize(p string) (string, error) {
 // joinPath is `Path::join`: no cleaning, and an absolute second part
 // replaces the first.
 func joinPath(a, b string) string {
-	if filepath.IsAbs(b) || a == "" {
+	// A drive-relative path (`C:x`) replaces the first part as well.
+	if filepath.IsAbs(b) || a == "" || (runtime.GOOS == "windows" && filepath.VolumeName(b) != "") {
 		return b
 	}
 	if strings.HasSuffix(a, "/") || strings.HasSuffix(a, string(filepath.Separator)) {
@@ -569,18 +609,18 @@ func readUTF8(p string) (string, error) {
 }
 
 // ioErrText is the reference's portable I/O error text.
+//
+// spec: it never carries the operating system's own wording, so the same
+// document resolves to the same string on every machine. A name the platform
+// cannot hold at all (a NUL, or `|` on Windows) is a file that is not there.
 func ioErrText(err error, ctx string) string {
 	switch {
-	case errors.Is(err, os.ErrNotExist):
+	case errors.Is(err, os.ErrNotExist), invalidFileName(err):
 		return "file not found: " + ctx
 	case errors.Is(err, os.ErrPermission):
 		return "permission denied: " + ctx
 	}
-	var pe *os.PathError
-	if errors.As(err, &pe) {
-		return pe.Err.Error()
-	}
-	return err.Error()
+	return "cannot read file: " + ctx
 }
 
 func isRegularFile(p string) bool {
@@ -600,11 +640,9 @@ func (r *resolver) loadIncludes(directives []IncludeDirective) *Object {
 		if errText != "" || checkFileSize(full) != "" {
 			continue
 		}
-		text, err := readUTF8(full)
-		if err != nil {
-			continue
+		if included, errText := r.includeFile(full, full, inc.Path); errText == "" {
+			out.Set(inc.Alias, included)
 		}
-		out.Set(inc.Alias, r.parseIncluded(text, full))
 	}
 	return out
 }
@@ -613,7 +651,10 @@ func (r *resolver) loadIncludes(directives []IncludeDirective) *Object {
 // manifest's `main` (or legacy `entry`), else `src/main.synx`.
 func (r *resolver) loadPackages(directives []UseDirective) *Object {
 	out := NewObjectMap()
-	if len(directives) == 0 {
+	// safety: a package may `!use` another. The depth was counted but never
+	// checked, and nothing noticed a package reaching itself: packages using
+	// one another recursed until the runtime ended the process.
+	if len(directives) == 0 || r.opts.IncludeDepth >= r.maxIncludeDepth() {
 		return out
 	}
 	pkgBase := r.opts.PackagesPath
@@ -633,11 +674,13 @@ func (r *resolver) loadPackages(directives []UseDirective) *Object {
 		if !isRegularFile(entry) || checkFileSize(entry) != "" {
 			continue
 		}
-		text, err := readUTF8(entry)
+		opened, err := canonicalize(entry)
 		if err != nil {
-			continue
+			opened = entry
 		}
-		out.Set(ud.Alias, r.parseIncluded(text, entry))
+		if included, errText := r.includeFile(opened, entry, ud.Package); errText == "" {
+			out.Set(ud.Alias, included)
+		}
 	}
 	return out
 }

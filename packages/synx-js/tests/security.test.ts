@@ -294,3 +294,46 @@ describe('Parity with synx-core — active mode', () => {
     expect((Synx.parse('!active\nport(int) 3000\n') as any).port).toBe(3000);
   });
 });
+
+// ─── 3.8.1: secrets, required, include cycles, jail ───────
+
+describe('Security — 3.8.1 fixes', () => {
+  const fs = require('fs');
+  const os = require('os');
+  const path = require('path');
+
+  test('unset :secret:env stays null and [required] fires', () => {
+    const r: any = Synx.parse('!active\na:secret:env NOPE_UNSET\nb[required]:secret:env NOPE_UNSET\nc:secret:env SET_ONE\n', { env: { SET_ONE: 'v' } });
+    expect(r.a).toBeNull();
+    expect(r.b).toBe("CONSTRAINT_ERR: 'b' is required");
+    expect(r.c.reveal()).toBe('v');
+  });
+
+  test('[required] key without a value is missing', () => {
+    const r: any = Synx.parse('!active\nname[required, min:1]\n', { env: {} });
+    expect(r.name).toBe("CONSTRAINT_ERR: 'name' is required");
+  });
+
+  test('double self-include stops at the cycle', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'synx-bomb-'));
+    const text = '!active\na:include bomb.synx\nb:include bomb.synx\nc:include bomb.synx\n';
+    fs.writeFileSync(path.join(dir, 'bomb.synx'), text);
+    const started = Date.now();
+    const r = Synx.parse(text, { basePath: dir, env: {} });
+    expect(Date.now() - started).toBeLessThan(5000);
+    expect(JSON.stringify(r)).toContain("circular include: 'bomb.synx'");
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  test('a junction or symlink out of the base does not pass the jail', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'synx-jail-'));
+    const base = path.join(root, 'base');
+    const outside = path.join(root, 'outside');
+    fs.mkdirSync(base); fs.mkdirSync(outside);
+    fs.writeFileSync(path.join(outside, 'secret.synx'), 'token OUTSIDE\n');
+    try { fs.symlinkSync(outside, path.join(base, 'link'), 'junction'); } catch { return; }
+    const r: any = Synx.parse('!active\nx:include link/secret.synx\n', { basePath: base, env: {} });
+    expect(String(r.x)).toContain('SECURITY: path escapes base directory');
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+});

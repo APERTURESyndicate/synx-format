@@ -7,11 +7,11 @@
 
     <groupId>com.aperturesyndicate</groupId>
     <artifactId>synx</artifactId>
-    <version>3.8.0</version>
+    <version>3.8.1</version>
     <packaging>jar</packaging>
 
     <name>SYNX</name>
-    <description>Native Java parser for SYNX (Active Data Format). Parity with synx-core 3.8.0.</description>
+    <description>Native Java parser for SYNX (Active Data Format). Parity with synx-core 3.8.1.</description>
     <url>https://synx.aperturesyndicate.com</url>
 
     <licenses>

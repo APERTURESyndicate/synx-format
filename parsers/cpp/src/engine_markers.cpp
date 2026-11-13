@@ -571,9 +571,23 @@ struct SortItem {
     std::string text;
 };
 
+// A total order: numbers first, by value (NaN after the rest of them), then
+// everything else by its text, by code point. Comparing a number with text as
+// text made `10 < 1a < 9 < 10` a cycle, and the result depended on the sort.
 bool sort_less(const SortItem& a, const SortItem& b) {
-    if (a.numeric && b.numeric) return a.number < b.number;  // NaN compares equal
+    if (a.numeric && b.numeric) {
+        if (std::isnan(a.number) || std::isnan(b.number)) return !std::isnan(a.number) && std::isnan(b.number);
+        return a.number < b.number;
+    }
+    if (a.numeric != b.numeric) return a.numeric;
     return a.text < b.text;  // byte order of UTF-8 is code-point order
+}
+
+// Non-overlapping occurrences of `needle` in `hay`, left to right.
+size_t count_matches(std::string_view hay, std::string_view needle) {
+    size_t n = 0;
+    for (size_t at = hay.find(needle); at != std::string_view::npos; at = hay.find(needle, at + needle.size())) ++n;
+    return n;
 }
 
 void merge_sort(std::vector<SortItem>& v, std::vector<SortItem>& tmp, size_t lo, size_t hi) {
@@ -597,9 +611,10 @@ void merge_sort(std::vector<SortItem>& v, std::vector<SortItem>& tmp, size_t lo,
 // ─── apply_markers ──────────────────────────────────────────────────────────
 
 void Resolver::apply_markers(Object& map, size_t index, const ObjectLookup& local, const Meta& meta,
-                             const std::string& path) {
+                             const std::string& path, size_t depth) {
     const std::vector<std::string>& markers = meta.markers;
     const uint32_t mb = marker_bits(markers);
+    const bool secret = (mb & mk::SECRET) != 0;
     const std::string key = map[index].key;
     Value& cur = map[index].value;
 
@@ -625,7 +640,7 @@ void Resolver::apply_markers(Object& map, size_t index, const ObjectLookup& loca
         }
         const Value* resolved = deep_get(root, target, &root_lookup);
         if (!resolved) resolved = local.get(target);
-        if (resolved) cur = Value(*resolved);
+        if (resolved) cur = budgeted_copy(*resolved, depth);
     }
 
     // ── :include / :import ──
@@ -643,7 +658,7 @@ void Resolver::apply_markers(Object& map, size_t index, const ObjectLookup& loca
                     const Array* a = pre->as_array();
                     const std::string* pre_path = a && a->size() == 2 ? (*a)[0].as_string() : nullptr;
                     if (pre_path && *pre_path == file) {
-                        cur = (*a)[1];
+                        cur = placed_document((*a)[1], depth, secret);
                         return;
                     }
                 }
@@ -658,10 +673,14 @@ void Resolver::apply_markers(Object& map, size_t index, const ObjectLookup& loca
                 cur = Value::make_string("INCLUDE_ERR: " + size_err);
                 return;
             }
-            std::string text, err;
-            if (read_text(j.path, file, text, err)) cur = load_synx_file(text, j.path, options);
+            Value included;
+            std::string err;
+            if (include_file(j.path, file, options, included, err)) cur = placed_document(std::move(included), depth, secret);
             else cur = Value::make_string("INCLUDE_ERR: " + err);
         }
+        // safety: the chain ends here, so `:secret` is applied here — a value
+        // that was not a path (`k:secret:include 5`) stayed in the clear.
+        if (secret) mask_secret_value(cur);
         return;
     }
 
@@ -678,11 +697,10 @@ void Resolver::apply_markers(Object& map, size_t index, const ObjectLookup& loca
             const bool force_string = wants_string(meta);
             const int di = marker_pos(markers, "default");
             if (env_val && !env_val->empty()) {
-                cur = force_string ? Value::make_string(*env_val) : cast_primitive(*env_val);
+                cur = external_value(*env_val, force_string, secret);
             } else if (di >= 0 && markers.size() > static_cast<size_t>(di) + 1) {
                 // Every part after `default`, rejoined with ':' (IPs, compound values).
-                std::string fallback = join_from(markers, static_cast<size_t>(di) + 1);
-                cur = force_string ? Value::make_string(std::move(fallback)) : cast_primitive(fallback);
+                cur = external_value(join_from(markers, static_cast<size_t>(di) + 1), force_string, secret);
             } else {
                 cur = Value::make_null();
             }
@@ -718,7 +736,7 @@ void Resolver::apply_markers(Object& map, size_t index, const ObjectLookup& loca
             const std::string target = *target_p;
             const Value* found = deep_get(root, target, &root_lookup);
             if (!found) found = local.get(target);
-            Value resolved = found ? Value(*found) : Value::make_null();
+            Value resolved = found ? budgeted_copy(*found, depth) : Value::make_null();
             double n = 0.0;
             const std::string* calc_expr = marker_after(markers, "calc");
             if ((mb & mk::CALC) && value_as_number(resolved, n) && calc_expr) {
@@ -838,7 +856,7 @@ void Resolver::apply_markers(Object& map, size_t index, const ObjectLookup& loca
                 cur = Value::make_string("ALIAS_ERR: self-referential alias: " + current_path + " \xE2\x86\x92 " + target);
             } else {
                 const Value* tv = deep_get(root, target, &root_lookup);
-                Value target_val = tv ? Value(*tv) : Value::make_null();
+                Value target_val = tv ? budgeted_copy(*tv, depth) : Value::make_null();
                 size_t dot = target.rfind('.');
                 std::string target_parent = dot == std::string::npos ? std::string() : target.substr(0, dot);
                 std::string target_key = dot == std::string::npos ? target : target.substr(dot + 1);
@@ -860,10 +878,6 @@ void Resolver::apply_markers(Object& map, size_t index, const ObjectLookup& loca
         }
     }
 
-    // ── :secret — idempotent: the pre-pass may already have masked it ──
-    if ((mb & mk::SECRET) && !cur.is_secret()) {
-        cur = Value::make_secret(value_to_string(cur));
-    }
 
     // ── :unique ──
     if (mb & mk::UNIQUE) {
@@ -937,10 +951,17 @@ void Resolver::apply_markers(Object& map, size_t index, const ObjectLookup& loca
         if (const Array* arr = cur.as_array()) {
             const std::string* kw = marker_after(markers, "join");
             const std::string sep = kw ? delimiter_from_keyword(*kw) : std::string(",");
+            // safety: the separator is as long as the document likes and is
+            // written once per item.
+            const size_t separators = sep.size() * (arr->empty() ? 0 : arr->size() - 1);
             std::string joined;
-            for (size_t i = 0; i < arr->size(); ++i) {
-                if (i > 0) joined.append(sep);
-                joined.append(value_to_string((*arr)[i]));
+            if (separators > arr->size() && !charge_expansion(separators)) {
+                joined = kLimitErr;
+            } else {
+                for (size_t i = 0; i < arr->size(); ++i) {
+                    if (i > 0) joined.append(sep);
+                    joined.append(value_to_string((*arr)[i]));
+                }
             }
             cur = Value::make_string(std::move(joined));
         }
@@ -951,8 +972,7 @@ void Resolver::apply_markers(Object& map, size_t index, const ObjectLookup& loca
         bool empty = cur.is_null() || (cur.is_string() && cur.as_string()->empty());
         const int di = marker_pos(markers, "default");
         if (empty && markers.size() > static_cast<size_t>(di) + 1) {
-            std::string fallback = join_from(markers, static_cast<size_t>(di) + 1);
-            cur = wants_string(meta) ? Value::make_string(std::move(fallback)) : cast_primitive(fallback);
+            cur = external_value(join_from(markers, static_cast<size_t>(di) + 1), wants_string(meta), secret);
         }
     }
 
@@ -981,9 +1001,19 @@ void Resolver::apply_markers(Object& map, size_t index, const ObjectLookup& loca
         if (!d || !parse_u64(*d, decimals) || decimals > UINT32_MAX) decimals = 0;
         double n = 0.0;
         if (value_as_number(cur, n)) {
-            double factor = powi(10.0, static_cast<int32_t>(static_cast<uint32_t>(decimals)));
-            double rounded = std::round(n * factor) / factor;
-            cur = decimals == 0 ? Value::make_int(saturating_i64(rounded)) : Value::make_float(rounded);
+            // A scale past the range of f64 rounds nothing: the number stays.
+            double factor = powi(10.0, static_cast<int>(std::min<uint64_t>(decimals, 400)));
+            double scaled = n * factor;
+            double rounded = std::isfinite(scaled) ? std::round(scaled) / factor : n;
+            // safety: only a whole number that fits is an integer. The cast
+            // alone saturated: `:round` of 1e30 was 9223372036854775807 and of
+            // NaN was 0 — invented values.
+            if (decimals == 0 && std::isfinite(rounded) && is_whole(rounded)
+                && std::fabs(rounded) < 9223372036854775807.0) {
+                cur = Value::make_int(static_cast<int64_t>(rounded));
+            } else {
+                cur = Value::make_float(rounded);
+            }
         }
     }
 
@@ -1015,7 +1045,10 @@ void Resolver::apply_markers(Object& map, size_t index, const ObjectLookup& loca
     // ── :format:PATTERN — printf-style %.2f, %d, %05d, %e ──
     if (mb & mk::FORMAT) {
         const std::string* pattern = marker_after(markers, "format");
-        cur = Value::make_string(apply_format_pattern(pattern ? *pattern : std::string("%s"), cur));
+        std::string formatted = apply_format_pattern(pattern ? *pattern : std::string("%s"), cur);
+        // safety: a width of 4096 on a twenty-byte line is a 200-fold growth.
+        if ((cur.is_int() || cur.is_float()) && !charge_expansion(formatted.size())) formatted = kLimitErr;
+        cur = Value::make_string(std::move(formatted));
     }
 
     // ── :replace:FROM:TO ──
@@ -1023,7 +1056,14 @@ void Resolver::apply_markers(Object& map, size_t index, const ObjectLookup& loca
         if (const std::string* s = cur.as_string()) {
             const std::string* from = marker_after(markers, "replace");
             const std::string* to = marker_after(markers, "replace", 2);
-            if (from && !from->empty()) cur = Value::make_string(replace_all(*s, *from, to ? *to : std::string()));
+            if (from && !from->empty()) {
+                const std::string with = to ? *to : std::string();
+                // safety: `:replace:a:<long>` on a run of `a` multiplies the two
+                // lengths; the growth is known before a byte is written.
+                const size_t grown = with.size() > from->size() ? count_matches(*s, *from) * (with.size() - from->size()) : 0;
+                cur = grown > 0 && !charge_expansion(grown) ? Value::make_string(kLimitErr)
+                                                            : Value::make_string(replace_all(*s, *from, with));
+            }
         }
     }
 
@@ -1062,8 +1102,9 @@ void Resolver::apply_markers(Object& map, size_t index, const ObjectLookup& loca
                     total += *f;
                     if (!is_whole(*f)) all_int = false;
                 } else if (const std::string* s = v.as_string()) {
+                    // `inf` and `nan` are text here as everywhere (see cast_primitive).
                     double parsed = 0.0;
-                    if (parse_f64(*s, parsed)) {
+                    if (parse_f64(*s, parsed) && std::isfinite(parsed)) {
                         total += parsed;
                         if (!is_whole(parsed)) all_int = false;
                     }
@@ -1146,12 +1187,12 @@ void Resolver::apply_markers(Object& map, size_t index, const ObjectLookup& loca
             }
             const std::string* key_path = marker_after(markers, "watch");
             std::string content, err;
-            if (read_text(j.path, file, content, err)) {
+            if (read_budgeted(j.path, file, content, err)) {
                 if (key_path) {
                     std::string ext = path_to_utf8(j.path.extension());
                     if (!ext.empty() && ext[0] == '.') ext.erase(0, 1);
                     std::optional<Value> v = extract_from_file_content(content, *key_path, ext);
-                    cur = v ? std::move(*v) : Value::make_null();
+                    cur = v ? placed_document(std::move(*v), depth, false) : Value::make_null();
                 } else {
                     cur = Value::make_string(std::string(trim_view(content)));
                 }
@@ -1161,11 +1202,19 @@ void Resolver::apply_markers(Object& map, size_t index, const ObjectLookup& loca
         }
     }
 
+    // ── :secret ──
+    // Last of the markers that produce the value, so whatever they resolved is
+    // what gets masked. It used to sit after `:alias`: `t:secret:once` came out
+    // as plain text and `:secret:format` formatted the mask. `:prompt` and
+    // custom markers below still see only the mask.
+    if (secret) mask_secret_value(cur);
+
     // ── :prompt[:LABEL] — the subtree as SYNX in a labelled code fence ──
     if (mb & mk::PROMPT) {
         const std::string* label = marker_after(markers, "prompt");
         std::string text = stringify_value(cur, 0);
-        cur = Value::make_string((label ? *label : key) + " (SYNX):\n```synx\n" + text + "```");
+        std::string block = (label ? *label : key) + " (SYNX):\n```synx\n" + text + "```";
+        cur = Value::make_string(charge_expansion(block.size()) ? std::move(block) : std::string(kLimitErr));
     }
 
     // ── custom markers: the first non-builtin one registered, with the

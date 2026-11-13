@@ -183,8 +183,16 @@ func Parse(text string) ParseResult {
 	r := &p.result
 
 	var block *blockState
-	var list *listState
+	// Open lists, outermost first.
+	//
+	// spec: a list inside a list item ends at the next item of the outer list
+	// (§8.5). One variable held "the" open list, so a nested `tags` replaced
+	// its parent: `- name b` after it matched no list and was dropped without
+	// a word, and the keys under it landed in the item before.
+	var lists []listState
 	inBlockComment := false
+	// Indent of a refused key whose block is being dropped, or -1.
+	droppedBelow := -1
 
 	pos := 0
 	for pos <= len(text) {
@@ -209,6 +217,13 @@ func Parse(text string) ParseResult {
 			continue
 		}
 		indent := indentLen(raw)
+
+		if droppedBelow >= 0 {
+			if indent > droppedBelow {
+				continue
+			}
+			droppedBelow = -1
+		}
 
 		// Continue a multiline block. This runs before every line-class rule
 		// below: a `|` / `|+` body is raw text (SYNX §8.4.1), so `#`, `//`,
@@ -272,7 +287,19 @@ func Parse(text string) ParseResult {
 		}
 
 		if strings.HasPrefix(trimmed, "- ") {
-			if list != nil && indent > list.indent {
+			// The list this item belongs to: the innermost open one whose key
+			// sits to the left of the dash. Lists nested deeper than the dash
+			// end here — but only when a list does take the line; a dash no
+			// list accepts is skipped and closes nothing, as it always was.
+			accepting := len(lists)
+			for accepting > 0 && indent < lists[accepting-1].indent {
+				accepting--
+			}
+			if accepting > 0 && indent > lists[accepting-1].indent {
+				lists = lists[:accepting]
+			}
+			if n := len(lists); n > 0 && indent > lists[n-1].indent {
+				list := &lists[n-1]
 				// Pop every frame of the previous item — its own frame and any
 				// object nested inside it.
 				for len(p.stack) > 1 && p.stack[len(p.stack)-1].indent >= indent {
@@ -280,14 +307,12 @@ func Parse(text string) ParseResult {
 				}
 				valStr := stripComment(trimWS(trimmed[2:]))
 
-				// The item is an object when the next content line is deeper
-				// and is neither another item nor a comment.
+				// The item is an object when the next line of content is deeper
+				// and is not another item.
 				nested := false
 				if ps, pe, ok := nextContentLine(text, pos); ok {
 					pl := text[ps:pe]
-					pt := trimWS(pl)
-					if indentLen(pl) > indent && !strings.HasPrefix(pt, "- ") &&
-						pt[0] != '#' && !strings.HasPrefix(pt, "//") {
+					if indentLen(pl) > indent && !strings.HasPrefix(trimWS(pl), "- ") {
 						nested = true
 					}
 				}
@@ -301,11 +326,18 @@ func Parse(text string) ParseResult {
 					}
 				}
 				av, isArr := parent.pairs[list.pos].Value.(ArrayValue)
-				if !isArr || len(av.V) >= MaxListItems {
+				if !isArr {
+					continue
+				}
+				if len(av.V) >= MaxListItems {
+					// The cap dropped an item: say so, like every other cap.
+					r.Truncated = true
 					continue
 				}
 				if nested {
 					item := NewObjectMap()
+					var headKey string
+					var headMeta *Meta
 					if pl, ok := parseLine(valStr); ok {
 						var v Value
 						switch {
@@ -318,6 +350,16 @@ func Parse(text string) ParseResult {
 						}
 						if !isReservedJSKey(pl.key) {
 							item.Set(pl.key, v)
+							if r.Mode == ModeActive && (len(pl.markers) > 0 || pl.constraints != nil || pl.hasTypeHint) {
+								headKey = pl.key
+								headMeta = &Meta{
+									Markers:     pl.markers,
+									Args:        pl.markerArgs,
+									TypeHint:    pl.typeHint,
+									Constraints: pl.constraints,
+									typeHintSet: pl.hasTypeHint,
+								}
+							}
 						}
 					} else {
 						item.Set("_value", cast(valStr))
@@ -328,6 +370,13 @@ func Parse(text string) ParseResult {
 					if len(p.stack) < MaxNestingDepth {
 						p.push(stackFrame{indent: indent, kind: frameListItem, key: list.key,
 							itemIdx: itemIdx, parent: list.stackIdx, obj: item})
+						// spec: the key on the `- ` line is a key line like the
+						// ones under it. Its markers and constraints were read
+						// and thrown away: `- token:secret abc` stayed in the
+						// clear and `- host:env H` kept the variable's name.
+						if headMeta != nil {
+							r.Metadata.level(p.currentPath()).Set(headKey, *headMeta)
+						}
 					}
 				} else {
 					av.V = append(av.V, cast(valStr))
@@ -335,21 +384,36 @@ func Parse(text string) ParseResult {
 				}
 				continue
 			}
-		} else if list != nil && indent <= list.indent {
-			// A non-item line at or below the list's indent closes it.
-			list = nil
-			for len(p.stack) > 1 {
-				top := p.stack[len(p.stack)-1]
-				if top.kind == frameListItem && top.indent >= indent {
-					p.pop()
-				} else {
-					break
+		} else {
+			// A non-item line closes every list it is at or below the indent of.
+			closed := false
+			for n := len(lists); n > 0 && indent <= lists[n-1].indent; n = len(lists) {
+				lists = lists[:n-1]
+				closed = true
+			}
+			if closed {
+				for len(p.stack) > 1 {
+					top := p.stack[len(p.stack)-1]
+					if top.kind == frameListItem && top.indent >= indent {
+						p.pop()
+					} else {
+						break
+					}
 				}
 			}
 		}
 
 		pl, ok := parseLine(trimmed)
-		if !ok || isReservedJSKey(pl.key) {
+		if !ok {
+			continue
+		}
+		// safety: the lines under a refused key go with it. Only the key line
+		// was skipped, so its block fell to whatever was open above it —
+		// `profile` / `__proto__` / `  role admin` gave `profile` the role —
+		// and under `prototype |` each line of the text was read as a line of
+		// the document.
+		if isReservedJSKey(pl.key) {
+			droppedBelow = indent
 			continue
 		}
 		for len(p.stack) > 1 && p.stack[len(p.stack)-1].indent >= indent {
@@ -401,11 +465,11 @@ func Parse(text string) ParseResult {
 				preserveIndent: pl.value == "|+", baseIndent: -1}
 		case isListMarker && pl.value == "":
 			parent.Set(pl.key, ArrayValue{V: []Value{}})
-			list = &listState{indent: indent, key: pl.key, stackIdx: parentIdx, parent: parent, pos: -1}
+			lists = append(lists, listState{indent: indent, key: pl.key, stackIdx: parentIdx, parent: parent, pos: -1})
 		case pl.value == "":
 			if ps, pe, ok := nextContentLine(text, pos); ok && strings.HasPrefix(trimWS(text[ps:pe]), "- ") {
 				parent.Set(pl.key, ArrayValue{V: []Value{}})
-				list = &listState{indent: indent, key: pl.key, stackIdx: parentIdx, parent: parent, pos: -1}
+				lists = append(lists, listState{indent: indent, key: pl.key, stackIdx: parentIdx, parent: parent, pos: -1})
 				continue
 			}
 			child := NewObjectMap()
@@ -511,10 +575,18 @@ func (p *parser) directive(t string) bool {
 	return false
 }
 
-// nextContentLine finds the first non-blank line at or after byte `from`,
-// as (start, end) with a trailing CR excluded.
+// nextContentLine finds the first line at or after byte `from` that is
+// content — not blank and not a comment — as (start, end) with a trailing CR
+// excluded.
+//
+// spec: a comment line is ignored (§5), so it cannot stand between a key and
+// its list or between a `- ` line and the keys of its item. Only blank lines
+// were skipped here: `items` / `# note` / `- a` read as an empty object and
+// lost every item, and a comment after `- name a` turned the item into the
+// text `name a` and sent its keys to the parent.
 func nextContentLine(text string, from int) (int, int, bool) {
 	p := from
+	inBlockComment := false
 	for p <= len(text) {
 		nl := strings.IndexByte(text[p:], '\n')
 		if nl < 0 {
@@ -526,7 +598,10 @@ func nextContentLine(text string, from int) (int, int, bool) {
 		if end > p && text[end-1] == '\r' {
 			end--
 		}
-		if trimWS(text[p:end]) != "" {
+		t := trimWS(text[p:end])
+		if t == "###" {
+			inBlockComment = !inBlockComment
+		} else if !inBlockComment && t != "" && t[0] != '#' && !strings.HasPrefix(t, "//") {
 			return p, end, true
 		}
 		p = nl + 1
@@ -674,8 +749,11 @@ func parseLine(trimmed string) (parsedLine, bool) {
 		// `:random` reads its weights from the value.
 		if containsString(out.markers, "random") {
 			var nums []string
+			// spec: a weight is `digits[.digits]`. Anything a float parser
+			// reads counted, so `a:random inf`, `-5` or `nan` lost its value
+			// to a weight list.
 			for _, tok := range strings.FieldsFunc(out.value, unicode.IsSpace) {
-				if _, ok := parseRustFloat(tok); ok {
+				if isWeight(tok) {
 					nums = append(nums, tok)
 				}
 			}
@@ -691,6 +769,25 @@ func parseLine(trimmed string) (parsedLine, bool) {
 		}
 	}
 	return out, true
+}
+
+// isWeight: `digits[.digits]` — a `:random` weight.
+func isWeight(s string) bool {
+	digits := func(t string) bool {
+		if t == "" {
+			return false
+		}
+		for i := 0; i < len(t); i++ {
+			if t[i] < '0' || t[i] > '9' {
+				return false
+			}
+		}
+		return true
+	}
+	if dot := strings.IndexByte(s, '.'); dot >= 0 {
+		return digits(s[:dot]) && digits(s[dot+1:])
+	}
+	return digits(s)
 }
 
 // parseConstraints parses the body of a `[…]` block.
@@ -722,14 +819,16 @@ func parseConstraints(raw string) Constraints {
 		k := strings.TrimSpace(part[:colon])
 		v := strings.TrimSpace(part[colon+1:])
 		switch k {
+		// A bound is a finite number: `inf` and `nan` bound nothing sensible
+		// (`[max:-inf]` rejected every value).
 		case "min":
 			c.Min = nil
-			if d, ok := parseRustFloat(v); ok {
+			if d, ok := parseRustFloat(v); ok && isFinite(d) {
 				c.Min = &d
 			}
 		case "max":
 			c.Max = nil
-			if d, ok := parseRustFloat(v); ok {
+			if d, ok := parseRustFloat(v); ok && isFinite(d) {
 				c.Max = &d
 			}
 		case "type":

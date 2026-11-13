@@ -8,8 +8,21 @@ public abstract record SynxValue
     public sealed record Int(long Value) : SynxValue;
     public sealed record Float(double Value) : SynxValue;
     public sealed record Str(string Value) : SynxValue;
-    /// <summary>Resolved secret — JSON emission matches string escaping (same as Rust).</summary>
-    public sealed record Secret(string Value) : SynxValue;
+    /// <summary>
+    /// Resolved secret. <see cref="Value"/> is the one way to the plaintext: every other view
+    /// of the object — <c>ToString()</c>, string interpolation, the debugger, a reflection-based
+    /// serializer — shows <c>[SECRET]</c> or nothing.
+    /// </summary>
+    [System.Diagnostics.DebuggerDisplay("[SECRET]")]
+    public sealed record Secret(
+        [property: System.Text.Json.Serialization.JsonIgnore]
+        [property: System.Runtime.Serialization.IgnoreDataMember]
+        [property: System.Diagnostics.DebuggerBrowsable(System.Diagnostics.DebuggerBrowsableState.Never)]
+        string Value) : SynxValue
+    {
+        // safety: the member list a record prints is `Value = hunter2`.
+        protected override bool PrintMembers(System.Text.StringBuilder builder) => false;
+    }
     public sealed record Arr(List<SynxValue> Items) : SynxValue;
     public sealed record Obj(Dictionary<string, SynxValue> Map) : SynxValue;
 
@@ -53,7 +66,12 @@ public abstract record SynxValue
     public SynxValue this[int index] => this is Arr a && index >= 0 && index < a.Items.Count ? a.Items[index] : new Null();
 
     /// <summary>Returns the value as a display string (unwraps primitives, returns type name for composites).</summary>
-    public override string ToString() => this switch
+    /// <remarks>
+    /// safety: sealed. A derived record synthesizes its own <c>ToString()</c> unless the base
+    /// seals it, so this method was dead code and <c>$"{config["password"]}"</c> printed
+    /// <c>Secret { Value = hunter2 }</c>.
+    /// </remarks>
+    public sealed override string ToString() => this switch
     {
         Null => "null",
         Bool b => b.Value ? "true" : "false",

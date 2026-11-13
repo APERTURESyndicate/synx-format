@@ -27,8 +27,18 @@ pub enum Value {
     Null,
     Array(Vec<Value>),
     Object(Map),
-    /// Secret value — displays as [SECRET], real value accessible via as_secret()
+    /// Secret value — displays, prints and serializes as `[SECRET]`; the real
+    /// value is read with [`Value::as_secret`] (or [`Value::as_str`]).
+    #[cfg_attr(feature = "serde", serde(serialize_with = "serialize_masked"))]
     Secret(std::string::String),
+}
+
+/// safety: a derived `Serialize` wrote the secret itself, so anything built
+/// on serde — a JSON dump, the WASM binding's objects — carried the plain
+/// text that `to_json` and `Debug` mask.
+#[cfg(feature = "serde")]
+fn serialize_masked<S: serde::Serializer>(_secret: &str, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str("[SECRET]")
 }
 
 // Hand-written so `{:?}` in a log line never prints a secret.
@@ -48,6 +58,7 @@ impl std::fmt::Debug for Value {
 }
 
 impl Value {
+    /// The text of a string — and of a secret, in the clear: do not log it.
     pub fn as_str(&self) -> Option<&str> {
         match self {
             Value::String(s) | Value::Secret(s) => Some(s),
@@ -128,7 +139,9 @@ impl Value {
 impl std::fmt::Display for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Value::String(s) | Value::Secret(s) => write!(f, "{}", s),
+            Value::String(s) => write!(f, "{}", s),
+            // safety: `{}` is how values reach logs. It printed the secret.
+            Value::Secret(_) => write!(f, "[SECRET]"),
             Value::Int(n) => write!(f, "{}", n),
             Value::Float(fl) => {
                 let s = fl.to_string();
@@ -167,12 +180,34 @@ pub enum Mode {
 }
 
 /// Metadata for a single key (markers, args, constraints).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct Meta {
     pub markers: Vec<String>,
     pub args: Vec<String>,
     pub type_hint: Option<String>,
     pub constraints: Option<Constraints>,
+}
+
+// safety: hand-written like `Value`'s. `key:secret:default:hunter2` keeps the
+// secret's value as the argument of `:default`, in `markers`; a derived
+// `Debug` put it into every `{:?}` of a parse result.
+impl std::fmt::Debug for Meta {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let secret = self.markers.iter().any(|m| m == "secret");
+        let default_at = self.markers.iter().position(|m| m == "default").filter(|_| secret);
+        let shown: Vec<&str> = match default_at {
+            Some(at) if at + 1 < self.markers.len() => {
+                self.markers[..=at].iter().map(String::as_str).chain(std::iter::once("[SECRET]")).collect()
+            }
+            _ => self.markers.iter().map(String::as_str).collect(),
+        };
+        f.debug_struct("Meta")
+            .field("markers", &shown)
+            .field("args", &self.args)
+            .field("type_hint", &self.type_hint)
+            .field("constraints", &self.constraints)
+            .finish()
+    }
 }
 
 /// Constraints from [min:3, max:30, required, type:int].
@@ -250,4 +285,38 @@ pub struct Options {
     /// Loaded WASM marker runtime (populated by engine from `type markers` packages).
     #[cfg(feature = "wasm")]
     pub wasm_runtime: Option<std::sync::Arc<crate::wasm::WasmMarkerRuntime>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // B-027: printing a secret, in any form, never shows its text.
+    #[test]
+    fn a_secret_prints_as_its_mask() {
+        let s = Value::Secret("hunter2".into());
+        assert_eq!(format!("{s}"), "[SECRET]");
+        assert!(!format!("{s:?}").contains("hunter2"));
+        let mut map = Map::default();
+        map.insert("pass".into(), s.clone());
+        let tree = Value::Object(map);
+        assert!(!format!("{tree}").contains("hunter2"));
+        assert!(!format!("{tree:?}").contains("hunter2"));
+        assert_eq!(s.as_secret(), Some("hunter2"));
+        #[cfg(feature = "serde")]
+        assert_eq!(serde_json::to_string(&tree).unwrap(), r#"{"pass":"[SECRET]"}"#);
+    }
+
+    // B-088: the default of a secret is its value; `{:?}` of the declarations
+    // (and of a whole parse result) does not print it.
+    #[test]
+    fn a_secret_default_is_not_printed_with_its_declaration() {
+        let parsed = crate::parse("!active\npass:secret:default:hunter2\nkey:secret:env:default:hun:ter2 KEY\nport:env:default:8080 PORT\n");
+        let printed = format!("{:?}", parsed);
+        assert!(!printed.contains("hunter2") && !printed.contains("ter2"), "{printed}");
+        assert!(printed.contains(r#"["secret", "default", "[SECRET]"]"#), "{printed}");
+        // What is not secret prints as it is, and the declarations are intact.
+        assert!(printed.contains(r#"["env", "default", "8080"]"#), "{printed}");
+        assert_eq!(parsed.metadata[""]["pass"].markers, ["secret", "default", "hunter2"]);
+    }
 }

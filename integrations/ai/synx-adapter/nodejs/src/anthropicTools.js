@@ -1,5 +1,6 @@
 import { Synx } from '@aperturesyndicate/synx-format';
 import { packForLlm } from './index.js';
+import { requestsActiveMode } from './guards.js';
 
 /**
  * Plain SYNX text for an Anthropic tool_result block.
@@ -36,8 +37,17 @@ export function toolResultSynxBody(data, opts = {}) {
 }
 
 /**
- * Parse model tool input: JSON first, then SYNX.
+ * Parse model tool input: JSON first, then SYNX — as static data.
+ *
+ * safety: this text is written by the model. `Synx.parse` resolves an
+ * `!active` document, so `q:env OPENAI_API_KEY` or `q:include ./secrets.synx`
+ * pulled the host's environment and files into tool arguments (the Python
+ * twin parses statically and never did). Where the installed synx-format has
+ * `Synx.parseStatic` it is used; otherwise a document that asks for active
+ * mode is refused, and anything else is static by the parser's own rule.
+ *
  * @param {string} text
+ * @throws {Error} when the text asks for active mode and cannot be parsed statically
  */
 export function toolInputFromText(text) {
   const t = text.trim();
@@ -48,6 +58,10 @@ export function toolInputFromText(text) {
     } catch {
       /* fall through */
     }
+  }
+  if (typeof Synx.parseStatic === 'function') return Synx.parseStatic(t);
+  if (requestsActiveMode(t)) {
+    throw new Error('SYNX tool input must be static data: `!active` and `#!mode:` are not accepted');
   }
   return Synx.parse(t);
 }

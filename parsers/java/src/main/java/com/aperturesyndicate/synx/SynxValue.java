@@ -45,9 +45,15 @@ public sealed interface SynxValue {
         @Override public String typeName() { return "object"; }
     }
 
-    /** Redacted in JSON / stringify output as {@code [SECRET]}. */
+    /** Redacted in JSON / stringify output and in {@code toString()} as {@code [SECRET]}. */
     record Secret(String value) implements SynxValue {
         @Override public String typeName() { return "secret"; }
+
+        // safety: a record's generated toString() prints its components —
+        // `Secret[value=hunter2]` in every log line, exception message and
+        // string concatenation the value passes through. `value()` is the one
+        // way to the plaintext.
+        @Override public String toString() { return "[SECRET]"; }
     }
 
     // ─── factories ───────────────────────────────────────────────────────────

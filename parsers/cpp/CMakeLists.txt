@@ -17,7 +17,7 @@
 
 cmake_minimum_required(VERSION 3.16)
 project(synx-cpp
-    VERSION 3.8.0
+    VERSION 3.8.1
     DESCRIPTION "SYNX (Active Data Format) — native C++17 parser"
     LANGUAGES CXX)
 
@@ -57,6 +57,7 @@ set(SYNX_SOURCES
     src/parser.cpp
     src/engine.cpp
     src/engine_markers.cpp
+    src/pattern.cpp
     src/json_read.cpp
     src/calc.cpp
     src/json.cpp

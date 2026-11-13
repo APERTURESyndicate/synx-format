@@ -50,9 +50,35 @@ constexpr uint8_t TAG_OBJECT = 0x07;
 constexpr uint8_t TAG_SECRET = 0x08;
 
 /// A count read from the file can never exceed the bytes left (every element
-/// costs at least one); clamp reservations to that.
+/// costs at least one); clamp reservations to that, and to 1024.
+///
+/// safety: capped at the bytes that remain alone, an 8 KB file of zeros still
+/// reserved 128 MiB for a list it did not hold.
 size_t safe_capacity(uint64_t count, size_t remaining) noexcept {
-    return static_cast<size_t>(std::min<uint64_t>(count, remaining));
+    return static_cast<size_t>(std::min<uint64_t>(std::min<uint64_t>(count, remaining), 1024));
+}
+
+/// What one decoded value costs against kMaxDecodedBytes, text aside.
+constexpr uint64_t kDecodedValueCost = 64;
+/// What one string table entry costs, text aside.
+constexpr uint64_t kStringEntryCost = 16;
+
+/// What decoding has built so far, in bytes.
+///
+/// safety: a value is one byte on the wire and tens of bytes in memory, a
+/// string is stored once and referenced any number of times, and deflate
+/// shrinks a run of either a thousandfold — 171 bytes of file decoded to
+/// 2 GiB. The tree shares the payload's limit: every value at a fixed cost,
+/// plus the bytes of each text it uses.
+thread_local uint64_t t_decoded = 0;
+
+bool charge(uint64_t n, std::string& err) {
+    t_decoded += n;
+    if (t_decoded > kMaxDecodedBytes) {
+        err = "decoded document exceeds " + std::to_string(kMaxDecodedBytes) + " bytes \xE2\x80\x94 refusing to decode";
+        return false;
+    }
+    return true;
 }
 
 // ─── Varint (LEB128) / zigzag ───────────────────────────────────────────────
@@ -227,6 +253,7 @@ struct StringTableReader {
                 err = "unexpected end of data in string table";
                 return false;
             }
+            if (!charge(kStringEntryCost + slen, err)) return false;
             std::string str(reinterpret_cast<const char*>(data + pos), static_cast<size_t>(slen));
             if (!detail::valid_utf8(str)) {
                 err = "invalid UTF-8 in string table";
@@ -244,6 +271,7 @@ struct StringTableReader {
                 + std::to_string(strings.size()) + ")";
             return false;
         }
+        if (!charge(strings[static_cast<size_t>(idx)].size(), err)) return false;
         out = strings[static_cast<size_t>(idx)];
         return true;
     }
@@ -319,6 +347,7 @@ bool decode_value(const uint8_t* data, size_t len, size_t& pos, const StringTabl
         err = "nesting exceeds " + std::to_string(kMaxDecodeDepth) + " \xE2\x80\x94 refusing to decode";
         return false;
     }
+    if (!charge(kDecodedValueCost, err)) return false;
     if (pos >= len) {
         err = "unexpected end of data";
         return false;
@@ -479,7 +508,7 @@ bool decode_strings(const uint8_t* data, size_t len, size_t& pos, const StringTa
     out.reserve(safe_capacity(count, len - pos));
     for (uint64_t i = 0; i < count; ++i) {
         std::string s;
-        if (!st.read(data, len, pos, s, err)) return false;
+        if (!charge(kDecodedValueCost, err) || !st.read(data, len, pos, s, err)) return false;
         out.push_back(std::move(s));
     }
     return true;
@@ -530,13 +559,13 @@ bool decode_metadata(const uint8_t* data, size_t len, size_t& pos, const StringT
     if (!decode_varint(data, len, pos, outer, err)) return false;
     for (uint64_t i = 0; i < outer; ++i) {
         std::string path;
-        if (!st.read(data, len, pos, path, err)) return false;
+        if (!charge(kDecodedValueCost, err) || !st.read(data, len, pos, path, err)) return false;
         uint64_t inner = 0;
         if (!decode_varint(data, len, pos, inner, err)) return false;
         MetaMap mm;
         for (uint64_t j = 0; j < inner; ++j) {
             std::string field;
-            if (!st.read(data, len, pos, field, err)) return false;
+            if (!charge(kDecodedValueCost, err) || !st.read(data, len, pos, field, err)) return false;
             Meta m;
             if (!decode_meta(data, len, pos, st, m, err)) return false;
             mm.insert_or_assign(std::move(field), std::move(m));
@@ -561,7 +590,10 @@ bool decode_includes(const uint8_t* data, size_t len, size_t& pos, const StringT
     out.reserve(safe_capacity(count, len - pos));
     for (uint64_t i = 0; i < count; ++i) {
         std::string path, alias;
-        if (!st.read(data, len, pos, path, err) || !st.read(data, len, pos, alias, err)) return false;
+        if (!charge(kDecodedValueCost, err) || !st.read(data, len, pos, path, err)
+            || !st.read(data, len, pos, alias, err)) {
+            return false;
+        }
         out.push_back(IncludeDirective{std::move(path), std::move(alias)});
     }
     return true;
@@ -602,16 +634,34 @@ bool inflate_raw(const uint8_t* in, size_t in_len, size_t expected, std::vector<
     zs.next_in = const_cast<Bytef*>(in);
     zs.avail_in = static_cast<uInt>(in_len);
     // One byte past the declared size, so a longer stream is caught as a mismatch.
-    out.resize(expected + 1);
-    zs.next_out = out.data();
-    zs.avail_out = static_cast<uInt>(out.size());
-    int rc = inflate(&zs, Z_FINISH);
-    if (rc != Z_STREAM_END && !(rc == Z_BUF_ERROR && zs.avail_out == 0)) {
-        inflateEnd(&zs);
-        err = "decompression failed";
-        return false;
+    //
+    // safety: the buffer grows with what the stream produces. It was reserved
+    // from the declared size before a byte was inflated — 13 bytes of file
+    // declaring 256 MiB cost 256 MiB each.
+    const size_t limit = expected + 1;
+    out.clear();
+    out.reserve(std::min<size_t>(limit, 64 * 1024));
+    uint8_t chunk[16 * 1024];
+    int rc = Z_OK;
+    while (out.size() < limit) {
+        zs.next_out = chunk;
+        zs.avail_out = static_cast<uInt>(std::min<size_t>(sizeof(chunk), limit - out.size()));
+        const uInt room = zs.avail_out;
+        rc = inflate(&zs, Z_NO_FLUSH);
+        out.insert(out.end(), chunk, chunk + (room - zs.avail_out));
+        if (rc == Z_STREAM_END) break;
+        if (rc != Z_OK && !(rc == Z_BUF_ERROR && zs.avail_out == 0)) {
+            inflateEnd(&zs);
+            err = "decompression failed";
+            return false;
+        }
+        if (zs.avail_in == 0 && zs.avail_out != 0) {
+            // The input ended inside the stream.
+            inflateEnd(&zs);
+            err = "decompression failed";
+            return false;
+        }
     }
-    out.resize(zs.total_out);
     inflateEnd(&zs);
     return true;
 }
@@ -656,6 +706,7 @@ uint8_t synxb_flags(const ParseResult& result, bool resolved) noexcept {
 Result<ParseResult> decode_synxb_payload(uint8_t flags, const uint8_t* payload, size_t len) {
     std::string err;
     size_t pos = 0;
+    t_decoded = 0;
     StringTableReader st;
     if (!st.decode(payload, len, pos, err)) return Result<ParseResult>::from_error(std::move(err));
     ParseResult out;

@@ -140,7 +140,7 @@
       ]
     },
     "list-item": {
-      "match": "^(\\s*)(-)\\s+(.*?)(?:\\s+(//|#)(.*))?$",
+      "match": "^(\\s*)(-)\\s+((?:\\S|\\s+(?!\\s|//|#))*)(?:\\s+(//|#)(.*))?$",
       "captures": {
         "2": { "name": "keyword.operator.list.synx" },
         "3": {
@@ -155,7 +155,7 @@
     "level0-keys": {
       "patterns": [
         {
-          "match": "^([^\\s\\[:#/!\\-(][^\\s\\[:(]*)(\\(\\w+\\))?(\\[[^\\]]*\\])?((?::[a-zA-Z_]\\w*)+)\\s+(.*?)\\s*$",
+          "match": "^([^\\s\\[:#/!\\-(][^\\s\\[:(]*)(\\(\\w+\\))?(\\[[^\\]]*\\])?((?::[a-zA-Z_]\\w*)+)\\s+((?:\\S|\\s+(?=\\S))*)\\s*$",
           "captures": {
             "1": { "name": "keyword.control.property.level0.synx" },
             "2": { "name": "storage.type.cast.synx" },
@@ -165,7 +165,7 @@
           }
         },
         {
-          "match": "^([^\\s\\[:#/!\\-(][^\\s\\[:(]*)(\\(\\w+\\))(\\[[^\\]]*\\])?\\s+(.*?)\\s*$",
+          "match": "^([^\\s\\[:#/!\\-(][^\\s\\[:(]*)(\\(\\w+\\))(\\[[^\\]]*\\])?\\s+((?:\\S|\\s+(?=\\S))*)\\s*$",
           "captures": {
             "1": { "name": "keyword.control.property.level0.synx" },
             "2": { "name": "storage.type.cast.synx" },
@@ -174,7 +174,7 @@
           }
         },
         {
-          "match": "^([^\\s\\[:#/!\\-(][^\\s\\[:(]*)\\s+(.*?)\\s*$",
+          "match": "^([^\\s\\[:#/!\\-(][^\\s\\[:(]*)\\s+((?:\\S|\\s+(?=\\S))*)\\s*$",
           "captures": {
             "1": { "name": "keyword.control.property.level0.synx" },
             "2": { "patterns": [{ "include": "#values" }] }
@@ -189,7 +189,7 @@
     "level1-keys": {
       "patterns": [
         {
-          "match": "^( {2})([^\\s\\[:#/!\\-(][^\\s\\[:(]*)(\\(\\w+\\))?(\\[[^\\]]*\\])?((?::[a-zA-Z_]\\w*)+)\\s+(.*?)\\s*$",
+          "match": "^( {2})([^\\s\\[:#/!\\-(][^\\s\\[:(]*)(\\(\\w+\\))?(\\[[^\\]]*\\])?((?::[a-zA-Z_]\\w*)+)\\s+((?:\\S|\\s+(?=\\S))*)\\s*$",
           "captures": {
             "2": { "name": "entity.name.tag.level1.synx" },
             "3": { "name": "storage.type.cast.synx" },
@@ -199,7 +199,7 @@
           }
         },
         {
-          "match": "^( {2})([^\\s\\[:#/!\\-(][^\\s\\[:(]*)(\\(\\w+\\))(\\[[^\\]]*\\])?\\s+(.*?)\\s*$",
+          "match": "^( {2})([^\\s\\[:#/!\\-(][^\\s\\[:(]*)(\\(\\w+\\))(\\[[^\\]]*\\])?\\s+((?:\\S|\\s+(?=\\S))*)\\s*$",
           "captures": {
             "2": { "name": "entity.name.tag.level1.synx" },
             "3": { "name": "storage.type.cast.synx" },
@@ -208,7 +208,7 @@
           }
         },
         {
-          "match": "^( {2})([^\\s\\[:#/!\\-(][^\\s\\[:(]*)\\s+(.*?)\\s*$",
+          "match": "^( {2})([^\\s\\[:#/!\\-(][^\\s\\[:(]*)\\s+((?:\\S|\\s+(?=\\S))*)\\s*$",
           "captures": {
             "2": { "name": "support.type.property-name.level1.synx" },
             "3": { "patterns": [{ "include": "#values" }] }
@@ -223,7 +223,7 @@
     "level2-keys": {
       "patterns": [
         {
-          "match": "^( {4})([^\\s\\[:#/!\\-(][^\\s\\[:(]*)(\\(\\w+\\))?(\\[[^\\]]*\\])?((?::[a-zA-Z_]\\w*)+)\\s+(.*?)\\s*$",
+          "match": "^( {4})([^\\s\\[:#/!\\-(][^\\s\\[:(]*)(\\(\\w+\\))?(\\[[^\\]]*\\])?((?::[a-zA-Z_]\\w*)+)\\s+((?:\\S|\\s+(?=\\S))*)\\s*$",
           "captures": {
             "2": { "name": "entity.name.function.level2.synx" },
             "3": { "name": "storage.type.cast.synx" },
@@ -233,7 +233,7 @@
           }
         },
         {
-          "match": "^( {4})([^\\s\\[:#/!\\-(][^\\s\\[:(]*)(\\(\\w+\\))(\\[[^\\]]*\\])?\\s+(.*?)\\s*$",
+          "match": "^( {4})([^\\s\\[:#/!\\-(][^\\s\\[:(]*)(\\(\\w+\\))(\\[[^\\]]*\\])?\\s+((?:\\S|\\s+(?=\\S))*)\\s*$",
           "captures": {
             "2": { "name": "entity.name.function.level2.synx" },
             "3": { "name": "storage.type.cast.synx" },
@@ -242,7 +242,7 @@
           }
         },
         {
-          "match": "^( {4})([^\\s\\[:#/!\\-(][^\\s\\[:(]*)\\s+(.*?)\\s*$",
+          "match": "^( {4})([^\\s\\[:#/!\\-(][^\\s\\[:(]*)\\s+((?:\\S|\\s+(?=\\S))*)\\s*$",
           "captures": {
             "2": { "name": "support.type.property-name.level2.synx" },
             "3": { "patterns": [{ "include": "#values" }] }
@@ -257,7 +257,7 @@
     "level3plus-keys": {
       "patterns": [
         {
-          "match": "^( {6,})([^\\s\\[:#/!\\-(][^\\s\\[:(]*)(\\(\\w+\\))?(\\[[^\\]]*\\])?((?::[a-zA-Z_]\\w*)+)\\s+(.*?)\\s*$",
+          "match": "^( {6,})([^\\s\\[:#/!\\-(][^\\s\\[:(]*)(\\(\\w+\\))?(\\[[^\\]]*\\])?((?::[a-zA-Z_]\\w*)+)\\s+((?:\\S|\\s+(?=\\S))*)\\s*$",
           "captures": {
             "2": { "name": "variable.parameter.level3.synx" },
             "3": { "name": "storage.type.cast.synx" },
@@ -267,7 +267,7 @@
           }
         },
         {
-          "match": "^( {6,})([^\\s\\[:#/!\\-(][^\\s\\[:(]*)(\\(\\w+\\))(\\[[^\\]]*\\])?\\s+(.*?)\\s*$",
+          "match": "^( {6,})([^\\s\\[:#/!\\-(][^\\s\\[:(]*)(\\(\\w+\\))(\\[[^\\]]*\\])?\\s+((?:\\S|\\s+(?=\\S))*)\\s*$",
           "captures": {
             "2": { "name": "variable.parameter.level3.synx" },
             "3": { "name": "storage.type.cast.synx" },
@@ -276,7 +276,7 @@
           }
         },
         {
-          "match": "^( {6,})([^\\s\\[:#/!\\-(][^\\s\\[:(]*)\\s+(.*?)\\s*$",
+          "match": "^( {6,})([^\\s\\[:#/!\\-(][^\\s\\[:(]*)\\s+((?:\\S|\\s+(?=\\S))*)\\s*$",
           "captures": {
             "2": { "name": "support.type.property-name.level3.synx" },
             "3": { "patterns": [{ "include": "#values" }] }
@@ -309,7 +309,7 @@
       ]
     },
     "template-placeholder": {
-      "match": "\\{([^}]+)\\}",
+      "match": "\\{([^{}]+)\\}",
       "captures": {
         "0": { "name": "variable.other.placeholder.synx" }
       }
@@ -341,25 +341,24 @@
           "name": "keyword.operator.pipe.synx"
         },
         {
-          "match": "\\{[^}]+\\}",
+          "match": "\\{[^{}]+\\}",
           "name": "variable.other.placeholder.synx"
         },
         {
-          "match": "(.+?)\\s+(//|#)(.*)$",
+          "match": "(?<!\\s)\\s+(//|#)(.*)$",
           "captures": {
-            "1": { "patterns": [{ "include": "#values" }] },
-            "2": { "name": "punctuation.definition.comment.synx" },
-            "3": { "name": "comment.line.inline.synx" }
+            "1": { "name": "punctuation.definition.comment.synx" },
+            "2": { "name": "comment.line.inline.synx" }
           }
         },
         {
-          "match": ".+",
+          "match": "(?:\\S|(?<!\\s)\\s+(?!\\s|//|#))+",
           "name": "string.unquoted.synx"
         }
       ]
     },
     "inline-comment": {
-      "match": "\\s+(//|#)(.*)",
+      "match": "(?<!\\s)\\s+(//|#)(.*)",
       "captures": {
         "1": { "name": "punctuation.definition.comment.synx" },
         "2": { "name": "comment.line.inline.synx" }

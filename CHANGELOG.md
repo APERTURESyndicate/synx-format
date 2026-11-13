@@ -14,6 +14,314 @@ All notable changes to this repository are documented in this file.
 > for `3.7.0` was free, so npm and every other registry — plus the
 > git tag — now publish on the same version number.
 
+## [3.8.1] — 2026-11-13
+
+A hardening release that is also faster. Every implementation was attacked
+with hostile inputs, differential fuzzing (3.8.0 against 3.8.1, Rust against
+TypeScript and the native ports) and a compatibility check that parses every
+production config of the APERTURESyndicate platform and every balance file of
+Rebellion with 3.8.0 and 3.8.1. Static parsing, `to_json`, `stringify` and
+active resolution with the environment set give the same result on all of
+them; the two deliberate differences are listed under **Compatibility**.
+
+### Speed
+
+synx-core, 3.8.0 → 3.8.1: both versions in one process, timed in alternating
+rounds on one machine (Windows 11, system allocator), same inputs. The figure
+is the median change over nine rounds. `configs` is the 62 production configs
+of the APERTURESyndicate platform (394 KB, 27 of them `!active`), `balance`
+the 79 balance files of Rebellion (1.5 MB), `skills` the largest of them
+(169 KB), `locale` a 656 KB file of Cyrillic text.
+
+| Operation | configs | balance / skills | other |
+|---|---|---|---|
+| Parse | 2.40 → 2.07 ms **−14 %** | 5.51 → 4.88 ms **−14 %** · skills **−20 %** | locale **−22 %** |
+| Parse and resolve (`!active`) | 823 → 697 µs **−15 %** | — | every marker, 400 groups: **−17 %** |
+| Resolve alone | 252 → 199 µs **−22 %** | — | — |
+| `to_json` | 515 → 333 µs **−36 %** | skills **−32 %** | SYNXL records **−19 %** |
+| `stringify` | 1.05 → 0.58 ms **−44 %** | skills **−48 %** | — |
+| `.synxb` → tree | **−11 %** | skills **−7 %** | — |
+| `format`, text already formatted | **−31 %** | skills **−46 %** | — |
+
+- Where the time went: half of a parse is the allocator, so the work was in
+  what surrounds it — the line count before parsing is no longer a pass of
+  its own, an inline comment is found in one search instead of three, a
+  marker chain is not collected into a list first. In active mode a marker
+  reads and writes its key by position instead of looking it up by name five
+  or six times, a value from `:env` or `:default` is not copied before it
+  turns out to be a number, the secret pre-pass follows the declarations
+  instead of walking the document, and constraints by field name are
+  referenced, not copied. JSON strings are scanned eight bytes at a time.
+- **`format` checks its own result** (see *Writers*), and that has a price: a
+  document that is not yet in canonical form is parsed twice, and formatting
+  it takes 2.3–2.9 times as long as in 3.8.0, which did not check and lost
+  data. A document that is already formatted — a save in an editor,
+  `format --check` — is returned without being parsed at all and is faster
+  than in 3.8.0.
+- `decompile` of an `!active` `.synxb` is 12 % slower: it now writes the
+  declarations 3.8.0 dropped. Writing `.synxb`, reading SYNXL, `:split` and
+  `:inherit` are unchanged.
+- Inputs that took quadratic time in 3.8.0 take 74–99 % less (see *Parsing
+  and active mode*). A document nested to the 128-level limit parses 47 %
+  slower — the parser no longer keeps a raw pointer into the tree it builds;
+  at ordinary depth the parse is the faster one above.
+- TypeScript: a service that reads one config at start pays for loading the
+  package first. The package now loads three files instead of eight, and a
+  cold `Synx.parse` of a 5 KB config is 11 % (Bun) to 17 % (Node) faster than
+  3.8.0; a warm parse of text blocks is 83 % faster, of a large static config
+  24 %.
+
+### Security
+
+- **A secret could be read in the clear.**
+  - A key *above* a `:secret` key read its plain text — `leak:alias password`,
+    `{password}`, `:map:password`. Every value under `:secret` is now masked
+    before anything resolves, and gets its text back only for its own marker
+    chain. The same holds for the tree a `:secret:include` brings in, which
+    `{name:key}` read in the clear.
+  - `:secret` on the first key of a list item (`- token:secret abc`) was not
+    applied; the item's first key now carries its markers, constraints and
+    type hint like any other key.
+  - In synx-core, `Display`, `Debug`, `serde::Serialize` and
+    `value_to_json_value` print a secret as `[SECRET]`, and JSON Schema
+    validation messages no longer quote it. `[pattern]` and the other
+    constraints are checked against a secret's text, so a failing secret
+    reports an error instead of being printed by the next validator.
+  - `:secret` now applies after every marker that produces a value, so
+    `:secret:once` and a secret after `:split` stay secret in TypeScript too;
+    a list or group under `:secret` keeps its shape with every leaf masked.
+  - Java, .NET and Go no longer print a secret through `toString`,
+    `ToString`, `fmt` or JSON.
+  - `child:inherit base` printed every field of a `base:secret` group in the
+    clear: the copies were taken before the group was masked. A field
+    inherited from a group under `:secret` is now a secret itself — masked
+    before any key can read it, resolved by its own markers, masked again.
+  - `:spam` under `:secret` named the value in its error
+    (`SPAM_ERR: '<value>' exceeded …`) from the second time a process resolved
+    the document; in synx-core the error now says `'[SECRET]'`, and `{:?}` of
+    a parse result no longer prints the default of a secret
+    (`:secret:default:<value>`).
+- **Signatures.** Package signatures are checked with `verify_strict`: a
+  signature built on a small-order key passed verification for unrelated
+  archives. `hex` parsing accepts only pairs of hexadecimal digits and no
+  longer panics on non-ASCII input.
+- **Files.** A missing file with `..` in its path is a path-traversal error on
+  every OS, and `C:relative` paths on Windows are refused as leaving the base
+  folder. Read errors no longer carry the operating system's text or the
+  host's absolute path: `file not found`, `not a file`, `permission denied`,
+  `file is not valid UTF-8`, `cannot read file`. A file that is not valid
+  UTF-8 is refused instead of being read with U+FFFD.
+- **`.synx.lock`.** In synx-core, `:once` no longer follows a `.synx.lock`
+  that is a symbolic link: it appended `<key> <value>` lines — the key chosen
+  by the document — to whatever file the link named, and read that file's
+  lines back as values. Such a lock is left alone and the values of the
+  resolve are kept in memory only.
+
+### Limits
+
+Each limit returns an error value at a position; none panics, overflows the
+stack or allocates past it.
+
+- Markers may add at most **64 MiB** to a document per `resolve` — copies made
+  by `:alias`, `:ref`, `:spam` and `:inherit` (fields and their declarations),
+  `{interpolation}`, `:replace`, `:join`, `:format` and `:prompt`. Past it the
+  marker gives `LIMIT_ERR: resolution budget exceeded`. 413 bytes of templates
+  used to grow to 503 MiB. Once the budget is spent every further copy is
+  refused at once — each `:alias` of a large group used to be measured in
+  full first, so 96 000 of them took 25 s — and a copy that fits neither the
+  budget nor the depth limit below is a `LIMIT_ERR`.
+- A `resolve` reads at most **1024 documents and 64 MiB** through `:include`,
+  `!include`, `!use` and `:watch`; an include cycle is
+  `INCLUDE_ERR: circular include: '<path>'`.
+- A value placed by a marker cannot sit deeper than **512** levels
+  (`NESTING_ERR`).
+- A `.synxb` file decodes into at most **192 MiB** of tree, charged before
+  anything is reserved; a count the rest of the file cannot hold is refused at
+  once. A 16 KB file used to take 0.8 GiB.
+- Declaration paths of one active document are capped at 64 MiB; a document
+  cut there, or by the list-item cap, sets `truncated`.
+- `.synx.lock` (`:once`) is read once and written once per `resolve`, and it
+  is appended to, so processes resolving at the same time no longer erase
+  each other's values.
+
+### Parsing and active mode
+
+- **List items after a nested list were lost.** `- name a` / `  tags` /
+  `    - x` / `- name b` gave one item with `b`'s keys merged into it; open
+  lists are now tracked as a stack and every item is kept.
+- A comment between a key and its first `- ` item no longer turns the list
+  into `{}`.
+- Numbers from outside — `:env`, `:default`, `:split`, `:map`, `:sum` — are
+  numbers only when finite: `inf`, `nan`, `1e999` stay text. `[min]` / `[max]`
+  take finite decimal bounds only.
+- `:round` no longer invents an integer: a result outside the 64-bit range,
+  `nan` or `inf` stays a float. Halves round away from zero in synx-core and
+  TypeScript alike.
+- `:sort` orders numbers by value, then everything else by text, stably;
+  `:random` weights are plain decimals only; `:calc` returns `0` for `-0`.
+- An unset `:secret:env` is `null`, not a secret holding the text `null`;
+  with `[required]` it is `CONSTRAINT_ERR: '<key>' is required`, as is an
+  empty string or group.
+- Under `:secret`, a value from `:env` or `:default` keeps its text:
+  `00123` stays `00123` instead of becoming `123`.
+- `[pattern]` uses one dialect everywhere — the Rust `regex` crate with its
+  Unicode classes (`\d \w \s \b`, `(?i)`, `\p{L}`). synx-core enabled the
+  Unicode features only when another crate happened to; TypeScript now runs
+  its own linear-time matcher, so `^(a|aa)+$` no longer hangs, and .NET uses
+  `RegexOptions.NonBacktracking`. The TypeScript reader follows the crate's
+  syntax step for step: the whole case-folding orbit under `(?i)` (`ſ` is an
+  `s`), the ASCII world of `(?-u)`, `(?x)`, `(?R)`, POSIX classes, nested
+  classes with `&&`, `--`, `~~`, `{start}`, loose property names — and
+  refuses what the crate refuses, including a pattern over the crate's size
+  limit (`^\w{300}$`), which this reader used to check.
+- Several inputs took quadratic time in synx-core and are now linear: a long
+  key above many groups, a group redeclared many times, `{` without `}`,
+  `:calc` next to a key with a dash, `:inherit` over declared fields.
+
+### Writers: `format`, `stringify`, `.synxb`
+
+- **`format` rewrote data.** A list of objects became an object (three
+  Rebellion balance files among them), and an `!active` document had its keys
+  sorted, which changes the order markers resolve in. `format` now keeps key
+  order in active documents, keeps every list, and returns the input
+  unchanged if its output would read back differently. Static documents are
+  formatted as before.
+- `stringify` and `decompile` wrote keys as they came, so a key containing a
+  line break could add an `!active` or `!include` line to the output. A key
+  that SYNX cannot write back — with a space, `:`, `[`, `(`, a control
+  character, a leading `-` or `#`, or equal to a directive — is written with
+  `_` in place of each such character, and `_2`, `_3` when that name is
+  taken; no key is lost or merged. A line break inside a list item is
+  written as a space. In synx-core, the keys a reader refuses —
+  `constructor`, `prototype`, `__proto__` — get a `_` after them; written as
+  they were, they were dropped on the next read with everything under them.
+  A value that begins with `#` or `//` is no longer put on the `- ` line of a
+  list item, where it read as a comment.
+- synx-core's `decompile` refuses a `.synxb` file whose root is not an object. `compile`
+  never writes one; a root that was a string came back as that string — a
+  document of its author's choosing, `!active` and `!include` lines included,
+  out of a file flagged static.
+- `decompile` of an unresolved `.synxb` writes the declarations back
+  (`port:env:default:8080 PORT`, `[required]`, `!include`) in document order;
+  3.8.0 kept `!active` and dropped every marker. A key declared on one line and
+  given its value on a later one (`x(int)` / `x h`) is written the same way
+  instead of as `x(int) h`, which read back as `0`. A resolved file is written
+  as a static document.
+- A `.synxb` file of an active document stores objects and declarations in
+  document order. Older readers read it unchanged.
+- SYNXL writers refuse a block key or field that would not read back, a list
+  item with a line break, and a list directly inside a list; a secret in an
+  inline cell is written as `[SECRET]`.
+
+### API additions (synx-core)
+
+- `Synx::compile_with(text, resolved, &Options)` resolves under the given
+  environment and base folder; `Synx::compile` still uses the process
+  environment.
+- `resolve_read_only(result, options)` resolves without creating or changing
+  `.synx.lock`.
+- `RUNTIME_ERROR_PREFIXES` lists the error prefixes the engine writes into
+  values.
+
+### TypeScript
+
+- Keys named like `Object.prototype` members (`valueOf`, `constructor`,
+  `__proto__`) no longer crash `Synx.parse` or leak into neighbours; a document
+  key `__synx` no longer replaces the engine's declarations.
+- A non-string argument to `parse`, `format`, `compile` and the other entry
+  points throws `SynxError: INPUT_ERR` instead of `TypeError`; `Buffer` and
+  `Uint8Array` are read as UTF-8.
+- `:format` follows synx-core (width and precision limits, `%i`, `%e`, exact
+  rounding); an included `!active` document resolves from its own root;
+  `strict` also stops on `TYPE_ERR`, `LIMIT_ERR` and `WASM_ERR`.
+- `toYAML` / `toTOML` handle integers beyond 2^53 and print a secret as
+  `[SECRET]`; the browser build's `stringify` uses the shared writer.
+- SYNXL: line numbers, `###` closing, empty `()` hints, `!fields :` and
+  `bigint` bounds follow synx-core.
+- A float with a whole value (`8080.0`) is a float for `[type:int]` and the
+  type registry, as in synx-core.
+
+### Tools and bindings
+
+- **CLI packages.** `synx pack` / `publish` pack only `src/` (or the listed
+  `files`), never follow links, skip credential files and VCS folders, and
+  refuse `..` and absolute paths; `publish` refuses a literal `:secret` value
+  unless `--allow-secret-literals` is given. `install` / `uninstall` validate
+  package names, install through a staging folder, pin the archive hash and
+  the publisher key in `synx.lock`, and unpack with path, size and entry-count
+  limits. `update` stays within the locked major version.
+- **CLI.** `synx format` refuses to write output that reads back differently;
+  `synx validate --strict` checks the whole tree, so nested `CONSTRAINT_ERR`s
+  now fail it; the stdin spool of `synx synxl -` is a private file removed on
+  every exit.
+- **MCP server.** Paths are judged by their real target, so a junction inside
+  the root cannot lead out; credential files and `.git` / `.ssh` are refused
+  by default; the child `synx` gets a minimal environment; literal secrets
+  are masked on read.
+- **AI adapter.** Text written by a model is parsed statically — `!active`
+  cannot read the server's environment or files.
+- **Language server.** No longer crashes on non-ASCII columns, understands
+  bracketed constraints and marker arguments, and stays fast on 200 000 keys.
+- **C ABI.** `synx_is_synxb` returns `int` and `synx_compile` takes an `int`,
+  matching `synx.h`; `synx_free_bytes` frees what `synx_compile` returned
+  without undefined behaviour; new `synx_parse_active_ex` /
+  `synx_parse_tool_ex` take the environment and base folder; a panic returns
+  `NULL` instead of ending the host. Kotlin gains `parseActive(text, env,
+  basePath)`.
+- **Python.** Hex input with non-ASCII characters raises `ValueError` instead
+  of panicking.
+- **Editor grammars.** VS Code and Sublime Text no longer take cubic time on a
+  line with a long run of spaces.
+
+### Native ports
+
+- Java, .NET and Go: `:calc` no longer recurses (a deep expression overflowed
+  the stack), include cycles are refused, the 1024-document include budget
+  applies, an unset `:secret:env` is `null`, read errors no longer show the
+  host's path, and a 13-byte `.synxb` no longer reserves gigabytes.
+- .NET and Go also refuse `!use` cycles, apply the 64 MiB read budget and the
+  `.synxb` tree budget, and follow the active-mode and list rules above; .NET
+  judges paths by their real target (junctions, symlinks) and checks
+  `[pattern]` in linear time.
+- Dart, C++ and Swift follow the parsing, secret, budget and include rules
+  above as well. Dart and C++ check `[pattern]` with a linear-time matcher of
+  their own in the dialect of the Rust `regex` crate — `^(a|aa)+$` used to
+  hang both — and no longer overflow the stack on a deep `:calc`.
+
+### Compatibility
+
+- **An unset `:secret:env` is `null`** (or `CONSTRAINT_ERR` with
+  `[required]`) instead of a secret whose text is `null`. A check such as
+  `if (config.smtp.pass)` used to see a truthy value for an unset variable.
+- **`format` output differs** for `!active` documents (keys keep their order)
+  and for documents whose lists 3.8.0 damaged.
+- `.synxb` of active documents and `decompile` text differ as described
+  above; static and resolved `.synxb` files are byte-for-byte as in 3.8.0.
+- A field inherited from a group under `:secret` is a secret. In synx-core,
+  `decompile` returns an error for a `.synxb` file whose root is not an
+  object, and the writers put `constructor`, `prototype` and `__proto__` out
+  as `constructor_`, `prototype_` and `__proto___`.
+
+### Known limitations
+
+- `stringify` cannot write an empty object as the last field of a list item
+  followed by another item, a list inside a list, or an empty object as a list
+  item: SYNX text has no form for them, and they read back as `[]` or `{}`.
+- For the same reason `stringify` does not keep a string that begins or ends
+  with a line break, or has an empty line, a carriage return or a space at the
+  end of a line in it (the `|+` block drops them), nor a list item that
+  contains ` #` or ` //` (it is cut there as a comment).
+- A line with a key under a key marked `:join`, `:random`, `:unique` or `:geo`
+  is read as a key of the parent, as in 3.8.0.
+- A `[pattern]` the dialect cannot compile is still not checked, as in 3.8.0.
+  That includes a pattern whose automaton passes the `regex` crate's 10 MiB
+  limit: `\w{210}` or `.{10486}` are not checked by any implementation.
+- A pattern just under that limit is slow against a long value in every
+  implementation: `[a-z]{100000}\d` against 128 KB takes synx-core 40 s.
+- `stringify` in TypeScript still writes the keys `constructor`, `prototype`
+  and `__proto__` as they are, and the reader drops them; synx-core renames
+  them.
+
 ## [3.8.0] — 2026-10-17
 
 A speed and parity release. Every parser path was measured against 3.7.4 on

@@ -110,7 +110,7 @@ const xml = packForLlm(data, {
 import { toolResultSynxBody, toolInputFromText } from '@aperturesyndicate/synx-format-adapter/anthropic';
 
 const text = toolResultSynxBody({ rows, meta });
-const args = toolInputFromText(rawString); // JSON first, else Synx.parse
+const args = toolInputFromText(rawString); // JSON first, else SYNX as static data: `!active` is refused, markers stay inert
 ```
 
 Peer: `@aperturesyndicate/synx-format`.

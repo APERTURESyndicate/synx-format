@@ -1,0 +1,52 @@
+# Adversarial harness for synx-core: one worker binary that the drivers in
+# tests/adversarial/ talk to over newline-delimited JSON.
+#
+# A workspace of its own, so it never joins the release build and can pick its
+# own profiles. Build:
+#   cargo build --release --manifest-path fuzz/Cargo.toml
+#   cargo build --profile checked --manifest-path fuzz/Cargo.toml
+[package]
+name = "synx-adversarial"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[[bin]]
+name = "advharness"
+path = "src/main.rs"
+
+[dependencies]
+synx-core = { path = "../crates/synx-core", features = ["serde", "signing"] }
+serde_json = "1"
+miniz_oxide = "0.8"
+# The crate and features synx-core checks `[pattern:…]` with: the `regex`
+# operation compares it with the TypeScript linear matcher directly.
+regex = { version = "1", default-features = false, features = ["std", "perf", "unicode"] }
+
+# tests/pkg_unpack.rs builds the CLI's archive guard (crates/synx-cli/src/pkg_guard.rs) on its own.
+[dev-dependencies]
+tar = "0.4"
+flate2 = "1"
+
+[features]
+default = []
+# Heavier surfaces, off by default to keep the edit-build-run loop short.
+jsonschema = ["synx-core/jsonschema"]
+wasm = ["synx-core/wasm"]
+
+# Same optimisation level as the shipped crates, without the LTO link time.
+[profile.release]
+opt-level = 3
+lto = false
+codegen-units = 16
+debug = 1
+
+# Optimised, but arithmetic overflow and debug assertions still trap: a wrap
+# that `release` hides is reported as a panic here.
+[profile.checked]
+inherits = "release"
+opt-level = 1
+overflow-checks = true
+debug-assertions = true
+
+[workspace]

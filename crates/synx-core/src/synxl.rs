@@ -37,6 +37,9 @@ pub const SYNXL_VERSION: u32 = 1;
 /// multi-gigabyte dataset (§11.1).
 pub const MAX_SYNXL_RECORD_BYTES: usize = 16 * 1024 * 1024;
 
+/// A field list longer than this keeps an index of its names.
+const FIELD_INDEX_FROM: usize = 32;
+
 /// Fields per field list. Exceeding it is a hard error.
 pub const MAX_SYNXL_FIELDS: usize = 4_096;
 
@@ -110,6 +113,9 @@ pub struct FieldList {
     fields: Vec<FieldDecl>,
     arity: usize,
     source: String,
+    /// Position of each field by name (the first, should a name repeat);
+    /// empty for a list of at most `FIELD_INDEX_FROM` fields.
+    index: HashMap<String, usize>,
     /// 1-based source line of the `!fields` line (0 when synthesised).
     pub line: usize,
 }
@@ -121,7 +127,15 @@ impl FieldList {
     /// names and the other §11.1 conditions while reading the `!fields` line.
     pub fn new(fields: Vec<FieldDecl>) -> Self {
         let arity = fields.iter().filter(|f| !f.block).count();
-        Self { fields, arity, source: String::new(), line: 0 }
+        // A short list is scanned faster than it is hashed.
+        let mut index = HashMap::new();
+        if fields.len() > FIELD_INDEX_FROM {
+            index.reserve(fields.len());
+            for (i, field) in fields.iter().enumerate() {
+                index.entry(field.name.clone()).or_insert(i);
+            }
+        }
+        Self { fields, arity, source: String::new(), index, line: 0 }
     }
 
     /// The `!fields` line exactly as it appeared in the document, trimmed of
@@ -148,8 +162,14 @@ impl FieldList {
     }
 
     /// Look a declaration up by exact name.
+    ///
+    /// perf: by index. A scan of the list for every block key made one record
+    /// with many keys cost keys × fields.
     pub fn get(&self, name: &str) -> Option<&FieldDecl> {
-        self.fields.iter().find(|f| f.name == name)
+        if self.fields.len() <= FIELD_INDEX_FROM {
+            return self.fields.iter().find(|f| f.name == name);
+        }
+        self.index.get(name).map(|i| &self.fields[*i])
     }
 }
 
@@ -392,12 +412,7 @@ impl SynxlDocument {
 pub fn records_to_json_array(records: &[Value]) -> String {
     let mut out = String::with_capacity(records.len() * 64 + 2);
     out.push('[');
-    for (i, rec) in records.iter().enumerate() {
-        if i > 0 {
-            out.push(',');
-        }
-        crate::write_json(&mut out, rec);
-    }
+    crate::write_json_each(&mut out, records, ",", "");
     out.push(']');
     out
 }
@@ -406,10 +421,7 @@ pub fn records_to_json_array(records: &[Value]) -> String {
 /// per line, `LF`-separated, no enclosing array.
 pub fn records_to_ndjson(records: &[Value]) -> String {
     let mut out = String::with_capacity(records.len() * 64);
-    for rec in records {
-        crate::write_json(&mut out, rec);
-        out.push('\n');
-    }
+    crate::write_json_each(&mut out, records, "", "\n");
     out
 }
 
@@ -1305,6 +1317,8 @@ pub struct SynxlStreamReader<R: std::io::BufRead> {
     /// Blank lines seen inside a block, held back until content follows so a
     /// trailing run of them stays out of the block (§9.1).
     deferred: String,
+    /// Bytes of such lines that no longer fit the record and were not kept.
+    deferred_dropped: usize,
     done: bool,
 }
 
@@ -1328,6 +1342,7 @@ impl<R: std::io::BufRead> SynxlStreamReader<R> {
             record: String::new(),
             block: String::new(),
             deferred: String::new(),
+            deferred_dropped: 0,
             done: false,
         };
         reader.read_prologue()?;
@@ -1464,6 +1479,7 @@ impl<R: std::io::BufRead> SynxlStreamReader<R> {
             let mut total = self.record.len() + self.cur_dropped;
             self.block.clear();
             self.deferred.clear();
+            self.deferred_dropped = 0;
             let mut block_first_no = 0usize;
 
             // §9.1 — the block runs to the next non-empty line at indent 0.
@@ -1475,9 +1491,19 @@ impl<R: std::io::BufRead> SynxlStreamReader<R> {
                     // §3.5 — blank lines never terminate a block, but a
                     // trailing run of them is not part of it either, so they
                     // wait here until content proves they were interior.
+                    // safety: held only while they still fit the record. A
+                    // block followed by an endless run of whitespace lines
+                    // grew this buffer without bound — in the reader whose
+                    // purpose is bounded memory.
                     if !self.block.is_empty() {
-                        self.deferred.push('\n');
-                        self.deferred.push_str(&self.cur);
+                        let add = 1 + self.cur.len();
+                        let held = self.record.len() + self.block.len() + self.deferred.len();
+                        if self.deferred_dropped == 0 && held + add <= MAX_SYNXL_RECORD_BYTES {
+                            self.deferred.push('\n');
+                            self.deferred.push_str(&self.cur);
+                        } else {
+                            self.deferred_dropped += add + self.cur_dropped;
+                        }
                     }
                     continue;
                 }
@@ -1489,12 +1515,11 @@ impl<R: std::io::BufRead> SynxlStreamReader<R> {
                     block_first_no = self.cur_no;
                 }
                 let sep = usize::from(!self.block.is_empty());
-                total += self.deferred.len() + sep + self.cur.len() + self.cur_dropped;
-                // Cut at exactly the offset the in-memory readers cut at, so
-                // the two paths agree byte-for-byte on a truncated record.
-                let room = (MAX_SYNXL_RECORD_BYTES + self.deferred.len())
-                    .saturating_sub(self.record.len() + self.block.len());
-                if room > self.deferred.len() + sep {
+                total += self.deferred.len() + self.deferred_dropped + sep + self.cur.len() + self.cur_dropped;
+                // Cut where the in-memory readers cut: the record line and the
+                // block, blank lines inside it included, share one budget.
+                let room = MAX_SYNXL_RECORD_BYTES.saturating_sub(self.record.len() + self.block.len());
+                if self.deferred_dropped == 0 && room > self.deferred.len() + sep {
                     let budget = room - self.deferred.len() - sep;
                     self.block.push_str(&self.deferred);
                     if sep == 1 {
@@ -1504,6 +1529,7 @@ impl<R: std::io::BufRead> SynxlStreamReader<R> {
                     self.block.push_str(&self.cur[..piece_len]);
                 }
                 self.deferred.clear();
+                self.deferred_dropped = 0;
             }
 
             let truncated_total = if total > MAX_SYNXL_RECORD_BYTES { Some(total) } else { None };
@@ -1718,6 +1744,9 @@ fn parse_field_list(rest: &str, source: &str, line: usize) -> Result<FieldList, 
     }
 
     let mut fields: Vec<FieldDecl> = Vec::new();
+    // perf: 300 lists of 4 096 fields spent 2.8 s comparing every name with
+    // every name before it.
+    let mut seen: HashSet<String> = HashSet::new();
     for decl in rest.split(';') {
         let decl = decl.trim();
         if decl.is_empty() {
@@ -1736,7 +1765,7 @@ fn parse_field_list(rest: &str, source: &str, line: usize) -> Result<FieldList, 
         }
         let field = parse_field_decl(decl, line)?;
         // §5.1 — duplicates are rejected rather than resolved.
-        if fields.iter().any(|f| f.name == field.name) {
+        if !seen.insert(field.name.clone()) {
             return Err(SynxlError::new(
                 SynxlErrorKind::DuplicateField,
                 line,
@@ -2258,8 +2287,70 @@ fn validate_writable_fields(fields: &[FieldDecl]) -> Result<(), SynxlError> {
                 format!("field name `{}` is declared twice (§5.1.4)", elide(name)),
             ));
         }
+        // safety: the hint, the type and the constraint values are written
+        // into the `!fields` line as they are. A line break in one starts new
+        // lines — a `type` of `int)\n!fields evil\n42\n!fields a(int` wrote a
+        // record of its own — and a `;` starts a new field.
+        let breaks = |text: &str, also: &[char]| text.chars().any(|c| c.is_control() || c == ';' || also.contains(&c));
+        let c = &field.constraints;
+        let bad = field.type_hint.as_deref().is_some_and(|t| breaks(t, &[')']))
+            || c.type_name.as_deref().is_some_and(|t| breaks(t, &[']', ',']))
+            || c.pattern.as_deref().is_some_and(|p| breaks(p, &[]))
+            || c.enum_values.iter().flatten().any(|e| breaks(e, &[]));
+        if bad {
+            return Err(SynxlError::new(
+                SynxlErrorKind::Unwritable,
+                0,
+                format!(
+                    "field `{}` has a type or constraint with a line break, `;` or a closing bracket in it; it would read back as a different schema",
+                    elide(name)
+                ),
+            ));
+        }
     }
     Ok(())
+}
+
+/// §14.3 — a block value that has no rendering: a key that is not a SYNX
+/// key, a list item with a line break in it, or a list directly inside a list. Written anyway, each
+/// reads back as something else, and a line break puts text at the start of
+/// a line — where a reader takes it for the next record.
+fn unwritable_in_block(value: &Value, depth: usize) -> Option<&'static str> {
+    if depth > MAX_WRITE_DEPTH {
+        return None;
+    }
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                // spec: SYNXL §9.4 — inside a block a `!…` line is dropped.
+                if !key_reads_back(key) || key.starts_with('!') {
+                    return Some("a key would not read back as the same key");
+                }
+                if let Some(why) = unwritable_in_block(child, depth + 1) {
+                    return Some(why);
+                }
+            }
+            None
+        }
+        Value::Array(items) => {
+            for item in items {
+                match item {
+                    Value::Array(_) => return Some("a list holds a list directly"),
+                    Value::String(s) | Value::Secret(s) if s.contains('\n') || s.contains('\r') => {
+                        return Some("a list item contains a line break")
+                    }
+                    Value::Object(_) => {
+                        if let Some(why) = unwritable_in_block(item, depth + 1) {
+                            return Some(why);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+        _ => None,
+    }
 }
 fn write_group(
     out: &mut String,
@@ -2364,7 +2455,21 @@ fn write_group(
                 // §9.2 — an absent block field needs no lines at all.
                 _ => continue,
             };
-            write_synx_entry(out, &field.name, value, 2, 0);
+            if let Some(why) = unwritable_in_block(value, 0) {
+                return Err(SynxlError::new(
+                    SynxlErrorKind::Unwritable,
+                    0,
+                    format!("field `{}`: {}; the value has no SYNXL rendering (§14.3)", elide(&field.name), why),
+                ));
+            }
+            if !key_reads_back(&field.name) || field.name.starts_with('!') {
+                return Err(SynxlError::new(
+                    SynxlErrorKind::Unwritable,
+                    0,
+                    format!("block field `{}` is not a key a block can open with (§9.1)", elide(&field.name)),
+                ));
+            }
+            write_named_entry(out, &field.name, value, 2, 0);
         }
     }
     Ok(())
@@ -2437,7 +2542,9 @@ fn needs_block(value: &Value, hint: Option<&str>) -> bool {
     match value {
         // Structure has no inline form at all.
         Value::Object(_) | Value::Array(_) => true,
-        Value::String(s) | Value::Secret(s) => {
+        // A secret is written as its mask, which is one plain word.
+        Value::Secret(_) => false,
+        Value::String(s) => {
             s.contains('\n')
                 || s.contains('\r')
                 // Quoting has no escapes (§7.4/§16.5), so a value that needs
@@ -2543,7 +2650,19 @@ fn write_inline(out: &mut String, value: &Value, hint: Option<&str>) {
             out.push_str(buf.format(*n));
         }
         Value::Float(f) => write_float(out, *f),
-        Value::String(s) | Value::Secret(s) => {
+        // safety: masked, as in the block writer and `to_json`. An inline
+        // column used to carry the secret itself into the written dataset.
+        Value::Secret(_) => {
+            let mask = "[SECRET]";
+            if inline_needs_quote(mask, hint) {
+                out.push('"');
+                out.push_str(mask);
+                out.push('"');
+            } else {
+                out.push_str(mask);
+            }
+        }
+        Value::String(s) => {
             if inline_needs_quote(s, hint) {
                 match pick_quote(s) {
                     Some(q) => {
@@ -2603,8 +2722,75 @@ fn trim_float(f: f64) -> String {
 
 // ─── §14 Block serialization (SYNX subset) ───────────────────
 
-/// Write `key: value` as SYNX at `indent` columns.
-pub(crate) fn write_synx_entry(out: &mut String, key: &str, value: &Value, indent: usize, depth: usize) {
+/// Write the entries of one object at `indent` columns, sorted by key.
+pub(crate) fn write_synx_object(out: &mut String, map: &Map, indent: usize, depth: usize) {
+    let names = KeyNames::of(map);
+    let order = KeyOrder::of(map);
+    for at in order.positions() {
+        if let Some((key, value)) = map.get_index(at) {
+            write_named_entry(out, names.name(key), value, indent, depth);
+        }
+    }
+}
+
+/// The positions of an object's keys in the order the writers put them out:
+/// sorted by key.
+///
+/// perf: an object of a few keys — nearly every one — is ordered in place on
+/// the stack. Each used to collect its entries into a vector to sort them.
+enum KeyOrder {
+    Small([u8; KeyOrder::SMALL], usize),
+    Large(Vec<usize>),
+}
+
+impl KeyOrder {
+    const SMALL: usize = 16;
+
+    fn of(map: &Map) -> Self {
+        let key = |at: usize| map.get_index(at).map_or("", |(k, _)| k.as_str());
+        if map.len() > Self::SMALL {
+            let mut order: Vec<usize> = (0..map.len()).collect();
+            // Keys are distinct, so any sort gives the one order.
+            order.sort_unstable_by(|a, b| key(*a).cmp(key(*b)));
+            return KeyOrder::Large(order);
+        }
+        let mut order = [0u8; Self::SMALL];
+        for (at, slot) in order.iter_mut().enumerate().take(map.len()) {
+            *slot = at as u8;
+        }
+        for sorted in 1..map.len() {
+            let mut at = sorted;
+            while at > 0 && key(order[at - 1] as usize) > key(order[at] as usize) {
+                order.swap(at - 1, at);
+                at -= 1;
+            }
+        }
+        KeyOrder::Small(order, map.len())
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            KeyOrder::Small(_, len) => *len,
+            KeyOrder::Large(order) => order.len(),
+        }
+    }
+
+    /// The position of the `n`-th key in sorted order.
+    fn at(&self, n: usize) -> Option<usize> {
+        match self {
+            KeyOrder::Small(order, len) => (n < *len).then(|| order[n] as usize),
+            KeyOrder::Large(order) => order.get(n).copied(),
+        }
+    }
+
+    fn positions(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..self.len()).filter_map(move |n| self.at(n))
+    }
+}
+
+/// Write `key value` as SYNX at `indent` columns. `key` is the name as it
+/// goes on the line (`KeyNames`).
+fn write_named_entry(out: &mut String, key: &str, value: &Value, indent: usize, depth: usize) {
     if depth > MAX_WRITE_DEPTH {
         return;
     }
@@ -2613,11 +2799,7 @@ pub(crate) fn write_synx_entry(out: &mut String, key: &str, value: &Value, inden
             push_indent(out, indent);
             out.push_str(key);
             out.push('\n');
-            let mut keys: Vec<&String> = map.keys().collect();
-            keys.sort_unstable();
-            for k in keys {
-                write_synx_entry(out, k, &map[k], indent + 2, depth + 1);
-            }
+            write_synx_object(out, map, indent + 2, depth + 1);
         }
         Value::Array(items) => {
             push_indent(out, indent);
@@ -2632,25 +2814,434 @@ pub(crate) fn write_synx_entry(out: &mut String, key: &str, value: &Value, inden
                 write_synx_item(out, item, indent + 2, depth + 1);
             }
         }
-        Value::String(s) if s.contains('\n') => write_synx_multiline(out, key, s, indent),
         _ => {
-            let scalar = synx_scalar(value);
-            match scalar {
+            // perf: the value is written where it goes. It used to be built
+            // as a string of its own first — one allocation per scalar.
+            let line = out.len();
+            push_indent(out, indent);
+            out.push_str(key);
+            out.push(' ');
+            if push_scalar(out, value) {
+                out.push('\n');
+            } else {
+                // Not representable as a single SYNX token (a line break, or
+                // ` #` / ` //` in it) — fall back to an indent-preserving
+                // block, whose body is never comment-stripped nor cast.
+                out.truncate(line);
+                write_synx_multiline(out, key, value.as_str().unwrap_or_default(), indent);
+            }
+        }
+    }
+}
+
+/// Write an `!active` document with the declarations it carries: every key
+/// as `key(type)[constraints]:markers value`, in the order the tree has —
+/// the order its markers resolve in.
+pub(crate) fn write_synx_declared(out: &mut String, root: &Value, metadata: &Map<crate::value::MetaMap>) {
+    if let Value::Object(map) = root {
+        let mut path = String::new();
+        write_declared_object(out, map, metadata, &mut path, 0, 0);
+    }
+}
+
+fn write_declared_object(
+    out: &mut String,
+    map: &Map,
+    metadata: &Map<crate::value::MetaMap>,
+    path: &mut String,
+    indent: usize,
+    depth: usize,
+) {
+    if depth > MAX_WRITE_DEPTH {
+        return;
+    }
+    // The declarations of this object are looked up once; `path` is reused below.
+    let declared: Vec<Option<&crate::value::Meta>> = {
+        let mm = metadata.get(path.as_str());
+        map.keys().map(|k| mm.and_then(|m| m.get(k.as_str()))).collect()
+    };
+    let names = KeyNames::of(map);
+    for ((key, value), meta) in map.iter().zip(declared) {
+        write_declared_entry(out, key, names.name(key), meta, value, metadata, path, indent, depth);
+    }
+}
+
+/// `name(type)[constraints]:markers` as the parser reads it back.
+fn declared_header(name: &str, meta: Option<&crate::value::Meta>) -> String {
+    let mut header = name.to_string();
+    let Some(meta) = meta else { return header };
+    if let Some(hint) = &meta.type_hint {
+        header.push('(');
+        header.push_str(hint);
+        header.push(')');
+    }
+    if let Some(c) = &meta.constraints {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(t) = &c.type_name {
+            parts.push(format!("type:{}", t));
+        }
+        if c.required {
+            parts.push("required".to_string());
+        }
+        if c.readonly {
+            parts.push("readonly".to_string());
+        }
+        if let Some(min) = c.min {
+            parts.push(format!("min:{}", trim_float(min)));
+        }
+        if let Some(max) = c.max {
+            parts.push(format!("max:{}", trim_float(max)));
+        }
+        if let Some(p) = &c.pattern {
+            parts.push(format!("pattern:{}", p));
+        }
+        if let Some(e) = &c.enum_values {
+            parts.push(format!("enum:{}", e.join("|")));
+        }
+        header.push('[');
+        header.push_str(&parts.join(", "));
+        header.push(']');
+    }
+    for marker in &meta.markers {
+        header.push(':');
+        header.push_str(marker);
+    }
+    header
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_declared_entry(
+    out: &mut String,
+    key: &str,
+    name: &str,
+    meta: Option<&crate::value::Meta>,
+    value: &Value,
+    metadata: &Map<crate::value::MetaMap>,
+    path: &mut String,
+    indent: usize,
+    depth: usize,
+) {
+    if depth > MAX_WRITE_DEPTH {
+        return;
+    }
+    let header = declared_header(name, meta);
+    // `tier:random 90 5 5` and `child:inherit base` keep their arguments on
+    // the key line; the parser moved them out of the value.
+    let args = meta.map_or(&[][..], |m| m.args.as_slice());
+    let empty_list = matches!(value, Value::Array(items) if items.is_empty());
+    if meta.is_none() && !empty_list {
+        write_declared_body(out, key, &header, args, meta, value, metadata, path, indent, depth);
+        return;
+    }
+    // spec: a key keeps the declarations of its first line and the value of
+    // its last (`x(int)` / `x h` is `"h"` declared `int`). Written as one
+    // line, `x(int) h`, the declaration acted on the value again and gave
+    // `0`; `b:join` with a group gave a list, `a:inherit` with a text took
+    // the text as parents. When the one line does not read back as this
+    // value, the declaration goes on a line of its own and the value
+    // follows on a plain line, which keeps the declarations.
+    let reads_back = match value {
+        Value::Object(_) | Value::Array(_) => {
+            let mut line = header.clone();
+            for arg in args {
+                line.push(' ');
+                line.push_str(arg);
+            }
+            declaration_reads_back(&line, name, value)
+        }
+        _ => {
+            let mut chunk = String::new();
+            write_declared_body(&mut chunk, key, &header, args, meta, value, metadata, path, 0, depth);
+            declaration_reads_back(&chunk, name, value)
+        }
+    };
+    if reads_back {
+        write_declared_body(out, key, &header, args, meta, value, metadata, path, indent, depth);
+        return;
+    }
+    if meta.is_some() {
+        push_indent(out, indent);
+        out.push_str(&header);
+        for arg in args {
+            out.push(' ');
+            out.push_str(arg);
+        }
+        out.push('\n');
+    }
+    if empty_list {
+        // A bare key is an empty list when the next line is a `- ` line that
+        // no open list takes (§8.5.2) — at the root no list is open. Deeper
+        // down an outer list could take it, so there the key stays a group.
+        push_indent(out, indent);
+        out.push_str(name);
+        out.push('\n');
+        if indent == 0 {
+            out.push_str("- _\n");
+        }
+        return;
+    }
+    match value {
+        Value::Object(_) | Value::Array(_) => {
+            write_declared_body(out, key, name, &[], None, value, metadata, path, indent, depth)
+        }
+        _ => write_named_entry(out, name, value, indent, depth),
+    }
+}
+
+/// Whether `chunk`, the lines of one root entry, gives `name` this value
+/// when read in an `!active` document — for an object or a list, whose
+/// lines follow, a container of the same kind with nothing in it yet.
+fn declaration_reads_back(chunk: &str, name: &str, value: &Value) -> bool {
+    let mut doc = String::with_capacity(chunk.len() + 8);
+    doc.push_str("!active\n");
+    doc.push_str(chunk);
+    let parsed = crate::parser::parse(&doc);
+    let got = match &parsed.root {
+        Value::Object(map) => map.get(name),
+        _ => None,
+    };
+    match (value, got) {
+        (Value::Object(_), Some(Value::Object(m))) => m.is_empty(),
+        (Value::Array(_), Some(Value::Array(g))) => g.is_empty(),
+        (Value::Array(items), Some(Value::Object(m))) => !items.is_empty() && m.is_empty(),
+        (Value::Object(_) | Value::Array(_), _) => false,
+        (v, Some(g)) => v == g,
+        (_, None) => false,
+    }
+}
+
+/// The lines of one declared entry, its key line starting with `header`.
+#[allow(clippy::too_many_arguments)]
+fn write_declared_body(
+    out: &mut String,
+    key: &str,
+    header: &str,
+    args: &[String],
+    meta: Option<&crate::value::Meta>,
+    value: &Value,
+    metadata: &Map<crate::value::MetaMap>,
+    path: &mut String,
+    indent: usize,
+    depth: usize,
+) {
+    let base = path.len();
+    match value {
+        Value::Object(_) | Value::Array(_) => {
+            push_indent(out, indent);
+            out.push_str(&header);
+            for arg in args {
+                out.push(' ');
+                out.push_str(arg);
+            }
+            out.push('\n');
+            if base > 0 {
+                path.push('.');
+            }
+            crate::engine::push_key_segment(path, key);
+            match value {
+                Value::Object(map) => write_declared_object(out, map, metadata, path, indent + 2, depth + 1),
+                Value::Array(items) => {
+                    let list_len = path.len();
+                    for (idx, item) in items.iter().enumerate() {
+                        match item {
+                            Value::Object(fields) => {
+                                crate::engine::push_item_segment(path, idx);
+                                write_declared_item(out, fields, metadata, path, indent + 2, depth + 1);
+                                path.truncate(list_len);
+                            }
+                            other => write_synx_item(out, other, indent + 2, depth + 1),
+                        }
+                    }
+                }
+                _ => {}
+            }
+            path.truncate(base);
+        }
+        Value::String(s) if s.contains('\n') => write_synx_multiline(out, &header, s, indent),
+        _ => {
+            // spec: `(string)` takes the text as written, quotes included, so
+            // it is written bare or — when a bare line cannot carry it — as
+            // a block, never quoted.
+            let text = match (meta.and_then(|m| m.type_hint.as_deref()), value) {
+                (Some("string"), Value::String(s)) => {
+                    let bare = !s.is_empty() && s.trim() == s && !s.contains(" #") && !s.contains(" //") && s != "|" && s != "|+";
+                    if bare { Some(s.clone()) } else { None }
+                }
+                _ => synx_scalar(value),
+            };
+            match text {
                 Some(text) => {
                     push_indent(out, indent);
-                    out.push_str(key);
+                    out.push_str(&header);
                     out.push(' ');
                     out.push_str(&text);
                     out.push('\n');
                 }
-                // Not representable as a single SYNX token — fall back to an
-                // indent-preserving block, whose body is never comment-stripped
-                // nor cast.
-                None => {
-                    let s = value.as_str().unwrap_or_default().to_string();
-                    write_synx_multiline(out, key, &s, indent);
-                }
+                None => write_synx_multiline(out, &header, value.as_str().unwrap_or_default(), indent),
             }
+        }
+    }
+}
+
+/// One list item that is an object: the first key rides the `- ` line, as it
+/// did in the source, and the rest follow in order.
+fn write_declared_item(
+    out: &mut String,
+    fields: &Map,
+    metadata: &Map<crate::value::MetaMap>,
+    path: &mut String,
+    indent: usize,
+    depth: usize,
+) {
+    if depth > MAX_WRITE_DEPTH {
+        return;
+    }
+    push_indent(out, indent);
+    let Some((head_key, head_value)) = fields.get_index(0) else {
+        out.push_str("-\n");
+        return;
+    };
+    let mm = metadata.get(path.as_str());
+    let head_meta = mm.and_then(|m| m.get(head_key.as_str()));
+    let names = KeyNames::of(fields);
+    out.push_str("- ");
+    let head_line = dash_line_safe(head_value).then(|| {
+        let mut line = declared_header(names.name(head_key), head_meta);
+        if let Some(text) = synx_scalar(head_value).filter(|t| !t.is_empty()) {
+            line.push(' ');
+            line.push_str(&text);
+        }
+        line
+    });
+    // The declaration must not act on the value a second time (B-082).
+    let head_line = head_line.filter(|line| {
+        head_meta.map_or(true, |m| {
+            m.type_hint.as_deref() != Some("string") && declaration_reads_back(line, names.name(head_key), head_value)
+        })
+    });
+    let mut skip_head = false;
+    if let Some(line) = head_line {
+        out.push_str(&line);
+        // An item is an object only when a deeper line follows its `- ` line.
+        skip_head = fields.len() > 1;
+    } else {
+        // The head does not fit the dash line: a bare key opens the item and
+        // the entry is written in full below (the later one wins).
+        out.push_str(names.name(head_key));
+    }
+    out.push('\n');
+    let declared: Vec<Option<&crate::value::Meta>> =
+        fields.keys().map(|k| mm.and_then(|m| m.get(k.as_str()))).collect();
+    for (i, ((key, value), meta)) in fields.iter().zip(declared).enumerate() {
+        if i == 0 && skip_head {
+            continue;
+        }
+        write_declared_entry(out, key, names.name(key), meta, value, metadata, path, indent + 2, depth + 1);
+    }
+}
+
+/// Whether `key`, written at the start of a line, is read back as that key
+/// and nothing else.
+fn key_reads_back(key: &str) -> bool {
+    let bytes = key.as_bytes();
+    let Some(&first) = bytes.first() else { return false };
+    if matches!(first, b'-' | b'#' | b'/' | b'[' | b':' | b'(') {
+        return false;
+    }
+    // Lines the parser takes for directives.
+    if first == b'!' && matches!(key, "!active" | "!lock" | "!tool" | "!schema" | "!llm" | "!include" | "!use") {
+        return false;
+    }
+    // Keys the parser drops, with everything under them.
+    if crate::parser::is_reserved_js_key(key) {
+        return false;
+    }
+    // perf: the usual key is printable ASCII, checked in one pass; every
+    // key written goes through here.
+    if bytes.iter().all(|&b| b > b' ' && b < 0x7f && !matches!(b, b'[' | b':' | b'(')) {
+        return true;
+    }
+    // Whitespace at an edge is trimmed away with the line; inside, only a
+    // space or a tab ends a key (U+00A0 is a letter like any other).
+    key.trim() == key && !key.chars().any(|c| c.is_control() || matches!(c, ' ' | '[' | ':' | '('))
+}
+
+/// `key` as the writers put it on a line.
+///
+/// safety: SYNX has no quoting for keys, and a key was written as it came.
+/// `port:env` gave the next reader a marker, `!active` on a line of its own
+/// switched the document to active mode, a line break began new lines — a
+/// map with caller-chosen keys, saved and loaded, could read the server's
+/// environment. A character that would end the key or start something else
+/// is written as `_`; a key that reads back as itself is untouched.
+fn writable_key(key: &str) -> std::borrow::Cow<'_, str> {
+    if key_reads_back(key) {
+        return std::borrow::Cow::Borrowed(key);
+    }
+    let mut out = String::with_capacity(key.len().max(1));
+    let last = key.chars().count().saturating_sub(1);
+    for (i, c) in key.chars().enumerate() {
+        let breaks = c.is_control()
+            || matches!(c, ' ' | '[' | ':' | '(')
+            || ((i == 0 || i == last) && c.is_whitespace())
+            || (i == 0 && matches!(c, '-' | '#' | '/' | '!'));
+        out.push(if breaks { '_' } else { c });
+    }
+    if out.is_empty() {
+        out.push('_');
+    }
+    // safety: `constructor`, `prototype` and `__proto__` are keys the reader
+    // refuses — it drops the line and what hangs under it, so a value saved
+    // under one was gone on the next load. Such a key gets a `_` after it.
+    if crate::parser::is_reserved_js_key(&out) {
+        out.push('_');
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// The names the keys of one object are written under.
+///
+/// safety: a key that reads back as itself is written as it is; one that
+/// does not is renamed (`writable_key`), and two keys must not end up under
+/// one name — `a b`, `a:b` and `a_b` were all written as `a_b`, and the
+/// reader kept the last of the three. A name already taken in the object
+/// gets a number: `a_b`, `a_b_2`, `a_b_3`, in the order of the object's keys.
+struct KeyNames<'a> {
+    renamed: Option<HashMap<&'a str, String>>,
+}
+
+impl<'a> KeyNames<'a> {
+    fn of(map: &'a Map) -> Self {
+        // perf: the usual object renames nothing and allocates nothing.
+        if map.keys().all(|k| key_reads_back(k)) {
+            return KeyNames { renamed: None };
+        }
+        let mut renamed: HashMap<&str, String> = HashMap::new();
+        let mut taken: HashSet<String> = HashSet::new();
+        // perf: the number to try next for a name, so that many keys with
+        // one name do not each count up from 2.
+        let mut next: HashMap<String, usize> = HashMap::new();
+        for key in map.keys() {
+            if key_reads_back(key) {
+                continue;
+            }
+            let base = writable_key(key).into_owned();
+            let mut name = base.clone();
+            while map.contains_key(name.as_str()) || taken.contains(name.as_str()) {
+                let n = next.entry(base.clone()).or_insert(2);
+                name = format!("{}_{}", base, n);
+                *n += 1;
+            }
+            taken.insert(name.clone());
+            renamed.insert(key.as_str(), name);
+        }
+        KeyNames { renamed: Some(renamed) }
+    }
+
+    fn name<'b>(&'b self, key: &'b str) -> &'b str {
+        match &self.renamed {
+            Some(renamed) => renamed.get(key).map_or(key, String::as_str),
+            None => key,
         }
     }
 }
@@ -2662,11 +3253,14 @@ fn write_synx_item(out: &mut String, item: &Value, indent: usize, depth: usize) 
     }
     match item {
         Value::Object(map) => {
-            let mut keys: Vec<&String> = map.keys().collect();
-            keys.sort_unstable();
+            let names = KeyNames::of(map);
+            // perf: the fields are reached by position; each was looked up by
+            // its key three times over.
+            let order = KeyOrder::of(map);
+            let field = |n: usize| order.at(n).and_then(|at| map.get_index(at));
             // The `- ` line has to carry a key whose value fits on it; SYNX
             // attaches everything deeper to the *item*, not to that key.
-            let head_safe = keys.iter().position(|k| dash_line_safe(&map[*k]));
+            let head_safe = (0..order.len()).find(|n| field(*n).is_some_and(|(_, v)| dash_line_safe(v)));
             let head = head_safe.unwrap_or(0);
             // §14.1 — an item is an object only when a deeper line follows its
             // `- ` line. A one-key item (`- item x` / `item y`) had none and
@@ -2674,41 +3268,48 @@ fn write_synx_item(out: &mut String, item: &Value, indent: usize, depth: usize) 
             // too big for the `- ` line lost the head value outright. Writing
             // the head again in full below covers both: a repeated key is
             // legal, the last one wins, and the line makes the item an object.
-            let repeat_head = head_safe.is_none() || keys.len() == 1;
+            let repeat_head = head_safe.is_none() || order.len() == 1;
             // An empty object in a list has no key to hang on the `- ` line.
             // SYNX writes it as a bare dash, which is how it parsed in the
-            // first place; indexing `keys` here would panic instead.
-            let Some(head_key) = keys.get(head).copied() else {
+            // first place; indexing the keys here would panic instead.
+            let Some((head_key, head_value)) = field(head) else {
                 push_indent(out, indent);
                 out.push_str("-\n");
                 return;
             };
             push_indent(out, indent);
             out.push_str("- ");
-            out.push_str(head_key);
-            match synx_scalar(&map[head_key]) {
-                Some(text) if !text.is_empty() => {
-                    out.push(' ');
-                    out.push_str(&text);
-                }
-                // An empty object is written as a bare key, which is exactly
-                // how SYNX produced it in the first place.
-                _ => {}
+            out.push_str(names.name(head_key));
+            // An empty object is written as a bare key, which is exactly how
+            // SYNX produced it in the first place; so is a value no token
+            // carries, which follows in full below.
+            let key_end = out.len();
+            out.push(' ');
+            let value_start = out.len();
+            if !push_scalar(out, head_value) || out.len() == value_start {
+                out.truncate(key_end);
             }
             out.push('\n');
-            for (i, k) in keys.iter().enumerate() {
-                if i == head && !repeat_head {
+            for n in 0..order.len() {
+                if n == head && !repeat_head {
                     continue;
                 }
-                write_synx_entry(out, k, &map[*k], indent + 2, depth + 1);
+                if let Some((key, value)) = field(n) {
+                    write_named_entry(out, names.name(key), value, indent + 2, depth + 1);
+                }
             }
         }
         _ => {
             push_indent(out, indent);
             out.push_str("- ");
-            match synx_scalar(item) {
-                Some(text) => out.push_str(&text),
-                None => out.push_str(item.as_str().unwrap_or_default()),
+            if !push_scalar(out, item) {
+                // safety: a list item is one line and SYNX has no block form
+                // for it, so a line break is written as a space. Written
+                // as it was, the rest of the text became lines of its own:
+                // keys in a `.synx`, forged records in a SYNXL block.
+                if let Value::String(s) = item {
+                    out.push_str(&s.replace(['\n', '\r'], " "));
+                }
             }
             out.push('\n');
         }
@@ -2720,7 +3321,13 @@ fn dash_line_safe(value: &Value) -> bool {
     match value {
         Value::Object(map) => map.is_empty(),
         Value::Array(_) => false,
-        Value::String(s) => !s.contains('\n') && synx_scalar(value).is_some() && !s.is_empty(),
+        // safety: on the `- ` line the key and its value are one text, cut at
+        // the first ` #` or ` //` — so a value that *begins* with `#` or `//`
+        // is a comment there (`- b //` read back as `b` with nothing), though
+        // on a key line of its own it is a value.
+        Value::String(s) => {
+            !s.is_empty() && !s.starts_with('#') && !s.starts_with("//") && string_token(s) != StringToken::None
+        }
         _ => true,
     }
 }
@@ -2742,34 +3349,78 @@ fn write_synx_multiline(out: &mut String, key: &str, body: &str, indent: usize) 
 /// A SYNX value is comment-stripped at ` #` / ` //` *before* casting, so a
 /// value containing either sequence cannot be rescued by quoting.
 fn synx_scalar(value: &Value) -> Option<String> {
+    let mut token = String::new();
+    push_scalar(&mut token, value).then_some(token)
+}
+
+/// [`synx_scalar`] written straight onto `out`; `false`, with nothing
+/// written, when no token can carry the value.
+fn push_scalar(out: &mut String, value: &Value) -> bool {
     match value {
-        Value::Null => Some("null".to_string()),
-        Value::Bool(b) => Some(if *b { "true" } else { "false" }.to_string()),
-        Value::Int(n) => Some(n.to_string()),
+        Value::Null => out.push_str("null"),
+        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Value::Int(n) => {
+            let mut buf = itoa::Buffer::new();
+            out.push_str(buf.format(*n));
+        }
         Value::Float(f) => {
             // A non-finite float has no JSON form either — `write_json` emits
             // `null` for it, so `null` is the projection-preserving token.
-            if !f.is_finite() {
-                return Some("null".to_string());
+            if f.is_finite() {
+                write_float(out, *f);
+            } else {
+                out.push_str("null");
             }
-            let mut s = String::new();
-            write_float(&mut s, *f);
-            Some(s)
         }
         // safety: a secret is written as its mask, never as the plaintext —
         // `Synx::stringify` and `decompile` write through here.
-        Value::Secret(_) => Some("[SECRET]".to_string()),
-        Value::String(s) => {
-            if s.contains('\n') || s.contains(" #") || s.contains(" //") {
-                return None;
+        Value::Secret(_) => out.push_str("[SECRET]"),
+        Value::String(s) => match string_token(s) {
+            StringToken::Bare => out.push_str(s),
+            StringToken::Quoted(quote) => {
+                out.push(quote);
+                out.push_str(s);
+                out.push(quote);
             }
-            if !synx_value_needs_quote(s) {
-                return Some(s.clone());
-            }
-            pick_quote(s).map(|q| format!("{}{}{}", q, s, q))
-        }
-        Value::Object(_) | Value::Array(_) => None,
+            StringToken::None => return false,
+        },
+        Value::Object(_) | Value::Array(_) => return false,
     }
+    true
+}
+
+/// How a string goes on a line as one value token.
+#[derive(Clone, Copy, PartialEq)]
+enum StringToken {
+    /// As it is.
+    Bare,
+    /// Wrapped in this quote, which it does not contain.
+    Quoted(char),
+    /// Not at all: it has a line break, ` #` or ` //` in it, or needs quotes
+    /// and holds both kinds.
+    None,
+}
+
+/// perf: one scan for what rules a token out — a line break, or a `#` or
+/// `//` with a space before it. It used to be three searches of the string.
+fn string_token(s: &str) -> StringToken {
+    let bytes = s.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = memchr::memchr3(b'\n', b'#', b'/', &bytes[from..]) {
+        let at = from + rel;
+        let after_space = at > 0 && bytes[at - 1] == b' ';
+        match bytes[at] {
+            b'\n' => return StringToken::None,
+            b'#' if after_space => return StringToken::None,
+            b'/' if after_space && bytes.get(at + 1) == Some(&b'/') => return StringToken::None,
+            _ => {}
+        }
+        from = at + 1;
+    }
+    if !synx_value_needs_quote(s) {
+        return StringToken::Bare;
+    }
+    pick_quote(s).map_or(StringToken::None, StringToken::Quoted)
 }
 
 /// Would this string be misread as a bare SYNX value?
@@ -3905,5 +4556,278 @@ mod tests {
         // A `;` inside quotes is not a delimiter.
         let parts: Vec<Part> = PartSplitter::new("\"a;b\"").collect();
         assert_eq!(parts, vec![Part { text: "a;b", quoted: true }]);
+    }
+}
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+    use crate::{parse, Synx};
+
+    fn obj(pairs: Vec<(&str, Value)>) -> Value {
+        Value::Object(pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
+    }
+
+    // S4-15: a type or a constraint is written into the `!fields` line as it is.
+    #[test]
+    fn field_declarations_cannot_carry_lines_or_fields() {
+        let rec = vec![obj(vec![("a", Value::Int(1))])];
+        let mut hint = FieldDecl::new("a");
+        hint.type_hint = Some("int)\n!fields evil\n42\n!fields a(int".to_string());
+        assert_eq!(write_lines(&[hint], &rec).unwrap_err().kind, SynxlErrorKind::Unwritable);
+
+        for (set, name) in [
+            (Box::new(|f: &mut FieldDecl| f.type_hint = Some("a;b".into())) as Box<dyn Fn(&mut FieldDecl)>, "hint ;"),
+            (Box::new(|f: &mut FieldDecl| f.type_hint = Some("a)b".into())), "hint )"),
+            (Box::new(|f: &mut FieldDecl| f.constraints.type_name = Some("int]\n!fields x".into())), "type"),
+            (Box::new(|f: &mut FieldDecl| f.constraints.pattern = Some("^a;b$".into())), "pattern ;"),
+            (Box::new(|f: &mut FieldDecl| f.constraints.enum_values = Some(vec!["x".into(), "y\n1".into()])), "enum"),
+        ] {
+            let mut f = FieldDecl::new("a");
+            set(&mut f);
+            assert_eq!(write_lines(&[f], &rec).unwrap_err().kind, SynxlErrorKind::Unwritable, "{}", name);
+        }
+        // What a reader accepts is still written.
+        let mut ok = FieldDecl::new("a");
+        ok.type_hint = Some("date-time".into());
+        ok.constraints.pattern = Some("^[a-z]{1,3}$".into());
+        let out = write_lines(&[ok], &rec).unwrap();
+        assert!(out.contains("!fields a(date-time)[pattern:^[a-z]{1,3}$]"), "{}", out);
+    }
+
+    // S1-10: a block value that has no rendering is refused, not rewritten.
+    #[test]
+    fn a_block_value_without_a_rendering_is_refused() {
+        let fields = [FieldDecl::new("id"), FieldDecl::new_block("m")];
+        let forged = vec![obj(vec![("id", Value::Int(1)), ("m", Value::Array(vec![Value::String("a\n2; FORGED".into())]))])];
+        assert_eq!(write_lines(&fields, &forged).unwrap_err().kind, SynxlErrorKind::Unwritable);
+        let matrix = vec![obj(vec![("id", Value::Int(1)), ("m", Value::Array(vec![Value::Array(vec![Value::Int(1)])]))])];
+        assert_eq!(write_lines(&fields, &matrix).unwrap_err().kind, SynxlErrorKind::Unwritable);
+        let key = vec![obj(vec![("id", Value::Int(1)), ("m", obj(vec![("a\n9", Value::Int(1))]))])];
+        assert_eq!(write_lines(&fields, &key).unwrap_err().kind, SynxlErrorKind::Unwritable);
+        let marker = vec![obj(vec![("id", Value::Int(1)), ("m", obj(vec![("port:env", Value::Int(1))]))])];
+        assert_eq!(write_lines(&fields, &marker).unwrap_err().kind, SynxlErrorKind::Unwritable);
+        // A multi-line string under a key is a `|+` block, as before.
+        let text = vec![obj(vec![("id", Value::Int(1)), ("m", obj(vec![("k", Value::String("a\nb".into()))]))])];
+        let out = write_lines(&fields, &text).unwrap();
+        assert_eq!(parse_lines(&out).unwrap().to_json(), records_to_json_array(&text));
+    }
+
+    // S1-06: a secret in an inline column is its mask.
+    #[test]
+    fn an_inline_secret_is_written_as_its_mask() {
+        let rec = vec![obj(vec![("id", Value::Int(1)), ("token", Value::Secret("hunter2".into()))])];
+        let out = write_lines(&[FieldDecl::new("id"), FieldDecl::new("token")], &rec).unwrap();
+        assert!(!out.contains("hunter2"), "{}", out);
+        assert_eq!(out, "!synxl 1\n!fields id; token\n1; [SECRET]\n");
+        let mut typed = FieldDecl::new("token");
+        typed.type_hint = Some("int".into());
+        let out = write_lines(&[FieldDecl::new("id"), typed], &rec).unwrap();
+        assert!(out.ends_with("1; \"[SECRET]\"\n"), "{}", out);
+    }
+
+    // B-082: a key declared on one line and given its value on another comes
+    // back from `.synxb` with the same value and the same declarations.
+    #[test]
+    fn decompile_keeps_a_value_given_after_its_declaration() {
+        let docs = [
+            "!active\nx(int)\nx h\n",
+            "!active\nb:join\nb\n",
+            "!active\na:inherit\na x\n",
+            "!active\nb(int)|\n",
+            "!active\nt:\n- 2\n",
+            "!active\nt\n- 2\n",
+            "!active\nl\n  - x(int)\n    x h\n    y 1\n",
+            "!active\ng\n  x(int)\n  x h\n  b:join\n  b\n    c 1\n",
+            // Lines that already read back stay one line each.
+            "!active\nport:env:default:8080 PORT\nn(int) 5\nr:random 90 10\n  - a\n  - b\n",
+        ];
+        for doc in docs {
+            let before = parse(doc);
+            let text = Synx::decompile(&Synx::compile(doc, false)).unwrap();
+            let after = parse(&text);
+            assert_eq!(crate::to_json(&after.root), crate::to_json(&before.root), "{doc:?} → {text:?}");
+            assert!(after.metadata == before.metadata, "{doc:?} → {text:?}");
+            assert_eq!(after.mode, before.mode, "{doc:?} → {text:?}");
+        }
+        let text = Synx::decompile(&Synx::compile("!active\nport:env:default:8080 PORT\nn(int) 5\n", false)).unwrap();
+        assert_eq!(text, "!active\n\nport:env:default:8080 PORT\nn(int) 5\n");
+    }
+
+    // B-021 / S5-06: what `stringify` writes has the lines it was given, no more.
+    #[test]
+    fn stringify_keeps_keys_and_items_on_their_lines() {
+        let value = obj(vec![
+            ("a\n!active\nleak:env PATH", Value::Int(1)),
+            ("list", Value::Array(vec![Value::String("x\n!include ../../secret.synx s".into()), Value::String("ok".into())])),
+            ("!active", obj(vec![])),
+            ("!include", Value::String("x.synx s".into())),
+            ("#!mode:active", obj(vec![])),
+            ("port:env", Value::String("HOME".into())),
+            ("my key", Value::Int(2)),
+            ("x[min:1]", Value::Int(3)),
+            ("e(int)", Value::String("z".into())),
+            ("- d", Value::Int(4)),
+            ("", Value::Int(5)),
+            ("fine_key", Value::Int(6)),
+            ("кл\u{a0}юч", Value::Int(7)),
+        ]);
+        let text = Synx::stringify(&value);
+        let back = parse(&text);
+        assert_eq!(back.mode, crate::Mode::Static, "{}", text);
+        assert!(back.includes.is_empty() && back.uses.is_empty(), "{}", text);
+        let root = back.root.as_object().unwrap();
+        // Thirteen keys in, thirteen keys out — each on one line, none a marker.
+        assert_eq!(root.len(), 13, "{}", text);
+        assert_eq!(root["fine_key"], Value::Int(6));
+        assert_eq!(root["кл\u{a0}юч"], Value::Int(7));
+        assert_eq!(root["port_env"], Value::String("HOME".into()));
+        assert_eq!(root["my_key"], Value::Int(2));
+        assert_eq!(root["_active"], Value::Object(Default::default()));
+        assert_eq!(root["list"].as_array().unwrap().len(), 2);
+        assert_eq!(text.lines().filter(|l| !l.starts_with(' ')).count(), 13);
+        // The same text resolved as an active document reads nothing.
+        let mut active = parse(&format!("!active\n{}", text));
+        crate::resolve(&mut active, &crate::Options { env: Some([("HOME".to_string(), "/h".to_string()), ("PATH".to_string(), "/p".to_string())].into_iter().collect()), ..Default::default() });
+        let json = crate::to_json(&active.root);
+        assert!(!json.contains("/h") && !json.contains("/p"), "{}", json);
+    }
+
+    // B-021: keys that are renamed on the way out never share a name.
+    #[test]
+    fn renamed_keys_do_not_collide() {
+        let value = obj(vec![
+            ("a b", Value::Int(1)),
+            ("a_b", Value::Int(2)),
+            ("a:b", Value::Int(3)),
+            ("a_b_2", Value::Int(4)),
+            ("a(b", Value::Int(5)),
+            ("items", Value::Array(vec![obj(vec![("x y", Value::Int(6)), ("x:y", Value::Int(7)), ("x_y", Value::Int(8))])])),
+        ]);
+        let check = |text: &str| {
+            let back = parse(text);
+            let root = back.root.as_object().unwrap();
+            assert_eq!(root.len(), 6, "{}", text);
+            assert_eq!(root["a_b"], Value::Int(2));
+            assert_eq!(root["a_b_2"], Value::Int(4));
+            // In the order of the object's keys: `a b`, then `a:b`, then `a(b`.
+            assert_eq!(root["a_b_3"], Value::Int(1));
+            assert_eq!(root["a_b_4"], Value::Int(3));
+            assert_eq!(root["a_b_5"], Value::Int(5));
+            let item = root["items"].as_array().unwrap()[0].as_object().unwrap();
+            assert_eq!(item.len(), 3, "{}", text);
+            assert_eq!((&item["x_y"], &item["x_y_2"], &item["x_y_3"]), (&Value::Int(8), &Value::Int(6), &Value::Int(7)));
+        };
+        check(&Synx::stringify(&value));
+        // The writer of documents with declarations (`decompile`) names keys the same way.
+        let mut declared = String::new();
+        write_synx_declared(&mut declared, &value, &Map::default());
+        check(&declared);
+
+        // Every key of one name gets a number of its own.
+        let mut many = Map::default();
+        for i in 0..4096u32 {
+            let key: String = (0..12).map(|bit| if i >> bit & 1 == 1 { ':' } else { '[' }).collect();
+            many.insert(format!("k{}", key), Value::Int(i as i64));
+        }
+        let back = parse(&Synx::stringify(&Value::Object(many)));
+        assert_eq!(back.root.as_object().unwrap().len(), 4096);
+    }
+
+    // B-021.5: a key the reader refuses is renamed like any key it would
+    // misread — the value under it is not lost with it.
+    #[test]
+    fn keys_the_reader_refuses_are_renamed() {
+        let value = obj(vec![
+            ("constructor", Value::Int(1)),
+            ("prototype", Value::Int(2)),
+            ("a", obj(vec![("__proto__", Value::Int(3)), ("kept", Value::Int(4))])),
+            ("items", Value::Array(vec![obj(vec![("constructor", Value::Int(5)), ("x", Value::Int(6))])])),
+            // The plain name is taken, so the renamed key moves on.
+            ("constructor_", Value::Int(7)),
+        ]);
+        let check = |text: &str| {
+            let back = parse(text);
+            let root = back.root.as_object().unwrap();
+            assert_eq!(root.len(), 5, "{}", text);
+            assert_eq!(root["constructor_"], Value::Int(7));
+            assert_eq!(root["constructor__2"], Value::Int(1));
+            assert_eq!(root["prototype_"], Value::Int(2));
+            let a = root["a"].as_object().unwrap();
+            assert_eq!((&a["__proto___"], &a["kept"]), (&Value::Int(3), &Value::Int(4)));
+            let item = root["items"].as_array().unwrap()[0].as_object().unwrap();
+            assert_eq!((&item["constructor_"], &item["x"]), (&Value::Int(5), &Value::Int(6)));
+        };
+        check(&Synx::stringify(&value));
+        let mut declared = String::new();
+        write_synx_declared(&mut declared, &value, &Map::default());
+        check(&declared);
+    }
+
+    // B-021 (returned): on the `- ` line the key and the value are cut as one
+    // text, so a value that begins with `#` or `//` is not written there.
+    #[test]
+    fn a_comment_like_value_does_not_ride_the_dash_line() {
+        for head in ["//", "#", "#c", "// note", "//x"] {
+            let value = obj(vec![("l", Value::Array(vec![obj(vec![("b", Value::String(head.into())), ("t", Value::Int(1))])]))]);
+            let text = Synx::stringify(&value);
+            assert_eq!(parse(&text).root, value, "{:?} via {}", head, text);
+            let one = obj(vec![("l", Value::Array(vec![obj(vec![("only", Value::String(head.into()))])]))]);
+            let text = Synx::stringify(&one);
+            assert_eq!(parse(&text).root, one, "{:?} via {}", head, text);
+            let mut declared = String::new();
+            write_synx_declared(&mut declared, &value, &Map::default());
+            assert_eq!(parse(&declared).root, value, "{:?} via {}", head, declared);
+        }
+    }
+
+    // A block field opens its block with its own name: that name is a SYNX key.
+    #[test]
+    fn a_block_field_name_is_a_synx_key() {
+        let value = obj(vec![("k", Value::Int(1))]);
+        for name in ["-m", "#m", "/m", "!m"] {
+            let rec = vec![obj(vec![("id", Value::Int(1)), (name, value.clone())])];
+            let err = write_lines(&[FieldDecl::new("id"), FieldDecl::new_block(name)], &rec).unwrap_err();
+            assert_eq!(err.kind, SynxlErrorKind::Unwritable, "{}", name);
+        }
+        let rec = vec![obj(vec![("id", Value::Int(1)), ("m", obj(vec![("!k", Value::Int(1))]))])];
+        let err = write_lines(&[FieldDecl::new("id"), FieldDecl::new_block("m")], &rec).unwrap_err();
+        assert_eq!(err.kind, SynxlErrorKind::Unwritable);
+    }
+
+    // A long field list is looked up by index; a short one by scan. Same answers.
+    #[test]
+    fn field_lookup_by_name() {
+        let many: Vec<FieldDecl> = (0..200).map(|i| FieldDecl::new(format!("f{}", i))).collect();
+        let list = FieldList::new(many);
+        assert_eq!(list.get("f0").unwrap().name, "f0");
+        assert_eq!(list.get("f199").unwrap().name, "f199");
+        assert!(list.get("f200").is_none());
+        let few = FieldList::new(vec![FieldDecl::new("a"), FieldDecl::new_block("b")]);
+        assert!(few.get("b").unwrap().block);
+        assert!(few.get("c").is_none());
+        // Parsed lists still reject a repeated name, long or short.
+        let mut src = String::from("!synxl 1\n!fields ");
+        for i in 0..100 {
+            src.push_str(&format!("f{};", i));
+        }
+        src.push_str("f7\n1\n");
+        assert_eq!(parse_lines(&src).unwrap_err().kind, SynxlErrorKind::DuplicateField);
+    }
+
+    // The stream reader holds one record: blank lines inside a block count.
+    #[test]
+    fn stream_reader_and_memory_reader_agree_past_blank_lines() {
+        let mut src = String::from("!synxl 1\n!fields a ; m[block]\n1\n  m |+\n    first\n");
+        for _ in 0..2000 {
+            src.push_str("          \n");
+        }
+        src.push_str("    last\n2\n  m\n    k v\n\n\n3\n");
+        let streamed: Vec<SynxlRecord> =
+            SynxlStreamReader::new(std::io::Cursor::new(&src)).unwrap().map(Result::unwrap).collect();
+        let borrowed: Vec<SynxlRecord> = SynxlReader::new(&src).unwrap().map(Result::unwrap).collect();
+        assert_eq!(streamed, borrowed);
+        assert_eq!(streamed.len(), 3);
+        assert_eq!(streamed[0].value.as_object().unwrap()["m"], Value::String("first\nlast".into()));
     }
 }

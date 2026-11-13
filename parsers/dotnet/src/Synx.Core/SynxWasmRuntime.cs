@@ -156,7 +156,9 @@ internal sealed class SynxWasmModule : IDisposable
         SynxValue.Int i => i.Value,
         SynxValue.Float f => f.Value,
         SynxValue.Str s => s.Value,
-        SynxValue.Secret s => s.Value,
+        // safety: a marker from an installed package got the plaintext and could return it
+        // in a value that reaches JSON; synx-core hands it the mask.
+        SynxValue.Secret => "[SECRET]",
         SynxValue.Arr a => a.Items.Select(ValueToJsonElement).ToList(),
         SynxValue.Obj o => o.Map.ToDictionary(kv => kv.Key, kv => ValueToJsonElement(kv.Value)),
         _ => null,

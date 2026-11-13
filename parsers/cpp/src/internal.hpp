@@ -47,6 +47,9 @@ std::string generate_uuid();
 
 // ─── synx_writer.cpp — SYNXL §14.1 block writer ──────────────────────────────
 
+/// Write the entries of one object at `indent` columns, sorted by key, each
+/// under a name that reads back as that key (Rust `synxl::write_synx_object`).
+void write_synx_object(std::string& out, const Object& map, size_t indent, size_t depth);
 /// Write `key value` as SYNX at `indent` columns (Rust `synxl::write_synx_entry`).
 void write_synx_entry(std::string& out, std::string_view key, const Value& value,
                       size_t indent, size_t depth);

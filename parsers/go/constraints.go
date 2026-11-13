@@ -56,6 +56,10 @@ func constraintViolation(key string, val Value, c *Constraints) (string, bool) {
 			empty = true
 		case StringValue:
 			empty = x.V == ""
+		case ObjectValue:
+			// A key written without a value parses as an empty group; for
+			// `[required]` that is the missing value, not a present object.
+			empty = x.V == nil || x.V.Len() == 0
 		}
 		if empty {
 			return "CONSTRAINT_ERR: '" + key + "' is required", true

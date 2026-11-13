@@ -1,6 +1,10 @@
 package synx
 
-import "sort"
+import (
+	"fmt"
+	"io"
+	"sort"
+)
 
 // Object is an insertion-ordered string→Value map — the Go counterpart of
 // synx-core's `IndexMap`. Order is load-bearing: active-mode markers resolve
@@ -31,6 +35,23 @@ func NewObjectMap() *Object {
 
 func newObjectCap(n int) *Object {
 	return &Object{pairs: make([]ObjectPair, 0, n)}
+}
+
+// String is the object as canonical JSON: keys sorted, secrets masked.
+func (o *Object) String() string {
+	if o == nil {
+		return "null"
+	}
+	return ToJSON(ObjectValue{V: o})
+}
+
+// Format prints the object as canonical JSON for every fmt verb.
+//
+// safety: the entries live in unexported fields, where fmt cannot call a
+// value's own methods, so it printed the raw struct — and with it the text of
+// every `:secret`: `fmt.Println(cfg)` was `&{[{password {hunter2}}] map[]}`.
+func (o *Object) Format(f fmt.State, verb rune) {
+	_, _ = io.WriteString(f, o.String())
 }
 
 // Pairs returns the underlying ordered entries. Mutating the slice does not

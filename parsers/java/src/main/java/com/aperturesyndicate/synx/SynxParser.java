@@ -150,8 +150,15 @@ public final class SynxParser {
         void run() {
             SynxParseResult r = result;
             BlockState block = null;
-            ListState list = null;
+            // Open lists, outermost first.
+            // spec: a list inside a list item ends at the next item of the outer list (§8.5).
+            // One variable held "the" open list, so a nested `tags` replaced its parent:
+            // `- name b` after it matched no list and was dropped without a word, and the
+            // keys under it landed in the item before.
+            ArrayList<ListState> lists = new ArrayList<>();
             boolean inBlockComment = false;
+            // Indent of a refused key whose block is being dropped, or -1.
+            int droppedBelow = -1;
             int len = text.length();
             int pos = 0;
             while (pos <= len) {
@@ -172,6 +179,10 @@ public final class SynxParser {
                 }
                 // A blank line is never structural and never body (SYNX §8.4.1).
                 if (a == end) continue;
+                if (droppedBelow >= 0) {
+                    if (indent > droppedBelow) continue;
+                    droppedBelow = -1;
+                }
                 int b = end;
                 while (b > a && isWs(text.charAt(b - 1))) b--;
                 String trimmed = text.substring(a, b);
@@ -225,22 +236,28 @@ public final class SynxParser {
                 if (trimmed.charAt(0) == '#' || trimmed.startsWith("//")) continue;
 
                 if (trimmed.startsWith("- ")) {
-                    if (list != null && indent > list.indent) {
+                    // The list this item belongs to: the innermost open one whose key sits to
+                    // the left of the dash. Lists nested deeper than the dash end here — but
+                    // only when a list does take the line; a dash no list accepts is skipped
+                    // and closes nothing, as it always was.
+                    int accepting = lists.size();
+                    while (accepting > 0 && indent < lists.get(accepting - 1).indent) accepting--;
+                    if (accepting > 0 && indent > lists.get(accepting - 1).indent) {
+                        lists.subList(accepting, lists.size()).clear();
+                    }
+                    if (!lists.isEmpty() && indent > lists.get(lists.size() - 1).indent) {
+                        ListState list = lists.get(lists.size() - 1);
                         // Pop every frame of the previous item — its own and any object inside it.
                         while (stack.size() > 1 && top().indent >= indent) pop();
                         String valStr = stripComment(trim(trimmed.substring(2)));
 
-                        // The item is an object when the next content line is deeper and is
-                        // neither another item nor a comment.
+                        // The item is an object when the next line of content is deeper and
+                        // is not another item.
                         boolean nested = false;
                         int[] peek = nextContentLine(text, pos);
                         if (peek != null) {
                             String pl = text.substring(peek[0], peek[1]);
-                            String pt = trim(pl);
-                            if (indentLen(pl) > indent && !pt.startsWith("- ")
-                                    && pt.charAt(0) != '#' && !pt.startsWith("//")) {
-                                nested = true;
-                            }
+                            if (indentLen(pl) > indent && !trim(pl).startsWith("- ")) nested = true;
                         }
 
                         SynxValue cur = list.parent.get(list.key);
@@ -248,16 +265,32 @@ public final class SynxParser {
                             cur = SynxValue.ofArray();
                             list.parent.set(list.key, cur);
                         }
-                        if (!(cur instanceof SynxValue.Arr arr) || arr.values().size() >= MAX_LIST_ITEMS) continue;
+                        if (!(cur instanceof SynxValue.Arr arr)) continue;
+                        if (arr.values().size() >= MAX_LIST_ITEMS) {
+                            // The cap dropped an item: say so, like every other cap.
+                            r.truncated = true;
+                            continue;
+                        }
                         if (nested) {
                             SynxObject item = new SynxObject();
                             ParsedLine pl = parseLine(valStr);
+                            SynxMeta headMeta = null;
                             if (pl != null) {
                                 SynxValue v;
                                 if (pl.typeHint != null) v = castTyped(pl.value, pl.typeHint);
                                 else if (!pl.value.isEmpty()) v = castValue(pl.value);
                                 else v = SynxValue.ofObject();
-                                if (!isReservedJsKey(pl.key)) item.set(pl.key, v);
+                                if (!isReservedJsKey(pl.key)) {
+                                    item.set(pl.key, v);
+                                    if (r.mode == SynxMode.ACTIVE
+                                            && (!pl.markers.isEmpty() || pl.constraints != null || pl.typeHint != null)) {
+                                        headMeta = new SynxMeta();
+                                        headMeta.markers = new ArrayList<>(pl.markers);
+                                        headMeta.args = pl.markerArgs;
+                                        headMeta.typeHint = pl.typeHint;
+                                        headMeta.constraints = pl.constraints;
+                                    }
+                                }
                             } else {
                                 item.set("_value", castValue(valStr));
                             }
@@ -265,20 +298,42 @@ public final class SynxParser {
                             arr.values().add(SynxValue.ofObject(item));
                             if (stack.size() < MAX_NESTING_DEPTH) {
                                 push(new Frame(indent, Frame.LIST_ITEM, list.key, itemIdx, list.stackIdx, item));
+                                // spec: the key on the `- ` line is a key line like the ones
+                                // under it. Its markers and constraints were read and thrown
+                                // away: `- token:secret abc` stayed in the clear and
+                                // `- host:env H` kept the variable's name.
+                                if (headMeta != null) {
+                                    r.metadata.computeIfAbsent(currentPath(), k -> new LinkedHashMap<>()).put(pl.key, headMeta);
+                                }
                             }
                         } else {
                             arr.values().add(castValue(valStr));
                         }
                         continue;
                     }
-                } else if (list != null && indent <= list.indent) {
-                    // A non-item line at or below the list's indent closes it.
-                    list = null;
-                    while (stack.size() > 1 && top().kind == Frame.LIST_ITEM && top().indent >= indent) pop();
+                } else {
+                    // A non-item line closes every list it is at or below the indent of.
+                    boolean closed = false;
+                    while (!lists.isEmpty() && indent <= lists.get(lists.size() - 1).indent) {
+                        lists.remove(lists.size() - 1);
+                        closed = true;
+                    }
+                    if (closed) {
+                        while (stack.size() > 1 && top().kind == Frame.LIST_ITEM && top().indent >= indent) pop();
+                    }
                 }
 
                 ParsedLine pl = parseLine(trimmed);
-                if (pl == null || isReservedJsKey(pl.key)) continue;
+                if (pl == null) continue;
+                // safety: the lines under a refused key go with it. Only the key
+                // line was skipped, so its block fell to whatever was open above
+                // it — `profile` / `__proto__` / `  role admin` gave `profile` the
+                // role — and under `prototype |` each line of the text was read as
+                // a line of the document.
+                if (isReservedJsKey(pl.key)) {
+                    droppedBelow = indent;
+                    continue;
+                }
                 while (stack.size() > 1 && top().indent >= indent) pop();
                 int parentIdx = stack.size() - 1;
                 SynxObject parent = stack.get(parentIdx).obj;
@@ -321,12 +376,12 @@ public final class SynxParser {
                     block = new BlockState(indent, pl.key, parent, pl.value.equals("|+"));
                 } else if (isListMarker && pl.value.isEmpty()) {
                     parent.set(pl.key, SynxValue.ofArray());
-                    list = new ListState(indent, pl.key, parentIdx, parent);
+                    lists.add(new ListState(indent, pl.key, parentIdx, parent));
                 } else if (pl.value.isEmpty()) {
                     int[] peek = nextContentLine(text, pos);
                     if (peek != null && trim(text.substring(peek[0], peek[1])).startsWith("- ")) {
                         parent.set(pl.key, SynxValue.ofArray());
-                        list = new ListState(indent, pl.key, parentIdx, parent);
+                        lists.add(new ListState(indent, pl.key, parentIdx, parent));
                         continue;
                     }
                     SynxObject child = new SynxObject();
@@ -399,16 +454,33 @@ public final class SynxParser {
         }
     }
 
-    /** The first non-blank line at or after {@code from}, as {start, end} without a trailing CR. */
+    /**
+     * The first line at or after {@code from} that is content — not blank and not a comment —
+     * as {start, end} without a trailing CR.
+     *
+     * <p>spec: a comment line is ignored (§5), so it cannot stand between a key and its list
+     * or between a `- ` line and the keys of its item. Only blank lines were skipped here:
+     * `items` / `# note` / `- a` read as an empty object and lost every item, and a comment
+     * after `- name a` turned the item into the text `name a` and sent its keys to the parent.
+     */
     private static int[] nextContentLine(String text, int from) {
         int p = from;
         int len = text.length();
+        boolean inComment = false;
         while (p <= len) {
             int nl = text.indexOf('\n', p);
             if (nl < 0) nl = len;
             int end = nl;
             if (end > p && text.charAt(end - 1) == '\r') end--;
-            if (!isBlank(text, p, end)) return new int[] { p, end };
+            int a = p;
+            while (a < end && isWs(text.charAt(a))) a++;
+            int b = end;
+            while (b > a && isWs(text.charAt(b - 1))) b--;
+            if (b - a == 3 && text.startsWith("###", a)) {
+                inComment = !inComment;
+            } else if (!inComment && a < b && text.charAt(a) != '#' && !text.startsWith("//", a)) {
+                return new int[] { p, end };
+            }
             p = nl + 1;
         }
         return null;
@@ -539,8 +611,10 @@ public final class SynxParser {
             // `:random` reads its weights from the value.
             if (out.markers.contains("random")) {
                 List<String> nums = new ArrayList<>();
+                // spec: a weight is `digits[.digits]`. Anything a float parser reads counted,
+                // so `a:random inf`, `-5` or `nan` lost its value to a weight list.
                 for (String tok : splitWhitespace(out.value)) {
-                    if (SynxNumbers.parseF64(tok) != null) nums.add(tok);
+                    if (isWeight(tok)) nums.add(tok);
                 }
                 if (!nums.isEmpty()) {
                     out.markerArgs = nums;
@@ -557,6 +631,26 @@ public final class SynxParser {
     }
 
     /** Rust {@code split_whitespace} (Unicode White_Space). */
+    private static Double finiteOrNull(Double d) {
+        return d != null && Double.isFinite(d) ? d : null;
+    }
+
+    /** {@code digits[.digits]} — a {@code :random} weight. */
+    static boolean isWeight(String s) {
+        int dot = s.indexOf('.');
+        if (dot < 0) return isDigits(s, 0, s.length());
+        return isDigits(s, 0, dot) && isDigits(s, dot + 1, s.length());
+    }
+
+    private static boolean isDigits(String s, int from, int to) {
+        if (from >= to) return false;
+        for (int i = from; i < to; i++) {
+            char c = s.charAt(i);
+            if (c < '0' || c > '9') return false;
+        }
+        return true;
+    }
+
     static List<String> splitWhitespace(String s) {
         List<String> out = new ArrayList<>();
         int i = 0;
@@ -586,8 +680,10 @@ public final class SynxParser {
             String k = trim(part.substring(0, colon));
             String v = trim(part.substring(colon + 1));
             switch (k) {
-                case "min":     c.min = SynxNumbers.parseF64(v); break;
-                case "max":     c.max = SynxNumbers.parseF64(v); break;
+                // A bound is a finite number: `inf` and `nan` bound nothing sensible
+                // (`[max:-inf]` rejected every value).
+                case "min":     c.min = finiteOrNull(SynxNumbers.parseF64(v)); break;
+                case "max":     c.max = finiteOrNull(SynxNumbers.parseF64(v)); break;
                 case "type":    c.typeName = v; break;
                 case "pattern": c.pattern = v;  break;
                 case "enum": {

@@ -21,6 +21,182 @@ const int _defaultMaxIncludeDepth = 16;
 /// Upper bound for one scratch string built from hostile templates, in UTF-8 bytes.
 const int _maxScratch = 4 * 1024 * 1024;
 
+/// Included documents one top-level resolve may read.
+const int _maxIncludeReads = 1024;
+
+/// Bytes one top-level resolve may read from disk through `:include`,
+/// `!include`, `!use` and `:watch`.
+///
+/// safety: every file is capped at 10 MiB, but a document may name the same
+/// file from a thousand keys; each read is parsed and kept.
+const int _maxResolveReadBytes = 64 * 1024 * 1024;
+
+/// Bytes the markers of one top-level resolve may add to the document: values
+/// copied by `:alias`, `:ref`, `:spam` and `:inherit`, and text built by
+/// `{interpolation}`, `:replace`, `:join`, `:format` and `:prompt`.
+///
+/// safety: each of them can multiply what it reads — `l:alias a` / `r:alias a`
+/// over 22 objects is 2^22 copies from 700 bytes. The costs are synx-core's,
+/// so a document runs out of budget at the same key in every port.
+const int _maxExpansionBytes = 64 * 1024 * 1024;
+
+/// What one copied value costs against [_maxExpansionBytes], text aside.
+const int _valueCost = 128;
+
+const String _limitErr = 'LIMIT_ERR: resolution budget exceeded';
+const String _nestingErr = 'NESTING_ERR: maximum object nesting depth exceeded';
+
+/// The prefixes of the strings the engine leaves in place of a value it could
+/// not produce.
+const List<String> runtimeErrorPrefixes = [
+  'INCLUDE_ERR:', 'WATCH_ERR:', 'CALC_ERR:', 'SPAM_ERR:', 'CONSTRAINT_ERR:',
+  'ALIAS_ERR:', 'NESTING_ERR:', 'LIMIT_ERR:', 'TYPE_ERR:', 'WASM_ERR:',
+];
+
+/// What a top-level resolve shares with the resolves it starts for included
+/// documents and packages (synx-core keeps the same state per thread).
+class _ResolveState {
+  /// Resolves in progress.
+  int depth = 0;
+
+  /// Files whose resolution is in progress, outermost first.
+  final List<String> chain = [];
+  int reads = 0;
+  int readBytes = 0;
+
+  /// Bytes added so far (see [_maxExpansionBytes]).
+  int expansion = 0;
+}
+
+final _ResolveState _state = _ResolveState();
+
+/// Take [bytes] from the expansion budget; false once it is spent.
+bool _charge(int bytes) {
+  final total = _state.expansion + bytes;
+  if (bytes >= 0 && total <= _maxExpansionBytes) {
+    _state.expansion = total;
+    return true;
+  }
+  _state.expansion = _maxExpansionBytes;
+  return false;
+}
+
+int _expansionRoom() => _maxExpansionBytes - _state.expansion;
+
+/// What copying [value] costs, and how many levels of objects and lists it nests.
+(int, int) _valueCostOf(SynxValue value) {
+  switch (value) {
+    case SynxStr(value: var s):
+      return (_valueCost + utf8Len(s), 0);
+    case SynxSecret(value: var s):
+      return (_valueCost + utf8Len(s), 0);
+    case SynxArr(values: var items):
+      var cost = _valueCost;
+      var depth = 0;
+      for (final item in items) {
+        final (c, d) = _valueCostOf(item);
+        cost += c;
+        if (d > depth) depth = d;
+      }
+      return (cost, depth + 1);
+    case SynxObj(map: var m):
+      var cost = _valueCost;
+      var depth = 0;
+      for (final e in m.entryView) {
+        final (c, d) = _valueCostOf(e.value);
+        cost += c + utf8Len(e.key);
+        if (d > depth) depth = d;
+      }
+      return (cost, depth + 1);
+    default:
+      return (_valueCost, 0);
+  }
+}
+
+/// A copy of [value] for a marker to place in an object [depth] levels below
+/// the root, or the error it leaves instead.
+SynxValue _budgetedCopy(SynxValue value, int depth) {
+  final (cost, nesting) = _valueCostOf(value);
+  if (depth + nesting >= maxResolveDepth) return synxString(_nestingErr);
+  if (!_charge(cost)) return synxString(_limitErr);
+  return cloneValue(value);
+}
+
+/// A value read from a file for an object [depth] levels below the root:
+/// refused past [maxResolveDepth], and under `:secret` masked leaf by leaf.
+SynxValue _placedDocument(SynxValue value, int depth, bool secret) {
+  final (_, nesting) = _valueCostOf(value);
+  if (depth + nesting >= maxResolveDepth) return synxString(_nestingErr);
+  return secret ? maskSecretValue(value) : value;
+}
+
+/// What copying one key's declarations costs against the budget.
+int _metaCost(String key, SynxMeta meta) {
+  var cost = 2 * _valueCost + utf8Len(key);
+  for (final s in meta.markers) {
+    cost += 24 + utf8Len(s);
+  }
+  for (final s in meta.args) {
+    cost += 24 + utf8Len(s);
+  }
+  final hint = meta.typeHint;
+  if (hint != null) cost += utf8Len(hint);
+  final c = meta.constraints;
+  if (c != null) {
+    final t = c.typeName;
+    if (t != null) cost += 24 + utf8Len(t);
+    final p = c.pattern;
+    if (p != null) cost += 24 + utf8Len(p);
+    for (final s in c.enumValues ?? const <String>[]) {
+      cost += 24 + utf8Len(s);
+    }
+  }
+  return cost;
+}
+
+int _metaMapCost(SynxMetaMap mm) {
+  var cost = _valueCost;
+  mm.forEach((k, m) => cost += _metaCost(k, m));
+  return cost;
+}
+
+/// [s] is an error the engine left in place of a value.
+bool isEngineError(String s) {
+  if (s.isEmpty) return false;
+  final c = s.codeUnitAt(0);
+  if (c < 0x41 || c > 0x5A) return false;
+  for (final p in runtimeErrorPrefixes) {
+    if (s.startsWith(p)) return true;
+  }
+  return false;
+}
+
+/// Make a resolved value a secret. A scalar becomes the secret of its text; a
+/// list or a group keeps its shape and every scalar in it is masked (in
+/// place). An absent value (null) stays null — wrapping it made the secret the
+/// text "null", which `[required]` read as a present value — an existing
+/// secret is kept, and an engine error stays readable.
+SynxValue maskSecretValue(SynxValue v) {
+  switch (v) {
+    case SynxSecret() || SynxNull():
+      return v;
+    case SynxArr(values: var items):
+      for (var i = 0; i < items.length; i++) {
+        items[i] = maskSecretValue(items[i]);
+      }
+      return v;
+    case SynxObj(map: var m):
+      for (final k in m.keys) {
+        m[k] = maskSecretValue(m[k]!);
+      }
+      return v;
+    case SynxStr(value: var s) when isEngineError(s):
+      return v;
+    default:
+      return synxSecret(valueToString(v));
+  }
+}
+
 /// Markers the engine handles itself; a custom marker (`SynxOptions.markerFns`)
 /// with one of these names is never called.
 const Set<String> _builtinMarkers = {
@@ -38,7 +214,19 @@ final Map<String, List<DateTime>> _spamBuckets = {};
 /// Apply markers and constraints to `result` in place. No-op on Static mode.
 void resolve(SynxParseResult result, SynxOptions opts) {
   if (result.mode != SynxMode.active) return;
-  _Resolver(result, opts).run();
+  final s = _state;
+  if (s.depth == 0) {
+    s.chain.clear();
+    s.reads = 0;
+    s.readBytes = 0;
+    s.expansion = 0;
+  }
+  s.depth++;
+  try {
+    _Resolver(result, opts).run();
+  } finally {
+    s.depth--;
+  }
 }
 
 class _Resolver {
@@ -50,6 +238,10 @@ class _Resolver {
   /// Root `:include` keys the pre-pass already resolved: key → (path, root).
   final Map<String, (String, SynxValue)> preresolved = {};
   final List<String> rootSpecial = [];
+
+  /// What the keys under `:secret` held before the pre-pass masked them, by
+  /// object path and key (see [_maskSecretLiterals]).
+  final Map<String, Map<String, SynxValue>> secretOriginals = {};
 
   _Resolver(this.result, this.opts) : rng = _seedRng(opts);
 
@@ -85,9 +277,13 @@ class _Resolver {
         try {
           final full = _jailPath(opts.basePath ?? '.', v.value);
           _checkFileSize(full);
-          final included = _readAndResolve(full).root;
+          final included = _includeFile(full, v.value).root;
           preresolved[e.key] = (v.value, included);
-          includes.putIfAbsent(e.key, () => included);
+          // safety: the tree is also what `{leaf:key}` reads. Under `:secret`
+          // that scope gets the masked tree, or `x {password:db}` printed what
+          // `db:secret:include` hid.
+          includes.putIfAbsent(
+              e.key, () => meta.markers.contains('secret') ? maskSecretValue(cloneValue(included)) : included);
         } catch (_) {
           // Same as Rust: an unreadable include is no alias.
         }
@@ -116,8 +312,9 @@ class _Resolver {
       }
     }
 
-    // safety: mask literal `:secret` values before any resolution, so a field
-    // that interpolates `{that_key}` can never observe the plaintext.
+    // safety: every value under `:secret` is masked before any resolution, so
+    // no field that names it — `{that_key}`, `:alias`, `:map` — reads the
+    // plain text, wherever in the document it stands.
     _maskSecretLiterals(result.root, '');
 
     if (rootObj is SynxObj) {
@@ -138,14 +335,24 @@ class _Resolver {
   void _resolveValue(SynxObject map, String? path, int depth) {
     if (depth >= maxResolveDepth) {
       for (final k in map.keys) {
-        map[k] = synxString('NESTING_ERR: maximum object nesting depth exceeded');
+        map[k] = synxString(_nestingErr);
       }
       return;
     }
     final keys = map.keys;
     final mm = path == null ? null : metadata[path];
+    // What this object's `:secret` keys held before the pre-pass.
+    final originals = path == null || secretOriginals.isEmpty ? null : secretOriginals.remove(path);
     var hasBrace = false;
     for (final key in keys) {
+      if (originals != null) {
+        final original = originals.remove(key);
+        if (original != null) {
+          map[key] = original;
+          // Secrets nested in it stay masked until their own turn.
+          if (original is SynxObj || original is SynxArr) _maskSecretSubtree(original, _childPath(path, key)!);
+        }
+      }
       final child = map[key];
       if (child is SynxObj) {
         _resolveValue(child.map, _childPath(path, key), depth + 1);
@@ -160,7 +367,7 @@ class _Resolver {
         }
       }
       final meta = mm?[key];
-      if (meta != null) _applyMarkers(map, key, meta, path!);
+      if (meta != null) _applyMarkers(map, key, meta, path!, depth);
       if (!hasBrace) {
         final v = map[key];
         if (v is SynxStr && v.value.contains('{')) hasBrace = true;
@@ -170,8 +377,17 @@ class _Resolver {
     for (final key in keys) {
       final v = map[key];
       if (v is SynxStr && v.value.contains('{')) {
-        final res = _resolveInterpolation(v.value, map);
-        if (res != v.value) map[key] = synxString(res);
+        // safety: the text may grow by what is left of the budget and no
+        // further — one 4 MiB value named from 600 keys was 2.4 GiB.
+        final before = utf8Len(v.value);
+        final res = _resolveInterpolation(v.value, map, before + _expansionRoom());
+        if (res == null) {
+          _state.expansion = _maxExpansionBytes;
+          map[key] = synxString(_limitErr);
+        } else if (res != v.value) {
+          _charge(max(0, utf8Len(res) - before));
+          map[key] = synxString(res);
+        }
       }
     }
   }
@@ -184,7 +400,9 @@ class _Resolver {
 
   // ─── files ────────────────────────────────────────────────────────────────
 
-  /// Resolve [rel] inside [base] or throw (Rust `jail_path`).
+  /// Resolve [rel] inside [base] or throw (Rust `jail_path`). Judged by the
+  /// real path: a junction or a symbolic link inside the base that leads out
+  /// of it is an escape.
   String _jailPath(String base, String rel) {
     if (rel.isNotEmpty && (rel[0] == '/' || rel[0] == '\\')) {
       throw StateError("SECURITY: rooted paths are not allowed: '$rel'");
@@ -192,24 +410,68 @@ class _Resolver {
     if (_isAbsolute(rel)) {
       throw StateError("SECURITY: absolute paths are not allowed: '$rel'");
     }
-    final baseCanon = Directory(base).absolute.path;
-    final joined = '$baseCanon${Platform.pathSeparator}$rel';
-    if (File(joined).existsSync() || Directory(joined).existsSync()) {
-      final full = File(joined).absolute.uri.normalizePath().toFilePath();
+    // A drive-relative path (`C:x`) leaves the base on Windows.
+    if (Platform.isWindows && rel.length >= 2 && rel.codeUnitAt(1) == 0x3A && _isAsciiLetter(rel.codeUnitAt(0))) {
+      throw StateError("SECURITY: path escapes base directory: '$rel'");
+    }
+    // safety: `NUL`, `con.txt` or `COM1` in any directory opens a device on
+    // Windows; synx-core reaches the disk through a verbatim path, where these
+    // are ordinary missing files.
+    if (Platform.isWindows && _hasDeviceName(rel)) throw StateError('file not found: $rel');
+    // A base that cannot be resolved refuses instead of jailing nothing.
+    final b = base.isEmpty ? '.' : base;
+    String baseCanon;
+    try {
+      baseCanon = Directory(b).resolveSymbolicLinksSync();
+    } on FileSystemException {
+      throw StateError("SECURITY: base directory not found: '$b'");
+    }
+    final full = '$baseCanon${Platform.pathSeparator}$rel';
+    String fullCanon;
+    try {
+      fullCanon = File(full).resolveSymbolicLinksSync();
+    } on FileSystemException {
+      // The file may not exist yet — at least verify no `..` escapes, judged
+      // by the path as the document wrote it.
+      if (rel.split(_pathSeparators).contains('..')) {
+        throw StateError("SECURITY: path traversal detected: '$rel'");
+      }
       if (!_isSubPath(baseCanon, full)) {
         throw StateError("SECURITY: path escapes base directory: '$rel'");
       }
       return full;
     }
-    // The file may not exist yet — at least verify no `..` escapes.
-    if (joined.contains('..')) {
-      throw StateError("SECURITY: path traversal detected: '$rel'");
+    if (!_isSubPath(baseCanon, fullCanon)) {
+      throw StateError("SECURITY: path escapes base directory: '$rel'");
     }
-    return joined;
+    return fullCanon;
   }
+
+  static final RegExp _pathSeparators = RegExp(r'[/\\]');
+
+  static bool _isAsciiLetter(int c) => (c >= 0x41 && c <= 0x5A) || (c >= 0x61 && c <= 0x7A);
 
   static bool _isAbsolute(String p) =>
       p.length >= 3 && p[1] == ':' && (p[2] == '\\' || p[2] == '/') || p.startsWith('\\\\');
+
+  /// A path component that names a DOS device, with or without an extension
+  /// or a stream: `NUL`, `con.txt`, `sub/COM1`, `aux:x`.
+  static bool _hasDeviceName(String rel) {
+    for (final part in rel.split(_pathSeparators)) {
+      var stem = part;
+      final cut = stem.indexOf(RegExp(r'[.:]'));
+      if (cut >= 0) stem = stem.substring(0, cut);
+      while (stem.endsWith(' ')) {
+        stem = stem.substring(0, stem.length - 1);
+      }
+      stem = stem.toUpperCase();
+      if (const {'CON', 'PRN', 'AUX', 'NUL', r'CONIN$', r'CONOUT$'}.contains(stem)) return true;
+      if ((stem.startsWith('COM') || stem.startsWith('LPT')) && stem.length == 4) {
+        if ('0123456789¹²³'.contains(stem[3])) return true;
+      }
+    }
+    return false;
+  }
 
   static bool _isSubPath(String root, String candidate) {
     String norm(String p) => File(p).absolute.uri.normalizePath().toFilePath().replaceAll('\\', '/');
@@ -235,16 +497,61 @@ class _Resolver {
     }
   }
 
-  /// Read a file as text, with Rust's portable not-found / permission messages.
-  String _readText(String full, String shown) {
+  /// Read a file for `:include`, `!include`, `!use` or `:watch`, counting its
+  /// size against [_maxResolveReadBytes]. The error text never carries the
+  /// operating system's wording or the absolute path, so the same document
+  /// resolves to the same string on every machine.
+  String _readBudgeted(String full, String shown) {
+    final type = FileSystemEntity.typeSync(full);
+    final size = type == FileSystemEntityType.file ? File(full).lengthSync() : 0;
+    if (_state.readBytes + size > _maxResolveReadBytes) {
+      throw StateError('read budget ($_maxResolveReadBytes bytes) exceeded');
+    }
+    // A directory reads as "permission denied" on Windows and "is a
+    // directory" elsewhere; it is neither.
+    if (type == FileSystemEntityType.directory) throw StateError('not a file: $shown');
+    List<int> data;
     try {
-      return File(full).readAsStringSync();
+      data = File(full).readAsBytesSync();
     } on PathNotFoundException {
       throw StateError('file not found: $shown');
     } on PathAccessException {
       throw StateError('permission denied: $shown');
     } on FileSystemException catch (e) {
-      throw StateError(e.message);
+      // A name the platform cannot hold (ERROR_INVALID_NAME) is a file that is not there.
+      if (e.osError?.errorCode == 123) throw StateError('file not found: $shown');
+      throw StateError('cannot read file: $shown');
+    }
+    String text;
+    try {
+      text = utf8.decode(data);
+    } on FormatException {
+      throw StateError('file is not valid UTF-8: $shown');
+    }
+    _state.readBytes += data.length;
+    return text;
+  }
+
+  /// Read and resolve the document at [full]; [shown] is the path as the
+  /// document wrote it.
+  ///
+  /// safety: the depth cap alone let `a:include self.synx` / `b:include
+  /// self.synx` resolve 2^16 times — minutes for a three-line file. A cycle
+  /// now stops at its first repeat, and the budget bounds an acyclic fan-out.
+  SynxParseResult _includeFile(String full, String shown) {
+    final id = Platform.isWindows ? full.toLowerCase() : full;
+    if (_state.chain.contains(id)) throw StateError("circular include: '$shown'");
+    if (_state.reads >= _maxIncludeReads) {
+      throw StateError('include budget ($_maxIncludeReads files) exceeded');
+    }
+    _state.reads++;
+    _state.chain.add(id);
+    try {
+      final sub = parser.parse(_readBudgeted(full, shown));
+      if (sub.mode == SynxMode.active) resolve(sub, _childOptions(File(full).parent.path));
+      return sub;
+    } finally {
+      _state.chain.removeLast();
     }
   }
 
@@ -259,12 +566,6 @@ class _Resolver {
     ..markerFns = opts.markerFns
     ..includeDepth = opts.includeDepth + 1;
 
-  SynxParseResult _readAndResolve(String full) {
-    final sub = parser.parse(File(full).readAsStringSync());
-    if (sub.mode == SynxMode.active) resolve(sub, _childOptions(File(full).parent.path));
-    return sub;
-  }
-
   Map<String, SynxValue> _loadIncludes() {
     final map = <String, SynxValue>{};
     final maxDepth = opts.maxIncludeDepth ?? _defaultMaxIncludeDepth;
@@ -273,7 +574,7 @@ class _Resolver {
       try {
         final full = _jailPath(opts.basePath ?? '.', inc.path);
         _checkFileSize(full);
-        map[inc.alias] = _readAndResolve(full).root;
+        map[inc.alias] = _includeFile(full, inc.path).root;
       } catch (_) {
         // Same as Rust: skip failed includes.
       }
@@ -284,7 +585,9 @@ class _Resolver {
   /// `!use @scope/name` → `<packages>/@scope/name/<manifest main>` or `src/main.synx`.
   Map<String, SynxValue> _loadPackages() {
     final map = <String, SynxValue>{};
-    if (result.uses.isEmpty) return map;
+    // safety: a package may `!use` another; packages using one another
+    // recursed until the process ran out of stack.
+    if (result.uses.isEmpty || opts.includeDepth >= (opts.maxIncludeDepth ?? _defaultMaxIncludeDepth)) return map;
     final pkgRoot = '${opts.basePath ?? '.'}/${opts.packagesPath ?? './synx_packages'}';
     for (final use in result.uses) {
       // safety: a package name or manifest entry must stay inside the packages
@@ -298,9 +601,13 @@ class _Resolver {
       if (!f.existsSync()) continue;
       try {
         _checkFileSize(entry);
-        final sub = parser.parse(f.readAsStringSync());
-        if (sub.mode == SynxMode.active) resolve(sub, _childOptions(f.parent.path));
-        map[use.alias] = sub.root;
+        String opened;
+        try {
+          opened = f.resolveSymbolicLinksSync();
+        } on FileSystemException {
+          opened = f.absolute.path;
+        }
+        map[use.alias] = _includeFile(opened, use.pkg).root;
       } catch (_) {
         // skip failed packages
       }
@@ -349,6 +656,16 @@ class _Resolver {
       if (parents.isNotEmpty) inherits.add((key, parents));
     });
 
+    if (inherits.isEmpty) return;
+
+    // perf: the declarations nested under each `object.field`, found once.
+    // Every inherited field used to walk the whole metadata table for them.
+    final nestedIndex = <String, List<String>>{};
+    for (final path in metadata.keys) {
+      final head = _twoSegmentHead(path);
+      if (head != null) nestedIndex.putIfAbsent(head, () => []).add(path);
+    }
+
     final map = root.map;
     for (final (childKey, parents) in inherits) {
       // spec: only an object inherits; a list or a scalar child is left as written.
@@ -357,16 +674,31 @@ class _Resolver {
 
       // Parents merge left to right, the child overrides all. `source` remembers
       // the object each field came from (null = the child itself).
+      //
+      // safety: every inherited field is a copy, charged to the document's
+      // budget — 3 000 children of a 3 000-field parent are nine million
+      // fields from a 130 KB file.
       final merged = SynxObject();
       final source = <String, String?>{};
+      var withinBudget = true;
+      parentsLoop:
       for (final parentName in parents) {
         final pv = map[parentName];
         if (pv is SynxObj) {
           for (final e in pv.map.entryView) {
+            final (cost, _) = _valueCostOf(e.value);
+            if (!_charge(cost + utf8Len(e.key))) {
+              withinBudget = false;
+              break parentsLoop;
+            }
             merged[e.key] = cloneValue(e.value);
             source[e.key] = parentName;
           }
         }
+      }
+      if (!withinBudget) {
+        map[childKey] = synxString(_limitErr);
+        continue;
       }
       for (final e in childVal.map.entryView) {
         merged[e.key] = cloneValue(e.value);
@@ -378,20 +710,39 @@ class _Resolver {
       final top = <String, SynxMeta>{};
       final nested = <(String, SynxMetaMap)>[];
       final childSeg = parser.keySegment(childKey);
-      source.forEach((k, src) {
+      for (final entry in source.entries) {
+        final k = entry.key;
+        final src = entry.value;
         final from = src ?? childKey;
         final m = metadata[parser.keySegment(from)]?[k];
-        if (m != null) top[k] = _cloneMeta(m);
+        if (m != null) {
+          if (src != null && !_charge(_metaCost(k, m))) {
+            withinBudget = false;
+            break;
+          }
+          top[k] = _cloneMeta(m);
+        }
         if (src != null) {
           final prefix = '${parser.keySegment(src)}.${parser.keySegment(k)}';
-          metadata.forEach((path, mm) {
-            if (!path.startsWith(prefix)) return;
+          final paths = nestedIndex[prefix];
+          if (paths == null) continue;
+          for (final path in paths) {
+            final mm = metadata[path];
+            if (mm == null) continue;
             final rest = path.substring(prefix.length);
-            if (rest.isNotEmpty && rest[0] != '.') return;
+            if (!_charge(_metaMapCost(mm) + utf8Len(path))) {
+              withinBudget = false;
+              break;
+            }
             nested.add(('$childSeg.${parser.keySegment(k)}$rest', _cloneMetaMap(mm)));
-          });
+          }
+          if (!withinBudget) break;
         }
-      });
+      }
+      if (!withinBudget) {
+        map[childKey] = synxString(_limitErr);
+        continue;
+      }
       map[childKey] = SynxObj(merged);
       if (top.isEmpty) {
         metadata.remove(childSeg);
@@ -399,9 +750,30 @@ class _Resolver {
         metadata[childSeg] = top;
       }
       for (final (path, mm) in nested) {
+        // A later child may inherit from this one: its copies are indexed too.
+        if (!metadata.containsKey(path)) {
+          final head = _twoSegmentHead(path);
+          if (head != null) nestedIndex.putIfAbsent(head, () => []).add(path);
+        }
         metadata[path] = mm;
       }
     }
+  }
+
+  /// The first two segments of a metadata path (`parent.field`), or null for a
+  /// path of one segment. A `.` escaped with `\` is part of its segment.
+  static String? _twoSegmentHead(String path) {
+    var dots = 0;
+    for (var i = 0; i < path.length; i++) {
+      final c = path.codeUnitAt(i);
+      if (c == 0x5C) {
+        i++;
+      } else if (c == 0x2E) {
+        dots++;
+        if (dots == 2) return path.substring(0, i);
+      }
+    }
+    return dots == 1 ? path : null;
   }
 
   static SynxMeta _cloneMeta(SynxMeta m) => SynxMeta()
@@ -498,45 +870,51 @@ class _Resolver {
 
   // ─── :secret pre-pass ─────────────────────────────────────────────────────
 
-  static const Set<String> _resolvingBeforeSecret = {
-    'env', 'include', 'import', 'watch', 'ref', 'alias', 'calc', 'map', 'i18n', 'default',
-    'fallback', 'once', 'split', 'join', 'format', 'replace',
-  };
-
-  /// Wrap every literal `:secret` value before resolution, so no later
-  /// interpolation can read the plaintext. A secret that itself needs resolving
-  /// (`:env:secret`, …) is left for its own marker to mask in place.
+  /// The `:secret` pre-pass: every value under `:secret` is masked before any
+  /// resolution. What the key held is kept in [secretOriginals] and comes back
+  /// for the key's own turn (its subtree and its marker chain); what that
+  /// produces is masked again by the `:secret` marker.
+  ///
+  /// safety: a literal next to `:default`, `:replace`, `:format`, `:split`, …
+  /// was left in the clear until its own turn, and the fields of a group under
+  /// `:secret` were never masked here: `leak:alias password` above
+  /// `password:secret:default:x hunter2` read `hunter2`.
   void _maskSecretLiterals(SynxValue value, String path) {
     if (value is! SynxObj || metadata.isEmpty) return;
     final o = value.map;
     final mm = metadata[path];
     if (mm != null) {
       mm.forEach((key, meta) {
-        if (!meta.markers.contains('secret') || meta.markers.any(_resolvingBeforeSecret.contains)) return;
+        if (!meta.markers.contains('secret')) return;
         final v = o[key];
-        if (v != null && v is! SynxSecret && v is! SynxObj && v is! SynxArr) {
-          o[key] = synxSecret(valueToString(v));
-        }
+        if (v == null || v is SynxSecret || v is SynxNull) return;
+        o[key] = maskSecretValue(cloneValue(v));
+        secretOriginals.putIfAbsent(path, () => {})[key] = v;
       });
     }
     for (final e in o.entryView) {
       final child = e.value;
-      if (child is SynxObj) {
-        _maskSecretLiterals(child, _childPath(path, e.key)!);
-      } else if (child is SynxArr) {
-        final listPath = _childPath(path, e.key)!;
-        for (var idx = 0; idx < child.values.length; idx++) {
-          final item = child.values[idx];
-          if (item is SynxObj) _maskSecretLiterals(item, '$listPath.#$idx');
-        }
+      if (child is SynxObj || child is SynxArr) _maskSecretSubtree(child, _childPath(path, e.key)!);
+    }
+  }
+
+  /// [_maskSecretLiterals] for the object or list at [path].
+  void _maskSecretSubtree(SynxValue child, String path) {
+    if (child is SynxObj) {
+      _maskSecretLiterals(child, path);
+    } else if (child is SynxArr) {
+      for (var idx = 0; idx < child.values.length; idx++) {
+        final item = child.values[idx];
+        if (item is SynxObj) _maskSecretLiterals(item, '$path.#$idx');
       }
     }
   }
 
   // ─── interpolation ────────────────────────────────────────────────────────
 
-  /// Resolve `{key}`, `{key.nested}`, `{key:alias}`, `{key:include}` in a string.
-  String _resolveInterpolation(String tpl, SynxObject local) {
+  /// Resolve `{key}`, `{key.nested}`, `{key:alias}`, `{key:include}` in a
+  /// string; null when the text would pass [cap] UTF-8 bytes.
+  String? _resolveInterpolation(String tpl, SynxObject local, int cap) {
     final out = StringBuffer();
     var bytes = 0;
     var i = 0;
@@ -568,6 +946,7 @@ class _Resolver {
           if (refName != null) {
             if (resolved != null) {
               bytes = _appendCapped(out, bytes, valueToString(resolved), _maxScratch - bytes);
+              if (bytes > cap) return null;
             } else {
               out.write('{');
               bytes++;
@@ -594,6 +973,7 @@ class _Resolver {
         i++;
       }
     }
+    if (bytes > cap) return null;
     return out.toString();
   }
 
@@ -626,11 +1006,13 @@ class _Resolver {
     return i < markers.length ? markers[i] : null;
   }
 
-  void _applyMarkers(SynxObject map, String key, SynxMeta meta, String path) {
+  /// [depth] is how many levels below the root [map] sits.
+  void _applyMarkers(SynxObject map, String key, SynxMeta meta, String path, int depth) {
     final markers = meta.markers;
     final root = result.root;
     final mb = markers.toSet();
     bool has(String m) => mb.contains(m);
+    final secret = has('secret');
 
     // ── :spam ── key:spam:MAX_CALLS[:WINDOW_SEC] target
     if (has('spam')) {
@@ -650,7 +1032,7 @@ class _Resolver {
       if (cur != null) {
         final t = valueToString(cur);
         final resolved = _deepGet(root, t) ?? map[t];
-        if (resolved != null) map[key] = cloneValue(resolved);
+        if (resolved != null) map[key] = _budgetedCopy(resolved, depth);
       }
     }
 
@@ -665,18 +1047,22 @@ class _Resolver {
         }
         final pre = path.isEmpty ? preresolved[key] : null;
         if (pre != null && pre.$1 == v.value) {
-          map[key] = pre.$2;
+          map[key] = _placedDocument(cloneValue(pre.$2), depth, secret);
           return;
         }
         try {
           final full = _jailPath(opts.basePath ?? '.', v.value);
           _checkFileSize(full);
-          final sub = parser.parse(_readText(full, v.value));
-          if (sub.mode == SynxMode.active) resolve(sub, _childOptions(File(full).parent.path));
-          map[key] = sub.root;
+          map[key] = _placedDocument(_includeFile(full, v.value).root, depth, secret);
         } on StateError catch (e) {
           map[key] = synxString('INCLUDE_ERR: ${e.message}');
         }
+      }
+      // safety: the chain ends here, so `:secret` is applied here — a value
+      // that was not a path (`k:secret:include 5`) stayed in the clear.
+      if (secret) {
+        final cur = map[key];
+        if (cur != null) map[key] = maskSecretValue(cur);
       }
       return;
     }
@@ -691,11 +1077,11 @@ class _Resolver {
         final forceStr = _wantsString(meta);
         final di = markers.indexOf('default');
         if (envVal != null && envVal.isNotEmpty) {
-          map[key] = forceStr ? synxString(envVal) : _castPrimitive(envVal);
+          map[key] = _externalValue(envVal, forceStr, secret);
         } else if (di >= 0 && markers.length > di + 1) {
           // All parts after `default`, joined back: IPs (0.0.0.0) and URLs survive.
           final fallback = markers.sublist(di + 1).join(':');
-          map[key] = forceStr ? synxString(fallback) : _castPrimitive(fallback);
+          map[key] = _externalValue(fallback, forceStr, secret);
         } else {
           map[key] = synxNull();
         }
@@ -727,9 +1113,9 @@ class _Resolver {
     if (has('ref')) {
       final v = map[key];
       if (v is SynxStr) {
-        final resolved = _deepGet(root, v.value) ?? map[v.value] ?? synxNull();
-        var out = cloneValue(resolved);
-        final n = _asNumber(resolved);
+        final found = _deepGet(root, v.value) ?? map[v.value];
+        var out = found == null ? synxNull() : _budgetedCopy(found, depth);
+        final n = _asNumber(out);
         final calcExpr = _arg(markers, 'calc', 1);
         if (has('calc') && n != null && calcExpr != null && calcExpr.isNotEmpty && '+-*/%'.contains(calcExpr[0])) {
           final res = safeCalc('${formatNumber(n)} $calcExpr');
@@ -823,16 +1209,10 @@ class _Resolver {
             final b = identical(a, currentPath) ? target : currentPath;
             map[key] = synxString('ALIAS_ERR: circular alias detected: $a → $b');
           } else {
-            map[key] = targetVal != null ? cloneValue(targetVal) : synxNull();
+            map[key] = targetVal != null ? _budgetedCopy(targetVal, depth) : synxNull();
           }
         }
       }
-    }
-
-    // ── :secret ── idempotent: the pre-pass may already have wrapped a literal.
-    if (has('secret')) {
-      final v = map[key];
-      if (v != null && v is! SynxSecret) map[key] = synxSecret(valueToString(v));
     }
 
     // ── :unique ──
@@ -893,7 +1273,14 @@ class _Resolver {
       final v = map[key];
       if (v is SynxArr) {
         final jk = _arg(markers, 'join', 1);
-        map[key] = synxString(v.values.map(valueToString).join(jk != null ? _delimiter(jk) : ','));
+        final sep = jk != null ? _delimiter(jk) : ',';
+        // safety: the separator is as long as the document likes and is
+        // written once per item.
+        final n = v.values.length;
+        final separators = utf8Len(sep) * (n > 0 ? n - 1 : 0);
+        map[key] = separators > n && !_charge(separators)
+            ? synxString(_limitErr)
+            : synxString(v.values.map(valueToString).join(sep));
       }
     }
 
@@ -905,7 +1292,7 @@ class _Resolver {
         final di = markers.indexOf('default');
         if (markers.length > di + 1) {
           final fallback = markers.sublist(di + 1).join(':');
-          map[key] = _wantsString(meta) ? synxString(fallback) : _castPrimitive(fallback);
+          map[key] = _externalValue(fallback, _wantsString(meta), secret);
         }
       }
     }
@@ -932,9 +1319,15 @@ class _Resolver {
       final v = map[key];
       final n = v == null ? null : _asNumber(v);
       if (n != null) {
-        final factor = pow(10, dec.toSigned(32)).toDouble();
-        final rounded = _roundHalfAway(n * factor) / factor;
-        map[key] = dec == 0 ? synxInt(saturatingI64(rounded)) : synxFloat(rounded);
+        // A scale past the range of f64 rounds nothing: the number stays.
+        final factor = pow(10.0, dec > 400 ? 400 : dec).toDouble();
+        final scaled = n * factor;
+        final rounded = scaled.isFinite ? _roundHalfAway(scaled) / factor : n;
+        // safety: only a whole number that fits is an integer. The cast alone
+        // saturated: `:round` of 1e30 was 9223372036854775807 and of NaN was 0.
+        map[key] = dec == 0 && rounded.isFinite && rounded % 1 == 0 && rounded.abs() < 9223372036854775807.0
+            ? synxInt(rounded.toInt())
+            : synxFloat(rounded);
       }
     }
 
@@ -965,7 +1358,12 @@ class _Resolver {
     // ── :format ── key:format:PATTERN value (printf-style: %.2f, %d, %05d, %e)
     if (has('format')) {
       final v = map[key];
-      if (v != null) map[key] = synxString(_applyFormat(_arg(markers, 'format', 1) ?? '%s', v));
+      if (v != null) {
+        var formatted = _applyFormat(_arg(markers, 'format', 1) ?? '%s', v);
+        // safety: a width of 4096 on a twenty-byte line is a 200-fold growth.
+        if ((v is SynxInt || v is SynxFloat) && !_charge(utf8Len(formatted))) formatted = _limitErr;
+        map[key] = synxString(formatted);
+      }
     }
 
     // ── :replace:FROM:TO ── literal substring replacement; TO defaults to deletion
@@ -974,12 +1372,21 @@ class _Resolver {
       if (v is SynxStr) {
         final from = _arg(markers, 'replace', 1) ?? '';
         final to = _arg(markers, 'replace', 2) ?? '';
-        if (from.isNotEmpty) map[key] = synxString(v.value.replaceAll(from, to));
+        if (from.isNotEmpty) {
+          // safety: `:replace:a:<long>` on a run of `a` multiplies the two
+          // lengths; the growth is known before a byte is written.
+          final fromBytes = utf8Len(from);
+          final toBytes = utf8Len(to);
+          final grown = toBytes > fromBytes ? _countMatches(v.value, from) * (toBytes - fromBytes) : 0;
+          map[key] = grown > 0 && !_charge(grown) ? synxString(_limitErr) : synxString(v.value.replaceAll(from, to));
+        }
       }
     }
 
-    // ── :sort / :sort:desc ── two numbers compare numerically, anything else as
-    // text by code point (never locale collation); stable.
+    // ── :sort / :sort:desc ──
+    // A total order: numbers first, by value (NaN after the rest of them), then
+    // everything else by its text, by code point; stable. Comparing a number
+    // with text as text made `10 < 1a < 9 < 10` a cycle.
     if (has('sort')) {
       final v = map[key];
       if (v is SynxArr) {
@@ -994,10 +1401,17 @@ class _Resolver {
           final yn = _asNumber(y.$1);
           int c;
           if (xn != null && yn != null) {
-            c = xn.isNaN || yn.isNaN ? 0 : xn.compareTo(yn);
-            if (c != 0 && xn == yn) c = 0; // -0.0 == 0.0
+            if (xn.isNaN || yn.isNaN) {
+              c = xn.isNaN == yn.isNaN ? 0 : (xn.isNaN ? 1 : -1);
+            } else {
+              c = xn < yn ? -1 : (xn > yn ? 1 : 0);
+            }
+          } else if (xn != null) {
+            c = -1;
+          } else if (yn != null) {
+            c = 1;
           } else {
-            c = compareCodePoints(x.$3 ?? valueToString(x.$1), y.$3 ?? valueToString(y.$1));
+            c = compareCodePoints(x.$3!, y.$3!);
           }
           return c != 0 ? c : x.$2 - y.$2;
         });
@@ -1020,8 +1434,9 @@ class _Resolver {
             total += item.value;
             if (item.value % 1 != 0) allInt = false;
           } else if (item is SynxStr) {
+            // `inf` and `nan` are text here as everywhere (see _castPrimitive).
             final f = parseF64(item.value);
-            if (f != null) {
+            if (f != null && f.isFinite) {
               total += f;
               if (f % 1 != 0) allInt = false;
             }
@@ -1091,22 +1506,40 @@ class _Resolver {
         }
         final kp = _arg(markers, 'watch', 1);
         try {
-          final content = _readText(full, v.value);
+          final content = _readBudgeted(full, v.value);
           final dot = full.lastIndexOf('.');
           final sep = max(full.lastIndexOf('/'), full.lastIndexOf('\\'));
           final ext = dot > sep ? full.substring(dot + 1) : '';
-          map[key] = kp != null ? (_extractFromContent(content, kp, ext) ?? synxNull()) : synxString(trimWs(content));
+          if (kp != null) {
+            final found = _extractFromContent(content, kp, ext);
+            map[key] = found == null ? synxNull() : _placedDocument(found, depth, false);
+          } else {
+            map[key] = synxString(trimWs(content));
+          }
         } on StateError catch (e) {
           map[key] = synxString('WATCH_ERR: ${e.message}');
         }
       }
     }
 
+    // ── :secret ──
+    // Last of the markers that produce the value, so whatever they resolved is
+    // what gets masked. It used to sit after `:alias`: `t:secret:once` came
+    // out as plain text and `:secret:format` formatted the mask. `:prompt` and
+    // custom markers below still see only the mask.
+    if (secret) {
+      final v = map[key];
+      if (v != null) map[key] = maskSecretValue(v);
+    }
+
     // ── :prompt ── key:prompt:LABEL subtree → fenced SYNX text
     if (has('prompt')) {
       final label = _arg(markers, 'prompt', 1) ?? key;
       final v = map[key];
-      if (v != null) map[key] = synxString('$label (SYNX):\n```synx\n${_stringifyValue(v, 0)}```');
+      if (v != null) {
+        final block = '$label (SYNX):\n```synx\n${_stringifyValue(v, 0)}```';
+        map[key] = synxString(_charge(utf8Len(block)) ? block : _limitErr);
+      }
     }
 
     // ── custom markers (the analog of synx-core's WASM markers) ──
@@ -1423,9 +1856,31 @@ SynxValue _castPrimitive(String val) {
   }
   final i = parseI64(val);
   if (i != null) return synxInt(i);
+  // spec: `inf`, `NaN` and `1e400` are text. Read as floats they became
+  // `null` in JSON: a host named `inf` lost its value.
   final d = parseF64(val);
-  if (d != null) return synxFloat(d);
+  if (d != null && d.isFinite) return synxFloat(d);
   return synxString(val);
+}
+
+/// Text from outside the document as a value. Under `:secret` a cast that
+/// gave a number or a bool keeps the text instead: `00123` stays `00123`.
+SynxValue _externalValue(String text, bool asString, bool secret) {
+  if (asString) return synxString(text);
+  final cast = _castPrimitive(text);
+  if (secret && (cast is SynxInt || cast is SynxFloat || cast is SynxBool)) return synxString(text);
+  return cast;
+}
+
+/// Non-overlapping occurrences of [needle] in [hay], left to right.
+int _countMatches(String hay, String needle) {
+  var n = 0;
+  var i = hay.indexOf(needle);
+  while (i >= 0) {
+    n++;
+    i = hay.indexOf(needle, i + needle.length);
+  }
+  return n;
 }
 
 /// `(string)` or `[type:string]` keeps env/default text as text instead of casting it.

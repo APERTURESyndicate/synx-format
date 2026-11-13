@@ -47,57 +47,25 @@ enum SynxValidate {
         return false
     }
 
-    /// Syntax the reference's `regex` crate refuses (so the constraint is skipped
-    /// there) but ICU would run: look-around, back-references, atomic groups and
-    /// possessive quantifiers.
-    static func usesSyntaxRustRefuses(_ pattern: String) -> Bool {
-        let p = Array(pattern.utf8)
-        var i = 0
-        var inClass = false
-        while i < p.count {
-            let c = p[i]
-            if c == 0x5C {  // backslash
-                if !inClass, i + 1 < p.count, p[i + 1] >= 0x31 && p[i + 1] <= 0x39 { return true }
-                if i + 1 < p.count, p[i + 1] == 0x6B { return true }  // \k<name>
-                i += 2
-                continue
-            }
-            if inClass {
-                if c == 0x5D { inClass = false }
-            } else if c == 0x5B {
-                inClass = true
-            } else if c == 0x28, i + 2 < p.count, p[i + 1] == 0x3F {
-                let k = p[i + 2]
-                if k == 0x3D || k == 0x21 || k == 0x3E { return true }                        // (?= (?! (?>
-                if k == 0x3C, i + 3 < p.count, p[i + 3] == 0x3D || p[i + 3] == 0x21 { return true }  // (?<= (?<!
-            } else if (c == 0x2A || c == 0x2B || c == 0x3F || c == 0x7D), i + 1 < p.count, p[i + 1] == 0x2B {
-                return true  // possessive *+ ++ ?+ {n}+
-            }
-            i += 1
-        }
-        return false
-    }
-
     private static let cacheLock = NSLock()
-    nonisolated(unsafe) private static var cache: [String: NSRegularExpression?] = [:]
+    nonisolated(unsafe) private static var cache: [String: SynxPattern?] = [:]
 
-    /// Does `s` fail `[pattern:…]`? Refused and invalid patterns never reject.
+    /// Does `s` fail `[pattern:…]`? A pattern the `regex` crate would not
+    /// compile and a backtracking-prone one never reject, as in synx-core.
     /// perf: compiled patterns are cached (bounded).
     static func patternRejects(_ pattern: String, _ s: String) -> Bool {
         cacheLock.lock()
-        var re: NSRegularExpression?
+        var re: SynxPattern?
         if let hit = cache[pattern] {
             re = hit
         } else {
             if cache.count >= 256 { cache.removeAll() }
-            if !hasNestedQuantifier(pattern) && !usesSyntaxRustRefuses(pattern) {
-                re = try? NSRegularExpression(pattern: pattern)
-            }
+            re = hasNestedQuantifier(pattern) ? nil : SynxPattern.compile(pattern)
             cache[pattern] = re
         }
         cacheLock.unlock()
         guard let r = re else { return false }
-        return r.firstMatch(in: s, options: [], range: NSRange(s.startIndex..<s.endIndex, in: s)) == nil
+        return !r.isMatch(s)
     }
 }
 
@@ -110,7 +78,16 @@ enum Constraints {
         if c.required {
             var empty = val.isNull
             if case .string(let s) = val, s.isEmpty { empty = true }
+            // A key written without a value parses as an empty group; for
+            // `[required]` that is the missing value, not a present object.
+            if case .object(let o) = val, o.count == 0 { empty = true }
             if empty { return "CONSTRAINT_ERR: '\(key)' is required" }
+        }
+        // A secret is checked by its text; no message quotes the value.
+        var textOf: String? = nil
+        switch val {
+        case .string(let s), .secret(let s): textOf = s
+        default: break
         }
         // An absent value (null) is checked against `enum` only, read as an empty
         // string; type, range and pattern apply to values that exist.
@@ -135,7 +112,7 @@ enum Constraints {
         if let ev = c.enumValues {
             let text: String
             switch val {
-            case .string(let s): text = s
+            case .string(let s), .secret(let s): text = s
             case .int(let n): text = String(n)
             case .float(let f): text = RustNumber.display(f)
             case .bool(let b): text = b ? "true" : "false"
@@ -151,6 +128,7 @@ enum Constraints {
         case .int(let n): measured = Double(n)
         case .float(let f): measured = f
         case .string(let s) where c.min != nil || c.max != nil: measured = Double(s.unicodeScalars.count)
+        case .secret(let s) where c.min != nil || c.max != nil: measured = Double(s.unicodeScalars.count)
         default: break
         }
         if let n = measured {
@@ -161,7 +139,7 @@ enum Constraints {
                 return "CONSTRAINT_ERR: '\(key)' value \(RustNumber.display(n)) exceeds max \(RustNumber.display(hi))"
             }
         }
-        if let pat = c.pattern, pat.utf8.count <= SynxValidate.maxPatternBytes, case .string(let s) = val,
+        if let pat = c.pattern, pat.utf8.count <= SynxValidate.maxPatternBytes, let s = textOf,
            SynxValidate.patternRejects(pat, s) {
             return "CONSTRAINT_ERR: '\(key)' does not match pattern /\(pat)/"
         }

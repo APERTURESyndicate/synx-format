@@ -4,13 +4,17 @@
 // exactly as in crates/synx-core/src/engine.rs.
 import 'meta.dart';
 import 'num.dart';
+import 'pattern.dart';
 import 'value.dart';
 
 const int _maxPatternBytes = 256;
 
 /// The error a value earns against its constraints, or null when it passes.
 String? constraintViolation(String key, SynxValue val, SynxConstraints c) {
-  if (c.required && (val is SynxNull || (val is SynxStr && val.value.isEmpty))) {
+  // A key written without a value parses as an empty group; for `[required]`
+  // that is the missing value, not a present object.
+  if (c.required &&
+      (val is SynxNull || (val is SynxStr && val.value.isEmpty) || (val is SynxObj && val.map.isEmpty))) {
     return "CONSTRAINT_ERR: '$key' is required";
   }
 
@@ -40,7 +44,9 @@ String? constraintViolation(String key, SynxValue val, SynxConstraints c) {
   final ev = c.enumValues;
   if (ev != null) {
     final text = switch (val) {
+      // A secret is checked by its text; no message quotes the value.
       SynxStr(value: var s) => s,
+      SynxSecret(value: var s) => s,
       SynxInt(value: var n) => n.toString(),
       SynxFloat(value: var f) => rustDisplay(f),
       SynxBool(value: var b) => b ? 'true' : 'false',
@@ -54,6 +60,7 @@ String? constraintViolation(String key, SynxValue val, SynxConstraints c) {
     SynxInt(value: var n) => n.toDouble(),
     SynxFloat(value: var f) => f,
     SynxStr(value: var s) when c.min != null || c.max != null => s.runes.length.toDouble(),
+    SynxSecret(value: var s) when c.min != null || c.max != null => s.runes.length.toDouble(),
     _ => null,
   };
   if (num != null) {
@@ -69,30 +76,30 @@ String? constraintViolation(String key, SynxValue val, SynxConstraints c) {
 
   // Over-long, invalid and nested-quantifier patterns are skipped silently.
   final pat = c.pattern;
-  if (pat != null && val is SynxStr && utf8Len(pat) <= _maxPatternBytes && patternRejects(pat, val.value)) {
+  final text = switch (val) {
+    SynxStr(value: var s) => s,
+    SynxSecret(value: var s) => s,
+    _ => null,
+  };
+  if (pat != null && text != null && utf8Len(pat) <= _maxPatternBytes && patternRejects(pat, text)) {
     return "CONSTRAINT_ERR: '$key' does not match pattern /$pat/";
   }
   return null;
 }
 
-final Map<String, RegExp?> _patterns = {};
+final Map<String, SynxPattern?> _patterns = {};
 
 /// Whether [value] fails `[pattern:…]` (unanchored, like Rust `is_match`).
-/// Invalid and backtracking-prone patterns never reject.
+/// A pattern the `regex` crate would not compile and a backtracking-prone one
+/// never reject, as in synx-core.
 /// perf: compiled patterns are cached, at most 256.
 bool patternRejects(String pattern, String value) {
-  RegExp? re;
+  SynxPattern? re;
   if (_patterns.containsKey(pattern)) {
     re = _patterns[pattern];
   } else {
     if (_patterns.length >= 256) _patterns.clear();
-    if (!hasNestedQuantifier(pattern)) {
-      try {
-        re = RegExp(pattern);
-      } on FormatException {
-        re = null;
-      }
-    }
+    re = hasNestedQuantifier(pattern) ? null : SynxPattern.compile(pattern);
     _patterns[pattern] = re;
   }
   return re != null && !re.hasMatch(value);

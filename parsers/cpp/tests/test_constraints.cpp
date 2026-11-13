@@ -13,7 +13,6 @@ using namespace synx;
 // Internal helper (src/engine_internal.hpp), linked from the library.
 namespace synx { namespace detail {
 bool has_nested_quantifier(std::string_view pattern);
-bool regex_pattern_is_supported(std::string_view pattern);
 } }
 
 namespace {
@@ -142,31 +141,49 @@ SYNX_TEST(whole_floats_interpolate_without_fraction) {
     EXPECT_EQ(str_at(r.root, "msg"), std::string("2 x"));
 }
 
-// ─── invalid patterns are skipped, never abort ─────────────────────────────
+// ─── patterns: the regex crate's dialect, linear time ──────────────────────
 
-SYNX_TEST(constraints_invalid_patterns_are_skipped_silently) {
-    // Each of these would make std::regex throw (= abort with -fno-exceptions).
-    const char* bad[] = {
-        "[", "(", ")", "a{2,1}", "\\", "*a", "a**", "[z-a]", "(?<n>x)", "x{", "x{,3}",
-        "\\1", "(a", "a)", "[a", "a|*", "^*", "(?=a)+", "[\\", "a{99999}", "\\x4", "[[:nope:]]",
+SYNX_TEST(constraints_patterns_the_regex_crate_refuses_are_skipped) {
+    // The `regex` crate refuses each of these; synx-core then checks nothing.
+    const char* refused[] = {
+        "[", "(", ")", "a{2,1}", "\\", "*a", "[z-a]", "x{", "x{,3}", "\\1", "(a", "a)", "[a", "a|*",
+        "(?=a)+", "[\\", "\\x4", "{", "(?i)*", "\\Q", "(?-u:.)", "\\p{N", "\\p{Word}",
     };
-    for (const char* pat : bad) {
+    for (const char* pat : refused) {
         ParseResult r = resolved(std::string("!active\nv[pattern:") + pat + "] hello\n");
         EXPECT_EQ(str_at(r.root, "v"), std::string("hello"));
-        EXPECT_FALSE(detail::regex_pattern_is_supported(pat));
     }
 }
 
-SYNX_TEST(constraints_valid_patterns_still_enforced) {
-    const char* good[] = {
-        "^[a-z]+$", "^\\d{3}-\\d{4}$", "^(ab|cd)+$", "^[A-Za-z0-9_.-]+$", "^a{2,}$", "^(?:x|y)?z*?$",
-        "^[[:alpha:]]+$", "^\\s*\\w+\\s*$", "^[^,]*$",
+SYNX_TEST(constraints_patterns_read_as_the_regex_crate_reads_them) {
+    // pattern, value, whether it matches: the crate's answers (`regex` 1.12).
+    struct Case { const char* pat; const char* value; bool match; };
+    const Case cases[] = {
+        {"a**", "b", true}, {"^*", "b", true}, {"(?<n>x)", "x", true}, {"a{99999}", "a", false},
+        {"[[:nope:]]", "e", true}, {"^[a-z]+$", "hello", true}, {"^\\d{3}-\\d{4}$", "555-1234", true},
+        {"(?i)^abc$", "ABC", true}, {"(?i)^abc$", "x", false},
+        {"^\\p{L}+$", "\xD0\xBC\xD0\xB8\xD1\x80", true}, {"^\\d+$", "\xD9\xA1\xD9\xA2", true},
+        {"\\bfoo\\b", "food", false}, {"\\bfoo\\b", "a foo b", true}, {"(?i)k", "\xE2\x84\xAA", true},
+        {"[a-z&&[^aeiou]]+$", "xyz", true}, {"^\\p{Greek}+$", "\xCE\xB1", true}, {"(?i)[^k]", "K", false},
+        {"^.$", "\xF0\x9F\x98\x80", true}, {"[\\w--\\d]", "5.", false}, {"(?x) a b # c", "ab", true},
     };
-    for (const char* pat : good) {
-        EXPECT_TRUE(detail::regex_pattern_is_supported(pat));
+    for (const Case& c : cases) {
+        ParseResult r = resolved(std::string("!active\nv[pattern:") + c.pat + "] " + c.value + "\n");
+        const std::string want = c.match ? std::string(c.value)
+                                         : "CONSTRAINT_ERR: 'v' does not match pattern /" + std::string(c.pat) + "/";
+        EXPECT_EQ(str_at(r.root, "v"), want);
     }
-    ParseResult r = resolved("!active\nv[pattern:^\\d{3}-\\d{4}$] 12-34\n");
-    EXPECT_EQ(str_at(r.root, "v"), std::string("CONSTRAINT_ERR: 'v' does not match pattern /^\\d{3}-\\d{4}$/"));
+}
+
+SYNX_TEST(constraints_patterns_run_in_linear_time) {
+    // `std::regex` took seconds per extra character here (B-079).
+    const std::string value = std::string(5000, 'a') + "!";
+    const auto start = std::chrono::steady_clock::now();
+    ParseResult r = resolved("!active\nv[pattern:^(a|aa)+$] " + value + "\nw[pattern:^(.*)(.*)(.*)(.*)(.*)(.*)(.*)x$] "
+                             + value + "\n");
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+    EXPECT_EQ(str_at(r.root, "v"), std::string("CONSTRAINT_ERR: 'v' does not match pattern /^(a|aa)+$/"));
+    EXPECT_TRUE(ms < 5000);
 }
 
 // ─── :calc failures carry the exact Rust CALC_ERR string ───────────────────

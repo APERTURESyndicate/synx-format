@@ -1,6 +1,6 @@
 [package]
 name = "synx-core"
-version = "3.8.0"
+version = "3.8.1"
 edition = "2021"
 authors = ["APERTURESyndicate <support@aperturesyndicate.com>"]
 description = "SYNX — The Active Data Format. Core parser + engine with full !active support."
@@ -19,8 +19,13 @@ itoa = "1"
 ryu = "1"
 miniz_oxide = "0.8"
 # `regex` is required for [pattern:...] constraint validation.
-# Compiled patterns are bounded by length and cached implicitly per Constraints.
-regex = { version = "1", default-features = false, features = ["std", "perf"] }
+# Compiled patterns are bounded by length and cached per thread.
+# spec: `unicode` is named, not left to whatever else is in the build. Without
+# it `\d`, `\w`, `\s`, `\b`, `(?i)` and `\p{L}` do not compile, and a pattern
+# that does not compile is skipped — so `port[pattern:^\d+$]` checked nothing
+# in a build of this crate alone and worked in the CLI, where another
+# dependency happened to switch the tables on.
+regex = { version = "1", default-features = false, features = ["std", "perf", "unicode"] }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = "1"
 jsonschema = { version = "0.30", optional = true }

@@ -30,13 +30,9 @@ func SafeCalc(expr string) CalcResult {
 	if len(tokens) == 0 {
 		return CalcResult{OK: true}
 	}
-	p := &calcParser{tokens: tokens}
-	v, err := p.expr()
+	v, err := calcEvaluate(tokens)
 	if err != "" {
 		return CalcResult{Error: err}
-	}
-	if p.pos < len(p.tokens) {
-		return CalcResult{Error: "SYNX :calc — unexpected token at position " + strconv.Itoa(p.pos)}
 	}
 	return CalcResult{OK: true, Value: v}
 }
@@ -125,91 +121,109 @@ func tokenText(t calcToken) string {
 	return ")"
 }
 
-type calcParser struct {
-	tokens []calcToken
-	pos    int
+// calcFrame is one open `expr` of the grammar — `expr → term (('+'|'-') term)*`,
+// `term → factor (('*'|'/'|'%') factor)*`, `factor → NUMBER | '(' expr ')'` —
+// the top level, or the inside of a pair of parentheses.
+type calcFrame struct {
+	// Sum so far and the `+` / `-` waiting for its right-hand term (0: none).
+	exprLeft float64
+	exprOp   byte
+	// Product so far and the `*` / `/` / `%` waiting for its factor.
+	termLeft float64
+	termOp   byte
 }
 
-func (p *calcParser) expr() (float64, string) {
-	left, err := p.term()
-	if err != "" {
-		return 0, err
-	}
-	for p.pos < len(p.tokens) {
-		t := p.tokens[p.pos]
-		if t.kind != calcOp || (t.op != '+' && t.op != '-') {
-			break
+// calcEvaluate evaluates a token stream.
+//
+// safety: parentheses used to recurse through expr → term → factor, three
+// calls per `(`. A goroutine stack grows to 1 GiB and then the runtime ends
+// the process — no recover reaches it; `:ref:calc` passes an expression of
+// any length. Open parentheses now live in a slice; the order of evaluation,
+// and so every result and error text, is the one the recursive parser gave
+// (and the one synx-core gives).
+func calcEvaluate(t []calcToken) (float64, string) {
+	stack := make([]calcFrame, 1, 8)
+	pos := 0
+	for {
+		// A factor is expected here.
+		if pos >= len(t) {
+			return 0, "SYNX :calc — unexpected end of expression"
 		}
-		p.pos++
-		r, err := p.term()
-		if err != "" {
-			return 0, err
+		tok := t[pos]
+		if tok.kind == calcLParen {
+			pos++
+			stack = append(stack, calcFrame{})
+			continue
 		}
-		if t.op == '+' {
-			left += r
-		} else {
-			left -= r
+		if tok.kind != calcNumber {
+			return 0, "SYNX :calc — unexpected token: '" + tokenText(tok) + "'"
 		}
-	}
-	return left, ""
-}
+		pos++
+		value := tok.number
 
-func (p *calcParser) term() (float64, string) {
-	left, err := p.factor()
-	if err != "" {
-		return 0, err
-	}
-	for p.pos < len(p.tokens) {
-		t := p.tokens[p.pos]
-		if t.kind != calcOp || (t.op != '*' && t.op != '/' && t.op != '%') {
-			break
-		}
-		p.pos++
-		r, err := p.factor()
-		if err != "" {
-			return 0, err
-		}
-		switch t.op {
-		case '*':
-			left *= r
-		case '/':
-			if r == 0 {
-				return 0, "SYNX :calc — division by zero"
+		// Fold the factor into its term, the term into its expr, and close
+		// every pair of parentheses that ends here.
+		for {
+			f := &stack[len(stack)-1]
+			termOp := f.termOp
+			f.termOp = 0
+			switch termOp {
+			case 0:
+				f.termLeft = value
+			case '*':
+				f.termLeft *= value
+			default:
+				if value == 0 {
+					return 0, "SYNX :calc — division by zero"
+				}
+				if termOp == '/' {
+					f.termLeft /= value
+				} else {
+					f.termLeft = math.Mod(f.termLeft, value)
+				}
 			}
-			left /= r
-		case '%':
-			if r == 0 {
-				return 0, "SYNX :calc — division by zero"
+			if pos < len(t) && t[pos].kind == calcOp && (t[pos].op == '*' || t[pos].op == '/' || t[pos].op == '%') {
+				f.termOp = t[pos].op
+				pos++
+				break
 			}
-			left = math.Mod(left, r)
+
+			exprOp := f.exprOp
+			f.exprOp = 0
+			switch exprOp {
+			case 0:
+				f.exprLeft = f.termLeft
+			case '+':
+				f.exprLeft += f.termLeft
+			default:
+				f.exprLeft -= f.termLeft
+			}
+			if pos < len(t) && t[pos].kind == calcOp && (t[pos].op == '+' || t[pos].op == '-') {
+				f.exprOp = t[pos].op
+				pos++
+				break
+			}
+
+			// This expr is complete.
+			result := f.exprLeft
+			if len(stack) == 1 {
+				if pos < len(t) {
+					return 0, "SYNX :calc — unexpected token at position " + strconv.Itoa(pos)
+				}
+				return result, ""
+			}
+			stack = stack[:len(stack)-1]
+			if pos >= len(t) || t[pos].kind != calcRParen {
+				return 0, "SYNX :calc — missing closing parenthesis"
+			}
+			pos++
+			value = result
 		}
 	}
-	return left, ""
 }
 
-func (p *calcParser) factor() (float64, string) {
-	if p.pos >= len(p.tokens) {
-		return 0, "SYNX :calc — unexpected end of expression"
-	}
-	t := p.tokens[p.pos]
-	switch t.kind {
-	case calcNumber:
-		p.pos++
-		return t.number, ""
-	case calcLParen:
-		p.pos++
-		v, err := p.expr()
-		if err != "" {
-			return 0, err
-		}
-		if p.pos >= len(p.tokens) || p.tokens[p.pos].kind != calcRParen {
-			return 0, "SYNX :calc — missing closing parenthesis"
-		}
-		p.pos++
-		return v, ""
-	}
-	return 0, "SYNX :calc — unexpected token: '" + tokenText(t) + "'"
-}
+// isFinite: neither an infinity nor NaN.
+func isFinite(f float64) bool { return !math.IsInf(f, 0) && !math.IsNaN(f) }
 
 // ─── Rust number text ───────────────────────────────────────────────────────
 

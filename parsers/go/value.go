@@ -2,6 +2,11 @@
 // Parity with crates/synx-core 3.8.0 — no cgo, no external dependencies.
 package synx
 
+import (
+	"fmt"
+	"io"
+)
+
 // Kind tags every SynxValue concrete type. Stable wire numbers (used by
 // .synxb).
 type Kind uint8
@@ -91,10 +96,42 @@ func (ObjectValue) Kind() Kind   { return KindObject }
 func (ObjectValue) isSynxValue() {}
 
 // SecretValue is the redacted variant — never appears literally in JSON output.
+// AsSecret and the V field are the way to its text; every print and encoder
+// gets the mask (see Format).
 type SecretValue struct{ V string }
 
 func (SecretValue) Kind() Kind   { return KindSecret }
 func (SecretValue) isSynxValue() {}
+
+const secretMask = "[SECRET]"
+
+// String is the mask, never the text.
+func (SecretValue) String() string { return secretMask }
+
+// Format writes the mask for every fmt verb.
+//
+// safety: a struct with an exported string field prints that field:
+// `fmt.Println(v)` was `{hunter2}`, `%+v` was `{V:hunter2}` and `%#v` spelled
+// the literal out. The same goes for a log line, an error wrapped with `%v`
+// and a panic message.
+func (SecretValue) Format(f fmt.State, verb rune) {
+	switch {
+	case verb == 'q':
+		_, _ = io.WriteString(f, `"`+secretMask+`"`)
+	case verb == 'v' && f.Flag('#'):
+		_, _ = io.WriteString(f, `synx.SecretValue{V:"`+secretMask+`"}`)
+	default:
+		_, _ = io.WriteString(f, secretMask)
+	}
+}
+
+// MarshalJSON keeps the text out of encoding/json, which would otherwise
+// write the exported field: `{"V":"hunter2"}`.
+func (SecretValue) MarshalJSON() ([]byte, error) { return []byte(`"` + secretMask + `"`), nil }
+
+// MarshalText does the same for encoding/xml and every other encoder that
+// takes a TextMarshaler.
+func (SecretValue) MarshalText() ([]byte, error) { return []byte(secretMask), nil }
 
 // ─── Constructors ───────────────────────────────────────────────────────────
 

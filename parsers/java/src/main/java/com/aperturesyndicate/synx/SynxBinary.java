@@ -51,6 +51,38 @@ public final class SynxBinary {
     private static final int MAX_DECODED_BYTES = 256 * 1024 * 1024;
     /** Upper bound on ARRAY/OBJECT nesting while decoding. */
     private static final int MAX_DECODE_DEPTH = 256;
+    /** What one decoded value costs against {@link #MAX_DECODED_BYTES}, text aside. */
+    private static final int DECODED_VALUE_COST = 64;
+    /** Elements reserved up front for a count read from the file. */
+    private static final int MAX_PREALLOC_ITEMS = 1024;
+
+    /**
+     * What decoding has built so far, in bytes.
+     *
+     * <p>safety: a value is one byte on the wire and tens of bytes in memory, a string is
+     * stored once and referenced any number of times, and deflate shrinks a run of either a
+     * thousandfold: unbudgeted, a file of a few kilobytes decoded to gigabytes (and to as
+     * much text once written out). The tree shares the payload's limit — every value at a
+     * fixed cost, plus the bytes of each key and string it refers to. Same accounting as
+     * synx-core, so both refuse the same files.
+     */
+    private static final class Budget {
+        long spent;
+
+        void charge(long bytes) {
+            spent += bytes;
+            if (spent > MAX_DECODED_BYTES) {
+                throw new BinaryException("decoded document exceeds " + MAX_DECODED_BYTES + " bytes — refusing to decode");
+            }
+        }
+
+        void value() { charge(DECODED_VALUE_COST); }
+
+        String text(String s) {
+            charge(SynxParser.utf8Len(s, 0, s.length()));
+            return s;
+        }
+    }
 
     public static boolean isSynxb(byte[] data) {
         if (data == null || data.length < 5) return false;
@@ -135,8 +167,9 @@ public final class SynxBinary {
         }
         try {
             Cursor cur = new Cursor(payload);
+            Budget budget = new Budget();
             StringTableReader reader = StringTableReader.decode(cur);
-            SynxValue root = decodeValue(cur, reader, 0);
+            SynxValue root = decodeValue(cur, reader, budget, 0);
             SynxParseResult pr = new SynxParseResult();
             pr.root = root;
             pr.mode = (flags & FLAG_ACTIVE) != 0 ? SynxMode.ACTIVE : SynxMode.STATIC;
@@ -145,8 +178,8 @@ public final class SynxBinary {
             pr.schema = (flags & FLAG_SCHEMA) != 0;
             pr.llm = (flags & FLAG_LLM) != 0;
             if ((flags & FLAG_HAS_META) != 0) {
-                pr.metadata = decodeMetadata(cur, reader);
-                pr.includes = decodeIncludes(cur, reader);
+                pr.metadata = decodeMetadata(cur, reader, budget);
+                pr.includes = decodeIncludes(cur, reader, budget);
             }
             return Outcome.success(pr);
         } catch (BinaryException e) {
@@ -170,21 +203,27 @@ public final class SynxBinary {
         return out.toByteArray();
     }
 
-    /** Inflates at most MAX_DECODED_BYTES + 1, so a small crafted stream cannot expand into gigabytes. */
+    /**
+     * Inflates at most {@code expected + 1} bytes: the stream may produce the declared size and
+     * not a byte more.
+     *
+     * <p>safety: bounded only by the 256 MiB cap, a 260 KB file declaring 1 KiB still inflated
+     * to the full cap before the size check rejected it; and the buffer was reserved from the
+     * declared size (up to 64 MiB) before a byte was inflated.
+     */
     private static byte[] inflateRaw(byte[] data, int offset, int length, int expected)
             throws DataFormatException {
         Inflater inflater = new Inflater(true /* nowrap = raw deflate */);
         inflater.setInput(data, offset, length);
-        ByteArrayOutputStream out = new ByteArrayOutputStream(Math.max(Math.min(expected, 64 << 20), 64));
+        ByteArrayOutputStream out = new ByteArrayOutputStream(Math.max(Math.min(expected, 1 << 20), 64));
         byte[] buf = new byte[16384];
         try {
-            while (!inflater.finished()) {
+            while (!inflater.finished() && out.size() <= expected) {
                 int n = inflater.inflate(buf);
                 if (n == 0) {
                     if (inflater.needsInput() || inflater.needsDictionary()) break;
                 } else {
                     out.write(buf, 0, n);
-                    if (out.size() > MAX_DECODED_BYTES) throw new DataFormatException("decoded payload exceeds limit");
                 }
             }
         } finally {
@@ -206,9 +245,23 @@ public final class SynxBinary {
         BinaryException(String msg) { super(msg, null, false, false); }
     }
 
-    /** Bounds a capacity read from the file: every element costs at least one byte. */
+    /**
+     * Bounds a capacity read from the file. Every element costs at least one byte on the wire,
+     * but several in memory, so the reservation is a small hint and the list grows as elements
+     * actually arrive.
+     */
     private static int safeCapacity(long count, Cursor cur) {
-        return (int) Math.min(Math.max(count, 0), cur.remaining());
+        return (int) Math.min(Math.min(Math.max(count, 0), cur.remaining()), MAX_PREALLOC_ITEMS);
+    }
+
+    /**
+     * Whether {@code i} is below a count read as an unsigned varint.
+     *
+     * <p>safety: a count of 2^63 or more is a negative {@code long}; compared signed, the loop
+     * did not run and the file decoded as an empty list where synx-core refuses it.
+     */
+    private static boolean below(long i, long count) {
+        return Long.compareUnsigned(i, count) < 0;
     }
 
     // ─── varint / zigzag ─────────────────────────────────────────────────────
@@ -313,7 +366,7 @@ public final class SynxBinary {
             var decoder = StandardCharsets.UTF_8.newDecoder()
                 .onMalformedInput(CodingErrorAction.REPORT)
                 .onUnmappableCharacter(CodingErrorAction.REPORT);
-            for (long i = 0; i < count; i++) {
+            for (long i = 0; below(i, count); i++) {
                 long len = decodeVarint(cur);
                 if (len < 0 || len > cur.remaining()) throw new BinaryException("unexpected end of data in string table");
                 int n = (int) len;
@@ -328,7 +381,9 @@ public final class SynxBinary {
         }
 
         String get(long idx) {
-            if (idx < 0 || idx >= strings.size()) {
+            // An index is a u32 on the wire of synx-core; anything larger is not an index.
+            if (idx < 0 || idx > 0xFFFF_FFFFL) throw new BinaryException("string index out of range");
+            if (idx >= strings.size()) {
                 throw new BinaryException("string index " + idx + " out of bounds (size " + strings.size() + ")");
             }
             return strings.get((int) idx);
@@ -411,8 +466,9 @@ public final class SynxBinary {
         }
     }
 
-    private static SynxValue decodeValue(Cursor cur, StringTableReader t, int depth) {
+    private static SynxValue decodeValue(Cursor cur, StringTableReader t, Budget budget, int depth) {
         if (depth > MAX_DECODE_DEPTH) throw new BinaryException("nesting exceeds " + MAX_DECODE_DEPTH + " — refusing to decode");
+        budget.value();
         if (cur.pos >= cur.data.length) throw new BinaryException("unexpected end of data");
         byte tag = cur.data[cur.pos++];
         switch (tag) {
@@ -421,20 +477,20 @@ public final class SynxBinary {
             case TAG_TRUE:   return SynxValue.ofBool(true);
             case TAG_INT:    return SynxValue.ofInt(zigzagDecode(decodeVarint(cur)));
             case TAG_FLOAT:  return SynxValue.ofFloat(decodeF64LE(cur, "unexpected end of data in float"));
-            case TAG_STRING: return SynxValue.ofString(t.get(decodeVarint(cur)));
-            case TAG_SECRET: return SynxValue.ofSecret(t.get(decodeVarint(cur)));
+            case TAG_STRING: return SynxValue.ofString(budget.text(t.get(decodeVarint(cur))));
+            case TAG_SECRET: return SynxValue.ofSecret(budget.text(t.get(decodeVarint(cur))));
             case TAG_ARRAY: {
                 long count = decodeVarint(cur);
                 List<SynxValue> arr = new ArrayList<>(safeCapacity(count, cur));
-                for (long i = 0; i < count; i++) arr.add(decodeValue(cur, t, depth + 1));
+                for (long i = 0; below(i, count); i++) arr.add(decodeValue(cur, t, budget, depth + 1));
                 return SynxValue.ofArray(arr);
             }
             case TAG_OBJECT: {
                 long count = decodeVarint(cur);
                 SynxObject obj = new SynxObject();
-                for (long i = 0; i < count; i++) {
-                    String key = t.get(decodeVarint(cur));
-                    obj.set(key, decodeValue(cur, t, depth + 1));
+                for (long i = 0; below(i, count); i++) {
+                    String key = budget.text(t.get(decodeVarint(cur)));
+                    obj.set(key, decodeValue(cur, t, budget, depth + 1));
                 }
                 return SynxValue.ofObject(obj);
             }
@@ -465,20 +521,23 @@ public final class SynxBinary {
         }
     }
 
-    private static SynxConstraints decodeConstraints(Cursor cur, StringTableReader t) {
+    private static SynxConstraints decodeConstraints(Cursor cur, StringTableReader t, Budget budget) {
         if (cur.pos >= cur.data.length) throw new BinaryException("unexpected end of data in constraints");
         int bits = cur.data[cur.pos++] & 0xFF;
         SynxConstraints c = new SynxConstraints();
         if ((bits & 0x01) != 0) c.min = decodeF64LE(cur, "truncated min");
         if ((bits & 0x02) != 0) c.max = decodeF64LE(cur, "truncated max");
-        if ((bits & 0x04) != 0) c.typeName = t.get(decodeVarint(cur));
+        if ((bits & 0x04) != 0) c.typeName = budget.text(t.get(decodeVarint(cur)));
         if ((bits & 0x08) != 0) c.required = true;
         if ((bits & 0x10) != 0) c.readonly = true;
-        if ((bits & 0x20) != 0) c.pattern = t.get(decodeVarint(cur));
+        if ((bits & 0x20) != 0) c.pattern = budget.text(t.get(decodeVarint(cur)));
         if ((bits & 0x40) != 0) {
             long count = decodeVarint(cur);
             List<String> vals = new ArrayList<>(safeCapacity(count, cur));
-            for (long i = 0; i < count; i++) vals.add(t.get(decodeVarint(cur)));
+            for (long i = 0; below(i, count); i++) {
+                budget.value();
+                vals.add(budget.text(t.get(decodeVarint(cur))));
+            }
             c.enumValues = vals;
         }
         return c;
@@ -518,26 +577,34 @@ public final class SynxBinary {
         }
     }
 
-    private static Map<String, Map<String, SynxMeta>> decodeMetadata(Cursor cur, StringTableReader t) {
+    private static Map<String, Map<String, SynxMeta>> decodeMetadata(Cursor cur, StringTableReader t, Budget budget) {
         long outer = decodeVarint(cur);
         Map<String, Map<String, SynxMeta>> tree = new LinkedHashMap<>();
-        for (long i = 0; i < outer; i++) {
-            String path = t.get(decodeVarint(cur));
+        for (long i = 0; below(i, outer); i++) {
+            budget.value();
+            String path = budget.text(t.get(decodeVarint(cur)));
             long inner = decodeVarint(cur);
             Map<String, SynxMeta> map = new LinkedHashMap<>();
-            for (long j = 0; j < inner; j++) {
-                String fk = t.get(decodeVarint(cur));
+            for (long j = 0; below(j, inner); j++) {
+                String fk = budget.text(t.get(decodeVarint(cur)));
+                budget.value();
                 SynxMeta m = new SynxMeta();
                 long mc = decodeVarint(cur);
-                for (long k = 0; k < mc; k++) m.markers.add(t.get(decodeVarint(cur)));
+                for (long k = 0; below(k, mc); k++) {
+                    budget.value();
+                    m.markers.add(budget.text(t.get(decodeVarint(cur))));
+                }
                 long ac = decodeVarint(cur);
-                for (long k = 0; k < ac; k++) m.args.add(t.get(decodeVarint(cur)));
+                for (long k = 0; below(k, ac); k++) {
+                    budget.value();
+                    m.args.add(budget.text(t.get(decodeVarint(cur))));
+                }
                 if (cur.pos >= cur.data.length) throw new BinaryException("unexpected end in meta");
                 int hasTh = cur.data[cur.pos++] & 0xFF;
-                if (hasTh != 0) m.typeHint = t.get(decodeVarint(cur));
+                if (hasTh != 0) m.typeHint = budget.text(t.get(decodeVarint(cur)));
                 if (cur.pos >= cur.data.length) throw new BinaryException("unexpected end in meta");
                 int hasC = cur.data[cur.pos++] & 0xFF;
-                if (hasC != 0) m.constraints = decodeConstraints(cur, t);
+                if (hasC != 0) m.constraints = decodeConstraints(cur, t, budget);
                 map.put(fk, m);
             }
             tree.put(path, map);
@@ -554,13 +621,14 @@ public final class SynxBinary {
         }
     }
 
-    private static List<SynxIncludeDirective> decodeIncludes(Cursor cur, StringTableReader t) {
+    private static List<SynxIncludeDirective> decodeIncludes(Cursor cur, StringTableReader t, Budget budget) {
         long count = decodeVarint(cur);
         List<SynxIncludeDirective> out = new ArrayList<>(safeCapacity(count, cur));
-        for (long i = 0; i < count; i++) {
+        for (long i = 0; below(i, count); i++) {
+            budget.value();
             long pathIdx = decodeVarint(cur);
             long aliasIdx = decodeVarint(cur);
-            out.add(new SynxIncludeDirective(t.get(pathIdx), t.get(aliasIdx)));
+            out.add(new SynxIncludeDirective(budget.text(t.get(pathIdx)), budget.text(t.get(aliasIdx))));
         }
         return out;
     }

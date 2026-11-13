@@ -218,8 +218,8 @@ class Release380Test {
 
     @Test
     void self_include_resolves_once_per_level(@org.junit.jupiter.api.io.TempDir java.nio.file.Path dir) throws Exception {
-        // Stops at the include depth cap, and each level is resolved once: the `:include` marker
-        // reuses the pre-pass result.
+        // Stops at the first repeat of a file already being resolved, and each level is resolved
+        // once: the `:include` marker reuses the pre-pass result.
         write(dir, "self.synx", "!active\nme:include self.synx\nn:tick 1\n");
         int[] calls = { 0 };
         SynxOptions o = new SynxOptions();
@@ -227,9 +227,9 @@ class Release380Test {
         o.basePath = dir.toString();
         o.markerFns.put("tick", (key, args, v) -> { calls[0]++; return v; });
         String got = Synx.toJson(Synx.parseFullActive(java.nio.file.Files.readString(dir.resolve("self.synx")), o).root);
-        String want = "{\"me\":".repeat(16) + "{\"me\":\"INCLUDE_ERR: max include depth (16) exceeded\",\"n\":1}" + ",\"n\":1}".repeat(16);
+        String want = "{\"me\":{\"me\":\"INCLUDE_ERR: circular include: 'self.synx'\",\"n\":1},\"n\":1}";
         assertEquals(want, got);
-        assertEquals(17, calls[0], "one resolution per level");
+        assertEquals(2, calls[0], "one resolution per level");
     }
 
     @Test

@@ -1,0 +1,3 @@
+# Scratch space of the suite and machine-specific paths.
+tmp/
+local.json

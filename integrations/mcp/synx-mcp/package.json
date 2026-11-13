@@ -7,7 +7,8 @@
     "synx-mcp": "./src/index.js"
   },
   "scripts": {
-    "start": "node src/index.js"
+    "start": "node src/index.js",
+    "test": "node --test"
   },
   "keywords": ["mcp", "synx", "claude", "modelcontextprotocol"],
   "license": "MIT",

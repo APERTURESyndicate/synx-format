@@ -1,0 +1,41 @@
+# Coverage-guided fuzzing of synx-core with libFuzzer (cargo-fuzz). Its own
+# workspace, like fuzz/: never part of the release build. Run from any
+# directory — targets resolve only under a scratch base and never write:
+#
+#   cargo +nightly fuzz run resolve --fuzz-dir fuzz/libfuzzer -s none \
+#     --target-dir <dir> -- -max_total_time=480 -timeout=10 -rss_limit_mb=2048 <corpus>
+[package]
+name = "synx-adversarial-libfuzzer"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+synx-core = { path = "../../crates/synx-core" }
+
+[[bin]]
+name = "resolve"
+path = "fuzz_targets/resolve.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode"
+path = "fuzz_targets/decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "synxl"
+path = "fuzz_targets/synxl.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

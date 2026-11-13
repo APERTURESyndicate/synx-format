@@ -28,12 +28,19 @@
  * @packageDocumentation
  */
 
-import { parseData, castType, parseConstraints, parseI64, rootKeyLines } from './parser';
-import { toCanonicalJSONString, compareUnicodeScalar } from './json';
+import {
+  parseData, castType, parseConstraints, parseI64, rootKeyLines, inputText, keysOf, metaMapOf,
+  compareUnicodeScalar, scalarLength, expandExponent, SynxError,
+  SYNXL_VERSION, MAX_SYNXL_RECORD_BYTES, MAX_SYNXL_FIELDS, MAX_SYNXL_FIELD_NAME_BYTES,
+  MAX_SYNXL_FIELD_LISTS, MAX_SYNXL_RECORDS,
+} from './parser';
+import { toCanonicalJSONString } from './json';
+import { matchesLinear } from './pattern';
 import type {
   SynxObject,
   SynxValue,
   SynxConstraints,
+  SynxMeta,
   SynxlDiagnostic,
   SynxlDiagnosticKind,
   SynxlDocument,
@@ -43,23 +50,14 @@ import type {
   SynxlRecord,
   SynxlWriteOptions,
 } from './types';
-import { SynxError } from './types';
 
-// ─── Format identity & resource limits (SYNXL §1.3, §13) ──
-
-/** The SYNXL format version implemented here. */
-export const SYNXL_VERSION = 1;
-
-/** Per-record byte budget (record line plus block). Exceeding it truncates. */
-export const MAX_SYNXL_RECORD_BYTES = 16 * 1024 * 1024; // 16 MiB
-/** Fields per field list. Exceeding it is a hard error. */
-export const MAX_SYNXL_FIELDS = 4096;
-/** Field-name length in UTF-8 bytes. Exceeding it is a hard error. */
-export const MAX_SYNXL_FIELD_NAME_BYTES = 255;
-/** Field lists per document. Exceeding it is a hard error. */
-export const MAX_SYNXL_FIELD_LISTS = 65536;
-/** Records per in-memory parse. The streaming reader has no record cap. */
-export const MAX_SYNXL_RECORDS = 16777216;
+// Format identity and resource limits (SYNXL §1.3, §13), the pattern matcher
+// and two text helpers are declared in modules the entry point can read
+// without loading this one; they stay part of what this module exports.
+export {
+  SYNXL_VERSION, MAX_SYNXL_RECORD_BYTES, MAX_SYNXL_FIELDS, MAX_SYNXL_FIELD_NAME_BYTES,
+  MAX_SYNXL_FIELD_LISTS, MAX_SYNXL_RECORDS, matchesLinear, scalarLength, expandExponent,
+};
 
 /** Type hints whose result varies between reads — forbidden by SYNXL §8.3. */
 const NON_DETERMINISTIC_HINTS = new Set([
@@ -248,7 +246,7 @@ function trimSpacesTabs(s: string): string {
 }
 
 /** One inline part of a record line. */
-interface SynxlPart {
+export interface SynxlPart {
   /** Part text: inner text for a quoted part, trimmed text otherwise. */
   value: string;
   /** True when the part was recognized as quoted per §7.1 step 2. */
@@ -490,12 +488,9 @@ function parseFieldDecl(decl: string, line: number): SynxlField {
     pos++;
   }
   const name = src.substring(0, pos);
-  if (!name) {
-    if (src.charCodeAt(0) === 58) {
-      hardError('MarkerChainInFieldDecl', `a marker is not allowed in a field declaration "${src}"`, line);
-    }
-    hardError('MalformedFieldList', `malformed field declaration "${src}"`, line);
-  }
+  // spec: a declaration with no name is malformed whatever follows — `:` too,
+  // as in synx-core (B-064); a marker chain is one after a name.
+  if (!name) hardError('MalformedFieldList', `malformed field declaration "${src}"`, line);
   if (utf8Length(name) > MAX_SYNXL_FIELD_NAME_BYTES) {
     hardError('LimitExceeded', `field name exceeds MAX_SYNXL_FIELD_NAME_BYTES (${MAX_SYNXL_FIELD_NAME_BYTES})`, line);
   }
@@ -527,17 +522,17 @@ function parseFieldDecl(decl: string, line: number): SynxlField {
     pos++; // skip ']'
   }
 
-  // Marker chains drive the !active engine and have no meaning in a record.
-  if (pos < len && src.charCodeAt(pos) === 58) {
-    hardError('MarkerChainInFieldDecl', `a marker is not allowed in a field declaration "${src}"`, line);
+  // Nothing but whitespace may follow. Marker chains drive the !active engine
+  // and have no meaning in a record.
+  // spec: the rest is trimmed first, as in synx-core — `a :` is a marker
+  // chain like `a:`, where this reader saw a malformed declaration (B-064.2).
+  const tail = trimUnicode(src.substring(pos));
+  if (tail !== '') {
+    if (tail.charCodeAt(0) === 58) {
+      hardError('MarkerChainInFieldDecl', `a marker is not allowed in a field declaration "${src}"`, line);
+    }
+    hardError('MalformedFieldList', `malformed field declaration "${src}"`, line);
   }
-
-  while (pos < len) {
-    const ch = src.charCodeAt(pos);
-    if (ch !== 32 && ch !== 9) break;
-    pos++;
-  }
-  if (pos < len) hardError('MalformedFieldList', `malformed field declaration "${src}"`, line);
 
   // Reuse the existing SYNX constraint parser (§5.2).
   const constraints: SynxConstraints | undefined =
@@ -551,17 +546,22 @@ function parseFieldDecl(decl: string, line: number): SynxlField {
     }
   }
 
-  const type = typeHint || constraints?.type;
+  // spec: an empty `()` is a hint too, as in synx-core (B-063): the value is
+  // cast automatically and `type:` of the constraints is only checked, not
+  // cast by; with `[block]` it is a type combined with a block.
+  const type = typeHint !== undefined ? typeHint : constraints?.type;
 
-  if (type && NON_DETERMINISTIC_HINTS.has(type)) {
-    hardError('NonDeterministicTypeHint', `non-deterministic type hint "${type}" is forbidden in SYNXL`, line);
+  for (const hint of [typeHint, constraints?.type]) {
+    if (hint !== undefined && NON_DETERMINISTIC_HINTS.has(hint)) {
+      hardError('NonDeterministicTypeHint', `non-deterministic type hint "${hint}" is forbidden in SYNXL`, line);
+    }
   }
-  if (block && type) {
+  if (block && (typeHint !== undefined || constraints?.type !== undefined)) {
     hardError('BlockCombinedWithType', `field "${name}" combines [block] with a type — the shape of a block value comes from the embedded SYNX document`, line);
   }
 
   const field: SynxlField = { name, block, decl: src };
-  if (type) field.type = type;
+  if (type !== undefined) field.type = type;
   if (constraints && Object.keys(constraints).length > 0) field.constraints = constraints;
   return field;
 }
@@ -612,7 +612,7 @@ function parseFieldList(trimmed: string, line: number): SynxlFieldList {
  * SYNXL §11.2 requires diagnostics, and corrupting a cell to report on it would
  * defeat the purpose in a dataset.
  */
-function checkConstraints(name: string, value: SynxValue, c: SynxConstraints): string | null {
+function checkConstraints(name: string, value: SynxValue, c: SynxConstraints, isFloat = false): string | null {
   if (c.required && (value === null || value === undefined || value === '')) {
     return `'${name}' is required`;
   }
@@ -621,8 +621,10 @@ function checkConstraints(name: string, value: SynxValue, c: SynxConstraints): s
   if (c.type) {
     const ok = (() => {
       switch (c.type) {
-        case 'int': return typeof value === 'number' && Number.isInteger(value);
-        case 'float': return typeof value === 'number';
+        // spec: an integer beyond 2^53 is a bigint and an int (B-061.3); a
+        // float with a whole value is not one (B-063.4) — as in synx-core.
+        case 'int': return (typeof value === 'number' && Number.isInteger(value) && !isFloat) || typeof value === 'bigint';
+        case 'float': return typeof value === 'number' || typeof value === 'bigint';
         case 'bool': return typeof value === 'boolean';
         case 'string': return typeof value === 'string';
         default: return true;
@@ -635,8 +637,12 @@ function checkConstraints(name: string, value: SynxValue, c: SynxConstraints): s
     return `'${name}' must be one of [${c.enum.join('|')}]`;
   }
 
+  // spec: a bigint is compared as synx-core compares an i64, by its f64 value
+  // (B-061.1, .2) — it went past `[min]` and `[max]` untested.
   const n = typeof value === 'number'
     ? value
+    : typeof value === 'bigint'
+      ? Number(value)
     : typeof value === 'string' && (c.min !== undefined || c.max !== undefined)
       // Unicode scalar values, as the engine and synx-core count — `length`
       // counted UTF-16 units and synx-core counted UTF-8 bytes, so `[max:2]`
@@ -644,8 +650,9 @@ function checkConstraints(name: string, value: SynxValue, c: SynxConstraints): s
       ? scalarLength(value)
       : null;
   if (n !== null) {
-    if (c.min !== undefined && n < c.min) return `'${name}' value ${n} is below min ${c.min}`;
-    if (c.max !== undefined && n > c.max) return `'${name}' value ${n} exceeds max ${c.max}`;
+    const shown = typeof value === 'bigint' ? value.toString() : n;
+    if (c.min !== undefined && n < c.min) return `'${name}' value ${shown} is below min ${c.min}`;
+    if (c.max !== undefined && n > c.max) return `'${name}' value ${shown} exceeds max ${c.max}`;
   }
 
   // Same 256-character cap as the engine and synx-core (this reader used 128,
@@ -664,83 +671,6 @@ function checkConstraints(name: string, value: SynxValue, c: SynxConstraints): s
     }
   }
   return null;
-}
-
-/**
- * Test `value` against `pattern`, refusing patterns that can backtrack
- * catastrophically.
- *
- * Returns `null` for a refused or uncompilable pattern, and the caller then
- * skips the constraint — the same outcome an invalid regex has always had.
- * Skipping a check is a visible gap; hanging the process on an 88-byte file is
- * not recoverable at all.
- */
-export function matchesLinear(pattern: string, value: string): boolean | null {
-  let re = PATTERN_CACHE.get(pattern);
-  if (re === undefined) {
-    re = null;
-    if (!hasNestedQuantifier(pattern)) {
-      try { re = new RegExp(pattern); } catch { re = null; }
-    }
-    // safety: bounded, so a document of distinct patterns cannot grow it forever.
-    if (PATTERN_CACHE.size >= 256) PATTERN_CACHE.clear();
-    PATTERN_CACHE.set(pattern, re);
-  }
-  return re === null ? null : re.test(value);
-}
-
-/**
- * Compiled `[pattern:…]` constraints; `null` marks a refused or invalid one.
- * perf: a pattern was compiled for every cell it checked.
- */
-const PATTERN_CACHE = new Map<string, RegExp | null>();
-
-/** Length in Unicode scalar values, without materialising `[...s]`. */
-export function scalarLength(s: string): number {
-  let n = s.length;
-  for (let i = 0; i < s.length - 1; i++) {
-    const c = s.charCodeAt(i);
-    if (c >= 0xd800 && c <= 0xdbff) {
-      const d = s.charCodeAt(i + 1);
-      if (d >= 0xdc00 && d <= 0xdfff) { n--; i++; }
-    }
-  }
-  return n;
-}
-
-/**
- * Does the pattern repeat something that already repeats — the `(a+)+` shape
- * behind exponential backtracking?
- *
- * Deliberately conservative: it looks for a quantified group whose body also
- * contains a quantifier, which covers the classic blow-ups without rejecting
- * the flat patterns constraints normally use.
- */
-function hasNestedQuantifier(pattern: string): boolean {
-  const opens: number[] = [];
-  for (let i = 0; i < pattern.length; i++) {
-    const ch = pattern[i];
-    if (ch === '\\') { i++; continue; }
-    if (ch === '[') {
-      // Skip a character class wholesale; quantifiers inside it are literal.
-      while (i < pattern.length && pattern[i] !== ']') {
-        if (pattern[i] === '\\') i++;
-        i++;
-      }
-      continue;
-    }
-    if (ch === '(') { opens.push(i); continue; }
-    if (ch === ')') {
-      const start = opens.pop();
-      if (start === undefined) continue;
-      const next = pattern[i + 1];
-      if (next === '*' || next === '+' || next === '{') {
-        const body = pattern.slice(start + 1, i).replace(/\\./g, '');
-        if (/[*+]|\{\d/.test(body)) return true;
-      }
-    }
-  }
-  return false;
 }
 
 // ─── Reader ───────────────────────────────────────────────
@@ -843,7 +773,13 @@ class SynxlReader {
     // prologue, an indented line falls through to the structural handling
     // below, which accepts it as the prologue or raises the §4.1 hard error.
     if (indent > 0 && this.prologueSeen) {
-      if (this.inBlockComment) return null;
+      // §4.3 — a `###` block comment ends at the closing marker whatever its
+      // indent, as in synx-core (B-062); the comment swallowed the rest of
+      // the document here.
+      if (this.inBlockComment) {
+        if (trimUnicode(line) === '###') this.inBlockComment = false;
+        return null;
+      }
       if (this.pending) {
         this.appendBlockLine(line, lineNo);
       } else {
@@ -1034,6 +970,7 @@ class SynxlReader {
 
     const values: SynxObject = {};
     const { fields, arity } = p.fields;
+    let wholeFloats: Set<string> | null = null;
 
     // §7.2 — the all-null record form. A record line that is exactly `;` sets
     // every inline field to null at any arity and reports nothing. It is
@@ -1059,14 +996,21 @@ class SynxlReader {
           continue;
         }
         if (value === '') { setField(values, f.name, null); continue; } // §7.2
-        if (f.type) {
-          const cast = castTypedValue(value, f.type);
+        let cast: SynxValue;
+        if (f.type !== undefined) {
+          cast = castTypedValue(value, f.type);
           if (!lastCastOk) {
             make('CastFailed', p.line, `cannot cast "${value}" to ${f.type}`, f.name);
           }
-          setField(values, f.name, cast);
         } else {
-          setField(values, f.name, castAuto(value));
+          cast = castAuto(value);
+        }
+        setField(values, f.name, cast);
+        // A whole number read as a float (`3.0`, or `3` under `(float)`) is not
+        // an int to `[type:int]`, as in synx-core; a JS number cannot say so.
+        if (this.opts.validate && typeof cast === 'number' && Number.isInteger(cast)
+            && (f.type === 'float' || (f.type !== 'int' && value.indexOf('.') !== -1))) {
+          (wholeFloats ??= new Set<string>()).add(f.name);
         }
       }
       // Surplus parts are counted, not kept (§7.3).
@@ -1100,9 +1044,7 @@ class SynxlReader {
       for (const f of fields) byName.set(f.name, f);
 
       // §9.3 — visit in Unicode scalar order so diagnostics are reproducible.
-      // Only the engine's exact `__synx` metadata key is internal; a field
-      // named `__synx_id` is ordinary data and §12.1 admits no exceptions.
-      const keys = Object.keys(root).filter(k => k !== '__synx').sort(compareUnicodeScalar);
+      const keys = Object.keys(root).sort(compareUnicodeScalar);
       for (const key of keys) {
         const f = byName.get(key);
         if (f && f.block) {
@@ -1121,7 +1063,7 @@ class SynxlReader {
     if (this.opts.validate) {
       for (const f of fields) {
         if (!f.constraints) continue;
-        const msg = checkConstraints(f.name, values[f.name], f.constraints);
+        const msg = checkConstraints(f.name, values[f.name], f.constraints, wholeFloats !== null && wholeFloats.has(f.name));
         // §11.2 — an inline field reports the record line, a block field the
         // line its key sits on.
         if (msg) make('ConstraintViolation', f.block ? blockKeyLine(p, f.name) : p.line, msg, f.name);
@@ -1141,6 +1083,7 @@ class SynxlReader {
  * @throws SynxError on any hard error of §11.1 (no partial result is returned).
  */
 export function parseSynxl(text: string, options: SynxlOptions = {}): SynxlDocument {
+  text = inputText(text, 'parseSynxl');
   const reader = new SynxlReader(options);
   const records: SynxlRecord[] = [];
   const lines = text.split('\n');
@@ -1162,7 +1105,9 @@ export function parseSynxl(text: string, options: SynxlOptions = {}): SynxlDocum
   collect(reader.end(), lines.length);
 
   if (reader.version < 0) {
-    hardError('MissingOrMalformedPrologue', 'missing prologue: the first significant line must be "!synxl 1"', 1);
+    // spec: reported at the last line read, as synx-core does (B-060).
+    const lastLine = text.endsWith('\n') ? lines.length - 1 : lines.length;
+    hardError('MissingOrMalformedPrologue', 'missing prologue: the first significant line must be "!synxl 1"', Math.max(1, lastLine));
   }
 
   const diagnostics: SynxlDiagnostic[] = [];
@@ -1204,8 +1149,11 @@ export function* streamSynxl(
       reader.markUnterminated();
     }
   } else {
+    if (source === null || source === undefined || typeof (source as Iterable<string>)[Symbol.iterator] !== 'function') {
+      throw new SynxError('INPUT_ERR: streamSynxl expects a string or an iterable of lines');
+    }
     for (const line of source) {
-      const rec = reader.push(line, ++lineNo);
+      const rec = reader.push(inputText(line, 'streamSynxl'), ++lineNo);
       if (rec) yield rec;
     }
   }
@@ -1239,9 +1187,19 @@ export async function* streamSynxlAsync(
   let overflowed = false;
 
   for await (const chunk of source) {
-    const text = typeof chunk === 'string'
-      ? chunk
-      : (decoder = decoder ?? new TextDecoder('utf-8')).decode(chunk, { stream: true });
+    let text: string;
+    if (typeof chunk === 'string') text = chunk;
+    else {
+      // safety: SYNXL is UTF-8 (§3.1). A lenient decoder turned every other
+      // byte into U+FFFD and went on: a dataset in the wrong encoding was
+      // read as records nobody wrote.
+      if (decoder === null) decoder = new (TextDecoder as any)('utf-8', { fatal: true }) as { decode(input?: Uint8Array, options?: { stream?: boolean }): string };
+      try {
+        text = decoder.decode(chunk, { stream: true });
+      } catch {
+        throw new SynxError(`INPUT_ERR: line ${lineNo + 1} is not valid UTF-8 (§3.1)`);
+      }
+    }
     buf += text;
 
     let nl = buf.indexOf('\n');
@@ -1258,7 +1216,14 @@ export async function* streamSynxlAsync(
       overflowed = true;
     }
   }
-  if (decoder) buf += decoder.decode();
+  if (decoder) {
+    try {
+      buf += decoder.decode();
+    } catch {
+      // The stream ended inside a character.
+      throw new SynxError(`INPUT_ERR: line ${lineNo + 1} is not valid UTF-8 (§3.1)`);
+    }
+  }
 
   if (buf.length > 0) {
     const rec = reader.push(buf, ++lineNo);
@@ -1284,7 +1249,8 @@ function canonicalJson(values: SynxObject): string {
 }
 
 function asDocument(source: string | SynxlDocument, options?: SynxlOptions): SynxlDocument {
-  return typeof source === 'string' ? parseSynxl(source, options) : source;
+  if (source !== null && typeof source === 'object' && Array.isArray((source as SynxlDocument).records)) return source;
+  return parseSynxl(source as string, options);
 }
 
 /** Canonical JSON **array** projection of a document (SYNXL §12.1). */
@@ -1314,14 +1280,6 @@ export function synxlToNDJSON(source: string | SynxlDocument, options: SynxlOpti
 
 // ─── §14 Canonical serialization (writer) ─────────────────
 
-/** True for values that can sit on the first line of a `- ` list item. */
-function isInlineScalar(v: SynxValue): boolean {
-  if (v === null) return true;
-  if (isSecretValue(v)) return true; // written as its `[SECRET]` mask
-  if (typeof v === 'object') return false;
-  return synxScalarText(v) !== null;
-}
-
 /**
  * Render a number in a form SYNX can read back (§14.3): SYNX §8.3 recognizes
  * only `-?digits[.digits]`, so exponent forms must be expanded. Returns null
@@ -1347,43 +1305,17 @@ function numberText(n: number): string | null {
   return expandExponent(String(n));
 }
 
-/** Spell an exponent-form number out in full: SYNX §8.3 reads only `-?d.d`. */
-export function expandExponent(s: string): string {
-  // perf: almost every number has no exponent; skip the regex for those.
-  if (s.indexOf('e') === -1 && s.indexOf('E') === -1) return s;
-  const m = /^([+-]?)(\d+)(?:\.(\d+))?[eE]([+-]?\d+)$/.exec(s);
-  if (!m) return s;
-
-  // Expand the exponent in place, so the shortest round-tripping digits are
-  // preserved exactly (toFixed would emit the full binary expansion instead).
-  const sign = m[1] === '-' ? '-' : '';
-  const digits = m[2] + (m[3] ?? '');
-  const point = m[2].length + parseInt(m[4], 10);
-  let out: string;
-  if (point <= 0) {
-    out = `0.${'0'.repeat(-point)}${digits}`;
-  } else if (point >= digits.length) {
-    out = digits + '0'.repeat(point - digits.length);
-  } else {
-    out = `${digits.slice(0, point)}.${digits.slice(point)}`;
-  }
-  if (out.indexOf('.') !== -1) {
-    out = out.replace(/0+$/, '');
-    if (out.endsWith('.')) out = out.slice(0, -1);
-  }
-  return sign + out;
-}
-
 /**
  * Render a scalar for a SYNX **block** value, or null when it needs a `|+`
  * multiline block (multi-line text, or text that quoting cannot express).
  */
 function synxScalarText(value: SynxValue): string | null {
-  if (value === null) return 'null';
+  if (value === null || value === undefined) return 'null';
   if (typeof value === 'bigint') return value.toString();
   if (typeof value === 'number') return numberText(value) ?? 'null';
   if (typeof value === 'boolean') return String(value);
-  if (typeof value !== 'string') return null;
+  // safety: a secret is written as its mask, never as its fields or plaintext.
+  if (typeof value !== 'string') return isSecretValue(value) ? '[SECRET]' : null;
   if (value === '') return '""';
   if (value.indexOf('\n') !== -1) return null;
   // ` //` and ` #` are stripped by SYNX §8.3 *before* quotes are recognised, so
@@ -1395,9 +1327,10 @@ function synxScalarText(value: SynxValue): string | null {
     // Edge whitespace, checked on the two edge characters — `trimUnicode`
     // built a copy of every value to compare it.
     isUnicodeSpace(value.charCodeAt(0)) || isUnicodeSpace(value.charCodeAt(value.length - 1)) ||
-    value.indexOf('\r') !== -1 ||
     value === '|' || value === '|+' ||
-    value.charCodeAt(0) === 34 || value.charCodeAt(0) === 39 ||
+    // Wrapped in quotes it would be read as the text between them. A quote at
+    // one end only is text as it stands, and so is a CR inside the line — as
+    // synx-core writes them.
     castType(value) !== value;
 
   if (!needsQuote) return value;
@@ -1481,81 +1414,452 @@ function isSecretValue(v: unknown): boolean {
   return v !== null && typeof v === 'object' && (v as Record<symbol, unknown>)[Symbol.for('synx.secret')] === true;
 }
 
-function emitListItem(item: SynxValue, indent: number, out: string[], step: number): void {
+/** Deepest nesting the block writer follows; what lies deeper is not written, as in synx-core. */
+const MAX_WRITE_DEPTH = 128;
+
+/** A value that is a group: an object that is neither a list nor a secret. */
+function isGroup(v: unknown): v is SynxObject {
+  return v !== null && typeof v === 'object' && !Array.isArray(v) && !isSecretValue(v);
+}
+
+/** May this value share the `- ` line of a list item? */
+function dashLineSafe(v: SynxValue): boolean {
+  if (typeof v === 'string') return v !== '' && v.indexOf('\n') === -1 && synxScalarText(v) !== null;
+  if (v === null || typeof v !== 'object' || isSecretValue(v)) return true;
+  if (Array.isArray(v)) return false;
+  return Object.keys(v).length === 0;
+}
+
+// ─── Keys as the writers put them on a line ───────────────
+
+/** A control character, as Unicode's `Cc`. */
+function isControl(c: number): boolean {
+  return c < 0x20 || (c >= 0x7f && c <= 0x9f);
+}
+
+/** Whether `key`, written at the start of a line, is read back as that key and nothing else. */
+function keyReadsBack(key: string): boolean {
+  if (key === '') return false;
+  const first = key.charCodeAt(0);
+  // `-`, `#`, `/`, `[`, `:`, `(` cannot open a key.
+  if (first === 45 || first === 35 || first === 47 || first === 91 || first === 58 || first === 40) return false;
+  if (first === 33) {
+    // Lines the parser takes for directives.
+    if (key === '!active' || key === '!lock' || key === '!tool' || key === '!schema' || key === '!llm'
+        || key === '!include' || key === '!use') {
+      return false;
+    }
+  }
+  // Whitespace at an edge is trimmed away with the line; inside, only a space
+  // or a tab ends a key (U+00A0 is a letter like any other).
+  if (isUnicodeSpace(first) || isUnicodeSpace(key.charCodeAt(key.length - 1))) return false;
+  for (let i = 0; i < key.length; i++) {
+    const c = key.charCodeAt(i);
+    if (c === 32 || c === 91 || c === 58 || c === 40 || isControl(c)) return false;
+  }
+  return true;
+}
+
+/**
+ * `key` as the writers put it on a line.
+ *
+ * safety: SYNX has no quoting for keys, and a key was written as it came.
+ * `port:env` gave the next reader a marker, `!active` on a line of its own
+ * switched the document to active mode, a line break began new lines — a map
+ * with caller-chosen keys, saved and loaded, could read the server's
+ * environment. A character that would end the key or start something else is
+ * written as `_`; a key that reads back as itself is untouched.
+ */
+function writableKey(key: string): string {
+  if (keyReadsBack(key)) return key;
+  const chars = Array.from(key);
+  const last = chars.length - 1;
+  let out = '';
+  for (let i = 0; i < chars.length; i++) {
+    const ch = chars[i];
+    const c = ch.charCodeAt(0);
+    const breaks = isControl(c) || c === 32 || c === 91 || c === 58 || c === 40
+      || ((i === 0 || i === last) && ch.length === 1 && isUnicodeSpace(c))
+      || (i === 0 && (c === 45 || c === 35 || c === 47 || c === 33));
+    out += breaks ? '_' : ch;
+  }
+  return out === '' ? '_' : out;
+}
+
+/**
+ * The names the keys of one object are written under, or `null` when every
+ * key is written as it is — the usual object.
+ *
+ * safety: a key that does not read back as itself is renamed
+ * (`writableKey`), and two keys must not end up under one name — `a b`, `a:b`
+ * and `a_b` were all `a_b` to the reader, which kept the last of the three. A
+ * name already taken in the object gets a number: `a_b`, `a_b_2`, `a_b_3`, in
+ * the order of the object's keys.
+ */
+function keyNames(obj: SynxObject, keys: string[]): Map<string, string> | null {
+  let renamed: Map<string, string> | null = null;
+  let taken: Set<string> | null = null;
+  let next: Map<string, number> | null = null;
+  for (let i = 0; i < keys.length; i++) {
+    const key = keys[i];
+    if (keyReadsBack(key)) continue;
+    if (renamed === null) {
+      renamed = new Map<string, string>();
+      taken = new Set<string>();
+      next = new Map<string, number>();
+    }
+    const base = writableKey(key);
+    let name = base;
+    while (Object.prototype.hasOwnProperty.call(obj, name) || taken!.has(name)) {
+      const n = next!.get(base) ?? 2;
+      name = `${base}_${n}`;
+      next!.set(base, n + 1);
+    }
+    taken!.add(name);
+    renamed.set(key, name);
+  }
+  return renamed;
+}
+
+/** The keys of an object as a writer walks them: as the object has them, or sorted by code point. */
+function writeOrder(obj: SynxObject, sorted: boolean): string[] {
+  return sorted ? Object.keys(obj).sort(compareUnicodeScalar) : keysOf(obj);
+}
+
+// ─── Block writer ─────────────────────────────────────────
+
+/** `key |+` plus an indented body (§14.3). */
+function emitMultiline(name: string, body: string, indent: number, out: string[], step: number): void {
   const pad = ' '.repeat(indent);
-  // safety: a secret is written as its mask, never as its fields or plaintext.
-  if (isSecretValue(item)) { out.push(`${pad}- [SECRET]`); return; }
-  if (item !== null && typeof item === 'object' && !Array.isArray(item)) {
-    const entries = Object.entries(item as SynxObject).filter(([k]) => !k.startsWith('__synx'));
-    if (entries.length === 0) { out.push(`${pad}- {}`); return; }
-    // The SYNX list-item form requires a scalar first key on the `- ` line;
-    // reorder so that one is available. Key order is not semantically
-    // significant (the canonical projection sorts keys anyway).
-    let first = entries.findIndex(([, v]) => isInlineScalar(v));
+  out.push(`${pad}${name} |+`);
+  const inner = pad + ' '.repeat(step);
+  // perf: one pass over the text; `split` built an array of every line first.
+  let from = 0;
+  for (;;) {
+    const nl = body.indexOf('\n', from);
+    if (nl === -1) {
+      out.push(inner + body.substring(from));
+      return;
+    }
+    out.push(inner + body.substring(from, nl));
+    from = nl + 1;
+  }
+}
+
+/** Write one `- item` list entry. */
+function emitListItem(item: SynxValue, indent: number, out: string[], step: number, depth: number, sorted: boolean): void {
+  if (depth > MAX_WRITE_DEPTH) return;
+  const pad = ' '.repeat(indent);
+  if (isGroup(item)) {
+    const keys = writeOrder(item, sorted);
+    // An empty object in a list has no key to hang on the `- ` line.
+    if (keys.length === 0) {
+      out.push(`${pad}-`);
+      return;
+    }
+    const names = keyNames(item, keys);
+    // The `- ` line has to carry a key whose value fits on it; SYNX attaches
+    // everything deeper to the *item*, not to that key.
+    let head = -1;
+    for (let i = 0; i < keys.length && head < 0; i++) if (dashLineSafe(item[keys[i]])) head = i;
     // §14.1 — an item is an object only when a deeper line follows its `- `
-    // line: a one-key item came back as a string, and an item with no inline
-    // value lost its head. Repeating the head in full below fixes both (a
-    // repeated key is legal; the last one wins). Mirrors synx-core.
-    const repeatHead = first < 0 || entries.length === 1;
-    if (first < 0) first = 0;
-    const [fk, fv] = entries[first];
-    const text = isSecretValue(fv) ? '[SECRET]' : isInlineScalar(fv) ? synxScalarText(fv) : null;
-    out.push(text === null ? `${pad}- ${fk}` : `${pad}- ${fk} ${text}`);
-    for (let i = 0; i < entries.length; i++) {
-      if (i === first && !repeatHead) continue;
-      emitBlockEntry(entries[i][0], entries[i][1], indent + step, out, step);
+    // line: a one-key item came back as a string, and an item with no value
+    // that fits the line lost its head. Writing the head again in full below
+    // covers both (a repeated key is legal; the last one wins).
+    const repeatHead = head < 0 || keys.length === 1;
+    if (head < 0) head = 0;
+    const headKey = keys[head];
+    const text = synxScalarText(item[headKey]);
+    const name = names?.get(headKey) ?? headKey;
+    out.push(text === null || text === '' ? `${pad}- ${name}` : `${pad}- ${name} ${text}`);
+    for (let i = 0; i < keys.length; i++) {
+      if (i === head && !repeatHead) continue;
+      emitNamedEntry(names?.get(keys[i]) ?? keys[i], item[keys[i]], indent + step, out, step, depth + 1, sorted);
     }
     return;
   }
-  if (item !== null && typeof item === 'object') {
-    // Nested array inside a list — SYNX has no syntax for it; emit as a
-    // single-key wrapper so the data is at least not silently dropped.
+  if (Array.isArray(item)) {
+    // A list inside a list — SYNX has no syntax for it; a single-key wrapper
+    // keeps the data from being dropped without a word.
     out.push(`${pad}- _value`);
-    emitBlockEntry('_value', item, indent + step, out, step);
+    emitNamedEntry('_value', item, indent + step, out, step, depth + 1, sorted);
     return;
   }
   const text = synxScalarText(item);
-  out.push(`${pad}- ${text === null ? String(item) : text}`);
+  if (text !== null) {
+    out.push(`${pad}- ${text}`);
+    return;
+  }
+  // safety: a list item is one line and SYNX has no block form for it, so a
+  // line break is written as a space. Written as it was, the rest of the text
+  // became lines of its own: keys in a `.synx`, forged records in a SYNXL block.
+  out.push(`${pad}- ${typeof item === 'string' ? item.replace(LINE_BREAKS, ' ') : ''}`);
 }
 
-function emitBlockEntry(key: string, value: SynxValue, indent: number, out: string[], step: number): void {
+/** `\n` and `\r`, one at a time: nothing here can backtrack. */
+const LINE_BREAKS = /[\n\r]/g;
+
+/** Write `name value` as SYNX at `indent` columns; `name` is the key as it goes on the line. */
+function emitNamedEntry(
+  name: string, value: SynxValue, indent: number, out: string[], step: number, depth: number, sorted: boolean,
+): void {
+  if (depth > MAX_WRITE_DEPTH) return;
   const pad = ' '.repeat(indent);
-  if (isSecretValue(value)) { out.push(`${pad}${key} [SECRET]`); return; }
   if (Array.isArray(value)) {
     // A bare key reads back as an empty object; the `:join` list marker is
     // the SYNX surface that yields an empty array, as synx-core writes it.
-    out.push(value.length === 0 ? `${pad}${key}:join` : `${pad}${key}`);
-    for (const item of value) emitListItem(item, indent + step, out, step);
+    out.push(value.length === 0 ? `${pad}${name}:join` : `${pad}${name}`);
+    for (let i = 0; i < value.length; i++) emitListItem(value[i], indent + step, out, step, depth + 1, sorted);
     return;
   }
-  if (value !== null && typeof value === 'object') {
-    out.push(`${pad}${key}`);
-    for (const [k, v] of Object.entries(value as SynxObject)) {
-      if (k.startsWith('__synx')) continue;
-      emitBlockEntry(k, v, indent + step, out, step);
-    }
+  if (isGroup(value)) {
+    out.push(`${pad}${name}`);
+    emitObject(value, indent + step, out, step, depth + 1, sorted);
     return;
   }
   const text = synxScalarText(value);
-  if (text !== null) { out.push(`${pad}${key} ${text}`); return; }
-
+  if (text !== null) {
+    out.push(`${pad}${name} ${text}`);
+    return;
+  }
   // Multi-line (or unquotable) text → §14.3 mandates `|+`, which preserves
   // indentation relative to the first continuation line.
-  out.push(`${pad}${key} |+`);
-  const body = String(value).split('\n');
-  for (const bodyLine of body) out.push(`${pad}${' '.repeat(step)}${bodyLine}`);
+  emitMultiline(name, typeof value === 'string' ? value : '', indent, out, step);
+}
+
+/** Write the entries of one object at `indent` columns. */
+function emitObject(obj: SynxObject, indent: number, out: string[], step: number, depth: number, sorted: boolean): void {
+  const keys = writeOrder(obj, sorted);
+  const names = keyNames(obj, keys);
+  for (let i = 0; i < keys.length; i++) {
+    emitNamedEntry(names?.get(keys[i]) ?? keys[i], obj[keys[i]], indent, out, step, depth, sorted);
+  }
+}
+
+/** A field of a SYNXL record written as a block entry (§14.3), under its field name. */
+function emitBlockEntry(key: string, value: SynxValue, indent: number, out: string[], step: number): void {
+  emitNamedEntry(key, value, indent, out, step, 0, false);
 }
 
 /**
  * Write an object as a SYNX document body that parses back to the same data
  * — the block writer of §14.1. Used by `Synx.stringify` and `Synx.decompile`.
+ *
+ * Keys go in the order the object has them (for a parsed document, the order
+ * of the document); with `sorted`, by code point at every level, as synx-core
+ * writes a document it has no order for.
  */
-export function writeSynxBody(obj: SynxObject, step = 2): string {
+export function writeSynxBody(obj: SynxObject, step = 2, sorted = false): string {
   const out: string[] = [];
-  for (const [k, v] of Object.entries(obj)) {
-    if (k.startsWith('__synx')) continue;
-    emitBlockEntry(k, v, 0, out, step);
+  emitObject(obj, 0, out, step, 0, sorted);
+  return out.length ? out.join('\n') + '\n' : '';
+}
+
+// ─── Declared writer ──────────────────────────────────────
+
+/** A constraint bound as synx-core prints it: no exponent, no trailing `.0`. */
+function boundText(n: number): string {
+  if (Number.isNaN(n)) return 'NaN';
+  if (!Number.isFinite(n)) return n > 0 ? 'inf' : '-inf';
+  return Object.is(n, -0) ? '-0' : expandExponent(String(n));
+}
+
+/** `name(type)[constraints]:markers` as the parser reads it back. */
+function declaredHeader(name: string, meta: SynxMeta | undefined): string {
+  if (meta === undefined) return name;
+  let header = name;
+  if (meta.typeHint !== undefined) header += `(${meta.typeHint})`;
+  const c = meta.constraints;
+  if (c) {
+    const parts: string[] = [];
+    if (c.type !== undefined) parts.push(`type:${c.type}`);
+    if (c.required) parts.push('required');
+    if (c.readonly) parts.push('readonly');
+    if (c.min !== undefined) parts.push(`min:${boundText(c.min)}`);
+    if (c.max !== undefined) parts.push(`max:${boundText(c.max)}`);
+    if (c.pattern !== undefined) parts.push(`pattern:${c.pattern}`);
+    if (c.enum !== undefined) parts.push(`enum:${c.enum.join('|')}`);
+    header += `[${parts.join(', ')}]`;
   }
+  for (let i = 0; i < meta.markers.length; i++) header += `:${meta.markers[i]}`;
+  return header;
+}
+
+function emitDeclaredObject(obj: SynxObject, indent: number, out: string[], depth: number): void {
+  if (depth > MAX_WRITE_DEPTH) return;
+  const metaMap = metaMapOf(obj);
+  const keys = keysOf(obj);
+  const names = keyNames(obj, keys);
+  for (let i = 0; i < keys.length; i++) {
+    const key = keys[i];
+    emitDeclaredEntry(names?.get(key) ?? key, metaMap?.get(key), obj[key], indent, out, depth);
+  }
+}
+
+function emitDeclaredEntry(
+  name: string, meta: SynxMeta | undefined, value: SynxValue, indent: number, out: string[], depth: number,
+): void {
+  if (depth > MAX_WRITE_DEPTH) return;
+  const header = declaredHeader(name, meta);
+  // `tier:random 90 5 5` and `child:inherit base` keep their arguments on
+  // the key line; the parser moved them out of the value.
+  const args = meta !== undefined && meta.args ? meta.args : NO_ARGS;
+  const emptyList = Array.isArray(value) && value.length === 0;
+  if (meta === undefined && !emptyList) {
+    emitDeclaredBody(header, meta, args, value, indent, out, depth);
+    return;
+  }
+  // spec: a key keeps the declarations of its first line and the value of
+  // its last (`x(int)` / `x h` is `"h"` declared `int`), as in synx-core
+  // (B-082). Written as one line, `x(int) h`, the declaration acted on the
+  // value again and gave `0`; `b:join` with a group gave a list, `a:inherit`
+  // with a text took the text as parents. When the one line does not read
+  // back as this value, the declaration goes on a line of its own and the
+  // value follows on a plain line, which keeps the declarations.
+  let readsBack: boolean;
+  if (Array.isArray(value) || isGroup(value)) {
+    let line = header;
+    for (const arg of args) line += ` ${arg}`;
+    readsBack = declarationReadsBack(line, name, value);
+  } else {
+    const chunk: string[] = [];
+    emitDeclaredBody(header, meta, args, value, 0, chunk, depth);
+    readsBack = declarationReadsBack(chunk.join('\n'), name, value);
+  }
+  if (readsBack) {
+    emitDeclaredBody(header, meta, args, value, indent, out, depth);
+    return;
+  }
+  const pad = ' '.repeat(indent);
+  if (meta !== undefined) {
+    let line = pad + header;
+    for (const arg of args) line += ` ${arg}`;
+    out.push(line);
+  }
+  if (emptyList) {
+    // A bare key is an empty list when the next line is a `- ` line that no
+    // open list takes (§8.5.2) — at the root no list is open. Deeper down an
+    // outer list could take it, so there the key stays a group.
+    out.push(pad + name);
+    if (indent === 0) out.push('- _');
+    return;
+  }
+  if (Array.isArray(value) || isGroup(value)) emitDeclaredBody(name, undefined, NO_ARGS, value, indent, out, depth);
+  else emitNamedEntry(name, value, indent, out, 2, depth, false);
+}
+
+const NO_ARGS: readonly string[] = [];
+
+/**
+ * Whether `chunk`, the lines of one root entry, gives `name` this value when
+ * read in an `!active` document — for an object or a list, whose lines
+ * follow, a container of the same kind with nothing in it yet.
+ * `declaration_reads_back` in synx-core.
+ */
+function declarationReadsBack(chunk: string, name: string, value: SynxValue): boolean {
+  const root = parseData(`!active\n${chunk}`).root;
+  if (!Object.prototype.hasOwnProperty.call(root, name)) return false;
+  const got = root[name];
+  const gotGroup = got !== null && typeof got === 'object' && !Array.isArray(got);
+  const gotEmptyGroup = gotGroup && Object.keys(got as SynxObject).length === 0;
+  if (Array.isArray(value)) {
+    if (Array.isArray(got)) return got.length === 0;
+    return value.length > 0 && gotEmptyGroup;
+  }
+  if (isGroup(value)) return gotEmptyGroup;
+  return got === value;
+}
+
+/** The lines of one declared entry, its key line starting with `header`. */
+function emitDeclaredBody(
+  header: string, meta: SynxMeta | undefined, args: readonly string[], value: SynxValue,
+  indent: number, out: string[], depth: number,
+): void {
+  const pad = ' '.repeat(indent);
+  if (Array.isArray(value) || isGroup(value)) {
+    let line = pad + header;
+    for (const arg of args) line += ` ${arg}`;
+    out.push(line);
+    if (Array.isArray(value)) {
+      for (let i = 0; i < value.length; i++) {
+        const item = value[i];
+        if (isGroup(item)) emitDeclaredItem(item, indent + 2, out, depth + 1);
+        else emitListItem(item, indent + 2, out, 2, depth + 1, false);
+      }
+    } else {
+      emitDeclaredObject(value, indent + 2, out, depth + 1);
+    }
+    return;
+  }
+  let text: string | null;
+  if (meta !== undefined && meta.typeHint === 'string' && typeof value === 'string') {
+    // spec: `(string)` takes the text as written, quotes included, so it is
+    // written bare or — when a bare line cannot carry it — as a block, never
+    // quoted.
+    const bare = value !== '' && value.indexOf('\n') === -1
+      && !isUnicodeSpace(value.charCodeAt(0)) && !isUnicodeSpace(value.charCodeAt(value.length - 1))
+      && value.indexOf(' #') === -1 && value.indexOf(' //') === -1 && value !== '|' && value !== '|+';
+    text = bare ? value : null;
+  } else {
+    text = synxScalarText(value);
+  }
+  if (text !== null) out.push(`${pad}${header} ${text}`);
+  else emitMultiline(header, typeof value === 'string' ? value : '', indent, out, 2);
+}
+
+/**
+ * One list item that is an object: the first key rides the `- ` line, as it
+ * did in the source, and the rest follow in order.
+ */
+function emitDeclaredItem(fields: SynxObject, indent: number, out: string[], depth: number): void {
+  if (depth > MAX_WRITE_DEPTH) return;
+  const pad = ' '.repeat(indent);
+  const keys = keysOf(fields);
+  if (keys.length === 0) {
+    out.push(`${pad}-`);
+    return;
+  }
+  const metaMap = metaMapOf(fields);
+  const names = keyNames(fields, keys);
+  const headKey = keys[0];
+  const headValue = fields[headKey];
+  const headMeta = metaMap?.get(headKey);
+  const headName = names?.get(headKey) ?? headKey;
+  let line = `${pad}- `;
+  let skipHead = false;
+  let headLine: string | null = null;
+  if (dashLineSafe(headValue) && !(headMeta !== undefined && headMeta.typeHint === 'string')) {
+    headLine = declaredHeader(headName, headMeta);
+    const text = synxScalarText(headValue);
+    if (text !== null && text !== '') headLine += ` ${text}`;
+    // The declaration must not act on the value a second time (B-082).
+    if (headMeta !== undefined && !declarationReadsBack(headLine, headName, headValue)) headLine = null;
+  }
+  if (headLine !== null) {
+    line += headLine;
+    // An item is an object only when a deeper line follows its `- ` line.
+    skipHead = keys.length > 1;
+  } else {
+    // The head does not fit the dash line: a bare key opens the item and the
+    // entry is written in full below (the later one wins).
+    line += headName;
+  }
+  out.push(line);
+  for (let i = 0; i < keys.length; i++) {
+    if (i === 0 && skipHead) continue;
+    const key = keys[i];
+    emitDeclaredEntry(names?.get(key) ?? key, metaMap?.get(key), fields[key], indent + 2, out, depth + 1);
+  }
+}
+
+/**
+ * Write an `!active` document with the declarations it carries: every key as
+ * `key(type)[constraints]:markers value`, in the order the tree has — the
+ * order its markers resolve in. Used by `Synx.decompile`.
+ */
+export function writeSynxDeclared(root: SynxObject): string {
+  const out: string[] = [];
+  emitDeclaredObject(root, 0, out, 0);
   return out.length ? out.join('\n') + '\n' : '';
 }
 
@@ -1570,7 +1874,7 @@ function synthesizeFields(records: readonly SynxObject[]): SynxlField[] {
   const seen = new Set<string>();
   for (const rec of records) {
     for (const k of Object.keys(rec)) {
-      if (k.startsWith('__synx') || seen.has(k)) continue;
+      if (seen.has(k)) continue;
       seen.add(k);
       names.push(k);
     }
@@ -1671,6 +1975,9 @@ export function writeSynxl(
   }
 
   const doc = input as SynxlDocument;
+  if (doc === null || typeof doc !== 'object' || !Array.isArray(doc.records) || !Array.isArray(doc.fieldLists)) {
+    throw new SynxError('INPUT_ERR: writeSynxl expects a parsed document or an array of records');
+  }
   const byList = new Map<SynxlFieldList, SynxObject[]>();
   for (const fl of doc.fieldLists) byList.set(fl, []);
   for (const r of doc.records) {

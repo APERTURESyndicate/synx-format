@@ -78,12 +78,12 @@ export interface SynxMeta {
   args?: string[];          // e.g. percentages for :random
   constraints?: SynxConstraints;
   typeHint?: string;        // e.g. 'string', 'int', 'float'
+  /** The engine's classification of `markers`, filled on first use. */
+  bits?: number;
 }
 
-/** Map of key → metadata for a single object level */
-export interface SynxMetaMap {
-  [key: string]: SynxMeta;
-}
+/** Declarations of one object's keys, in the order the document makes them. */
+export type SynxMetaMap = Map<string, SynxMeta>;
 
 /** Include directive parsed from !include */
 export interface SynxInclude {
@@ -103,6 +103,8 @@ export interface SynxParseResult {
   /** File declares `!schema` (used with !tool for schema mode). */
   schema?: boolean;
   includes?: SynxInclude[];
+  /** Input was dropped: it passed a size, line, block or list limit. */
+  truncated?: boolean;
 }
 
 /** Options for Synx.parse() / Synx.load() */
@@ -119,6 +121,12 @@ export interface SynxOptions {
   strict?: boolean;
   /** Maximum include/import nesting depth (default: 16) */
   maxIncludeDepth?: number;
+  /**
+   * Resolve without writing to disk: `:once` returns the value `.synx.lock`
+   * already holds, or a new one that is not recorded. For documents the host
+   * does not trust with its files.
+   */
+  readOnly?: boolean;
 }
 
 /** Structural diff result from Synx.diff() */
@@ -230,18 +238,6 @@ export interface SynxlWriteOptions {
   indent?: number;
 }
 
-/**
- * Typed error thrown by SYNX in strict mode.
- * The `code` field contains the error prefix (e.g. "CALC_ERR", "ALIAS_ERR").
- */
-export class SynxError extends Error {
-  readonly code: string;
-
-  constructor(message: string) {
-    super(message);
-    this.name = 'SynxError';
-    // Extract prefix up to first ':'
-    const colonIdx = message.indexOf(':');
-    this.code = colonIdx !== -1 ? message.slice(0, colonIdx) : 'SYNX_ERR';
-  }
-}
+// perf: the class is declared in the parser — the one module every entry
+// point loads — so that this file is types only and nothing loads it to run.
+export { SynxError } from './parser';

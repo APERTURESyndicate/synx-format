@@ -36,8 +36,7 @@ public static class SynxSafeCalc
         {
             var toks = Tokenize(trimmed);
             if (toks.Count == 0) return true;
-            var p = new Parser(toks);
-            value = p.Parse();
+            value = Evaluate(toks);
             return true;
         }
         catch (CalcException e)
@@ -114,73 +113,99 @@ public static class SynxSafeCalc
     };
 
     /// <summary>
-    /// Recursive descent: <c>expr → term (('+'|'-') term)*</c>,
-    /// <c>term → factor (('*'|'/'|'%') factor)*</c>, <c>factor → NUMBER | '(' expr ')'</c>.
+    /// One open <c>expr</c> of the grammar — <c>expr → term (('+'|'-') term)*</c>,
+    /// <c>term → factor (('*'|'/'|'%') factor)*</c>, <c>factor → NUMBER | '(' expr ')'</c> —
+    /// the top level, or the inside of a pair of parentheses.
     /// </summary>
-    private sealed class Parser(List<Tok> t)
+    private struct Frame
     {
-        private int _i;
+        /// <summary>Sum so far and the <c>+</c> / <c>-</c> waiting for its right-hand term (<c>'\0'</c>: none).</summary>
+        internal double ExprLeft;
+        internal char ExprOp;
+        /// <summary>Product so far and the <c>*</c> / <c>/</c> / <c>%</c> waiting for its factor.</summary>
+        internal double TermLeft;
+        internal char TermOp;
+    }
 
-        internal double Parse()
+    /// <summary>
+    /// Evaluates a token stream.
+    /// safety: parentheses used to recurse through Expr → Term → Factor, one group of stack
+    /// frames per <c>(</c>. A stack overflow cannot be caught in .NET: <c>x:calc ((((…</c> — 1.6 KB
+    /// of document on a thread-pool thread, 20 000 parentheses through <c>:ref:calc</c> anywhere —
+    /// ended the whole process. Open parentheses now live in a list; the order of evaluation,
+    /// and so every result and error text, is the one the recursive parser produced (and the
+    /// one synx-core produces).
+    /// </summary>
+    private static double Evaluate(List<Tok> t)
+    {
+        var stack = new List<Frame> { default };
+        var pos = 0;
+        while (true)
         {
-            var r = Expr();
-            if (_i < t.Count)
-                throw new CalcException($"SYNX :calc — unexpected token at position {_i}");
-            return r;
-        }
-
-        private double Expr()
-        {
-            var r = Term();
-            while (_i < t.Count && t[_i].T == TokType.Op && t[_i].Op is '+' or '-')
-            {
-                var op = t[_i].Op;
-                _i++;
-                var right = Term();
-                r = op == '+' ? r + right : r - right;
-            }
-            return r;
-        }
-
-        private double Term()
-        {
-            var r = Factor();
-            while (_i < t.Count && t[_i].T == TokType.Op && t[_i].Op is '*' or '/' or '%')
-            {
-                var op = t[_i].Op;
-                _i++;
-                var d = Factor();
-                if (op == '*')
-                {
-                    r *= d;
-                    continue;
-                }
-                if (d == 0) throw new CalcException("SYNX :calc — division by zero");
-                r = op == '/' ? r / d : r % d;
-            }
-            return r;
-        }
-
-        private double Factor()
-        {
-            if (_i >= t.Count)
+            // A factor is expected here.
+            if (pos >= t.Count)
                 throw new CalcException("SYNX :calc — unexpected end of expression");
-            var tok = t[_i];
-            if (tok.T == TokType.Num)
-            {
-                _i++;
-                return tok.Num;
-            }
+            var tok = t[pos];
             if (tok.T == TokType.Lp)
             {
-                _i++;
-                var v = Expr();
-                if (_i >= t.Count || t[_i].T != TokType.Rp)
-                    throw new CalcException("SYNX :calc — missing closing parenthesis");
-                _i++;
-                return v;
+                pos++;
+                stack.Add(default);
+                continue;
             }
-            throw new CalcException($"SYNX :calc — unexpected token: '{TokenText(tok)}'");
+            if (tok.T != TokType.Num)
+                throw new CalcException($"SYNX :calc — unexpected token: '{TokenText(tok)}'");
+            pos++;
+            var value = tok.Num;
+
+            // Fold the factor into its term, the term into its expr, and close every pair of
+            // parentheses that ends here.
+            while (true)
+            {
+                var frame = stack[^1];
+                var termOp = frame.TermOp;
+                frame.TermOp = '\0';
+                if (termOp == '\0') frame.TermLeft = value;
+                else if (termOp == '*') frame.TermLeft *= value;
+                else
+                {
+                    if (value == 0) throw new CalcException("SYNX :calc — division by zero");
+                    frame.TermLeft = termOp == '/' ? frame.TermLeft / value : frame.TermLeft % value;
+                }
+                if (pos < t.Count && t[pos].T == TokType.Op && t[pos].Op is '*' or '/' or '%')
+                {
+                    frame.TermOp = t[pos].Op;
+                    pos++;
+                    stack[^1] = frame;
+                    break;
+                }
+
+                var exprOp = frame.ExprOp;
+                frame.ExprOp = '\0';
+                if (exprOp == '\0') frame.ExprLeft = frame.TermLeft;
+                else if (exprOp == '+') frame.ExprLeft += frame.TermLeft;
+                else frame.ExprLeft -= frame.TermLeft;
+                if (pos < t.Count && t[pos].T == TokType.Op && t[pos].Op is '+' or '-')
+                {
+                    frame.ExprOp = t[pos].Op;
+                    pos++;
+                    stack[^1] = frame;
+                    break;
+                }
+
+                // This expr is complete.
+                var result = frame.ExprLeft;
+                if (stack.Count == 1)
+                {
+                    if (pos < t.Count)
+                        throw new CalcException($"SYNX :calc — unexpected token at position {pos}");
+                    return result;
+                }
+                stack.RemoveAt(stack.Count - 1);
+                if (pos >= t.Count || t[pos].T != TokType.Rp)
+                    throw new CalcException("SYNX :calc — missing closing parenthesis");
+                pos++;
+                value = result;
+            }
         }
     }
 }

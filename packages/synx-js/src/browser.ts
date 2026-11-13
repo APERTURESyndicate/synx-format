@@ -6,9 +6,10 @@
  * Provides: parse, stringify.
  */
 
-import { parseData } from './parser';
-import { resolve } from './engine';
+import { parseData, inputText, markLocked } from './parser';
+import { resolve, assertNoRuntimeErrors } from './engine';
 import {
+  writeSynxBody,
   parseSynxl,
   streamSynxl,
   streamSynxlAsync,
@@ -47,20 +48,24 @@ export {
 
 class Synx {
   static parse<T extends SynxObject = SynxObject>(text: string, options: SynxOptions = {}): T {
-    const { root, mode } = parseData(text);
+    const { root, mode, locked, includes } = parseData(inputText(text, 'Synx.parse'));
     if (mode === 'active') {
-      resolve(root, options);
+      resolve(root, { ...options, _includes: includes } as any);
+    }
+    // spec: the same result as the Node build — `!lock` and `strict` were
+    // ignored here.
+    if (locked) markLocked(root);
+    if (options.strict) {
+      assertNoRuntimeErrors(root);
     }
     return root as T;
   }
 
   static stringify(obj: SynxObject, active = false): string {
-    let out = '';
-    if (active) {
-      out += '!active\n';
-    }
-    out += serializeObject(obj, 0);
-    return out;
+    // spec: the round-trip writer of the Node build. The writer that lived
+    // here quoted nothing (`"007"` came back as 7), wrote `|` for text that
+    // needs `|+`, and printed an object in a list item as [object Object].
+    return (active ? '!active\n' : '') + writeSynxBody(obj);
   }
 
   // ─── SYNXL — "SYNX Lines" record stream (SYNXL 1) ───────
@@ -102,43 +107,6 @@ class Synx {
   ): string {
     return writeSynxl(input, options);
   }
-}
-
-function serializeObject(obj: SynxObject, indent: number): string {
-  let out = '';
-  const spaces = ' '.repeat(indent);
-
-  for (const [key, val] of Object.entries(obj)) {
-    if (Array.isArray(val)) {
-      out += `${spaces}${key}\n`;
-      for (const item of val) {
-        if (item && typeof item === 'object' && !Array.isArray(item)) {
-          const entries = Object.entries(item as SynxObject);
-          if (entries.length > 0) {
-            const [firstKey, firstVal] = entries[0];
-            out += `${spaces}  - ${firstKey} ${firstVal}\n`;
-            for (let i = 1; i < entries.length; i++) {
-              out += `${spaces}    ${entries[i][0]} ${entries[i][1]}\n`;
-            }
-          }
-        } else {
-          out += `${spaces}  - ${item}\n`;
-        }
-      }
-    } else if (val && typeof val === 'object') {
-      out += `${spaces}${key}\n`;
-      out += serializeObject(val as SynxObject, indent + 2);
-    } else if (typeof val === 'string' && val.includes('\n')) {
-      out += `${spaces}${key} |\n`;
-      for (const line of val.split('\n')) {
-        out += `${spaces}  ${line}\n`;
-      }
-    } else {
-      out += `${spaces}${key} ${val}\n`;
-    }
-  }
-
-  return out;
 }
 
 export default Synx;

@@ -57,7 +57,32 @@ const (
 	maxDecodedBytes = 256 * 1024 * 1024
 	// maxDecodeDepth bounds ARRAY/OBJECT nesting while decoding.
 	maxDecodeDepth = 256
+	// decodedValueCost is what one decoded value costs against
+	// maxDecodedBytes, text aside.
+	decodedValueCost = 64
+	// maxPreallocItems caps the capacity reserved for a count read from the file.
+	maxPreallocItems = 1024
 )
+
+// decodeBudget is what decoding has built so far, in bytes.
+//
+// safety: a value is one byte on the wire and tens of bytes in memory, a
+// string is stored once and referenced any number of times, and deflate
+// shrinks a run of either a thousandfold: unbudgeted, 8 KB of file decoded to
+// half a gigabyte and 171 bytes to 1.4 GiB. The tree shares the payload's
+// limit — every value at a fixed cost, plus the bytes of each key and string
+// it refers to.
+type decodeBudget struct{ spent int64 }
+
+func (b *decodeBudget) charge(n int) error {
+	b.spent += int64(n)
+	if b.spent > maxDecodedBytes {
+		return fmt.Errorf("decoded document exceeds %d bytes — refusing to decode", maxDecodedBytes)
+	}
+	return nil
+}
+
+func (b *decodeBudget) value() error { return b.charge(decodedValueCost) }
 
 // IsSynxb reports whether `data` starts with the `.synxb` magic prefix.
 func IsSynxb(data []byte) bool {
@@ -199,21 +224,26 @@ func deflateRaw(data []byte) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// inflateRaw inflates at most maxDecodedBytes (+1 to detect an overrun), so
-// a small crafted stream cannot expand into gigabytes.
+// inflateRaw inflates at most `expected` + 1 bytes: one more than declared, to
+// notice a stream that inflates past it.
+//
+// safety: the buffer was reserved from the declared size before a byte was
+// inflated — 13 bytes of file declaring 256 MiB cost 256 MiB each — and the
+// stream was read up to the 256 MiB cap whatever it declared. The buffer now
+// grows with what the stream actually produces.
 func inflateRaw(data []byte, expected int) ([]byte, error) {
 	r := flate.NewReader(bytes.NewReader(data))
 	defer r.Close()
-	if expected <= 0 {
-		expected = 1024
+	if expected < 0 {
+		expected = 0
 	}
-	buf := bytes.NewBuffer(make([]byte, 0, expected))
-	n, err := io.Copy(buf, io.LimitReader(r, maxDecodedBytes+1))
-	if err != nil {
+	reserve := expected
+	if reserve > 64*1024 {
+		reserve = 64 * 1024
+	}
+	buf := bytes.NewBuffer(make([]byte, 0, reserve))
+	if _, err := io.Copy(buf, io.LimitReader(r, int64(expected)+1)); err != nil {
 		return nil, err
-	}
-	if n > maxDecodedBytes {
-		return nil, errors.New("decoded payload exceeds limit")
 	}
 	return buf.Bytes(), nil
 }
@@ -357,6 +387,10 @@ func decodeStringTable(cur *cursor) (*stringTableReader, error) {
 }
 
 func (r *stringTableReader) get(idx uint64) (string, error) {
+	// An index is a u32 on the wire of synx-core; anything larger is not one.
+	if idx > math.MaxUint32 {
+		return "", errors.New("string index out of range")
+	}
 	if idx >= uint64(len(r.strings)) {
 		return "", fmt.Errorf("string index %d out of bounds (size %d)", idx, len(r.strings))
 	}
@@ -365,10 +399,17 @@ func (r *stringTableReader) get(idx uint64) (string, error) {
 
 // safeCapacity bounds a capacity read from untrusted input: every element
 // costs at least one byte, so a count never exceeds the bytes left.
+//
+// safety: and never more than maxPreallocItems. Capped at the bytes that
+// remain alone, an 8 KB file of zeros still reserved 128 MiB for a list it
+// did not hold.
 func safeCapacity(count uint64, cur *cursor) int {
 	remaining := uint64(len(cur.data) - cur.pos)
 	if count > remaining {
-		return int(remaining)
+		count = remaining
+	}
+	if count > maxPreallocItems {
+		count = maxPreallocItems
 	}
 	return int(count)
 }
@@ -376,8 +417,20 @@ func safeCapacity(count uint64, cur *cursor) int {
 // ─── varint / zigzag ────────────────────────────────────────────────────────
 
 type cursor struct {
-	data []byte
-	pos  int
+	data   []byte
+	pos    int
+	budget decodeBudget
+}
+
+// text charges a string the tree refers to and returns it.
+func (cur *cursor) text(s string, err error) (string, error) {
+	if err != nil {
+		return "", err
+	}
+	if err := cur.budget.charge(len(s)); err != nil {
+		return "", err
+	}
+	return s, nil
 }
 
 func encodeVarint(out *bytes.Buffer, value uint64) {
@@ -481,6 +534,9 @@ func decodeValue(cur *cursor, t *stringTableReader, depth int) (Value, error) {
 	if depth > maxDecodeDepth {
 		return nil, fmt.Errorf("nesting exceeds %d — refusing to decode", maxDecodeDepth)
 	}
+	if err := cur.budget.value(); err != nil {
+		return nil, err
+	}
 	if cur.pos >= len(cur.data) {
 		return nil, errors.New("unexpected end of data")
 	}
@@ -510,7 +566,7 @@ func decodeValue(cur *cursor, t *stringTableReader, depth int) (Value, error) {
 		if err != nil {
 			return nil, err
 		}
-		s, err := t.get(idx)
+		s, err := cur.text(t.get(idx))
 		if err != nil {
 			return nil, err
 		}
@@ -543,7 +599,7 @@ func decodeValue(cur *cursor, t *stringTableReader, depth int) (Value, error) {
 			if err != nil {
 				return nil, err
 			}
-			k, err := t.get(ki)
+			k, err := cur.text(t.get(ki))
 			if err != nil {
 				return nil, err
 			}
@@ -656,7 +712,7 @@ func decodeIndexed(cur *cursor, t *stringTableReader) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return t.get(idx)
+	return cur.text(t.get(idx))
 }
 
 func decodeStrings(cur *cursor, t *stringTableReader) ([]string, error) {
@@ -666,6 +722,9 @@ func decodeStrings(cur *cursor, t *stringTableReader) ([]string, error) {
 	}
 	out := make([]string, 0, safeCapacity(count, cur))
 	for i := uint64(0); i < count; i++ {
+		if err := cur.budget.value(); err != nil {
+			return nil, err
+		}
 		s, err := decodeIndexed(cur, t)
 		if err != nil {
 			return nil, err
@@ -719,6 +778,9 @@ func decodeMetadata(cur *cursor, t *stringTableReader) (*MetadataTree, error) {
 	}
 	tree := NewMetadataTree()
 	for i := uint64(0); i < outer; i++ {
+		if err := cur.budget.value(); err != nil {
+			return nil, err
+		}
 		path, err := decodeIndexed(cur, t)
 		if err != nil {
 			return nil, err
@@ -731,6 +793,9 @@ func decodeMetadata(cur *cursor, t *stringTableReader) (*MetadataTree, error) {
 		for j := uint64(0); j < inner; j++ {
 			fk, err := decodeIndexed(cur, t)
 			if err != nil {
+				return nil, err
+			}
+			if err := cur.budget.value(); err != nil {
 				return nil, err
 			}
 			var meta Meta
@@ -783,6 +848,9 @@ func decodeIncludes(cur *cursor, t *stringTableReader) ([]IncludeDirective, erro
 	}
 	out := make([]IncludeDirective, 0, safeCapacity(count, cur))
 	for i := uint64(0); i < count; i++ {
+		if err := cur.budget.value(); err != nil {
+			return nil, err
+		}
 		p, err := decodeIndexed(cur, t)
 		if err != nil {
 			return nil, err

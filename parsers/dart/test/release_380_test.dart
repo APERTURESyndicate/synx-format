@@ -121,7 +121,7 @@ void main() {
           static_('items\n  - name a\n    sub\n      k 1\n  - name b\n    v 2\n    w 3\nafter 1\nx:join\n x_1\n # c\n'
               '  - k v\n   y 2\nlst\n  - a\n  lst 5\n  - b\nobjs\n  - one\n  - two 2\n    three 3\n  - 4\n'),
           '{"after":1,"items":[{"name":"a","sub":{"k":1}},{"name":"b","v":2,"w":3}],"lst":5,'
-          '"objs":["one",{"three":3,"two":2},4],"x":[{"k":"v","y":2}],"x_1":{}}');
+          '"objs":["one",{"three":3,"two":2},4],"x":[],"x_1":[{"k":"v","y":2}]}');
     });
 
     test('an item of a re-declared list pops its frames before it is dropped', () {
@@ -211,16 +211,16 @@ void main() {
       expect(format(sb.toString()), expected.toString());
     });
 
-    test('a self-include nests to the depth cap, once per level', () {
+    test('a self-include stops at the first repeat', () {
       final dir = Directory.systemTemp.createTempSync('synx-self-').path;
       try {
         File('$dir/self.synx').writeAsStringSync('!active\nme:include ./self.synx\nv 1\n');
         final sw = Stopwatch()..start();
         final json = toJson(synxObject(parseActive(File('$dir/self.synx').readAsStringSync(), SynxOptions()..basePath = dir)));
         sw.stop();
-        final expected = '${'{"me":' * 16}{"me":"INCLUDE_ERR: max include depth (16) exceeded","v":1}${',"v":1}' * 16}';
-        expect(json, expected);
-        // Resolving every level twice is 2^16 resolutions; once per level is 16.
+        // The text handed to parseActive has no path; the file it includes is
+        // open once, and including it again from inside itself is the cycle.
+        expect(json, '{"me":{"me":"INCLUDE_ERR: circular include: \'./self.synx\'","v":1},"v":1}');
         expect(sw.elapsedMilliseconds, lessThan(3000));
 
         // The pre-pass result is no extra include: `{x:include}` still sees exactly one.

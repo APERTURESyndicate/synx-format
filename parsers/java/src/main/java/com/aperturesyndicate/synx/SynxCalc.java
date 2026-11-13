@@ -29,7 +29,7 @@ public final class SynxCalc {
         String err = tokenize(t, tokens);
         if (err != null) return Result.failure(err);
         if (tokens.isEmpty()) return Result.success(0);
-        return new ExprParser(tokens).parse();
+        return evaluateTokens(tokens);
     }
 
     // ─── tokens ─────────────────────────────────────────────────────────────
@@ -95,74 +95,99 @@ public final class SynxCalc {
         }
     }
 
-    // ─── recursive descent ─────────────────────────────────────────────────
+    // ─── evaluation ────────────────────────────────────────────────────────
 
-    private static final class CalcException extends RuntimeException {
-        CalcException(String msg) { super(msg, null, false, false); }
+    /**
+     * One open {@code expr} of the grammar: the top level, or the inside of a pair of
+     * parentheses.
+     */
+    private static final class Frame {
+        /** Sum so far and the {@code +} / {@code -} waiting for its right-hand term (0 = none). */
+        double exprLeft;
+        char exprOp;
+        /** Product so far and the {@code *} / {@code /} / {@code %} waiting for its factor (0 = none). */
+        double termLeft;
+        char termOp;
     }
 
-    private static final class ExprParser {
-        final List<Token> tokens;
-        int pos;
+    private static boolean isOp(List<Token> tokens, int pos, char a, char b, char c) {
+        if (pos >= tokens.size()) return false;
+        Token t = tokens.get(pos);
+        return t.kind == Kind.OP && (t.op == a || t.op == b || t.op == c);
+    }
 
-        ExprParser(List<Token> tokens) { this.tokens = tokens; }
-
-        Result parse() {
-            try {
-                double v = expr();
-                if (pos < tokens.size()) return Result.failure("SYNX :calc — unexpected token at position " + pos);
-                return Result.success(v);
-            } catch (CalcException e) {
-                return Result.failure(e.getMessage());
-            }
-        }
-
-        double expr() {
-            double left = term();
-            while (pos < tokens.size()) {
-                Token t = tokens.get(pos);
-                if (t.kind != Kind.OP || (t.op != '+' && t.op != '-')) break;
-                pos++;
-                double right = term();
-                left = t.op == '+' ? left + right : left - right;
-            }
-            return left;
-        }
-
-        double term() {
-            double left = factor();
-            while (pos < tokens.size()) {
-                Token t = tokens.get(pos);
-                if (t.kind != Kind.OP || (t.op != '*' && t.op != '/' && t.op != '%')) break;
-                pos++;
-                double right = factor();
-                if (t.op == '*') {
-                    left *= right;
-                } else {
-                    if (right == 0.0) throw new CalcException("SYNX :calc — division by zero");
-                    left = t.op == '/' ? left / right : left % right;
-                }
-            }
-            return left;
-        }
-
-        double factor() {
-            if (pos >= tokens.size()) throw new CalcException("SYNX :calc — unexpected end of expression");
+    /**
+     * Evaluates a token stream.
+     *
+     * <p>safety: parentheses used to recurse through expr → term → factor, one group of stack
+     * frames per {@code (}. {@code x:calc ((((…} ended in a StackOverflowError — an Error,
+     * which {@code catch (Exception e)} around a parse does not catch. Open parentheses now
+     * live in a list; the order of evaluation, and so every result and error text, is the one
+     * the recursive parser produced (and the one synx-core produces).
+     */
+    private static Result evaluateTokens(List<Token> tokens) {
+        ArrayList<Frame> stack = new ArrayList<>();
+        stack.add(new Frame());
+        int pos = 0;
+        while (true) {
+            // A factor is expected here.
+            if (pos >= tokens.size()) return Result.failure("SYNX :calc — unexpected end of expression");
             Token t = tokens.get(pos);
-            if (t.kind == Kind.NUMBER) {
-                pos++;
-                return t.number;
-            }
             if (t.kind == Kind.LPAREN) {
                 pos++;
-                double v = expr();
+                stack.add(new Frame());
+                continue;
+            }
+            if (t.kind != Kind.NUMBER) {
+                return Result.failure("SYNX :calc — unexpected token: '" + tokenText(t) + "'");
+            }
+            pos++;
+            double value = t.number;
+
+            // Fold the factor into its term, the term into its expr, and close every pair of
+            // parentheses that ends here.
+            while (true) {
+                Frame frame = stack.get(stack.size() - 1);
+                char termOp = frame.termOp;
+                frame.termOp = 0;
+                if (termOp == 0) {
+                    frame.termLeft = value;
+                } else if (termOp == '*') {
+                    frame.termLeft *= value;
+                } else {
+                    if (value == 0.0) return Result.failure("SYNX :calc — division by zero");
+                    frame.termLeft = termOp == '/' ? frame.termLeft / value : frame.termLeft % value;
+                }
+                if (isOp(tokens, pos, '*', '/', '%')) {
+                    frame.termOp = tokens.get(pos).op;
+                    pos++;
+                    break;
+                }
+
+                char exprOp = frame.exprOp;
+                frame.exprOp = 0;
+                if (exprOp == 0) frame.exprLeft = frame.termLeft;
+                else if (exprOp == '+') frame.exprLeft += frame.termLeft;
+                else frame.exprLeft -= frame.termLeft;
+                if (isOp(tokens, pos, '+', '-', '+')) {
+                    frame.exprOp = tokens.get(pos).op;
+                    pos++;
+                    break;
+                }
+
+                // This expr is complete.
+                double result = frame.exprLeft;
+                if (stack.size() == 1) {
+                    if (pos < tokens.size()) return Result.failure("SYNX :calc — unexpected token at position " + pos);
+                    return Result.success(result);
+                }
+                stack.remove(stack.size() - 1);
                 if (pos >= tokens.size() || tokens.get(pos).kind != Kind.RPAREN) {
-                    throw new CalcException("SYNX :calc — missing closing parenthesis");
+                    return Result.failure("SYNX :calc — missing closing parenthesis");
                 }
                 pos++;
-                return v;
+                value = result;
             }
-            throw new CalcException("SYNX :calc — unexpected token: '" + tokenText(t) + "'");
         }
     }
 }

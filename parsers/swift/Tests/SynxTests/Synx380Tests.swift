@@ -182,7 +182,7 @@ final class Synx380Tests: XCTestCase {
     }
 
     func test_version_constant() {
-        XCTAssertEqual(Synx.version, "3.8.0")
+        XCTAssertEqual(Synx.version, "3.8.1")
     }
 
     // ── synx-core fixes after the 3.8.0 review ──────────────────────────────
@@ -263,8 +263,10 @@ final class Synx380Tests: XCTestCase {
         XCTAssertTrue(out.contains("\n    back 1\n"))
     }
 
-    // A file that includes itself stops at depth 16, resolving each level once.
-    func test_self_include_resolves_each_level_once() throws {
+    // A file that includes itself stops at the first repeat: the text handed to
+    // resolve has no path, the file it includes is open once, and including it
+    // again from inside itself is the cycle (synx-core: `circular include`).
+    func test_self_include_stops_at_the_first_repeat() throws {
         final class Counter: @unchecked Sendable {
             private let lock = NSLock()
             private var n = 0
@@ -275,10 +277,9 @@ final class Synx380Tests: XCTestCase {
         try put(t, "self.synx", "!active\nme:include self.synx\nc:tick 1\n")
         let ticks = Counter()
         let options = SynxOptions(markerFns: ["tick": { _, _, v in ticks.tick(); return v }])
-        var want = "\"INCLUDE_ERR: max include depth (16) exceeded\""
-        for _ in 0..<17 { want = "{\"c\":1,\"me\":" + want + "}" }
-        XCTAssertEqual(json("!active\nme:include self.synx\nc:tick 1\n", in: t, options), want)
-        XCTAssertEqual(ticks.value, 17)
+        XCTAssertEqual(json("!active\nme:include self.synx\nc:tick 1\n", in: t, options),
+                       "{\"c\":1,\"me\":{\"c\":1,\"me\":\"INCLUDE_ERR: circular include: 'self.synx'\"}}")
+        XCTAssertEqual(ticks.value, 2)
         // `{key:include}` still reads the only include when the pre-pass resolved it.
         try put(t, "common.synx", "name Common\n")
         XCTAssertEqual(json("!active\ndb:include common.synx\ng {name:include} {name:db}\n", in: t),

@@ -277,10 +277,68 @@ double? parseF64(String s) {
     expPart = 'e${s.substring(expStart, i)}';
   }
   if (i != s.length) return null;
+  if (intDigits + fracDigits > _maxExactDigits) {
+    return _parseLongDecimal(s, neg, intStart, intDigits, fracStart, fracDigits, expPart);
+  }
   // Canonical spelling for double.parse: no bare `.`, no empty integer part.
   final intText = intDigits == 0 ? '0' : s.substring(intStart, intStart + intDigits);
   final fracText = fracDigits == 0 ? '' : '.${s.substring(fracStart, fracStart + fracDigits)}';
   return double.parse('${neg ? '-' : ''}$intText$fracText$expPart');
+}
+
+/// Significant digits that decide the nearest double; one more, standing for
+/// everything after them, settles a tie.
+const int _maxExactDigits = 800;
+
+/// [parseF64] for a long run of digits: the first [_maxExactDigits]
+/// significant ones, a sticky last digit for the rest, and the exponent moved
+/// to match — the same nearest double.
+///
+/// perf: double.parse read a megabyte of digits in time that grew with its
+/// square: `x(float) 999…` took 16 s for 1 MiB (synx-core: 27 ms).
+double _parseLongDecimal(String s, bool neg, int intStart, int intDigits, int fracStart, int fracDigits, String expPart) {
+  final all = s.substring(intStart, intStart + intDigits) + s.substring(fracStart, fracStart + fracDigits);
+  var z = 0;
+  while (z < all.length && all.codeUnitAt(z) == 0x30) {
+    z++;
+  }
+  if (z == all.length) return neg ? -0.0 : 0.0;
+  final sig = all.substring(z);
+  var exp = _saturatingExponent(expPart) - fracDigits;
+  var digits = sig;
+  if (sig.length > _maxExactDigits) {
+    var sticky = false;
+    for (var k = _maxExactDigits; k < sig.length; k++) {
+      if (sig.codeUnitAt(k) != 0x30) {
+        sticky = true;
+        break;
+      }
+    }
+    digits = '${sig.substring(0, _maxExactDigits)}${sticky ? '1' : '0'}';
+    exp += sig.length - digits.length;
+  }
+  return double.parse('${neg ? '-' : ''}${digits}e$exp');
+}
+
+/// The exponent of `e…` text, held within a range where the result is
+/// already 0 or infinity.
+int _saturatingExponent(String expPart) {
+  if (expPart.isEmpty) return 0;
+  var k = 1;
+  var neg = false;
+  if (k < expPart.length && (expPart.codeUnitAt(k) == 0x2B || expPart.codeUnitAt(k) == 0x2D)) {
+    neg = expPart.codeUnitAt(k) == 0x2D;
+    k++;
+  }
+  var v = 0;
+  for (; k < expPart.length; k++) {
+    v = v * 10 + (expPart.codeUnitAt(k) - 0x30);
+    if (v > 100000000) {
+      v = 100000000;
+      break;
+    }
+  }
+  return neg ? -v : v;
 }
 
 final BigInt _i64Min = BigInt.parse('-9223372036854775808');
@@ -295,7 +353,14 @@ int? parseI64(String s) {
     if (!_isDigit(s.codeUnitAt(j))) return null;
   }
   if (s.length - i <= 18) return int.parse(s);
-  final b = BigInt.parse(s);
+  // perf: past 20 significant digits the number is out of range; BigInt.parse
+  // of a megabyte of digits took time that grew with its square.
+  var z = i;
+  while (z < s.length - 1 && s.codeUnitAt(z) == 0x30) {
+    z++;
+  }
+  if (s.length - z > 20) return null;
+  final b = BigInt.parse('${s.substring(0, i)}${s.substring(z)}');
   if (b < _i64Min || b > _i64Max) return null;
   return b.toInt();
 }
@@ -309,7 +374,12 @@ int? parseUnsigned(String s, BigInt max) {
   for (var j = i; j < s.length; j++) {
     if (!_isDigit(s.codeUnitAt(j))) return null;
   }
-  final b = BigInt.parse(s.substring(i));
+  var z = i;
+  while (z < s.length - 1 && s.codeUnitAt(z) == 0x30) {
+    z++;
+  }
+  if (s.length - z > 20) return null; // past u64, whatever the digits
+  final b = BigInt.parse(s.substring(z));
   if (b > max) return null;
   return b > _i64Max ? _i64Max.toInt() : b.toInt();
 }

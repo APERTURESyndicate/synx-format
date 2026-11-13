@@ -12,34 +12,41 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { parseData } from './parser';
-import { resolve, SynxSecret } from './engine';
-import { toCanonicalJSONString, compareUnicodeScalar } from './json';
 import {
-  parseSynxl,
-  streamSynxl,
-  streamSynxlAsync,
-  synxlToJSON,
-  synxlToNDJSON,
-  writeSynxl,
-  writeSynxBody,
-  splitRecordLine as synxlSplitRecordLine,
-  utf8Length as synxlUtf8Length,
-  SYNXL_VERSION,
-  MAX_SYNXL_RECORD_BYTES,
-  MAX_SYNXL_FIELDS,
-  MAX_SYNXL_FIELD_NAME_BYTES,
-  MAX_SYNXL_FIELD_LISTS,
-  MAX_SYNXL_RECORDS,
-} from './synxl';
-import type { SynxObject, SynxOptions, SynxValue, SynxMetaMap, SynxDiff } from './types';
+  parseData, inputText, decodeUtf8, metaMapOf, markLocked, isLockedRoot, utf8Length, SynxError,
+  SYNXL_VERSION, MAX_SYNXL_RECORD_BYTES, MAX_SYNXL_FIELDS, MAX_SYNXL_FIELD_NAME_BYTES,
+  MAX_SYNXL_FIELD_LISTS, MAX_SYNXL_RECORDS,
+} from './parser';
+import { resolve, SynxSecret, assertNoRuntimeErrors } from './engine';
+import type { SynxObject, SynxOptions, SynxValue, SynxDiff, SynxMeta } from './types';
 import type {
   SynxlDocument,
   SynxlOptions,
   SynxlRecord,
   SynxlWriteOptions,
 } from './types';
-import { SynxError } from './types';
+import type { SynxlPart } from './synxl';
+
+// perf: a service reads its config once, at start, and what it pays for is
+// mostly the loading of this package. Reading a document takes the parser and
+// the engine; the record reader and writer, the JSON writer, the formatter and
+// the `.synxb` codec are loaded by the first call that needs them.
+let synxlModule: typeof import('./synxl') | undefined;
+let jsonModule: typeof import('./json') | undefined;
+let formatModule: typeof import('./format') | undefined;
+let binaryModule: typeof import('./binary') | undefined;
+function synxl(): typeof import('./synxl') {
+  return synxlModule ?? (synxlModule = require('./synxl') as typeof import('./synxl'));
+}
+function json(): typeof import('./json') {
+  return jsonModule ?? (jsonModule = require('./json') as typeof import('./json'));
+}
+function format(): typeof import('./format') {
+  return formatModule ?? (formatModule = require('./format') as typeof import('./format'));
+}
+function binary(): typeof import('./binary') {
+  return binaryModule ?? (binaryModule = require('./binary') as typeof import('./binary'));
+}
 
 export type { SynxObject, SynxOptions, SynxValue, SynxArray, SynxPrimitive, SynxDiff } from './types';
 export type {
@@ -52,15 +59,8 @@ export type {
   SynxlOptions,
   SynxlWriteOptions,
 } from './types';
-export { SynxError } from './types';
 export {
-  parseSynxl,
-  streamSynxl,
-  streamSynxlAsync,
-  synxlToJSON,
-  synxlToNDJSON,
-  writeSynxl,
-  splitRecordLine,
+  SynxError,
   utf8Length,
   SYNXL_VERSION,
   MAX_SYNXL_RECORD_BYTES,
@@ -68,7 +68,58 @@ export {
   MAX_SYNXL_FIELD_NAME_BYTES,
   MAX_SYNXL_FIELD_LISTS,
   MAX_SYNXL_RECORDS,
-} from './synxl';
+};
+
+// ─── SYNXL, as functions of this module ───────────────────
+// The same functions as the statics of `Synx` below; each loads the record
+// module on its first call.
+
+/**
+ * Parse a `.synxl` record-stream document (SYNXL §4–§11).
+ * @throws SynxError on a hard error (§11.1) — no partial result is returned.
+ */
+export function parseSynxl(text: string, options: SynxlOptions = {}): SynxlDocument {
+  return synxl().parseSynxl(text, options);
+}
+
+/** Streaming SYNXL reader over text or an iterable of lines (§15.1). */
+export function streamSynxl(
+  source: string | Iterable<string>,
+  options: SynxlOptions = {},
+): Generator<SynxlRecord, void, undefined> {
+  return synxl().streamSynxl(source, options);
+}
+
+/** Async streaming SYNXL reader over chunks (§15.1). */
+export function streamSynxlAsync(
+  source: AsyncIterable<string | Uint8Array>,
+  options: SynxlOptions = {},
+): AsyncGenerator<SynxlRecord, void, undefined> {
+  return synxl().streamSynxlAsync(source, options);
+}
+
+/** Canonical JSON array projection of a SYNXL document (§12.1). */
+export function synxlToJSON(source: string | SynxlDocument, options: SynxlOptions = {}): string {
+  return synxl().synxlToJSON(source, options);
+}
+
+/** Canonical NDJSON projection of a SYNXL document (§12.2). */
+export function synxlToNDJSON(source: string | SynxlDocument, options: SynxlOptions = {}): string {
+  return synxl().synxlToNDJSON(source, options);
+}
+
+/** Serialize records back to SYNXL text, with automatic quoting (§14). */
+export function writeSynxl(
+  input: SynxlDocument | readonly SynxObject[],
+  options: SynxlWriteOptions = {},
+): string {
+  return synxl().writeSynxl(input, options);
+}
+
+/** Split a record line into parts on `;` (SYNXL §7.1). */
+export function splitRecordLine(line: string): SynxlPart[] {
+  return synxl().splitRecordLine(line);
+}
 
 // ─── Native binding auto-detection ───────────────────────
 
@@ -105,40 +156,6 @@ function tryLoadNative(): NativeBinding | false {
   return false;
 }
 
-const RUNTIME_ERROR_PREFIXES = [
-  'INCLUDE_ERR:',
-  'WATCH_ERR:',
-  'CALC_ERR:',
-  'SPAM_ERR:',
-  'CONSTRAINT_ERR:',
-  'ALIAS_ERR:',
-  'NESTING_ERR:',
-] as const;
-
-function assertNoRuntimeErrors(value: unknown, path = 'root'): void {
-  if (typeof value === 'string') {
-    for (const prefix of RUNTIME_ERROR_PREFIXES) {
-      if (value.startsWith(prefix)) {
-        throw new SynxError(`${value}`);
-      }
-    }
-    return;
-  }
-
-  if (Array.isArray(value)) {
-    for (let i = 0; i < value.length; i++) {
-      assertNoRuntimeErrors(value[i], `${path}[${i}]`);
-    }
-    return;
-  }
-
-  if (value && typeof value === 'object') {
-    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-      assertNoRuntimeErrors(v, `${path}.${k}`);
-    }
-  }
-}
-
 class Synx {
   /**
    * Parse a .synx text string into a native JS object.
@@ -153,6 +170,7 @@ class Synx {
    * @returns A plain JS object with all data resolved.
    */
   static parse<T extends SynxObject = SynxObject>(text: string, options: SynxOptions = {}): T {
+    text = inputText(text, 'Synx.parse');
     // Large files → try native Rust binding
     if (text.length >= NATIVE_THRESHOLD) {
       const native = tryLoadNative();
@@ -174,14 +192,7 @@ class Synx {
     if (mode === 'active') {
       resolve(root, { ...options, _includes: includes } as any);
     }
-    if (locked) {
-      Object.defineProperty(root, '__synx_locked', {
-        value: true,
-        enumerable: false,
-        writable: false,
-        configurable: false,
-      });
-    }
+    if (locked) markLocked(root);
     if (options.strict) {
       assertNoRuntimeErrors(root);
     }
@@ -203,7 +214,7 @@ class Synx {
    */
   static loadSync<T extends SynxObject = SynxObject>(filePath: string, options: SynxOptions = {}): T {
     const absPath = path.resolve(filePath);
-    const text = fs.readFileSync(absPath, 'utf-8');
+    const text = decodeUtf8(fs.readFileSync(absPath), filePath);
     // Spread to avoid mutating the caller's options object
     const opts = options.basePath ? options : { ...options, basePath: path.dirname(absPath) };
     return Synx.parse<T>(text, opts);
@@ -224,7 +235,7 @@ class Synx {
    */
   static async load<T extends SynxObject = SynxObject>(filePath: string, options: SynxOptions = {}): Promise<T> {
     const absPath = path.resolve(filePath);
-    const text = await fs.promises.readFile(absPath, 'utf-8');
+    const text = decodeUtf8(await fs.promises.readFile(absPath), filePath);
     // Spread to avoid mutating the caller's options object
     const opts = options.basePath ? options : { ...options, basePath: path.dirname(absPath) };
     return Synx.parse<T>(text, opts);
@@ -282,7 +293,7 @@ class Synx {
     // cast or be cut as a comment are quoted or carried as `|+`, multi-line
     // text keeps its relative indent. The previous writer quoted nothing
     // (`"007"` came back as 7) and printed objects in list items as [object Object].
-    out += writeSynxBody(obj);
+    out += synxl().writeSynxBody(obj);
     return out;
   }
 
@@ -301,7 +312,7 @@ class Synx {
    * ```
    */
   static set(obj: SynxObject, keyPath: string, value: SynxValue): void {
-    if ((obj as any).__synx_locked) {
+    if (isLockedRoot(obj)) {
       throw new Error(`SYNX: Cannot set "${keyPath}" — config is locked (!lock)`);
     }
     const parts = keyPath.split('.');
@@ -347,7 +358,7 @@ class Synx {
    * ```
    */
   static add(obj: SynxObject, keyPath: string, item: SynxValue): void {
-    if ((obj as any).__synx_locked) {
+    if (isLockedRoot(obj)) {
       throw new Error(`SYNX: Cannot add to "${keyPath}" — config is locked (!lock)`);
     }
     const parts = keyPath.split('.');
@@ -380,7 +391,7 @@ class Synx {
    * ```
    */
   static remove(obj: SynxObject, keyPath: string, item?: SynxValue): void {
-    if ((obj as any).__synx_locked) {
+    if (isLockedRoot(obj)) {
       throw new Error(`SYNX: Cannot remove "${keyPath}" — config is locked (!lock)`);
     }
     const parts = keyPath.split('.');
@@ -406,19 +417,22 @@ class Synx {
    * Check if the config is locked (`!lock` directive).
    */
   static isLocked(obj: SynxObject): boolean {
-    return !!(obj as any).__synx_locked;
+    return isLockedRoot(obj);
   }
 
   /**
    * Reformat a .synx string into canonical form:
-   * - Keys sorted alphabetically at every nesting level
    * - Exactly 2 spaces per indentation level
+   * - Keys sorted alphabetically at every nesting level of a static
+   *   document; list items, and the fields inside one, keep their order
+   * - An `!active` document keeps its key order — markers resolve in it
    * - One blank line between top-level blocks (objects / lists)
    * - Comments stripped — canonical form is comment-free
-   * - Directive lines (`!active`, `!lock`) preserved at the top
+   * - Directive lines (`!active`, `!lock`, `!include …`) moved to the top
    *
-   * The same data always produces byte-for-byte identical output,
-   * making `.synx` files deterministic and noise-free in `git diff`.
+   * The result always reads back as the same data: it is parsed and compared
+   * with the input before it is returned, and a document the formatter cannot
+   * reproduce — or one cut by a parser limit — is returned unchanged.
    *
    * @param text - Raw .synx file contents.
    * @returns Canonical .synx string.
@@ -430,32 +444,7 @@ class Synx {
    * ```
    */
   static format(text: string): string {
-    const lines = text.split(/\r?\n/);
-    const directives: string[] = [];
-    let bodyStart = 0;
-
-    for (let i = 0; i < lines.length; i++) {
-      const t = lines[i].trim();
-      // Match the Rust canonical formatter's preserved-directive set — it kept
-      // !tool / !schema / !llm too, so the JS formatter was silently dropping
-      // them from a reformatted document.
-      if (t === '!active' || t === '!lock' || t === '!tool' || t === '!schema' || t === '!llm' || t === '#!mode:active') {
-        directives.push(t);
-        bodyStart = i + 1;
-      } else if (!t || t.startsWith('#') || t.startsWith('//')) {
-        bodyStart = i + 1;
-      } else {
-        break;
-      }
-    }
-
-    const [nodes] = fmtParse(lines, bodyStart, 0);
-    fmtSort(nodes);
-
-    let out = directives.join('\n');
-    if (directives.length) out += '\n\n';
-    out += fmtEmit(nodes, 0).trimEnd();
-    return out + '\n';
+    return format().formatSynx(inputText(text, 'Synx.format'));
   }
 
   // ─── Export Converters ──────────────────────────────────
@@ -487,7 +476,7 @@ class Synx {
     const opts = options.basePath ? options : { ...options, basePath: path.dirname(absPath) };
 
     try {
-      const text = fs.readFileSync(absPath, 'utf-8');
+      const text = decodeUtf8(fs.readFileSync(absPath), filePath);
       const config = Synx.parse(text, opts);
       callback(config);
     } catch (e: any) {
@@ -496,7 +485,7 @@ class Synx {
 
     const watcher = fs.watch(absPath, { persistent: true }, (_event) => {
       try {
-        const text = fs.readFileSync(absPath, 'utf-8');
+        const text = decodeUtf8(fs.readFileSync(absPath), filePath);
         const config = Synx.parse(text, opts);
         callback(config);
       } catch (e: any) {
@@ -509,22 +498,21 @@ class Synx {
 
   /** Extract a JSON Schema from SYNX constraints. @since 3.1.3 */
   static schema(text: string): SynxSchema {
-    const { root } = parseData(text);
-    const metaMap: SynxMetaMap | undefined = (root as any).__synx;
+    const { root } = parseData(inputText(text, 'Synx.schema'));
+    const metaMap = metaMapOf(root);
     const properties: Record<string, SynxSchemaProperty> = {};
     const required: string[] = [];
 
     if (metaMap) {
-      for (const [key, meta] of Object.entries(metaMap)) {
+      // In the order an object lists its keys, as this always reported them.
+      const byKey: Record<string, SynxMeta> = Object.create(null);
+      for (const [key, meta] of metaMap) byKey[key] = meta;
+      for (const key of Object.keys(byKey)) {
+        const meta = byKey[key];
         if (!meta.constraints) continue;
         const c = meta.constraints;
         const prop: SynxSchemaProperty = {};
-        if (c.type) {
-          const typeMap: Record<string, string> = {
-            int: 'integer', float: 'number', bool: 'boolean', string: 'string',
-          };
-          prop.type = typeMap[c.type] || c.type;
-        }
+        if (c.type) prop.type = schemaTypeName(c.type);
         if (c.min !== undefined) prop.minimum = c.min;
         if (c.max !== undefined) prop.maximum = c.max;
         if (c.pattern) prop.pattern = c.pattern;
@@ -595,9 +583,6 @@ class Synx {
 
   // ─── Binary Format (.synxb) ─────────────────────────────
 
-  /** Magic header for .synxb files */
-  private static readonly SYNXB_MAGIC = new Uint8Array([0x53, 0x59, 0x4e, 0x58, 0x42]); // "SYNXB"
-
   /**
    * Check if data is a `.synxb` binary file.
    *
@@ -610,12 +595,13 @@ class Synx {
    * if (Synx.isSynxb(buf)) { ... }
    * ```
    */
+  // Not read here any more; 3.8.0 had it on the class, private by type but
+  // reachable at run time, so it stays where a caller may have found it.
+  private static readonly SYNXB_MAGIC = new Uint8Array([0x53, 0x59, 0x4e, 0x58, 0x42]); // "SYNXB"
+
   static isSynxb(data: Buffer | Uint8Array): boolean {
-    if (data.length < 6) return false;
-    for (let i = 0; i < 5; i++) {
-      if (data[i] !== Synx.SYNXB_MAGIC[i]) return false;
-    }
-    return true;
+    return data instanceof Uint8Array && data.length >= 6
+      && data[0] === 0x53 && data[1] === 0x59 && data[2] === 0x4e && data[3] === 0x58 && data[4] === 0x42; // SYNXB
   }
 
   /**
@@ -623,148 +609,43 @@ class Synx {
    *
    * Wire format (v1) — matches `synx-core::binary` for cross-language interop:
    *   header   : "SYNXB" (5) + version (1) + flags (1) + uncompressed_size u32 LE (4) = 11 bytes
-   *   payload  : raw-deflate(level=9) of (string_table || value_tree)
+   *   payload  : raw-deflate(level=9) of (string_table || value_tree [|| declarations || includes])
+   *
+   * Without `resolved` the document is written as parsed: an `!active`
+   * document keeps its markers, constraints and `!include` lines, and nothing
+   * of it is resolved — no variable of the environment is read and no file is
+   * touched. With `resolved`, an `!active` document is resolved first (against
+   * the environment and the current directory of the process) and its values
+   * are written as they came out.
    *
    * @param text     - The .synx source text.
    * @param resolved - If true and text is `!active`, resolve markers first.
    * @returns A Uint8Array containing the `.synxb` binary.
    */
   static compile(text: string, resolved: boolean = false): Uint8Array {
-    const input = resolved && !/(?:^|\n)\s*!active\b/.test(text) ? '!active\n' + text : text;
-    const parsed = parseData(input);
-    if (parsed.mode === 'active') {
+    const parsed = parseData(inputText(text, 'Synx.compile'));
+    // safety: only on request. Every compile of an `!active` document used to
+    // resolve it — the values of the host's environment went into the file,
+    // `:once` wrote `.synx.lock` into the current directory — and the
+    // declarations were dropped, so the file could not be resolved again.
+    if (resolved && parsed.mode === 'active') {
       resolve(parsed.root, { _includes: parsed.includes } as any);
     }
-    stripMetadata(parsed.root);
-    const valueTree = parsed.root;
-
-    let strings: string[] = [];
-    const stringIndex = new Map<string, number>();
-    const uses: number[] = [];
-
-    function internString(s: string): number {
-      const known = stringIndex.get(s);
-      if (known !== undefined) return known;
-      const idx = strings.length;
-      strings.push(s);
-      stringIndex.set(s, idx);
-      return idx;
-    }
-
-    // First pass: collect strings (keys + string values) so the string table
-    // is written before encoded values reference it, counting each use.
-    function collectStrings(val: unknown): void {
-      if (val === null || val === undefined) return;
-      if (typeof val === 'string') { const i = internString(val); uses[i] = (uses[i] ?? 0) + 1; return; }
-      if (Array.isArray(val)) { val.forEach(collectStrings); return; }
-      if (typeof val === 'object') {
-        for (const k of Object.keys(val as Record<string, unknown>)) {
-          const i = internString(k);
-          uses[i] = (uses[i] ?? 0) + 1;
-          collectStrings((val as Record<string, unknown>)[k]);
-        }
-      }
-    }
-    collectStrings(valueTree);
-    // Most-used strings first (ties in first-seen order), as synx-core does:
-    // one-byte varints for the frequent ones and a regular index stream that
-    // deflate compresses well. The reader is indifferent to the order.
-    {
-      const order = strings.map((_, i) => i).sort((a, b) => (uses[b] - uses[a]) || (a - b));
-      strings = order.map((i) => strings[i]);
-      strings.forEach((str, i) => stringIndex.set(str, i));
-    }
-
-    // Build the *uncompressed* payload (string table || value tree).
-    const payload: number[] = [];
-    writeVarint(payload, strings.length);
-    const enc = new TextEncoder();
-    for (const s of strings) {
-      const bytes = enc.encode(s);
-      writeVarint(payload, bytes.length);
-      for (const b of bytes) payload.push(b);
-    }
-
-    function writeValue(val: unknown): void {
-      if (val === null || val === undefined) { payload.push(0x00); return; }
-      if (typeof val === 'boolean') { payload.push(val ? 0x02 : 0x01); return; }
-      if (typeof val === 'number') {
-        if (Number.isInteger(val)) {
-          payload.push(0x03);
-          writeZigzag(payload, val);
-        } else {
-          payload.push(0x04);
-          FLOAT_SCRATCH.setFloat64(0, val, true);
-          for (let i = 0; i < 8; i++) payload.push(FLOAT_SCRATCH.getUint8(i));
-        }
-        return;
-      }
-      // An integer beyond 2^53 is a bigint: it is an i64 like any other INT.
-      // It had no branch here, so nothing was written for it and every later
-      // value was read from the wrong offset.
-      if (typeof val === 'bigint') {
-        payload.push(0x03);
-        writeZigzag(payload, val);
-        return;
-      }
-      if (typeof val === 'string') {
-        payload.push(0x05);
-        writeVarint(payload, internString(val));
-        return;
-      }
-      if (Array.isArray(val)) {
-        payload.push(0x06);
-        writeVarint(payload, val.length);
-        val.forEach(writeValue);
-        return;
-      }
-      if (typeof val === 'object') {
-        payload.push(0x07);
-        const obj = val as Record<string, unknown>;
-        const keys = Object.keys(obj).sort();
-        writeVarint(payload, keys.length);
-        for (const k of keys) {
-          writeVarint(payload, internString(k));
-          writeValue(obj[k]);
-        }
-      }
-    }
-    writeValue(valueTree);
-
-    const payloadBytes = Uint8Array.from(payload);
-    const compressed = compressRawDeflate(payloadBytes);
-
-    // Header. All flag bits the reader honours must be written, or a compiled
-    // `!lock` / `!tool` / `!schema` / `!llm` document silently loses its flags
-    // on the round trip (only active/resolved were emitted before).
-    let flags = 0;
-    if (parsed.mode === 'active') flags |= 0x01; // active
-    if (parsed.locked) flags |= 0x02;            // locked
-    if (resolved) flags |= 0x08;                 // resolved
-    if (parsed.tool) flags |= 0x10;              // tool
-    if (parsed.schema) flags |= 0x20;            // schema
-    if (parsed.llm) flags |= 0x40;               // llm
-
-    const out = new Uint8Array(11 + compressed.length);
-    out[0] = 0x53; out[1] = 0x59; out[2] = 0x4e; out[3] = 0x58; out[4] = 0x42; // SYNXB
-    out[5] = 0x01;       // version
-    out[6] = flags;      // flags
-    // uncompressed size, little-endian u32
-    const u = payloadBytes.length >>> 0;
-    out[7]  = u & 0xff;
-    out[8]  = (u >>> 8)  & 0xff;
-    out[9]  = (u >>> 16) & 0xff;
-    out[10] = (u >>> 24) & 0xff;
-    out.set(compressed, 11);
-    return out;
+    return binary().compileSynxb(parsed, resolved === true);
   }
 
   /**
    * Decompile a `.synxb` binary back into a .synx text string.
    *
+   * A file compiled without `resolved` carries its declarations, and they are
+   * written back: `port:env:default:8080 PORT`, `name[required] x`,
+   * `!include` lines, keys in the order the file holds them. A resolved file
+   * is written as the static document it now is — its values are final, and
+   * `!active` would have `{braces}` in them interpolated a second time.
+   *
    * @param data - Raw `.synxb` bytes.
    * @returns The reconstructed .synx text.
-   * @throws Error if the data is not valid `.synxb`.
+   * @throws SynxError if the data is not valid `.synxb`.
    *
    * @example
    * ```ts
@@ -774,142 +655,32 @@ class Synx {
    * ```
    */
   static decompile(data: Buffer | Uint8Array): string {
-    if (!Synx.isSynxb(data)) {
-      throw new SynxError('Not a valid .synxb file');
+    const doc = binary().decodeSynxb(data);
+    const root = doc.root;
+    const isObject = root !== null && typeof root === 'object' && !Array.isArray(root) && !(root instanceof SynxSecret);
+    // safety: a document is an object, and the compiler writes no other root.
+    // A file whose root was a string came back as that string — text of its
+    // author's choosing, `!active` and `!include` lines included, out of a
+    // file flagged static; a list or a scalar came back as another document
+    // (B-086). As in synx-core, such a root has no text form.
+    if (!isObject) throw new SynxError('the root of this .synxb file is not an object; it has no text form');
+    // Directives in the order synx-core writes them.
+    let out = '';
+    if (doc.tool) out += '!tool\n';
+    if (doc.schema) out += '!schema\n';
+    if (doc.llm) out += '!llm\n';
+    if (doc.mode === 'active' && !doc.resolved) out += '!active\n';
+    if (doc.locked) out += '!lock\n';
+    for (const inc of doc.includes) out += `!include ${inc.path} ${inc.alias}\n`;
+    if (out !== '') out += '\n';
+    // An unresolved active document goes through the declared writer even
+    // without declarations, as in synx-core: the plain one writes an empty
+    // list as `key:join`, a marker the next `resolve` would apply (B-082.5).
+    if (doc.hasMeta || (doc.mode === 'active' && !doc.resolved)) {
+      return out + synxl().writeSynxDeclared(root as SynxObject);
     }
-    if (data.length < 11) {
-      throw new SynxError('.synxb file is truncated (header too short)');
-    }
-
-    const version = data[5];
-    if (version !== 1) throw new SynxError(`Unsupported .synxb version: ${version}`);
-
-    const flags = data[6];
-    const isActive = (flags & 0x01) !== 0;
-    const isLocked = (flags & 0x02) !== 0;
-    const isTool = (flags & 0x10) !== 0;
-    const isSchema = (flags & 0x20) !== 0;
-    const isLlm = (flags & 0x40) !== 0;
-
-    // Uncompressed size, little-endian u32 (>>> 0 keeps it unsigned; a shift
-    // by 24 on a high byte would otherwise sign-flip the length).
-    const uncompSize =
-      ((data[7]) | (data[8] << 8) | (data[9] << 16) | (data[10] << 24)) >>> 0;
-    if (uncompSize > MAX_DECODED_BYTES) {
-      throw new SynxError(`.synxb declared size ${uncompSize} exceeds limit ${MAX_DECODED_BYTES}`);
-    }
-
-    // Decompress raw-deflate payload
-    const compressed = data.slice(11);
-    const payload = decompressRawDeflate(compressed, uncompSize >>> 0);
-    if (payload.length !== (uncompSize >>> 0)) {
-      throw new SynxError(`.synxb size mismatch: expected ${uncompSize}, got ${payload.length}`);
-    }
-
-    // String table
-    let offset = 0;
-    const [strCount, o1] = readVarint(payload, offset); offset = o1;
-    // A count taken from the file can be astronomically large (u64::MAX); each
-    // entry costs at least one byte, so it can never exceed the bytes left.
-    // Without this clamp the loop below spins for ~2^64 iterations (a hang).
-    if (strCount > payload.length - offset) {
-      throw new SynxError(`.synxb string-table count ${strCount} exceeds remaining bytes`);
-    }
-    const strings: string[] = [];
-    const decoder = new TextDecoder();
-    for (let i = 0; i < strCount; i++) {
-      const [len, o2] = readVarint(payload, offset); offset = o2;
-      if (len > payload.length - offset) {
-        throw new SynxError('.synxb string table truncated');
-      }
-      strings.push(decoder.decode(payload.slice(offset, offset + len)));
-      offset += len;
-    }
-
-    // Bounds-checked string-table lookup: an out-of-range index is a corrupt
-    // or hostile file, not a silent `undefined` key/value.
-    const str = (idx: number): string => {
-      if (idx < 0 || idx >= strings.length) {
-        throw new SynxError(`.synxb string index ${idx} out of bounds (table size ${strings.length})`);
-      }
-      return strings[idx];
-    };
-    let depth = 0;
-    // Twice the parser's 128-level cap; matches MAX_DECODE_DEPTH in synx-core.
-    const MAX_DEPTH = 256;
-    // Value tree
-    function readValue(): unknown {
-      if (++depth > MAX_DEPTH) throw new SynxError('.synxb nesting too deep');
-      try {
-        const tag = payload[offset++];
-        switch (tag) {
-          case 0x00: return null;
-          case 0x01: return false;
-          case 0x02: return true;
-          case 0x03: { const [v, o] = readZigzag(payload, offset); offset = o; return v; }
-          case 0x04: {
-            if (offset + 8 > payload.length) throw new SynxError('.synxb truncated float');
-            const view = new DataView(payload.buffer, payload.byteOffset + offset, 8);
-            offset += 8;
-            return view.getFloat64(0, true);
-          }
-          case 0x05: { const [idx, o] = readVarint(payload, offset); offset = o; return str(idx); }
-          case 0x06: {
-            const [len, o] = readVarint(payload, offset); offset = o;
-            // Each element is at least one byte; a count beyond the remaining
-            // bytes is corrupt/hostile and would otherwise spin the loop.
-            if (len > payload.length - offset) throw new SynxError('.synxb array count exceeds remaining bytes');
-            const arr: unknown[] = [];
-            for (let i = 0; i < len; i++) arr.push(readValue());
-            return arr;
-          }
-          case 0x07: {
-            const [len, o] = readVarint(payload, offset); offset = o;
-            if (len > payload.length - offset) throw new SynxError('.synxb object count exceeds remaining bytes');
-            const obj: Record<string, unknown> = {};
-            for (let i = 0; i < len; i++) {
-              const [ki, o2] = readVarint(payload, offset); offset = o2;
-              const key = str(ki);
-              const val = readValue();
-              // `obj.__proto__ = x` would hit the prototype setter and poison
-              // the object; define it as an own data property so a `__proto__`
-              // key from the file stays plain data, matching the Rust HashMap,
-              // while the object keeps a normal prototype (nested values still
-              // stringify — a null-proto object would throw in the serializer).
-              if (key === '__proto__' || key === 'constructor' || key === 'prototype') {
-                Object.defineProperty(obj, key, { value: val, writable: true, enumerable: true, configurable: true });
-              } else {
-                obj[key] = val;
-              }
-            }
-            return obj;
-          }
-          case 0x08: { const [idx, o] = readVarint(payload, offset); offset = o; void str(idx); return '[SECRET]'; }
-          default: throw new SynxError(`Unknown value tag: 0x${(tag ?? 0).toString(16)}`);
-        }
-      } finally {
-        depth--;
-      }
-    }
-    const value = readValue();
-
-    // Emit directives in the same order as the Rust decompiler (Synx::decompile):
-    // tool, schema, llm, active, lock.
-    let header = '';
-    if (isTool) header += '!tool\n';
-    if (isSchema) header += '!schema\n';
-    if (isLlm) header += '!llm\n';
-    if (isActive) header += '!active\n';
-    if (isLocked) header += '!lock\n';
-    if (header) header += '\n';
-    // A well-formed `.synxb` has an object root, but a crafted file can carry a
-    // bare scalar/null/array. Rust's decompiler renders that as a primitive
-    // line; matching it here keeps the block writer from being handed a
-    // non-object (it did `Object.entries(null)` and threw).
-    if (value === null || typeof value !== 'object' || Array.isArray(value)) {
-      return header + primitiveToSynx(value) + '\n';
-    }
-    return header + writeSynxBody(value as SynxObject);
+    // Sorted at every level: the order a file without declarations is in.
+    return out + synxl().writeSynxBody(root as SynxObject, 2, true);
   }
 
   /**
@@ -936,13 +707,11 @@ class Synx {
   ): { tool: string | null; params: SynxObject } | { tools: Array<{ name: string; params: SynxObject }> } {
     // Run the parse without auto-engine routing — the reshape semantics are tied
     // to the directive flags, which the pure-TS parser sets.
-    const parsed = parseData(text);
+    const parsed = parseData(inputText(text, 'Synx.parseTool'));
     const root = parsed.root;
     if (parsed.mode === 'active') {
       resolve(root, { ...options, _includes: parsed.includes } as any);
     }
-    // Strip the internal __synx metadata from the resulting tree.
-    stripMetadata(root);
 
     const keys = Object.keys(root).sort();
 
@@ -988,19 +757,19 @@ class Synx {
    * ```
    */
   static parseSynxl(text: string, options: SynxlOptions = {}): SynxlDocument {
-    return parseSynxl(text, options);
+    return synxl().parseSynxl(text, options);
   }
 
   /** Load and parse a `.synxl` file synchronously. */
   static loadSynxlSync(filePath: string, options: SynxlOptions = {}): SynxlDocument {
-    const text = fs.readFileSync(path.resolve(filePath), 'utf-8');
-    return parseSynxl(text, options);
+    const text = decodeUtf8(fs.readFileSync(path.resolve(filePath)), filePath);
+    return synxl().parseSynxl(text, options);
   }
 
   /** Load and parse a `.synxl` file asynchronously. */
   static async loadSynxl(filePath: string, options: SynxlOptions = {}): Promise<SynxlDocument> {
-    const text = await fs.promises.readFile(path.resolve(filePath), 'utf-8');
-    return parseSynxl(text, options);
+    const text = decodeUtf8(await fs.promises.readFile(path.resolve(filePath)), filePath);
+    return synxl().parseSynxl(text, options);
   }
 
   /** Streaming SYNXL reader over text or an iterable of lines (§15.1). */
@@ -1008,7 +777,7 @@ class Synx {
     source: string | Iterable<string>,
     options: SynxlOptions = {},
   ): Generator<SynxlRecord, void, undefined> {
-    return streamSynxl(source, options);
+    return synxl().streamSynxl(source, options);
   }
 
   /** Async streaming SYNXL reader over chunks (§15.1). */
@@ -1016,7 +785,7 @@ class Synx {
     source: AsyncIterable<string | Uint8Array>,
     options: SynxlOptions = {},
   ): AsyncGenerator<SynxlRecord, void, undefined> {
-    return streamSynxlAsync(source, options);
+    return synxl().streamSynxlAsync(source, options);
   }
 
   /** Stream records from a `.synxl` file without materialising it (§15.1). */
@@ -1024,18 +793,19 @@ class Synx {
     filePath: string,
     options: SynxlOptions = {},
   ): AsyncGenerator<SynxlRecord, void, undefined> {
-    const stream = fs.createReadStream(path.resolve(filePath), { encoding: 'utf-8' });
-    return streamSynxlAsync(stream as AsyncIterable<string>, options);
+    // Bytes, not text: the reader decodes them itself and refuses what is not UTF-8.
+    const stream = fs.createReadStream(path.resolve(filePath));
+    return synxl().streamSynxlAsync(stream as AsyncIterable<Uint8Array>, options);
   }
 
   /** Canonical JSON array projection of a SYNXL document (§12.1). */
   static synxlToJSON(source: string | SynxlDocument, options: SynxlOptions = {}): string {
-    return synxlToJSON(source, options);
+    return synxl().synxlToJSON(source, options);
   }
 
   /** Canonical NDJSON projection of a SYNXL document (§12.2). */
   static synxlToNDJSON(source: string | SynxlDocument, options: SynxlOptions = {}): string {
-    return synxlToNDJSON(source, options);
+    return synxl().synxlToNDJSON(source, options);
   }
 
   /** Serialize records back to SYNXL text, with automatic quoting (§14). */
@@ -1043,7 +813,7 @@ class Synx {
     input: SynxlDocument | readonly SynxObject[],
     options: SynxlWriteOptions = {},
   ): string {
-    return writeSynxl(input, options);
+    return synxl().writeSynxl(input, options);
   }
 
   /** Save records to a `.synxl` file synchronously. */
@@ -1052,7 +822,7 @@ class Synx {
     input: SynxlDocument | readonly SynxObject[],
     options: SynxlWriteOptions = {},
   ): void {
-    fs.writeFileSync(path.resolve(filePath), writeSynxl(input, options), 'utf-8');
+    fs.writeFileSync(path.resolve(filePath), synxl().writeSynxl(input, options), 'utf-8');
   }
 
   /** Save records to a `.synxl` file asynchronously. */
@@ -1061,160 +831,22 @@ class Synx {
     input: SynxlDocument | readonly SynxObject[],
     options: SynxlWriteOptions = {},
   ): Promise<void> {
-    await fs.promises.writeFile(path.resolve(filePath), writeSynxl(input, options), 'utf-8');
+    await fs.promises.writeFile(path.resolve(filePath), synxl().writeSynxl(input, options), 'utf-8');
   }
 }
 
-/** Recursively strip the non-enumerable __synx metadata field. */
-function stripMetadata(obj: unknown): void {
-  if (!obj || typeof obj !== 'object') return;
-  if (Array.isArray(obj)) {
-    for (const item of obj) stripMetadata(item);
-    return;
+/** JSON Schema's name for a SYNX type; one it does not know is kept as written.
+ *  A switch, not a table: `[type:constructor]` read a built-in off the table. */
+function schemaTypeName(type: string): string {
+  switch (type) {
+    case 'int': return 'integer';
+    case 'float': return 'number';
+    case 'bool': return 'boolean';
+    default: return type;
   }
-  const o = obj as Record<string, unknown>;
-  if (Object.prototype.hasOwnProperty.call(o, '__synx')) {
-    try { delete o.__synx; } catch { /* non-configurable */ }
-  }
-  for (const v of Object.values(o)) stripMetadata(v);
 }
 
 // ─── Binary encoding helpers ──────────────────────────────
-
-/** Lazy load Node's zlib once (browser callers don't compile/decompile binary). */
-let _zlib: typeof import('zlib') | undefined;
-function getZlib(): typeof import('zlib') {
-  if (_zlib) return _zlib;
-  try {
-    _zlib = require('zlib');
-    return _zlib!;
-  } catch {
-    throw new SynxError('.synxb compile/decompile requires Node.js zlib (not available in this environment)');
-  }
-}
-
-/** Raw-deflate compression at level 9 (matches Rust `miniz_oxide::deflate::compress_to_vec`). */
-function compressRawDeflate(payload: Uint8Array): Uint8Array {
-  const z = getZlib();
-  const out = z.deflateRawSync(Buffer.from(payload), { level: 9 });
-  return new Uint8Array(out.buffer, out.byteOffset, out.byteLength);
-}
-
-/** Upper bound on a decompiled `.synxb` payload — mirrors the Rust decoder's
- *  MAX_DECODED_BYTES so a decompression bomb cannot expand into gigabytes. */
-const MAX_DECODED_BYTES = 256 * 1024 * 1024;
-
-/** Raw-inflate decompression (matches Rust `miniz_oxide::inflate::decompress_to_vec`). */
-function decompressRawDeflate(compressed: Uint8Array, uncompressedSize: number): Uint8Array {
-  const z = getZlib();
-  const out = z.inflateRawSync(Buffer.from(compressed), {
-    // Hint to the decoder to pre-allocate the right buffer size.
-    chunkSize: Math.max(uncompressedSize | 0, 1024),
-    // Hard ceiling: zlib aborts instead of materialising a bomb.
-    maxOutputLength: MAX_DECODED_BYTES,
-  });
-  return new Uint8Array(out.buffer, out.byteOffset, out.byteLength);
-}
-
-// Varints/zigzag carry i64/u64 on the Rust side. JavaScript's bitwise
-// operators are 32-bit, so the previous `>>>`/`<<` forms silently corrupted any
-// value past 2^31 (string-table indices and integers alike). These use
-// arithmetic on plain numbers, exact up to 2^53, and BigInt beyond, matching
-// `synx_core::binary` for the whole i64 range.
-// Varints/zigzag carry u64/i64 on the Rust side. JavaScript bitwise operators
-// are 32-bit and even plain-number arithmetic loses precision past 2^53 — and a
-// zigzag value is ~twice its integer's magnitude, so an int as small as ~4.5e15
-// (well inside the JS-safe range) would overflow 2^53 mid-encode. Both writers
-// accumulate in BigInt; readers return a Number, exact through the whole
-// JS-safe range and matching `synx_core::binary` byte for byte.
-function writeVarintBig(buf: number[], value: bigint): void {
-  let b = value;
-  if (b < 0n) throw new SynxError('varint cannot encode a negative value');
-  while (b > 0x7fn) { buf.push(Number(b & 0x7fn) | 0x80); b >>= 7n; }
-  buf.push(Number(b));
-}
-
-function writeVarint(buf: number[], value: number): void {
-  if (value < 0 || !Number.isFinite(value)) throw new SynxError('varint cannot encode this value');
-  let v = Math.trunc(value);
-  if (v > Number.MAX_SAFE_INTEGER) { writeVarintBig(buf, BigInt(v)); return; }
-  // perf: plain arithmetic — the BigInt round trip ran for every varint.
-  while (v > 0x7f) {
-    buf.push((v % 0x80) | 0x80);
-    v = Math.floor(v / 0x80);
-  }
-  buf.push(v);
-}
-
-/** Scratch for float encoding — a DataView per float was allocated before. */
-const FLOAT_SCRATCH = new DataView(new ArrayBuffer(8));
-
-function readVarintBig(data: Uint8Array | Buffer, offset: number): [bigint, number] {
-  let result = 0n;
-  let shift = 0n;
-  while (offset < data.length) {
-    const byte = data[offset++];
-    result |= BigInt(byte & 0x7f) << shift;
-    if ((byte & 0x80) === 0) break;
-    shift += 7n;
-    if (shift >= 64n) break; // malformed / overlong — stop like the Rust decoder
-  }
-  return [result, offset];
-}
-
-/**
- * A varint of up to 7 bytes (49 bits) as a plain number, or -1 in `fastEnd`
- * when it is longer or truncated and needs the BigInt reader.
- * perf: every index and length went through BigInt before.
- */
-let fastEnd = 0;
-function readVarintFast(data: Uint8Array | Buffer, offset: number): number {
-  let result = 0;
-  let mul = 1;
-  for (let i = 0; i < 7 && offset < data.length; i++) {
-    const byte = data[offset++];
-    result += (byte & 0x7f) * mul;
-    if ((byte & 0x80) === 0) { fastEnd = offset; return result; }
-    mul *= 128;
-  }
-  fastEnd = -1;
-  return 0;
-}
-
-function readVarint(data: Uint8Array | Buffer, offset: number): [number, number] {
-  const v = readVarintFast(data, offset);
-  if (fastEnd >= 0) return [v, fastEnd];
-  const [big, o] = readVarintBig(data, offset);
-  return [Number(big), o];
-}
-
-function writeZigzag(buf: number[], value: number | bigint): void {
-  // perf: within ±2^52 the doubled magnitude is still exact as a number.
-  if (typeof value === 'number' && Math.abs(value) <= 2 ** 52) {
-    const v = Math.trunc(value);
-    writeVarint(buf, v >= 0 ? v * 2 : -v * 2 - 1);
-    return;
-  }
-  // zigzag: (n << 1) ^ (n >> 63), kept in BigInt so the doubled magnitude never
-  // rounds before it is written.
-  const n = typeof value === 'bigint' ? value : BigInt(Math.trunc(value));
-  const zz = ((n << 1n) ^ (n >> 63n)) & ((1n << 64n) - 1n);
-  writeVarintBig(buf, zz);
-}
-
-function readZigzag(data: Uint8Array | Buffer, offset: number): [number | bigint, number] {
-  const fast = readVarintFast(data, offset);
-  if (fastEnd >= 0) {
-    // ≤ 49 bits: the zigzag halving is exact as a number.
-    return [fast % 2 === 0 ? fast / 2 : -(fast + 1) / 2, fastEnd];
-  }
-  const [raw, newOffset] = readVarintBig(data, offset);
-  const value = BigInt.asIntN(64, (raw >> 1n) ^ -(raw & 1n));
-  // An integer beyond 2^53 stays exact as a bigint, as the parser returns it;
-  // `Number()` rounded it to a neighbouring id.
-  const n = Number(value);
-  return [Number.isSafeInteger(n) ? n : value, newOffset];
-}
 
 function deepEqual(a: unknown, b: unknown): boolean {
   if (a === b) return true;
@@ -1238,125 +870,20 @@ function deepEqual(a: unknown, b: unknown): boolean {
   return false;
 }
 
-// ─── Serializer ───────────────────────────────────────────
-
-/** Render a non-object root value the way Rust's `format_primitive` does. */
-function primitiveToSynx(v: unknown): string {
-  if (v === null || v === undefined) return 'null';
-  if (typeof v === 'boolean') return v ? 'true' : 'false';
-  if (typeof v === 'number' || typeof v === 'bigint') return String(v);
-  if (typeof v === 'string') return v;
-  if (Array.isArray(v)) return '[' + v.map(primitiveToSynx).join(', ') + ']';
-  return '[Object]';
-}
-
-// ─── Canonical Formatter ──────────────────────────────────
-
-interface FmtNode {
-  header: string;
-  children: FmtNode[];
-  listItems: string[];
-  isMultiline: boolean;
-}
-
-/** Same nesting cap as the Rust formatter; deeper input is dropped, not recursed into. */
-const MAX_FMT_PARSE_DEPTH = 128;
-
-function fmtParse(lines: string[], start: number, base: number, depth = 0): [FmtNode[], number] {
-  // safety: unbounded recursion overflowed the stack on a deeply nested file.
-  if (depth > MAX_FMT_PARSE_DEPTH) {
-    // The subtree is dropped but its lines are consumed: returning `start`
-    // left the caller on the same line forever, so a file nested deeper than
-    // the cap hung `format` (as it did in synx-core).
-    let i = start;
-    while (i < lines.length) {
-      const raw = lines[i];
-      if (raw.trim() && raw.search(/\S/) < base) break;
-      i++;
-    }
-    return [[], i];
-  }
-  const nodes: FmtNode[] = [];
-  let i = start;
-  while (i < lines.length) {
-    const raw = lines[i];
-    const t = raw.trim();
-    if (!t) { i++; continue; }
-    const ind = raw.search(/\S/);
-    if (ind < base) break;
-    if (ind > base) { i++; continue; }
-    if (t.startsWith('- ') || t.startsWith('#') || t.startsWith('//')) { i++; continue; }
-    // spec: `|+` opens a block too. Read as a header, its body lines were
-    // parsed as child keys and sorted — reordering the text of a code sample
-    // or prompt. Its lines keep their indent relative to the first.
-    const preserve = t.endsWith(' |+') || t === '|+';
-    const isMultiline = preserve || t.endsWith(' |') || t === '|';
-    const node: FmtNode = { header: t, children: [], listItems: [], isMultiline };
-    let blockBase = -1;
-    i++;
-    while (i < lines.length) {
-      const cr = lines[i];
-      const ct = cr.trim();
-      if (!ct) { i++; continue; }
-      const ci = cr.search(/\S/);
-      if (ci <= base) break;
-      if (preserve) {
-        if (blockBase < 0) blockBase = ci;
-        node.listItems.push(cr.substring(Math.min(ci, blockBase)).trimEnd());
-        i++;
-      } else if (isMultiline || ct.startsWith('- ')) {
-        node.listItems.push(ct);
-        i++;
-      } else if (ct.startsWith('#') || ct.startsWith('//')) {
-        i++;
-      } else {
-        const [subs, ni] = fmtParse(lines, i, ci, depth + 1);
-        // A loop, not push(...subs): spreading 100k+ siblings overflows the stack.
-        for (const sub of subs) node.children.push(sub);
-        i = ni;
-      }
-    }
-    nodes.push(node);
-  }
-  return [nodes, i];
-}
-
-function fmtSort(nodes: FmtNode[]): void {
-  // spec: code-point order of the lowercased key, as synx-core sorts.
-  // `localeCompare` depended on the machine's locale (and ignores punctuation
-  // in most), so the "canonical" form differed between machines and
-  // implementations. perf: each key is computed once, not per comparison.
-  const keyed = nodes.map((n) => ({ n, k: n.header.split(/[\s\[:(]/)[0].toLowerCase() }));
-  keyed.sort((a, b) => compareUnicodeScalar(a.k, b.k));
-  for (let i = 0; i < nodes.length; i++) nodes[i] = keyed[i].n;
-  for (const n of nodes) fmtSort(n.children);
-}
-
-function fmtEmit(nodes: FmtNode[], indent: number): string {
-  const sp = ' '.repeat(indent);
-  let out = '';
-  for (const n of nodes) {
-    out += `${sp}${n.header}\n`;
-    if (n.children.length > 0) out += fmtEmit(n.children, indent + 2);
-    for (const li of n.listItems) out += `${sp}  ${li}\n`;
-    if (indent === 0 && (n.children.length > 0 || n.listItems.length > 0)) out += '\n';
-  }
-  return out;
-}
-
 // ─── Export Converters ────────────────────────────────────
 
 function toJSONString(obj: SynxObject, pretty = true): string {
   // Per SYNX 3.6 §10: canonical JSON has object keys sorted lexicographically.
   // The implementation lives in ./json so that the SYNXL projection (§12) uses
   // the very same writer.
-  return toCanonicalJSONString(obj, pretty);
+  return json().toCanonicalJSONString(obj, pretty);
 }
 
 function toYAMLString(value: unknown, indent = 0): string {
   const sp = ' '.repeat(indent);
   if (value === null || value === undefined) return `${sp}null\n`;
-  if (typeof value === 'boolean' || typeof value === 'number') return `${sp}${value}\n`;
+  if (typeof value === 'boolean' || typeof value === 'number' || typeof value === 'bigint') return `${sp}${value}\n`;
+  if (value instanceof SynxSecret) return `${sp}"[SECRET]"\n`;
   if (typeof value === 'string') {
     if (value.includes('\n') || value.includes(':') || value.includes('#') ||
         value.startsWith('{') || value.startsWith('[') || value.startsWith('"') ||
@@ -1370,7 +897,7 @@ function toYAMLString(value: unknown, indent = 0): string {
     if (value.length === 0) return `${sp}[]\n`;
     let out = '';
     for (const item of value) {
-      if (item && typeof item === 'object' && !Array.isArray(item)) {
+      if (item && typeof item === 'object' && !Array.isArray(item) && !(item instanceof SynxSecret)) {
         out += `${sp}- `;
         const entries = Object.entries(item as Record<string, unknown>);
         if (entries.length > 0) {
@@ -1389,8 +916,7 @@ function toYAMLString(value: unknown, indent = 0): string {
   if (typeof value === 'object') {
     let out = '';
     for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-      if (k.startsWith('__synx')) continue;
-      if (v && typeof v === 'object') {
+      if (v && typeof v === 'object' && !(v instanceof SynxSecret)) {
         out += `${sp}${k}:\n`;
         out += Array.isArray(v)
           ? toYAMLString(v, indent + 2)
@@ -1406,7 +932,10 @@ function toYAMLString(value: unknown, indent = 0): string {
 
 function toYAMLValue(v: unknown): string {
   if (v === null || v === undefined) return 'null';
-  if (typeof v === 'boolean' || typeof v === 'number') return String(v);
+  // A 64-bit integer is a YAML integer; `JSON.stringify` throws on a bigint.
+  if (typeof v === 'boolean' || typeof v === 'number' || typeof v === 'bigint') return String(v);
+  // safety: a secret is written as its mask, never as an empty mapping.
+  if (v instanceof SynxSecret) return '"[SECRET]"';
   if (typeof v === 'string') {
     if (v.includes('\n') || v.includes(':') || v.includes('#') ||
         v.startsWith('{') || v.startsWith('[') || v.startsWith('"') ||
@@ -1426,7 +955,6 @@ function toTOMLString(obj: Record<string, unknown>, prefix = ''): string {
   const arrays: [string, unknown[]][] = [];
 
   for (const [k, v] of Object.entries(obj)) {
-    if (k.startsWith('__synx')) continue;
     if (Array.isArray(v)) {
       const allObjects = v.length > 0 && v.every(i => i && typeof i === 'object' && !Array.isArray(i));
       if (allObjects) {
@@ -1434,7 +962,7 @@ function toTOMLString(obj: Record<string, unknown>, prefix = ''): string {
       } else {
         simple.push([k, v]);
       }
-    } else if (v && typeof v === 'object') {
+    } else if (v && typeof v === 'object' && !(v instanceof SynxSecret)) {
       tables.push([k, v as Record<string, unknown>]);
     } else {
       simple.push([k, v]);
@@ -1464,7 +992,8 @@ function toTOMLString(obj: Record<string, unknown>, prefix = ''): string {
 
 function toTOMLValue(v: unknown): string {
   if (v === null || v === undefined) return '""';
-  if (typeof v === 'boolean') return String(v);
+  if (typeof v === 'boolean' || typeof v === 'bigint') return String(v);
+  if (v instanceof SynxSecret) return '"[SECRET]"';
   if (typeof v === 'number') {
     if (Number.isInteger(v)) return String(v);
     const s = String(v);
@@ -1478,9 +1007,8 @@ function toTOMLValue(v: unknown): string {
 function toEnvString(obj: Record<string, unknown>, prefix = ''): string {
   let out = '';
   for (const [k, v] of Object.entries(obj)) {
-    if (k.startsWith('__synx')) continue;
     const envKey = prefix ? `${prefix}_${k}`.toUpperCase() : k.toUpperCase();
-    if (v && typeof v === 'object' && !Array.isArray(v)) {
+    if (v && typeof v === 'object' && !Array.isArray(v) && !(v instanceof SynxSecret)) {
       out += toEnvString(v as Record<string, unknown>, envKey);
     } else if (Array.isArray(v)) {
       out += `${envKey}=${v.map(String).join(',')}\n`;
@@ -1536,8 +1064,8 @@ if (typeof module !== 'undefined' && module.exports) {
   // SYNXL: `module.exports` is the Synx class, so every SYNXL static above is
   // already reachable as a named CommonJS export. Only the helpers and limits
   // that have no static counterpart need re-attaching here.
-  module.exports.splitRecordLine = synxlSplitRecordLine;
-  module.exports.utf8Length = synxlUtf8Length;
+  module.exports.splitRecordLine = splitRecordLine;
+  module.exports.utf8Length = utf8Length;
   module.exports.MAX_SYNXL_RECORD_BYTES = MAX_SYNXL_RECORD_BYTES;
   module.exports.MAX_SYNXL_FIELDS = MAX_SYNXL_FIELDS;
   module.exports.MAX_SYNXL_FIELD_NAME_BYTES = MAX_SYNXL_FIELD_NAME_BYTES;

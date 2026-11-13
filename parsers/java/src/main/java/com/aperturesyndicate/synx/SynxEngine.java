@@ -45,7 +45,120 @@ public final class SynxEngine {
     /** Apply markers and constraints to {@code result} in place. No-op on Static mode. */
     public static void resolve(SynxParseResult result, SynxOptions options) {
         if (result.mode != SynxMode.ACTIVE) return;
-        new Resolver(result, options == null ? new SynxOptions() : options).run();
+        SynxOptions opts = options == null ? new SynxOptions() : options;
+        if (opts.includeDepth == 0) {
+            IncludeState state = INCLUDE_STATE.get();
+            if (state.open.isEmpty()) {
+                state.reads = 0;
+                state.readBytes = 0;
+            }
+        }
+        new Resolver(result, opts).run();
+    }
+
+    /** Most included documents one top-level resolve may read and resolve. */
+    private static final int MAX_INCLUDE_READS = 1024;
+
+    /**
+     * Most bytes one top-level resolve may read from disk through {@code :include},
+     * {@code !include}, {@code !use} and {@code :watch}.
+     *
+     * <p>safety: every file is capped at {@link #MAX_FILE_SIZE}, but a document may name the
+     * same file from a thousand keys; each read is parsed and kept.
+     */
+    private static final long MAX_RESOLVE_READ_BYTES = 64L * 1024 * 1024;
+
+    /** Files whose resolution is in progress, outermost first, and what has been read so far. */
+    private static final class IncludeState {
+        final ArrayList<Path> open = new ArrayList<>();
+        int reads;
+        long readBytes;
+    }
+
+    /** A file the document may not read; the message is the text the document gets. */
+    private static final class ReadRefused extends Exception {
+        private static final long serialVersionUID = 1L;
+
+        ReadRefused(String message) { super(message, null, false, false); }
+    }
+
+    /**
+     * Reads a file for {@code :include}, {@code !include}, {@code !use} or {@code :watch},
+     * counting its size against {@link #MAX_RESOLVE_READ_BYTES}. {@code shown} is the path as
+     * the document wrote it.
+     *
+     * <p>spec: the refusal never carries the operating system's wording or the absolute path,
+     * so the same document resolves to the same string on every machine.
+     */
+    static String readBudgeted(Path p, String shown) throws ReadRefused {
+        // A name this platform cannot hold at all is a file that is not there.
+        if (p == null) throw new ReadRefused("file not found: " + shown);
+        IncludeState state = INCLUDE_STATE.get();
+        long size = 0;
+        try {
+            size = Files.size(p);
+        } catch (IOException | RuntimeException ignored) {
+            // A file whose size cannot be read fails below, on read.
+        }
+        if (state.readBytes + size > MAX_RESOLVE_READ_BYTES) {
+            throw new ReadRefused("read budget (" + MAX_RESOLVE_READ_BYTES + " bytes) exceeded");
+        }
+        // A directory reads as "permission denied" on Windows and "is a directory" elsewhere;
+        // it is neither.
+        boolean isDirectory;
+        try {
+            isDirectory = Files.isDirectory(p);
+        } catch (RuntimeException e) {
+            isDirectory = false;
+        }
+        if (isDirectory) throw new ReadRefused("not a file: " + shown);
+        byte[] bytes;
+        try {
+            bytes = Files.readAllBytes(p);
+        } catch (NoSuchFileException e) {
+            throw new ReadRefused("file not found: " + shown);
+        } catch (AccessDeniedException e) {
+            throw new ReadRefused("permission denied: " + shown);
+        } catch (IOException | RuntimeException e) {
+            // An invalid or over-long name reaches here as a plain FileSystemException.
+            throw new ReadRefused((exists(p) ? "cannot read file: " : "file not found: ") + shown);
+        }
+        String text;
+        try {
+            text = StandardCharsets.UTF_8.newDecoder()
+                .onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
+                .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT)
+                .decode(java.nio.ByteBuffer.wrap(bytes)).toString();
+        } catch (CharacterCodingException e) {
+            throw new ReadRefused("file is not valid UTF-8: " + shown);
+        }
+        state.readBytes += bytes.length;
+        return text;
+    }
+
+    private static final ThreadLocal<IncludeState> INCLUDE_STATE = ThreadLocal.withInitial(IncludeState::new);
+
+    /**
+     * Opens {@code full} for resolution; returns {@code null}, or why it may not be opened:
+     * the file is already being resolved (a cycle), or the document has read its budget.
+     * A successful call is paired with {@link #includeLeave()}.
+     *
+     * <p>safety: the depth cap alone let {@code a:include self.synx} / {@code b:include
+     * self.synx} resolve 2^16 times — minutes for a three-line file, and a third key made it
+     * hang. A cycle now stops at its first repeat, and the budget bounds an acyclic fan-out.
+     */
+    static String includeEnter(Path full, String shown) {
+        IncludeState state = INCLUDE_STATE.get();
+        if (state.open.contains(full)) return "circular include: '" + shown + "'";
+        if (state.reads >= MAX_INCLUDE_READS) return "include budget (" + MAX_INCLUDE_READS + " files) exceeded";
+        state.reads++;
+        state.open.add(full);
+        return null;
+    }
+
+    static void includeLeave() {
+        IncludeState state = INCLUDE_STATE.get();
+        if (!state.open.isEmpty()) state.open.remove(state.open.size() - 1);
     }
 
     /** Names a custom marker ({@link SynxOptions#markerFns}) cannot take. */
@@ -110,6 +223,11 @@ public final class SynxEngine {
          * document declares.
          */
         final Map<String, PreInclude> preIncludes = new HashMap<>();
+        /**
+         * What the keys under {@code :secret} held before the pre-pass masked them, by object
+         * path and key (see {@link #maskSecretLiterals}).
+         */
+        final Map<String, Map<String, SynxValue>> secretOriginals = new HashMap<>();
 
         Resolver(SynxParseResult r, SynxOptions o) {
             this.result = r;
@@ -147,13 +265,23 @@ public final class SynxEngine {
                         if (!(root.get(key) instanceof SynxValue.Str p)) continue;
                         Jail jail = jailPath(basePath(), p.value());
                         if (jail.error != null || checkFileSize(jail.path) != null) continue;
-                        String text;
-                        try { text = readUtf8(jail.path); } catch (IOException e) { continue; }
-                        SynxValue included = parseIncluded(text, jail.path);
+                        if (jail.path != null && includeEnter(jail.path, p.value()) != null) continue;
+                        SynxValue included;
+                        try {
+                            included = parseIncluded(readBudgeted(jail.path, p.value()), jail.path);
+                        } catch (ReadRefused e) {
+                            continue;
+                        } finally {
+                            if (jail.path != null) includeLeave();
+                        }
                         // The key's `:include` marker takes this result instead of reading and
                         // resolving the file a second time (2^depth for a chain of includes).
                         preIncludes.put(key, new PreInclude(p.value(), included));
-                        includes.putIfAbsent(key, included);
+                        // safety: the tree is also what `{leaf:key}` reads. Under `:secret`
+                        // that scope gets the masked tree, or `x {password:db}` printed what
+                        // `db:secret:include` hid.
+                        includes.putIfAbsent(key, m.hasMarker("secret")
+                            ? maskSecretValue(SynxObject.deepCopy(included)) : included);
                     }
                 }
                 for (var e : packages.entrySet()) {
@@ -173,7 +301,7 @@ public final class SynxEngine {
                 for (String k : root.keys()) if (k.startsWith("_")) root.remove(k);
             }
 
-            // Literal `:secret` values are masked before anything can interpolate them.
+            // Every value under `:secret` is masked before anything can read it.
             path.setLength(0);
             maskSecretLiterals(rootValue);
 
@@ -215,8 +343,20 @@ public final class SynxEngine {
             }
             Map<String, SynxMeta> mm = meta.get(path.toString());
             int baseLen = path.length();
+            // What this object's `:secret` keys held before the pre-pass.
+            Map<String, SynxValue> originals = secretOriginals.isEmpty() ? null : secretOriginals.remove(path.toString());
             List<String> keys = obj.keys();
             for (String key : keys) {
+                SynxValue original = originals == null ? null : originals.remove(key);
+                if (original != null) {
+                    obj.set(key, original);
+                    if (original instanceof SynxValue.Obj || original instanceof SynxValue.Arr) {
+                        // Secrets nested in it stay masked until their own turn.
+                        pushKey(key);
+                        maskSecretSubtree(original);
+                        path.setLength(baseLen);
+                    }
+                }
                 SynxValue child = obj.get(key);
                 if (child instanceof SynxValue.Obj o) {
                     pushKey(key);
@@ -299,10 +439,13 @@ public final class SynxEngine {
                         obj.set(key, SynxValue.ofString("INCLUDE_ERR: max include depth (" + maxDepth + ") exceeded"));
                         return;
                     }
+                    // `:include` with `:secret` masks the leaves of the included tree.
+                    boolean isSecret = (mb & MK_SECRET) != 0;
                     if (metaPath.isEmpty()) {
                         PreInclude pre = preIncludes.get(key);
                         if (pre != null && pre.path().equals(fp.value())) {
-                            obj.set(key, SynxObject.deepCopy(pre.root()));
+                            SynxValue copy = SynxObject.deepCopy(pre.root());
+                            obj.set(key, isSecret ? maskSecretValue(copy) : copy);
                             return;
                         }
                     }
@@ -316,10 +459,18 @@ public final class SynxEngine {
                         obj.set(key, SynxValue.ofString("INCLUDE_ERR: " + sizeErr));
                         return;
                     }
+                    String openErr = jail.path == null ? null : includeEnter(jail.path, fp.value());
+                    if (openErr != null) {
+                        obj.set(key, SynxValue.ofString("INCLUDE_ERR: " + openErr));
+                        return;
+                    }
                     try {
-                        obj.set(key, parseIncluded(readUtf8(jail.path), jail.path));
-                    } catch (IOException e) {
-                        obj.set(key, SynxValue.ofString("INCLUDE_ERR: " + ioErrText(e, fp.value())));
+                        SynxValue included = parseIncluded(readBudgeted(jail.path, fp.value()), jail.path);
+                        obj.set(key, isSecret ? maskSecretValue(included) : included);
+                    } catch (ReadRefused e) {
+                        obj.set(key, SynxValue.ofString("INCLUDE_ERR: " + e.getMessage()));
+                    } finally {
+                        if (jail.path != null) includeLeave();
                     }
                 }
                 return;
@@ -476,12 +627,6 @@ public final class SynxEngine {
                 }
             }
 
-            // :secret (idempotent: the pre-pass may have masked it already)
-            if ((mb & MK_SECRET) != 0) {
-                SynxValue v = obj.get(key);
-                if (v != null && !(v instanceof SynxValue.Secret)) obj.set(key, SynxValue.ofSecret(valueToString(v)));
-            }
-
             // :unique
             if ((mb & MK_UNIQUE) != 0) {
                 if (obj.get(key) instanceof SynxValue.Arr arr) {
@@ -590,9 +735,15 @@ public final class SynxEngine {
                 }
                 Double n = valueAsNumber(obj.get(key));
                 if (n != null) {
-                    double factor = powi(10, (int) decimals);
-                    double rounded = roundHalfAway(n * factor) / factor;
-                    obj.set(key, decimals == 0 ? SynxValue.ofInt(SynxNumbers.toI64(rounded)) : SynxValue.ofFloat(rounded));
+                    // A scale past the range of f64 rounds nothing: the number stays.
+                    double factor = powi(10, (int) Math.min(decimals, 400));
+                    double scaled = n * factor;
+                    double rounded = Double.isFinite(scaled) ? roundHalfAway(scaled) / factor : n;
+                    // safety: only a whole number that fits is an integer. The cast alone
+                    // saturates: `:round` of 1e30 was 9223372036854775807 and of NaN was 0 —
+                    // invented values, where `:calc` and `:clamp` keep the float.
+                    obj.set(key, decimals == 0 && SynxNumbers.isWhole(rounded) && Math.abs(rounded) < SynxNumbers.I64_MAX_F
+                        ? SynxValue.ofInt(SynxNumbers.toI64(rounded)) : SynxValue.ofFloat(rounded));
                 }
             }
 
@@ -661,8 +812,9 @@ public final class SynxEngine {
                             total += f.value();
                             if (!SynxNumbers.isWhole(f.value())) allInt = false;
                         } else if (item instanceof SynxValue.Str s) {
+                            // `inf` and `nan` are text here as everywhere (see castPrimitive).
                             Double f = SynxNumbers.parseF64(s.value());
-                            if (f != null) {
+                            if (f != null && Double.isFinite(f)) {
                                 total += f;
                                 if (!SynxNumbers.isWhole(f)) allInt = false;
                             }
@@ -739,17 +891,28 @@ public final class SynxEngine {
                     }
                     String keyPath = markerArg(markers, "watch", 1);
                     try {
-                        String content = readUtf8(jail.path);
+                        String content = readBudgeted(jail.path, fp.value());
                         if (keyPath != null) {
                             SynxValue v = extractFromFileContent(content, keyPath, fileExtension(jail.path));
                             obj.set(key, v == null ? SynxValue.ofNull() : v);
                         } else {
                             obj.set(key, SynxValue.ofString(SynxParser.trim(content)));
                         }
-                    } catch (IOException e) {
-                        obj.set(key, SynxValue.ofString("WATCH_ERR: " + ioErrText(e, fp.value())));
+                    } catch (ReadRefused e) {
+                        obj.set(key, SynxValue.ofString("WATCH_ERR: " + e.getMessage()));
                     }
                 }
+            }
+
+            // :secret
+            // Last of the markers that produce the value, so whatever they resolved is what
+            // gets masked. It used to sit after `:alias`: `t:secret:once` came out as plain
+            // text, `:secret:default:x` and `:secret:watch` masked the argument instead of the
+            // result, and `:secret:format` formatted the mask. `:prompt` and custom markers
+            // below still see only the mask.
+            if ((mb & MK_SECRET) != 0) {
+                SynxValue v = obj.get(key);
+                if (v != null) obj.set(key, maskSecretValue(v));
             }
 
             // :prompt[:LABEL]
@@ -1001,39 +1164,55 @@ public final class SynxEngine {
             }
         }
 
+        /**
+         * The {@code :secret} pre-pass: every value under {@code :secret} is masked before any
+         * resolution, so no field that names it — <code>{that_key}</code>, {@code :alias},
+         * {@code :map} — reads the plain text, wherever in the document it stands. What the
+         * key held is kept in {@link #secretOriginals} and comes back for the key's own turn
+         * (its subtree and its marker chain); what that produces is masked again.
+         *
+         * <p>safety: a literal next to {@code :default}, {@code :replace}, {@code :format},
+         * {@code :split}, … was left in the clear until its own turn, and the fields of a
+         * group under {@code :secret} were never masked here: {@code leak:alias password}
+         * above {@code password:secret:default:x hunter2} read {@code hunter2}.
+         */
         void maskSecretLiterals(SynxValue v) {
             if (!(v instanceof SynxValue.Obj o)) return;
             SynxObject obj = o.map();
             Map<String, SynxMeta> mm = meta.get(path.toString());
             if (mm != null) {
                 for (var e : mm.entrySet()) {
-                    SynxMeta m = e.getValue();
-                    if (!m.hasMarker("secret") || needsResolutionBeforeSecret(m.markers)) continue;
+                    if (!e.getValue().hasMarker("secret")) continue;
                     SynxValue val = obj.get(e.getKey());
-                    if (val == null || val instanceof SynxValue.Secret || val instanceof SynxValue.Obj
-                            || val instanceof SynxValue.Arr) continue;
-                    obj.set(e.getKey(), SynxValue.ofSecret(valueToString(val)));
+                    if (val == null || val instanceof SynxValue.Secret || val instanceof SynxValue.Null) continue;
+                    obj.set(e.getKey(), maskSecretValue(SynxObject.deepCopy(val)));
+                    secretOriginals.computeIfAbsent(path.toString(), k -> new HashMap<>()).put(e.getKey(), val);
                 }
             }
             int baseLen = path.length();
-            for (var e : obj) {
-                SynxValue child = e.getValue();
-                if (child instanceof SynxValue.Obj) {
-                    pushKey(e.getKey());
-                    maskSecretLiterals(child);
+            for (String key : obj.keys()) {
+                SynxValue child = obj.get(key);
+                if (child instanceof SynxValue.Obj || child instanceof SynxValue.Arr) {
+                    pushKey(key);
+                    maskSecretSubtree(child);
                     path.setLength(baseLen);
-                } else if (child instanceof SynxValue.Arr a) {
-                    pushKey(e.getKey());
-                    int listLen = path.length();
-                    List<SynxValue> items = a.values();
-                    for (int idx = 0; idx < items.size(); idx++) {
-                        if (items.get(idx) instanceof SynxValue.Obj) {
-                            pushItem(idx);
-                            maskSecretLiterals(items.get(idx));
-                            path.setLength(listLen);
-                        }
+                }
+            }
+        }
+
+        /** {@link #maskSecretLiterals} for the object or list at the current path. */
+        void maskSecretSubtree(SynxValue child) {
+            if (child instanceof SynxValue.Obj) {
+                maskSecretLiterals(child);
+            } else if (child instanceof SynxValue.Arr a) {
+                int listLen = path.length();
+                List<SynxValue> items = a.values();
+                for (int idx = 0; idx < items.size(); idx++) {
+                    if (items.get(idx) instanceof SynxValue.Obj) {
+                        pushItem(idx);
+                        maskSecretLiterals(items.get(idx));
+                        path.setLength(listLen);
                     }
-                    path.setLength(baseLen);
                 }
             }
         }
@@ -1172,7 +1351,10 @@ public final class SynxEngine {
 
         Map<String, SynxValue> loadPackages(List<SynxUseDirective> directives) {
             Map<String, SynxValue> out = new LinkedHashMap<>();
-            if (directives == null || directives.isEmpty()) return out;
+            // safety: a package may `!use` another. The depth was counted but never checked,
+            // and nothing noticed a package reaching itself: packages using one another
+            // overflowed the stack.
+            if (directives == null || directives.isEmpty() || opts.includeDepth >= maxIncludeDepth()) return out;
             String pkgBase = opts.packagesPath == null ? "./synx_packages" : opts.packagesPath;
             Path pkgRoot = joinPath(basePath(), pkgBase);
             if (pkgRoot == null) return out;
@@ -1183,9 +1365,16 @@ public final class SynxEngine {
                 Path entry = readManifestMain(pkgDir);
                 if (entry == null) entry = pkgDir.resolve("src").resolve("main.synx");
                 if (!Files.isRegularFile(entry) || checkFileSize(entry) != null) continue;
-                String text;
-                try { text = readUtf8(entry); } catch (IOException e) { continue; }
-                out.put(ud.alias(), parseIncluded(text, entry));
+                Path opened;
+                try { opened = entry.toRealPath(); } catch (IOException | RuntimeException e) { opened = entry; }
+                if (includeEnter(opened, ud.pkg()) != null) continue;
+                try {
+                    out.put(ud.alias(), parseIncluded(readBudgeted(entry, ud.pkg()), entry));
+                } catch (ReadRefused e) {
+                    continue;
+                } finally {
+                    includeLeave();
+                }
             }
             return out;
         }
@@ -1195,9 +1384,14 @@ public final class SynxEngine {
             for (SynxIncludeDirective inc : directives) {
                 Jail jail = jailPath(basePath(), inc.path());
                 if (jail.error != null || checkFileSize(jail.path) != null) continue;
-                String text;
-                try { text = readUtf8(jail.path); } catch (IOException e) { continue; }
-                includes.put(inc.alias(), parseIncluded(text, jail.path));
+                if (jail.path != null && includeEnter(jail.path, inc.path()) != null) continue;
+                try {
+                    includes.put(inc.alias(), parseIncluded(readBudgeted(jail.path, inc.path()), jail.path));
+                } catch (ReadRefused e) {
+                    continue;
+                } finally {
+                    if (jail.path != null) includeLeave();
+                }
             }
         }
     }
@@ -1206,7 +1400,12 @@ public final class SynxEngine {
 
     /** The error a value earns against its constraints, or {@code null}; the first failing check wins. */
     static String constraintViolation(String key, SynxValue val, SynxConstraints c) {
-        if (c.required && (val instanceof SynxValue.Null || (val instanceof SynxValue.Str s && s.value().isEmpty()))) {
+        // A key written without a value parses as an empty group; for `[required]` that is
+        // the missing value, not a present object.
+        boolean isMissing = val instanceof SynxValue.Null
+            || (val instanceof SynxValue.Str s && s.value().isEmpty())
+            || (val instanceof SynxValue.Obj o && o.map().isEmpty());
+        if (c.required && isMissing) {
             return "CONSTRAINT_ERR: '" + key + "' is required";
         }
         // An absent value (null) is checked against `enum` only, read as an empty string.
@@ -1438,22 +1637,50 @@ public final class SynxEngine {
         }
         Long n = SynxNumbers.parseI64(val);
         if (n != null) return SynxValue.ofInt(n);
+        // spec: `inf`, `NaN` and `1e400` are text. Read as floats they became `null` in JSON:
+        // a host named `inf` lost its value.
         Double d = SynxNumbers.parseF64(val);
-        if (d != null) return SynxValue.ofFloat(d);
+        if (d != null && Double.isFinite(d)) return SynxValue.ofFloat(d);
         return SynxValue.ofString(val);
     }
 
-    static boolean needsResolutionBeforeSecret(List<String> markers) {
-        for (String m : markers) {
-            switch (m) {
-                case "env": case "include": case "import": case "watch": case "ref": case "alias":
-                case "calc": case "map": case "i18n": case "default": case "fallback": case "once":
-                case "split": case "join": case "format": case "replace":
-                    return true;
-                default: break;
-            }
+    /** The prefixes of the strings the engine leaves in place of a value it could not produce. */
+    private static final String[] RUNTIME_ERROR_PREFIXES = {
+        "INCLUDE_ERR:", "WATCH_ERR:", "CALC_ERR:", "SPAM_ERR:", "CONSTRAINT_ERR:",
+        "ALIAS_ERR:", "NESTING_ERR:", "LIMIT_ERR:", "TYPE_ERR:", "WASM_ERR:",
+    };
+
+    /** Whether {@code s} is an error the engine left in place of a value. */
+    static boolean isEngineError(String s) {
+        if (s.isEmpty() || s.charAt(0) < 'A' || s.charAt(0) > 'Z') return false;
+        for (String prefix : RUNTIME_ERROR_PREFIXES) {
+            if (s.startsWith(prefix)) return true;
         }
         return false;
+    }
+
+    /**
+     * Makes a resolved value a secret. A scalar becomes the secret of its text; a list or a
+     * group keeps its shape and every scalar in it is masked. An absent value (null) stays
+     * null — wrapping it made the secret the text "null", which {@code [required]} read as a
+     * present value — an existing secret is kept, and an engine error stays readable:
+     * {@code :secret:watch missing.txt} is a failure to report, not a value to hide.
+     */
+    static SynxValue maskSecretValue(SynxValue v) {
+        if (v == null) return SynxValue.ofNull();
+        if (v instanceof SynxValue.Secret || v instanceof SynxValue.Null) return v;
+        if (v instanceof SynxValue.Arr a) {
+            List<SynxValue> out = new ArrayList<>(a.values().size());
+            for (SynxValue item : a.values()) out.add(maskSecretValue(item));
+            return SynxValue.ofArray(out);
+        }
+        if (v instanceof SynxValue.Obj o) {
+            SynxObject map = o.map();
+            for (String k : map.keys()) map.set(k, maskSecretValue(map.get(k)));
+            return v;
+        }
+        if (v instanceof SynxValue.Str s && isEngineError(s.value())) return v;
+        return SynxValue.ofSecret(valueToString(v));
     }
 
     static SynxValue deepGet(SynxValue root, String path) {
@@ -1584,9 +1811,18 @@ public final class SynxEngine {
      * a mixed list orders exactly as in the reference.
      */
     static void stableSort(List<SynxValue> items) {
+        // A total order: numbers first, by value (NaN after the rest of them), then
+        // everything else by its text, by code point. Comparing a number with text as text
+        // made `10 < 1a < 9 < 10` a cycle — TimSort answers that with
+        // IllegalArgumentException — and the result depended on the algorithm.
         java.util.Comparator<SynxValue> cmp = (a, b) -> {
             Double an = valueAsNumber(a), bn = valueAsNumber(b);
-            if (an != null && bn != null) return an < bn ? -1 : (an > bn ? 1 : 0);
+            if (an != null && bn != null) {
+                if (an.isNaN() || bn.isNaN()) return Boolean.compare(an.isNaN(), bn.isNaN());
+                return an < bn ? -1 : (an > bn ? 1 : 0);
+            }
+            if (an != null) return -1;
+            if (bn != null) return 1;
             return SynxParser.compareCodePoints(valueToString(a), valueToString(b));
         };
         if (items.size() <= 20) {
@@ -1869,23 +2105,56 @@ public final class SynxEngine {
             return new Jail(null, null);
         }
         if (fp.isAbsolute()) return new Jail(null, "SECURITY: absolute paths are not allowed: '" + file + "'");
+        // safety: `NUL`, `con.txt` or `COM1` in any directory opens a device on Windows —
+        // `:include NUL` read it as an empty document, and a console or a serial port blocks
+        // the read. synx-core reaches the disk through a verbatim path, where these are
+        // ordinary missing files; the same answer is given here.
+        if (IS_WINDOWS && hasDeviceName(fp)) return new Jail(null, "file not found: " + file);
         Path baseCanon;
         try {
             baseCanon = Path.of(base.isEmpty() ? "." : base).toRealPath();
         } catch (IOException | InvalidPathException e) {
-            try { baseCanon = Path.of(base); } catch (InvalidPathException e2) { baseCanon = Path.of("."); }
+            // A base that cannot be resolved refuses instead of jailing nothing.
+            return new Jail(null, "SECURITY: base directory not found: '" + (base.isEmpty() ? "." : base) + "'");
         }
         Path full = baseCanon.resolve(fp);
         Path fullCanon;
         try {
             fullCanon = full.toRealPath();
         } catch (IOException e) {
-            if (full.toString().contains("..")) return new Jail(null, "SECURITY: path traversal detected: '" + file + "'");
+            // Judged by the path as the document wrote it, segment by segment: a base
+            // directory named `a..b` is no traversal.
+            for (String seg : file.split("[/\\\\]")) {
+                if (seg.equals("..")) return new Jail(null, "SECURITY: path traversal detected: '" + file + "'");
+            }
             if (!full.startsWith(baseCanon)) return new Jail(null, "SECURITY: path escapes base directory: '" + file + "'");
             return new Jail(full, null);
         }
         if (!fullCanon.startsWith(baseCanon)) return new Jail(null, "SECURITY: path escapes base directory: '" + file + "'");
         return new Jail(fullCanon, null);
+    }
+
+    private static final boolean IS_WINDOWS =
+        System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT).startsWith("windows");
+
+    /** Whether a component of {@code p} is a DOS device name, with or without an extension. */
+    static boolean hasDeviceName(Path p) {
+        for (Path part : p) {
+            String name = part.toString();
+            int dot = name.indexOf('.');
+            String stem = (dot < 0 ? name : name.substring(0, dot)).stripTrailing().toUpperCase(java.util.Locale.ROOT);
+            switch (stem) {
+                case "CON": case "PRN": case "AUX": case "NUL": case "CONIN$": case "CONOUT$":
+                    return true;
+                default:
+                    break;
+            }
+            if (stem.length() == 4 && (stem.startsWith("COM") || stem.startsWith("LPT"))) {
+                char d = stem.charAt(3);
+                if ((d >= '0' && d <= '9') || d == '\u00b9' || d == '\u00b2' || d == '\u00b3') return true;
+            }
+        }
+        return false;
     }
 
     /** {@code Path::join}: an absolute second part replaces the first. */
@@ -1915,22 +2184,14 @@ public final class SynxEngine {
 
     /** {@code fs::read_to_string}: the file must be valid UTF-8. */
     static String readUtf8(Path p) throws IOException {
-        if (p == null) throw new IOException("The filename, directory name, or volume label syntax is incorrect.");
+        if (p == null) throw new NoSuchFileException("");
         try {
             return Files.readString(p, StandardCharsets.UTF_8);
         } catch (CharacterCodingException e) {
             throw new IOException("stream did not contain valid UTF-8", e);
         } catch (InvalidPathException e) {
-            throw new IOException(e.getMessage(), e);
+            throw new NoSuchFileException("");
         }
-    }
-
-    /** The reference's portable I/O error text. */
-    private static String ioErrText(IOException e, String ctx) {
-        if (e instanceof NoSuchFileException) return "file not found: " + ctx;
-        if (e instanceof AccessDeniedException) return "permission denied: " + ctx;
-        String m = e.getMessage();
-        return m == null ? e.toString() : m;
     }
 
     /** {@code Path::extension}: none for a dot-file without another dot. */

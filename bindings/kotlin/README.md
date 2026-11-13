@@ -60,15 +60,17 @@ Or add the **`jar`** from `build/libs/` plus **`jna-5.15.0.jar`** to your classp
 |--------|---|
 | `parse` | `synx_parse` |
 | `parseActive` | `synx_parse_active` |
+| `parseActive(text, env, basePath)` | `synx_parse_active_ex` |
 | `stringify` | `synx_stringify` |
 | `format` | `synx_format` |
 | `parseTool` | `synx_parse_tool` |
+| `parseTool(text, env, basePath)` | `synx_parse_tool_ex` |
 | `diff` | `synx_diff` |
 | `compile` | `synx_compile` |
 | `decompile` | `synx_decompile` |
 | `isSynxb` | `synx_is_synxb` |
 
-Returns are **`String`** or **`ByteArray`**; failures throw **`SynxEngineError`**.
+Returns are **`String`** or **`ByteArray`**; failures throw **`SynxEngineError`**. Text that contains U+0000 throws `IllegalArgumentException`: a C string ends there, and the rest of the document would otherwise be lost silently.
 
 ## Android
 
